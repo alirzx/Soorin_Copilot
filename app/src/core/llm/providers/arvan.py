@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import time
 from typing import Any
 
@@ -12,11 +13,20 @@ from src.core.llm.errors import LLMError
 from src.core.llm.providers.base import LLMProviderResult
 
 
+logger = logging.getLogger(__name__)
+
+
 class ArvanProvider:
     provider_name = "arvan"
 
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
+        logger.info(
+            "event=arvan_provider_initialized provider=%s model=%s chat_path=%s",
+            self.provider_name,
+            settings.arvan_model,
+            settings.arvan_chat_path,
+        )
 
     @property
     def endpoint(self) -> str:
@@ -64,14 +74,40 @@ class ArvanProvider:
             self.settings.arvan_timeout_seconds,
         )
 
+        logger.info(
+            "event=provider_request_start provider=%s model=%s message_count=%s chat_path=%s",
+            self.provider_name,
+            self.settings.arvan_model,
+            len(messages),
+            self.settings.arvan_chat_path,
+        )
         started = time.perf_counter()
         try:
             response = requests.post(self.endpoint, json=payload, headers=headers, timeout=timeout)
         except requests.RequestException as exc:
+            logger.exception(
+                "event=provider_request_exception provider=%s model=%s",
+                self.provider_name,
+                self.settings.arvan_model,
+            )
             raise LLMError("Arvan request failed.", reason="provider_request_failed") from exc
 
         latency_ms = int((time.perf_counter() - started) * 1000)
+        logger.info(
+            "event=provider_response provider=%s model=%s status_code=%s latency_ms=%s",
+            self.provider_name,
+            self.settings.arvan_model,
+            response.status_code,
+            latency_ms,
+        )
         if response.status_code >= 400:
+            logger.warning(
+                "event=provider_http_error provider=%s model=%s status_code=%s latency_ms=%s",
+                self.provider_name,
+                self.settings.arvan_model,
+                response.status_code,
+                latency_ms,
+            )
             raise LLMError(
                 "Arvan provider returned an error.",
                 reason="provider_http_error",
@@ -81,6 +117,13 @@ class ArvanProvider:
         try:
             data: dict[str, Any] = response.json()
         except ValueError as exc:
+            logger.exception(
+                "event=provider_invalid_json provider=%s model=%s status_code=%s latency_ms=%s",
+                self.provider_name,
+                self.settings.arvan_model,
+                response.status_code,
+                latency_ms,
+            )
             raise LLMError("Arvan provider returned invalid JSON.", reason="provider_invalid_json") from exc
 
         choice = (data.get("choices") or [{}])[0]
@@ -89,7 +132,22 @@ class ArvanProvider:
         reasoning_present = bool(message.get("reasoning_content"))
 
         if not text:
+            logger.warning(
+                "event=provider_empty_answer provider=%s model=%s latency_ms=%s",
+                self.provider_name,
+                self.settings.arvan_model,
+                latency_ms,
+            )
             raise LLMError("Arvan provider returned an empty answer.", reason="provider_empty_answer")
+
+        logger.info(
+            "event=provider_latency provider=%s model=%s latency_ms=%s assistant_preview=%r reasoning_present=%s",
+            self.provider_name,
+            str(data.get("model") or self.settings.arvan_model),
+            latency_ms,
+            text.strip().replace("\n", " ")[:120],
+            reasoning_present,
+        )
 
         return LLMProviderResult(
             text=text,

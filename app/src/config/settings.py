@@ -54,6 +54,9 @@ class Settings:
     api_port: int
     api_reload: bool
     log_level: str
+    api_base_url: str
+    api_timeout_seconds: int
+    streamlit_server_port: int
     llm_enabled: bool
     llm_provider: str
     arvan_base_url: str
@@ -77,9 +80,12 @@ def get_settings() -> Settings:
     _load_env_file(ENV_PATH)
     return Settings(
         api_host=os.getenv("API_HOST", "0.0.0.0"),
-        api_port=_int("API_PORT", 6997),
+        api_port=_int("API_PORT", 6998),
         api_reload=_bool("API_RELOAD", True),
         log_level=os.getenv("LOG_LEVEL", "INFO"),
+        api_base_url=os.getenv("SOORIN_API_BASE_URL", "http://127.0.0.1:6998").strip().rstrip("/"),
+        api_timeout_seconds=_int("SOORIN_API_TIMEOUT_SECONDS", 120),
+        streamlit_server_port=_int("STREAMLIT_SERVER_PORT", 8503),
         llm_enabled=_bool("SOORIN_LLM_ENABLED", True),
         llm_provider=os.getenv("SOORIN_LLM_PROVIDER", "arvan").strip().lower(),
         arvan_base_url=os.getenv("SOORIN_ARVAN_BASE_URL", "").strip().rstrip("/"),

@@ -2,10 +2,15 @@
 
 from __future__ import annotations
 
+import logging
+
 from src.config.settings import Settings
 from src.core.llm.errors import LLMDisabledError, LLMError
 from src.core.llm.providers.arvan import ArvanProvider
 from src.core.llm.providers.base import LLMProviderResult
+
+
+logger = logging.getLogger(__name__)
 
 
 class LLMClient:
@@ -15,6 +20,13 @@ class LLMClient:
             self.provider = ArvanProvider(settings)
         else:
             self.provider = None
+        logger.info(
+            "event=provider_initialization provider=%s model=%s enabled=%s ready=%s",
+            settings.llm_provider,
+            settings.arvan_model,
+            settings.llm_enabled,
+            self.provider is not None,
+        )
 
     def chat(self, messages: list[dict[str, str]]) -> LLMProviderResult:
         if not self.settings.llm_enabled:

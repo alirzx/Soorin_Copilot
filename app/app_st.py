@@ -7,11 +7,13 @@ from uuid import uuid4
 import requests
 import streamlit as st
 
+from src.config.settings import get_settings
 
-API_BASE_URL = "http://127.0.0.1:6998"
+settings = get_settings()
+API_BASE_URL = settings.api_base_url
 CHAT_URL = f"{API_BASE_URL}/chat"
 HEALTH_URL = f"{API_BASE_URL}/health"
-REQUEST_TIMEOUT_SECONDS = 120
+REQUEST_TIMEOUT_SECONDS = settings.api_timeout_seconds
 
 
 st.set_page_config(page_title="Soorin Cyber Copilot", layout="centered")
@@ -59,7 +61,7 @@ def ask_copilot(message: str) -> tuple[str | None, str | None]:
     except requests.Timeout:
         return None, "The Copilot request timed out. Please try again."
     except requests.ConnectionError:
-        return None, "The backend API is not reachable on port 6998."
+        return None, f"The backend API is not reachable at {API_BASE_URL}."
     except requests.RequestException:
         return None, "The backend API returned an error."
     except ValueError:
@@ -77,6 +79,10 @@ with st.sidebar:
     st.subheader("Connection")
     st.caption("API URL")
     st.code(API_BASE_URL, language=None)
+    st.caption("Request timeout")
+    st.write(f"{REQUEST_TIMEOUT_SECONDS} seconds")
+    st.caption("Configured UI port")
+    st.write(str(settings.streamlit_server_port))
 
     if st.button("Check health", use_container_width=True):
         healthy, health_message = get_backend_health()

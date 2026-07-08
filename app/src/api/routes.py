@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 from fastapi import APIRouter
@@ -14,6 +15,7 @@ from src.core.llm.errors import LLMError
 from src.core.memory.store import MemoryStore
 
 
+logger = logging.getLogger(__name__)
 router = APIRouter()
 settings = get_settings()
 memory_store = MemoryStore(settings.chat_max_history_messages)
@@ -42,19 +44,38 @@ def envelope(
 
 @router.get("/health")
 def health() -> dict[str, str]:
+    logger.info("event=http_health status=ok")
     return {"status": "ok"}
 
 
 @router.get("/llm/health")
 def llm_health() -> dict[str, Any]:
-    return envelope("ok", llm_client.health())
+    result = llm_client.health()
+    logger.info(
+        "event=http_llm_health ready=%s provider=%s model=%s",
+        result.get("ready"),
+        result.get("provider"),
+        result.get("model"),
+    )
+    return envelope("ok", result)
 
 
 @router.post("/chat")
 def chat(request: ChatRequest) -> dict[str, Any]:
+    user_preview = request.message.strip().replace("\n", " ")[:120]
+    logger.info(
+        "event=http_chat_request session_id=%s user_preview=%r",
+        request.session_id or "",
+        user_preview,
+    )
     try:
         result = copilot_service.chat(request.message, request.session_id)
     except LLMError as exc:
+        logger.warning(
+            "event=http_chat_error reason=%s session_id=%s",
+            exc.reason,
+            request.session_id or "",
+        )
         return envelope(
             "error",
             errors=[
