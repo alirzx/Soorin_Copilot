@@ -73,6 +73,7 @@ class Settings:
     llm_log_raw_response: bool
     chat_store_history: bool
     chat_max_history_messages: int
+    system_prompt_path: str
 
 
 @lru_cache(maxsize=1)
@@ -102,4 +103,5 @@ def get_settings() -> Settings:
         llm_log_raw_response=_bool("SOORIN_LLM_LOG_RAW_RESPONSE", False),
         chat_store_history=_bool("SOORIN_CHAT_STORE_HISTORY", True),
         chat_max_history_messages=_int("SOORIN_CHAT_MAX_HISTORY_MESSAGES", 20),
+        system_prompt_path=os.getenv("SOORIN_SYSTEM_PROMPT_PATH", "app/prompts/system_prompt.md").strip(),
     )
