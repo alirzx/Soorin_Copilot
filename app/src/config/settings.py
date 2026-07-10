@@ -74,6 +74,22 @@ class Settings:
     chat_store_history: bool
     chat_max_history_messages: int
     system_prompt_path: str
+    product_api_base_url: str
+    product_topology_path: str
+    product_api_token: str
+    product_hwid: str
+    product_connect_timeout_seconds: int
+    product_read_timeout_seconds: int
+    product_max_retries: int
+    product_retry_backoff_seconds: float
+    graph_raw_path: str
+    graph_pickle_path: str
+    graph_stats_path: str
+    graph_graphml_path: str
+    graph_gexf_path: str
+    graph_max_ui_nodes: int
+    graph_default_min_degree: int
+    graph_api_max_neighbors: int
 
 
 @lru_cache(maxsize=1)
@@ -104,4 +120,20 @@ def get_settings() -> Settings:
         chat_store_history=_bool("SOORIN_CHAT_STORE_HISTORY", True),
         chat_max_history_messages=_int("SOORIN_CHAT_MAX_HISTORY_MESSAGES", 20),
         system_prompt_path=os.getenv("SOORIN_SYSTEM_PROMPT_PATH", "app/prompts/system_prompt.md").strip(),
+        product_api_base_url=os.getenv("SOORIN_PRODUCT_API_BASE_URL", "").strip().rstrip("/"),
+        product_topology_path=os.getenv("SOORIN_PRODUCT_TOPOLOGY_PATH", "/zeek/connections/unique-ip-pairs").strip(),
+        product_api_token=os.getenv("SOORIN_PRODUCT_API_TOKEN", "").strip(),
+        product_hwid=os.getenv("SOORIN_PRODUCT_HWID", "").strip(),
+        product_connect_timeout_seconds=_int("SOORIN_PRODUCT_CONNECT_TIMEOUT_SECONDS", 60),
+        product_read_timeout_seconds=_int("SOORIN_PRODUCT_READ_TIMEOUT_SECONDS", 300),
+        product_max_retries=_int("SOORIN_PRODUCT_MAX_RETRIES", 5),
+        product_retry_backoff_seconds=_float("SOORIN_PRODUCT_RETRY_BACKOFF_SECONDS", 3.0),
+        graph_raw_path=os.getenv("SOORIN_GRAPH_RAW_PATH", "data/raw/topology_raw.json").strip(),
+        graph_pickle_path=os.getenv("SOORIN_GRAPH_PICKLE_PATH", "data/processed/topology_graph.pkl").strip(),
+        graph_stats_path=os.getenv("SOORIN_GRAPH_STATS_PATH", "data/processed/topology_stats.json").strip(),
+        graph_graphml_path=os.getenv("SOORIN_GRAPH_GRAPHML_PATH", "data/processed/topology_graph.graphml").strip(),
+        graph_gexf_path=os.getenv("SOORIN_GRAPH_GEXF_PATH", "data/processed/topology_graph.gexf").strip(),
+        graph_max_ui_nodes=_int("SOORIN_GRAPH_MAX_UI_NODES", 200),
+        graph_default_min_degree=_int("SOORIN_GRAPH_DEFAULT_MIN_DEGREE", 1),
+        graph_api_max_neighbors=_int("SOORIN_GRAPH_API_MAX_NEIGHBORS", 100),
     )

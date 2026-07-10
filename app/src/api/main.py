@@ -6,6 +6,7 @@ import logging
 
 from fastapi import FastAPI
 
+from src.api.graph_routes import router as graph_router
 from src.api.routes import router
 from src.config.settings import get_settings
 
@@ -16,6 +17,7 @@ logger = logging.getLogger(__name__)
 def create_app() -> FastAPI:
     app = FastAPI(title="Soorin Copilot API")
     app.include_router(router)
+    app.include_router(graph_router)
 
     @app.on_event("startup")
     def on_startup() -> None:

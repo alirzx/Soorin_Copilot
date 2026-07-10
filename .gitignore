@@ -2,3 +2,9 @@ app/.env
 __pycache__/
 *.pyc
 .venv
+data/raw/*.json
+data/processed/*.json
+data/processed/*.pkl
+data/processed/*.graphml
+data/processed/*.gexf
+/lib
