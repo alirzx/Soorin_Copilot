@@ -22,6 +22,8 @@ def show_topology_page() -> None:
     """Display the network topology analysis page."""
     st.title("🌐 Network Topology")
     st.write("Interactive visualization of the real network topology graph.")
+    if st.session_state.get("copilot_graph_context_ip"):
+        st.caption(f"Copilot graph context: {st.session_state.copilot_graph_context_ip}")
 
     settings = get_settings()
     try:
@@ -143,6 +145,10 @@ def show_topology_page() -> None:
             if "error" in neighbors:
                 st.error(neighbors["error"])
             else:
+                if st.button("Use as Copilot context", use_container_width=True):
+                    st.session_state.copilot_graph_context_ip = ip_input.strip()
+                    st.success(f"{ip_input.strip()} will be sent as Copilot graph context.")
+
                 col1, col2, col3 = st.columns(3)
                 with col1:
                     st.metric("Total Degree", neighbors["total_degree"])

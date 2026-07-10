@@ -9,6 +9,7 @@ from typing import Any
 import requests
 
 from src.config.settings import Settings
+from src.core.context.models import approx_tokens
 from src.core.llm.errors import LLMError
 from src.core.llm.providers.base import LLMProviderResult
 
@@ -53,7 +54,7 @@ class ArvanProvider:
             "missing": missing,
         }
 
-    def chat(self, messages: list[dict[str, str]]) -> LLMProviderResult:
+    def chat(self, messages: list[dict[str, str]], *, request_id: str = "") -> LLMProviderResult:
         readiness = self.health()
         if not readiness["ready"]:
             raise LLMError("Arvan provider is not configured.", reason="provider_not_ready")
@@ -75,7 +76,8 @@ class ArvanProvider:
         )
 
         logger.info(
-            "event=provider_request_start provider=%s model=%s message_count=%s chat_path=%s",
+            "event=provider_request_start request_id=%s provider=%s model=%s message_count=%s chat_path=%s",
+            request_id,
             self.provider_name,
             self.settings.arvan_model,
             len(messages),
@@ -86,7 +88,8 @@ class ArvanProvider:
             response = requests.post(self.endpoint, json=payload, headers=headers, timeout=timeout)
         except requests.RequestException as exc:
             logger.exception(
-                "event=provider_request_exception provider=%s model=%s",
+                "event=provider_request_exception request_id=%s provider=%s model=%s",
+                request_id,
                 self.provider_name,
                 self.settings.arvan_model,
             )
@@ -94,7 +97,8 @@ class ArvanProvider:
 
         latency_ms = int((time.perf_counter() - started) * 1000)
         logger.info(
-            "event=provider_response provider=%s model=%s status_code=%s latency_ms=%s",
+            "event=provider_response request_id=%s provider=%s model=%s status_code=%s latency_ms=%s",
+            request_id,
             self.provider_name,
             self.settings.arvan_model,
             response.status_code,
@@ -102,7 +106,8 @@ class ArvanProvider:
         )
         if response.status_code >= 400:
             logger.warning(
-                "event=provider_http_error provider=%s model=%s status_code=%s latency_ms=%s",
+                "event=provider_http_error request_id=%s provider=%s model=%s status_code=%s latency_ms=%s",
+                request_id,
                 self.provider_name,
                 self.settings.arvan_model,
                 response.status_code,
@@ -118,7 +123,8 @@ class ArvanProvider:
             data: dict[str, Any] = response.json()
         except ValueError as exc:
             logger.exception(
-                "event=provider_invalid_json provider=%s model=%s status_code=%s latency_ms=%s",
+                "event=provider_invalid_json request_id=%s provider=%s model=%s status_code=%s latency_ms=%s",
+                request_id,
                 self.provider_name,
                 self.settings.arvan_model,
                 response.status_code,
@@ -133,18 +139,29 @@ class ArvanProvider:
 
         if not text:
             logger.warning(
-                "event=provider_empty_answer provider=%s model=%s latency_ms=%s",
+                "event=provider_empty_answer request_id=%s provider=%s model=%s latency_ms=%s",
+                request_id,
                 self.provider_name,
                 self.settings.arvan_model,
                 latency_ms,
             )
             raise LLMError("Arvan provider returned an empty answer.", reason="provider_empty_answer")
 
+        usage = data.get("usage") or {}
+        prompt_tokens = usage.get("prompt_tokens")
+        completion_tokens = usage.get("completion_tokens")
+        total_tokens = usage.get("total_tokens")
         logger.info(
-            "event=provider_latency provider=%s model=%s latency_ms=%s assistant_preview=%r reasoning_present=%s",
+            "event=provider_latency request_id=%s provider=%s model=%s latency_ms=%s assistant_chars=%s approx_output_tokens=%s prompt_tokens=%s completion_tokens=%s total_tokens=%s assistant_preview=%r reasoning_present=%s",
+            request_id,
             self.provider_name,
             str(data.get("model") or self.settings.arvan_model),
             latency_ms,
+            len(text),
+            approx_tokens(text),
+            prompt_tokens if prompt_tokens is not None else "",
+            completion_tokens if completion_tokens is not None else "",
+            total_tokens if total_tokens is not None else "",
             text.strip().replace("\n", " ")[:120],
             reasoning_present,
         )
@@ -154,7 +171,7 @@ class ArvanProvider:
             provider=self.provider_name,
             model=str(data.get("model") or self.settings.arvan_model),
             finish_reason=choice.get("finish_reason"),
-            usage=data.get("usage") or {},
+            usage=usage,
             latency_ms=latency_ms,
             status_code=response.status_code,
             endpoint=self.settings.arvan_chat_path,

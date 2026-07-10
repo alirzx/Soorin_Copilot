@@ -47,6 +47,8 @@ def init_session_state() -> None:
         st.session_state.session_id = uuid4().hex
     if "messages" not in st.session_state:
         st.session_state.messages = []
+    if "copilot_graph_context_ip" not in st.session_state:
+        st.session_state.copilot_graph_context_ip = None
 
 def clear_chat() -> None:
     st.session_state.messages = []
@@ -66,10 +68,14 @@ def get_backend_health() -> tuple[bool, str]:
     return False, "Backend health check did not return ok."
 
 def ask_copilot(message: str) -> tuple[str | None, str | None]:
+    payload = {"session_id": st.session_state.session_id, "message": message}
+    if st.session_state.get("copilot_graph_context_ip"):
+        payload["ui_context"] = {"selected_ip": st.session_state.copilot_graph_context_ip}
+
     try:
         response = requests.post(
             CHAT_URL,
-            json={"session_id": st.session_state.session_id, "message": message},
+            json=payload,
             timeout=REQUEST_TIMEOUT_SECONDS,
         )
         response.raise_for_status()
@@ -126,6 +132,8 @@ with st.sidebar:
     st.write(f"Backend: {'ready' if get_backend_health()[0] else 'offline'}")
     st.write("LLM: GLM-5.2 (Arvan)")
     st.write(f"Graph: {'loaded' if graph_loaded else 'not found'} ({graph_node_count} nodes)")
+    if st.session_state.get("copilot_graph_context_ip"):
+        st.caption(f"Copilot graph context: {st.session_state.copilot_graph_context_ip}")
     st.write("RAG: planned")
 
 # ============================================================

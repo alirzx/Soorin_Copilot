@@ -3,13 +3,16 @@
 from __future__ import annotations
 
 import logging
+import time
 from typing import Any
+from uuid import uuid4
 
 from fastapi import APIRouter
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from src.config.settings import get_settings
 from src.core.copilot.service import CopilotService
+from src.core.context.models import approx_tokens, compact_preview
 from src.core.llm.client import LLMClient
 from src.core.llm.errors import LLMError
 from src.core.memory.store import MemoryStore
@@ -23,9 +26,22 @@ llm_client = LLMClient(settings)
 copilot_service = CopilotService(settings, llm_client, memory_store)
 
 
+class ChatUIContext(BaseModel):
+    selected_ip: str | None = Field(default=None)
+
+    @field_validator("selected_ip")
+    @classmethod
+    def normalize_selected_ip(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        value = value.strip()
+        return value or None
+
+
 class ChatRequest(BaseModel):
     session_id: str | None = Field(default=None)
     message: str = Field(min_length=1)
+    ui_context: ChatUIContext | None = Field(default=None)
 
 
 def envelope(
@@ -62,19 +78,34 @@ def llm_health() -> dict[str, Any]:
 
 @router.post("/chat")
 def chat(request: ChatRequest) -> dict[str, Any]:
-    user_preview = request.message.strip().replace("\n", " ")[:120]
+    request_id = uuid4().hex[:12]
+    started = time.perf_counter()
+    selected_ip_present = bool(request.ui_context and request.ui_context.selected_ip)
     logger.info(
-        "event=http_chat_request session_id=%s user_preview=%r",
+        "event=http_chat_request request_id=%s session_id=%s message_chars=%s approx_tokens=%s ui_context_present=%s selected_ip_present=%s user_preview=%r",
+        request_id,
         request.session_id or "",
-        user_preview,
+        len(request.message),
+        approx_tokens(request.message),
+        bool(request.ui_context),
+        selected_ip_present,
+        compact_preview(request.message),
     )
     try:
-        result = copilot_service.chat(request.message, request.session_id)
+        result = copilot_service.chat(
+            request.message,
+            request.session_id,
+            ui_context=request.ui_context.model_dump() if request.ui_context else None,
+            request_id=request_id,
+        )
     except LLMError as exc:
+        latency_ms = int((time.perf_counter() - started) * 1000)
         logger.warning(
-            "event=http_chat_error reason=%s session_id=%s",
+            "event=http_chat_error request_id=%s reason=%s session_id=%s latency_ms=%s error_count=1",
+            request_id,
             exc.reason,
             request.session_id or "",
+            latency_ms,
         )
         return envelope(
             "error",
@@ -85,4 +116,15 @@ def chat(request: ChatRequest) -> dict[str, Any]:
                 }
             ],
         )
+    latency_ms = int((time.perf_counter() - started) * 1000)
+    logger.info(
+        "event=http_chat_response request_id=%s session_id=%s status=ok provider=%s model=%s answer_chars=%s answer_approx_tokens=%s latency_ms=%s warning_count=0 error_count=0",
+        request_id,
+        result.get("session_id", ""),
+        result.get("provider", ""),
+        result.get("model", ""),
+        len(result.get("answer", "")),
+        approx_tokens(result.get("answer", "")),
+        latency_ms,
+    )
     return envelope("ok", result)

@@ -28,12 +28,12 @@ class LLMClient:
             self.provider is not None,
         )
 
-    def chat(self, messages: list[dict[str, str]]) -> LLMProviderResult:
+    def chat(self, messages: list[dict[str, str]], *, request_id: str = "") -> LLMProviderResult:
         if not self.settings.llm_enabled:
             raise LLMDisabledError("LLM is disabled.", reason="llm_disabled")
         if self.provider is None:
             raise LLMError("Unsupported LLM provider.", reason="provider_not_supported")
-        return self.provider.chat(messages)
+        return self.provider.chat(messages, request_id=request_id)
 
     def health(self) -> dict[str, object]:
         if self.provider is None:
