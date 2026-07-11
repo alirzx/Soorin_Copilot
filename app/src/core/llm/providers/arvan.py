@@ -150,6 +150,20 @@ class ArvanProvider:
         reasoning_present = bool(message.get("reasoning_content"))
 
         if not text:
+            if purpose == "intent_router":
+                return LLMProviderResult(
+                    text="",
+                    provider=self.provider_name,
+                    model=str(data.get("model") or self.settings.arvan_model),
+                    finish_reason=choice.get("finish_reason"),
+                    usage=data.get("usage") or {},
+                    latency_ms=latency_ms,
+                    status_code=response.status_code,
+                    endpoint=self.settings.arvan_chat_path,
+                    reasoning_present=reasoning_present,
+                    reasoning_exposed=False,
+                    payload_format="chat_completions",
+                )
             logger.warning(
                 "event=provider_empty_answer request_id=%s provider=%s model=%s latency_ms=%s",
                 request_id,

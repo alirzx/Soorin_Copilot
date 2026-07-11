@@ -21,6 +21,21 @@ class GraphStatusResponse(BaseModel):
     edges: int = Field(ge=0)
     directed: bool
     artifact_available: bool
+    active_graph_loaded_at: str | None = None
+    active_graph_source: str | None = None
+    active_graph_version: str | None = None
+    refresh_enabled: bool = False
+    refresh_running: bool = False
+    refresh_interval_seconds: int = Field(default=0, ge=0)
+    refresh_last_attempt_at: str | None = None
+    refresh_last_success_at: str | None = None
+    refresh_last_failure_at: str | None = None
+    refresh_last_error_type: str | None = None
+    refresh_last_error_message: str | None = None
+    refresh_consecutive_failures: int = Field(default=0, ge=0)
+    raw_snapshot_path: str | None = None
+    processed_snapshot_path: str | None = None
+    last_known_good: bool = False
 
 
 class GraphStatsResponse(BaseModel):

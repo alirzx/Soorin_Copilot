@@ -37,11 +37,14 @@ def _validate_ip(value: str, *, field_name: str = "ip") -> str:
 def graph_status(service: GraphService = Depends(get_graph_service)) -> GraphStatusResponse:
     status = service.status()
     logger.info(
-        "event=graph_api_status loaded=%s nodes=%s edges=%s artifact_available=%s",
+        "event=graph_api_status loaded=%s nodes=%s edges=%s artifact_available=%s refresh_enabled=%s refresh_running=%s refresh_consecutive_failures=%s",
         status.loaded,
         status.nodes,
         status.edges,
         status.artifact_available,
+        status.refresh_enabled,
+        status.refresh_running,
+        status.refresh_consecutive_failures,
     )
     return GraphStatusResponse(**status.__dict__)
 

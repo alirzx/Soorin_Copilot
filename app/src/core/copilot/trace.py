@@ -46,11 +46,12 @@ def render_human_copilot_trace(trace: CopilotRequestTrace) -> None:
     ]
     order = [
         "REQUEST",
+        "ROUTER INPUT",
         "ROUTING STATE",
         "ENTITY",
         "INTENT",
         "ROUTING",
-        "GRAPH CONTEXT",
+        "GRAPH RETRIEVAL",
         "MODEL INPUT",
         "MODEL RESPONSE",
         "STATE UPDATE",

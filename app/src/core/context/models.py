@@ -17,10 +17,11 @@ IntentName = Literal[
     "graph_relationships",
     "graph_path",
     "graph_followup",
-    "unrelated",
     "unclear",
 ]
 IntentDecisionSource = Literal["deterministic", "glm", "fallback", "disabled"]
+GraphScope = Literal["none", "node_summary", "one_hop", "full_neighbors", "two_hop", "path"]
+GraphDirection = Literal["none", "inbound", "outbound", "both"]
 
 
 def compact_preview(text: str, limit: int = 120) -> str:
@@ -57,15 +58,31 @@ class EntityResolution:
 @dataclass(frozen=True)
 class IntentDecision:
     intent: IntentName
-    use_graph: bool
+    scope: GraphScope
+    direction: GraphDirection
+    depth: int
+    requires_graph: bool
+    requires_multiple_entities: bool = False
     is_followup: bool = False
-    target_reference: str = "none"
-    confidence: float = 0.0
+    classification_confidence: float = 0.0
     reason: str = ""
     decision_source: IntentDecisionSource = "deterministic"
     router_called: bool = False
     latency_ms: int = 0
+    retry_count: int = 0
+    finish_reason: str | None = None
+    content_present: bool = False
     error_reason: str | None = None
+    fallback_used: bool = False
+    fallback_reason: str | None = None
+
+    @property
+    def use_graph(self) -> bool:
+        return self.requires_graph
+
+    @property
+    def confidence(self) -> float:
+        return self.classification_confidence
 
 
 @dataclass(frozen=True)
@@ -73,17 +90,26 @@ class RouteDecision:
     use_graph: bool
     reason: str
     target_entity: ResolvedEntity | None = None
+    target_entities: list[ResolvedEntity] = field(default_factory=list)
     matched_signals: list[str] = field(default_factory=list)
     graph_intent_detected: bool = False
     asset_investigation_detected: bool = False
     followup_detected: bool = False
     intent: IntentName = "unclear"
+    scope: GraphScope = "none"
+    direction: GraphDirection = "none"
+    depth: int = 0
+    requires_multiple_entities: bool = False
     intent_confidence: float = 0.0
     decision_source: IntentDecisionSource = "deterministic"
     glm_router_called: bool = False
     glm_router_latency_ms: int = 0
+    glm_router_retry_count: int = 0
+    glm_router_finish_reason: str | None = None
+    glm_router_content_present: bool = False
     glm_router_error: str | None = None
-    should_call_intent_router: bool = False
+    fallback_used: bool = False
+    fallback_reason: str | None = None
 
 
 @dataclass(frozen=True)

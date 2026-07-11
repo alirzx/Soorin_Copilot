@@ -1,4 +1,5 @@
 app/.env
+app/.env.backup.*
 __pycache__/
 *.pyc
 .venv
@@ -11,3 +12,4 @@ data/processed/*.gexf
 
 # Local GLM router test outputs
 script/router_test_results/
+script/router_e2e_results/

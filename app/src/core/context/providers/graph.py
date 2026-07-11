@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
-import json
 import logging
 import time
 
-from src.core.context.models import GraphProviderResult, ProviderProvenance, ResolvedEntity, approx_tokens
-from src.core.graph.context import build_graph_context
+from src.config.settings import Settings
+from src.core.context.models import GraphProviderResult, ProviderProvenance, ResolvedEntity, RouteDecision, approx_tokens
+from src.core.graph.retrieval import GraphRetrievalSpec, retrieve_graph_context
 
 
 logger = logging.getLogger(__name__)
@@ -16,18 +16,38 @@ logger = logging.getLogger(__name__)
 class GraphContextProvider:
     """Call graph context code directly; no self-HTTP and no raw graph exposure."""
 
-    def provide(self, entity: ResolvedEntity, *, request_id: str = "") -> GraphProviderResult:
+    def __init__(self, settings: Settings) -> None:
+        self.settings = settings
+
+    def provide(
+        self,
+        entity: ResolvedEntity,
+        *,
+        route: RouteDecision | None = None,
+        request_id: str = "",
+    ) -> GraphProviderResult:
         started = time.perf_counter()
+        entities = route.target_entities if route and route.target_entities else [entity]
+        scope = route.scope if route else "node_summary"
+        direction = route.direction if route else "both"
+        depth = route.depth if route else 0
         logger.info(
-            "event=graph_context_provider_start request_id=%s target_ip=%s source=%s",
+            "event=graph_context_provider_start request_id=%s target_ip=%s source=%s scope=%s direction=%s depth=%s entity_count=%s",
             request_id,
             entity.value,
             entity.source,
+            scope,
+            direction,
+            depth,
+            len(entities),
         )
         provenance = ProviderProvenance(source="observed_communication_graph", status="unavailable")
 
         try:
-            context = build_graph_context(entity.value)
+            context = retrieve_graph_context(
+                GraphRetrievalSpec(scope=scope, direction=direction, depth=depth, entities=entities),
+                self.settings,
+            )
         except FileNotFoundError:
             latency_ms = int((time.perf_counter() - started) * 1000)
             logger.warning(
@@ -65,21 +85,28 @@ class GraphContextProvider:
 
         status = "available" if context.get("node_found") else "not_found"
         provenance = ProviderProvenance(source="observed_communication_graph", status=status)
-        degree = context.get("degree") or {}
-        inbound_count = len(context.get("top_inbound_peers") or [])
-        outbound_count = len(context.get("top_outbound_peers") or [])
-        context_chars = len(json.dumps(context, sort_keys=True))
+        context_chars = len(str(context))
         latency_ms = int((time.perf_counter() - started) * 1000)
         logger.info(
-            "event=graph_context_provider_complete request_id=%s target_ip=%s status=%s degree_in=%s degree_out=%s degree_total=%s inbound_peers=%s outbound_peers=%s context_chars=%s context_approx_tokens=%s latency_ms=%s",
+            "event=graph_context_provider_complete request_id=%s target_ip=%s status=%s scope=%s direction=%s depth=%s inbound_total=%s inbound_retrieved=%s outbound_total=%s outbound_retrieved=%s bidirectional_total=%s bidirectional_retrieved=%s candidate_nodes=%s retrieved_nodes=%s candidate_edges=%s retrieved_edges=%s retrieval_truncated=%s retrieval_truncation_reason=%s context_chars=%s context_approx_tokens=%s latency_ms=%s",
             request_id,
             entity.value,
             status,
-            degree.get("in", 0),
-            degree.get("out", 0),
-            degree.get("total", 0),
-            inbound_count,
-            outbound_count,
+            context.get("scope", ""),
+            context.get("direction", ""),
+            context.get("depth", ""),
+            context.get("inbound_total", 0),
+            context.get("inbound_retrieved", context.get("inbound_returned", 0)),
+            context.get("outbound_total", 0),
+            context.get("outbound_retrieved", context.get("outbound_returned", 0)),
+            context.get("bidirectional_total", 0),
+            context.get("bidirectional_retrieved", context.get("bidirectional_returned", 0)),
+            context.get("candidate_node_count", 0),
+            context.get("retrieved_node_count", context.get("returned_node_count", 0)),
+            context.get("candidate_edge_count", 0),
+            context.get("retrieved_edge_count", context.get("returned_edge_count", 0)),
+            context.get("retrieval_truncated", context.get("truncated", False)),
+            context.get("retrieval_truncation_reason") or context.get("truncation_reason") or "",
             context_chars,
             approx_tokens("x" * context_chars),
             latency_ms,

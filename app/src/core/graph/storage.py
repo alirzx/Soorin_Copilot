@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import pickle
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -29,6 +30,52 @@ def save_json(payload: Any, path: str | Path) -> Path:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
     logger.info("event=graph_json_saved path=%s bytes=%s", path, output_path.stat().st_size)
+    return output_path
+
+
+def atomic_write_json(payload: Any, path: str | Path) -> Path:
+    output_path = resolve_path(path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = output_path.with_name(f"{output_path.name}.{uuid.uuid4().hex}.tmp")
+    temp_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    temp_path.replace(output_path)
+    logger.info("event=graph_json_atomic_saved path=%s bytes=%s", path, output_path.stat().st_size)
+    return output_path
+
+
+def atomic_write_pickle(graph: nx.DiGraph, path: str | Path) -> Path:
+    output_path = resolve_path(path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = output_path.with_name(f"{output_path.name}.{uuid.uuid4().hex}.tmp")
+    with temp_path.open("wb") as handle:
+        pickle.dump(graph, handle)
+    temp_path.replace(output_path)
+    logger.info(
+        "event=graph_pickle_atomic_saved path=%s nodes=%s edges=%s",
+        path,
+        graph.number_of_nodes(),
+        graph.number_of_edges(),
+    )
+    return output_path
+
+
+def atomic_write_graphml(graph: nx.DiGraph, path: str | Path) -> Path:
+    output_path = resolve_path(path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = output_path.with_name(f"{output_path.name}.{uuid.uuid4().hex}.tmp")
+    nx.write_graphml(graph, temp_path)
+    temp_path.replace(output_path)
+    logger.info("event=graph_graphml_atomic_saved path=%s", path)
+    return output_path
+
+
+def atomic_write_gexf(graph: nx.DiGraph, path: str | Path) -> Path:
+    output_path = resolve_path(path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = output_path.with_name(f"{output_path.name}.{uuid.uuid4().hex}.tmp")
+    nx.write_gexf(graph, temp_path)
+    temp_path.replace(output_path)
+    logger.info("event=graph_gexf_atomic_saved path=%s", path)
     return output_path
 
 

@@ -9,6 +9,10 @@ from dataclasses import dataclass
 class SessionRoutingState:
     active_ip: str | None = None
     last_provider: str | None = None
+    previous_intent: str | None = None
+    previous_scope: str | None = None
+    previous_direction: str | None = None
+    previous_depth: int | None = None
 
 
 class SessionRoutingStateStore:

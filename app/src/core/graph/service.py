@@ -10,7 +10,8 @@ from typing import Any
 import networkx as nx
 
 from src.config.settings import Settings, get_settings
-from src.core.graph.loader import get_cached_graph, get_graph
+from src.core.graph.loader import get_cached_graph, get_graph, get_graph_metadata
+from src.core.graph.refresh import get_refresh_status
 from src.core.graph.storage import resolve_path
 
 logger = logging.getLogger(__name__)
@@ -23,6 +24,21 @@ class GraphStatus:
     edges: int
     directed: bool
     artifact_available: bool
+    active_graph_loaded_at: str | None = None
+    active_graph_source: str | None = None
+    active_graph_version: str | None = None
+    refresh_enabled: bool = False
+    refresh_running: bool = False
+    refresh_interval_seconds: int = 0
+    refresh_last_attempt_at: str | None = None
+    refresh_last_success_at: str | None = None
+    refresh_last_failure_at: str | None = None
+    refresh_last_error_type: str | None = None
+    refresh_last_error_message: str | None = None
+    refresh_consecutive_failures: int = 0
+    raw_snapshot_path: str | None = None
+    processed_snapshot_path: str | None = None
+    last_known_good: bool = False
 
 
 class GraphService:
@@ -34,6 +50,24 @@ class GraphService:
     def status(self) -> GraphStatus:
         cached = get_cached_graph()
         artifact_available = resolve_path(self.settings.graph_pickle_path).exists()
+        metadata = get_graph_metadata()
+        refresh = get_refresh_status()
+        common = {
+            "active_graph_loaded_at": metadata.get("active_graph_loaded_at") or refresh.get("active_graph_loaded_at"),
+            "active_graph_source": metadata.get("active_graph_source") or refresh.get("active_graph_source"),
+            "active_graph_version": metadata.get("active_graph_version") or refresh.get("active_graph_version"),
+            "refresh_enabled": bool(refresh.get("enabled", False)),
+            "refresh_running": bool(refresh.get("running", False)),
+            "refresh_interval_seconds": int(refresh.get("interval_seconds", 0) or 0),
+            "refresh_last_attempt_at": refresh.get("last_attempt_at"),
+            "refresh_last_success_at": refresh.get("last_success_at"),
+            "refresh_last_failure_at": refresh.get("last_failure_at"),
+            "refresh_last_error_type": refresh.get("last_error_type"),
+            "refresh_last_error_message": refresh.get("last_error_message"),
+            "refresh_consecutive_failures": int(refresh.get("consecutive_failures", 0) or 0),
+            "raw_snapshot_path": refresh.get("raw_snapshot_path") or metadata.get("raw_snapshot_path"),
+            "processed_snapshot_path": refresh.get("processed_snapshot_path") or metadata.get("processed_snapshot_path"),
+        }
         if cached is None:
             logger.info(
                 "event=graph_query type=status loaded=false artifact_available=%s",
@@ -45,6 +79,8 @@ class GraphService:
                 edges=0,
                 directed=True,
                 artifact_available=artifact_available,
+                last_known_good=False,
+                **common,
             )
 
         logger.info(
@@ -59,6 +95,8 @@ class GraphService:
             edges=cached.number_of_edges(),
             directed=cached.is_directed(),
             artifact_available=artifact_available,
+            last_known_good=True,
+            **common,
         )
 
     def stats(self) -> dict[str, Any]:

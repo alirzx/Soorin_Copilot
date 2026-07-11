@@ -69,6 +69,9 @@ class Settings:
     arvan_max_tokens: int
     arvan_temperature: float
     arvan_top_p: float
+    llm_context_window_tokens: int
+    llm_reserved_output_tokens: int
+    llm_context_safety_margin_tokens: int
     llm_expose_reasoning: bool
     llm_log_raw_response: bool
     chat_store_history: bool
@@ -91,9 +94,37 @@ class Settings:
     graph_max_ui_nodes: int
     graph_default_min_degree: int
     graph_api_max_neighbors: int
+    graph_default_scope: str
+    graph_one_hop_max_nodes: int
+    graph_full_neighbors_hard_max: int
+    graph_two_hop_max_nodes: int
+    graph_max_edges: int
+    graph_max_context_tokens: int
+    graph_max_path_length: int
+    graph_full_enumeration_max_peers: int
+    graph_context_max_enumerated_nodes: int
+    graph_context_max_enumerated_edges: int
     intent_router_enabled: bool
     intent_router_timeout_seconds: int
     intent_router_min_confidence: float
+    intent_router_retry_enabled: bool
+    intent_router_temperature: float
+    intent_router_top_p: float
+    intent_router_max_tokens: int
+    intent_router_retry_max_tokens: int
+    graph_auto_refresh_enabled: bool
+    graph_refresh_interval_seconds: int
+    graph_refresh_on_startup: bool
+    graph_refresh_startup_delay_seconds: int
+    graph_refresh_jitter_seconds: int
+    graph_refresh_max_consecutive_failures: int
+    graph_refresh_keep_raw_snapshots: int
+    graph_refresh_keep_processed_snapshots: int
+    graph_refresh_lock_timeout_seconds: int
+    graph_refresh_min_nodes: int
+    graph_refresh_min_edges: int
+    graph_refresh_max_node_drop_ratio: float
+    graph_refresh_max_edge_drop_ratio: float
     copilot_human_trace_enabled: bool
 
 
@@ -117,9 +148,12 @@ def get_settings() -> Settings:
         arvan_chat_path=os.getenv("SOORIN_ARVAN_CHAT_PATH", "/chat/completions").strip(),
         arvan_timeout_seconds=_int("SOORIN_ARVAN_TIMEOUT_SECONDS", 300),
         arvan_connect_timeout_seconds=_int("SOORIN_ARVAN_CONNECT_TIMEOUT_SECONDS", 30),
-        arvan_max_tokens=_int("SOORIN_ARVAN_MAX_TOKENS", 8192),
+        arvan_max_tokens=_int("SOORIN_ARVAN_MAX_TOKENS", 12288),
         arvan_temperature=_float("SOORIN_ARVAN_TEMPERATURE", 0.2),
         arvan_top_p=_float("SOORIN_ARVAN_TOP_P", 0.9),
+        llm_context_window_tokens=_int("SOORIN_LLM_CONTEXT_WINDOW_TOKENS", 32768),
+        llm_reserved_output_tokens=_int("SOORIN_LLM_RESERVED_OUTPUT_TOKENS", 12288),
+        llm_context_safety_margin_tokens=_int("SOORIN_LLM_CONTEXT_SAFETY_MARGIN_TOKENS", 2048),
         llm_expose_reasoning=_bool("SOORIN_LLM_EXPOSE_REASONING", False),
         llm_log_raw_response=_bool("SOORIN_LLM_LOG_RAW_RESPONSE", False),
         chat_store_history=_bool("SOORIN_CHAT_STORE_HISTORY", True),
@@ -142,11 +176,39 @@ def get_settings() -> Settings:
         graph_stats_path=os.getenv("SOORIN_GRAPH_STATS_PATH", "data/processed/topology_stats.json").strip(),
         graph_graphml_path=os.getenv("SOORIN_GRAPH_GRAPHML_PATH", "data/processed/topology_graph.graphml").strip(),
         graph_gexf_path=os.getenv("SOORIN_GRAPH_GEXF_PATH", "data/processed/topology_graph.gexf").strip(),
-        graph_max_ui_nodes=_int("SOORIN_GRAPH_MAX_UI_NODES", 200),
+        graph_max_ui_nodes=_int("SOORIN_GRAPH_MAX_UI_NODES", 1000),
         graph_default_min_degree=_int("SOORIN_GRAPH_DEFAULT_MIN_DEGREE", 1),
-        graph_api_max_neighbors=_int("SOORIN_GRAPH_API_MAX_NEIGHBORS", 100),
+        graph_api_max_neighbors=_int("SOORIN_GRAPH_API_MAX_NEIGHBORS", 1000),
+        graph_default_scope=os.getenv("SOORIN_GRAPH_DEFAULT_SCOPE", "node_summary").strip(),
+        graph_one_hop_max_nodes=_int("SOORIN_GRAPH_ONE_HOP_MAX_NODES", 500),
+        graph_full_neighbors_hard_max=_int("SOORIN_GRAPH_FULL_NEIGHBORS_HARD_MAX", 5000),
+        graph_two_hop_max_nodes=_int("SOORIN_GRAPH_TWO_HOP_MAX_NODES", 1000),
+        graph_max_edges=_int("SOORIN_GRAPH_MAX_EDGES", 5000),
+        graph_max_context_tokens=_int("SOORIN_GRAPH_MAX_CONTEXT_TOKENS", 8000),
+        graph_max_path_length=_int("SOORIN_GRAPH_MAX_PATH_LENGTH", 24),
+        graph_full_enumeration_max_peers=_int("SOORIN_GRAPH_FULL_ENUMERATION_MAX_PEERS", 100),
+        graph_context_max_enumerated_nodes=_int("SOORIN_GRAPH_CONTEXT_MAX_ENUMERATED_NODES", 250),
+        graph_context_max_enumerated_edges=_int("SOORIN_GRAPH_CONTEXT_MAX_ENUMERATED_EDGES", 500),
         intent_router_enabled=_bool("SOORIN_INTENT_ROUTER_ENABLED", True),
-        intent_router_timeout_seconds=_int("SOORIN_INTENT_ROUTER_TIMEOUT_SECONDS", 20),
+        intent_router_timeout_seconds=_int("SOORIN_INTENT_ROUTER_TIMEOUT_SECONDS", 45),
         intent_router_min_confidence=_float("SOORIN_INTENT_ROUTER_MIN_CONFIDENCE", 0.65),
+        intent_router_retry_enabled=_bool("SOORIN_INTENT_ROUTER_RETRY_ENABLED", True),
+        intent_router_temperature=_float("SOORIN_INTENT_ROUTER_TEMPERATURE", 0.0),
+        intent_router_top_p=_float("SOORIN_INTENT_ROUTER_TOP_P", 0.1),
+        intent_router_max_tokens=_int("SOORIN_INTENT_ROUTER_MAX_TOKENS", 768),
+        intent_router_retry_max_tokens=_int("SOORIN_INTENT_ROUTER_RETRY_MAX_TOKENS", 1536),
+        graph_auto_refresh_enabled=_bool("SOORIN_GRAPH_AUTO_REFRESH_ENABLED", True),
+        graph_refresh_interval_seconds=_int("SOORIN_GRAPH_REFRESH_INTERVAL_SECONDS", 900),
+        graph_refresh_on_startup=_bool("SOORIN_GRAPH_REFRESH_ON_STARTUP", True),
+        graph_refresh_startup_delay_seconds=_int("SOORIN_GRAPH_REFRESH_STARTUP_DELAY_SECONDS", 5),
+        graph_refresh_jitter_seconds=_int("SOORIN_GRAPH_REFRESH_JITTER_SECONDS", 30),
+        graph_refresh_max_consecutive_failures=_int("SOORIN_GRAPH_REFRESH_MAX_CONSECUTIVE_FAILURES", 5),
+        graph_refresh_keep_raw_snapshots=_int("SOORIN_GRAPH_REFRESH_KEEP_RAW_SNAPSHOTS", 5),
+        graph_refresh_keep_processed_snapshots=_int("SOORIN_GRAPH_REFRESH_KEEP_PROCESSED_SNAPSHOTS", 3),
+        graph_refresh_lock_timeout_seconds=_int("SOORIN_GRAPH_REFRESH_LOCK_TIMEOUT_SECONDS", 60),
+        graph_refresh_min_nodes=_int("SOORIN_GRAPH_REFRESH_MIN_NODES", 1),
+        graph_refresh_min_edges=_int("SOORIN_GRAPH_REFRESH_MIN_EDGES", 0),
+        graph_refresh_max_node_drop_ratio=_float("SOORIN_GRAPH_REFRESH_MAX_NODE_DROP_RATIO", 0.80),
+        graph_refresh_max_edge_drop_ratio=_float("SOORIN_GRAPH_REFRESH_MAX_EDGE_DROP_RATIO", 0.90),
         copilot_human_trace_enabled=_bool("SOORIN_COPILOT_HUMAN_TRACE_ENABLED", True),
     )

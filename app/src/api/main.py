@@ -6,9 +6,11 @@ import logging
 
 from fastapi import FastAPI
 
+from src.api.dependencies import get_graph_refresh_service as get_api_graph_refresh_service
 from src.api.graph_routes import router as graph_router
 from src.api.routes import router
 from src.config.settings import get_settings
+from src.core.graph.refresh import set_graph_refresh_service
 
 
 logger = logging.getLogger(__name__)
@@ -30,6 +32,24 @@ def create_app() -> FastAPI:
             settings.llm_provider,
             settings.arvan_model,
         )
+        refresh_service = get_api_graph_refresh_service()
+        set_graph_refresh_service(refresh_service)
+        loaded = refresh_service.load_last_known_good()
+        logger.info(
+            "event=graph_startup_last_known_good loaded=%s refresh_enabled=%s refresh_on_startup=%s interval_seconds=%s",
+            loaded,
+            settings.graph_auto_refresh_enabled,
+            settings.graph_refresh_on_startup,
+            settings.graph_refresh_interval_seconds,
+        )
+        refresh_service.start_background()
+
+    @app.on_event("shutdown")
+    def on_shutdown() -> None:
+        refresh_service = get_api_graph_refresh_service()
+        refresh_service.stop_background()
+        set_graph_refresh_service(None)
+        logger.info("event=application_shutdown")
 
     return app
 
