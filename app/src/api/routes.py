@@ -15,15 +15,17 @@ from src.core.copilot.service import CopilotService
 from src.core.context.models import approx_tokens, compact_preview
 from src.core.llm.client import LLMClient
 from src.core.llm.errors import LLMError
+from src.core.memory.routing_state import SessionRoutingStateStore
 from src.core.memory.store import MemoryStore
 
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
 settings = get_settings()
-memory_store = MemoryStore(settings.chat_max_history_messages)
+memory_store = MemoryStore(settings.conversation_max_messages)
+routing_state_store = SessionRoutingStateStore()
 llm_client = LLMClient(settings)
-copilot_service = CopilotService(settings, llm_client, memory_store)
+copilot_service = CopilotService(settings, llm_client, memory_store, routing_state_store)
 
 
 class ChatUIContext(BaseModel):
@@ -81,10 +83,19 @@ def chat(request: ChatRequest) -> dict[str, Any]:
     request_id = uuid4().hex[:12]
     started = time.perf_counter()
     selected_ip_present = bool(request.ui_context and request.ui_context.selected_ip)
+    session_for_log = (request.session_id or "").strip()
+    separator = "=" * 80
+    logger.info("%s", separator)
+    logger.info(
+        "event=copilot_request_begin request_id=%s session_id=%s",
+        request_id,
+        session_for_log,
+    )
+    logger.info("%s", separator)
     logger.info(
         "event=http_chat_request request_id=%s session_id=%s message_chars=%s approx_tokens=%s ui_context_present=%s selected_ip_present=%s user_preview=%r",
         request_id,
-        request.session_id or "",
+        session_for_log,
         len(request.message),
         approx_tokens(request.message),
         bool(request.ui_context),
@@ -107,6 +118,12 @@ def chat(request: ChatRequest) -> dict[str, Any]:
             request.session_id or "",
             latency_ms,
         )
+        logger.info(
+            "event=copilot_request_end request_id=%s status=error latency_ms=%s",
+            request_id,
+            latency_ms,
+        )
+        logger.info("%s", separator)
         return envelope(
             "error",
             errors=[
@@ -127,4 +144,10 @@ def chat(request: ChatRequest) -> dict[str, Any]:
         approx_tokens(result.get("answer", "")),
         latency_ms,
     )
+    logger.info(
+        "event=copilot_request_end request_id=%s status=ok latency_ms=%s",
+        request_id,
+        latency_ms,
+    )
+    logger.info("%s", separator)
     return envelope("ok", result)

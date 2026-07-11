@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from typing import Any, Literal
 
 
-EntitySource = Literal["message", "ui"]
+EntitySource = Literal["message", "ui", "conversation"]
 EntityType = Literal["ip"]
 ProviderStatus = Literal["available", "not_found", "unavailable", "skipped"]
 ResolutionStatus = Literal["resolved", "none", "ambiguous"]
@@ -35,6 +35,10 @@ class EntityResolution:
     entities: list[ResolvedEntity] = field(default_factory=list)
     primary_entity: ResolvedEntity | None = None
     candidate_count: int = 0
+    explicit_candidate_count: int = 0
+    valid_entity_count: int = 0
+    reference_detected: bool = False
+    reference_type: str | None = None
 
 
 @dataclass(frozen=True)
@@ -43,6 +47,9 @@ class RouteDecision:
     reason: str
     target_entity: ResolvedEntity | None = None
     matched_signals: list[str] = field(default_factory=list)
+    graph_intent_detected: bool = False
+    asset_investigation_detected: bool = False
+    followup_detected: bool = False
 
 
 @dataclass(frozen=True)

@@ -151,8 +151,14 @@ class ArvanProvider:
         prompt_tokens = usage.get("prompt_tokens")
         completion_tokens = usage.get("completion_tokens")
         total_tokens = usage.get("total_tokens")
+        usage_keys = sorted(str(key) for key in usage.keys())
+        numeric_usage_fields = sorted(
+            str(key)
+            for key, value in usage.items()
+            if isinstance(value, (int, float)) and ("token" in str(key).lower() or "cache" in str(key).lower())
+        )
         logger.info(
-            "event=provider_latency request_id=%s provider=%s model=%s latency_ms=%s assistant_chars=%s approx_output_tokens=%s prompt_tokens=%s completion_tokens=%s total_tokens=%s assistant_preview=%r reasoning_present=%s",
+            "event=provider_latency request_id=%s provider=%s model=%s latency_ms=%s assistant_chars=%s output_approx_tokens=%s provider_prompt_tokens=%s provider_completion_tokens=%s provider_total_tokens=%s usage_keys=%s numeric_usage_fields=%s assistant_preview=%r reasoning_present=%s",
             request_id,
             self.provider_name,
             str(data.get("model") or self.settings.arvan_model),
@@ -162,6 +168,8 @@ class ArvanProvider:
             prompt_tokens if prompt_tokens is not None else "",
             completion_tokens if completion_tokens is not None else "",
             total_tokens if total_tokens is not None else "",
+            ",".join(usage_keys),
+            ",".join(numeric_usage_fields),
             text.strip().replace("\n", " ")[:120],
             reasoning_present,
         )

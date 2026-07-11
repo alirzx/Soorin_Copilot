@@ -5,6 +5,8 @@ from __future__ import annotations
 import streamlit as st
 import streamlit.components.v1 as components
 import pandas as pd
+import logging
+import time
 
 from src.config.settings import get_settings
 from src.core.graph.loader import load_graph
@@ -17,13 +19,20 @@ from src.core.graph.service import (
 )
 from src.core.graph.visualization import generate_pyvis_graph, get_color
 
+logger = logging.getLogger(__name__)
+SELECTED_COPILOT_IP_KEY = "selected_copilot_ip"
 
-def show_topology_page() -> None:
+def show_topology_page(*, embedded: bool = False) -> None:
     """Display the network topology analysis page."""
-    st.title("🌐 Network Topology")
-    st.write("Interactive visualization of the real network topology graph.")
-    if st.session_state.get("copilot_graph_context_ip"):
-        st.caption(f"Copilot graph context: {st.session_state.copilot_graph_context_ip}")
+    if embedded:
+        st.subheader("Live Topology")
+    else:
+        st.title("Network Topology")
+    st.caption("Observed communication relationships. Paths do not prove routed packet paths.")
+    if st.session_state.get(SELECTED_COPILOT_IP_KEY):
+        st.caption(f"Selected topology target: {st.session_state[SELECTED_COPILOT_IP_KEY]}")
+    else:
+        st.caption("Selected topology target: none")
 
     settings = get_settings()
     try:
@@ -140,14 +149,34 @@ def show_topology_page() -> None:
         )
 
         if ip_input:
+            started = time.perf_counter()
             neighbors = get_neighbors(ip_input)
+            latency_ms = int((time.perf_counter() - started) * 1000)
 
             if "error" in neighbors:
                 st.error(neighbors["error"])
+                logger.info(
+                    "event=ui_graph_node_inspection target_ip=%s node_found=false neighbor_count=0 latency_ms=%s",
+                    ip_input.strip(),
+                    latency_ms,
+                )
             else:
-                if st.button("Use as Copilot context", use_container_width=True):
-                    st.session_state.copilot_graph_context_ip = ip_input.strip()
-                    st.success(f"{ip_input.strip()} will be sent as Copilot graph context.")
+                logger.info(
+                    "event=ui_graph_node_inspection target_ip=%s node_found=true neighbor_count=%s latency_ms=%s",
+                    ip_input.strip(),
+                    neighbors["total_degree"],
+                    latency_ms,
+                )
+                if st.button("Use as Copilot target", use_container_width=True):
+                    previous_ip = st.session_state.get(SELECTED_COPILOT_IP_KEY) or ""
+                    st.session_state[SELECTED_COPILOT_IP_KEY] = ip_input.strip()
+                    logger.info(
+                        "event=ui_investigation_target_updated session_id=%s previous_ip=%s selected_ip=%s source=topology_explore",
+                        st.session_state.get("session_id", ""),
+                        previous_ip,
+                        ip_input.strip(),
+                    )
+                    st.rerun()
 
                 col1, col2, col3 = st.columns(3)
                 with col1:

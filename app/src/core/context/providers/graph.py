@@ -6,7 +6,7 @@ import json
 import logging
 import time
 
-from src.core.context.models import GraphProviderResult, ProviderProvenance, ResolvedEntity
+from src.core.context.models import GraphProviderResult, ProviderProvenance, ResolvedEntity, approx_tokens
 from src.core.graph.context import build_graph_context
 
 
@@ -69,7 +69,7 @@ class GraphContextProvider:
         context_chars = len(json.dumps(context, sort_keys=True))
         latency_ms = int((time.perf_counter() - started) * 1000)
         logger.info(
-            "event=graph_context_provider_complete request_id=%s target_ip=%s status=%s degree_in=%s degree_out=%s degree_total=%s inbound_peers=%s outbound_peers=%s context_chars=%s latency_ms=%s",
+            "event=graph_context_provider_complete request_id=%s target_ip=%s status=%s degree_in=%s degree_out=%s degree_total=%s inbound_peers=%s outbound_peers=%s context_chars=%s context_approx_tokens=%s latency_ms=%s",
             request_id,
             entity.value,
             status,
@@ -79,6 +79,7 @@ class GraphContextProvider:
             inbound_count,
             outbound_count,
             context_chars,
+            approx_tokens("x" * context_chars),
             latency_ms,
         )
         return GraphProviderResult(

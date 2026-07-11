@@ -25,7 +25,7 @@ class ContextComposer:
         graph = package.graph
         if not graph or graph.status not in {"available", "not_found"}:
             logger.info(
-                "event=context_composer_complete request_id=%s section_count=0 context_chars=0 approx_tokens=0",
+                "event=context_composer_complete request_id=%s section_count=0 context_chars=0 context_approx_tokens=0",
                 request_id,
             )
             return ""
@@ -35,6 +35,7 @@ class ContextComposer:
         lines = [
             "[SOORIN GRAPH EVIDENCE]",
             "Use this section as bounded product evidence. Do not infer beyond it.",
+            "Describe graph structure as observed communication relationships.",
             f"Evidence source: {graph.provenance.source if graph.provenance else 'observed_communication_graph'}",
             f"Target IP: {context.get('target_ip') or (graph.target_entity.value if graph.target_entity else '')}",
             f"Node found: {bool(context.get('node_found'))}",
@@ -63,12 +64,15 @@ class ContextComposer:
                 "- Mention graph evidence only when useful for the user's question.",
                 "- If the evidence is missing or insufficient, say what is missing.",
                 "- Do not claim live logs, live assets, routing proof, or raw topology access.",
+                "- Inbound-only can be called inbound-only or sink-like in this graph, not server/client/asset role proof.",
+                "- Do not describe edges as successful sessions or established connections unless supplied.",
+                "- Do not infer ports, protocols, bytes, traffic volume, processes, maliciousness, or physical topology.",
             ]
         )
 
         text = "\n".join(lines)
         logger.info(
-            "event=context_composer_complete request_id=%s section_count=1 context_chars=%s approx_tokens=%s graph_status=%s limitation_count=%s",
+            "event=context_composer_complete request_id=%s section_count=1 context_chars=%s context_approx_tokens=%s graph_status=%s limitation_count=%s",
             request_id,
             len(text),
             approx_tokens(text),

@@ -73,6 +73,7 @@ class Settings:
     llm_log_raw_response: bool
     chat_store_history: bool
     chat_max_history_messages: int
+    conversation_max_messages: int
     system_prompt_path: str
     product_api_base_url: str
     product_topology_path: str
@@ -119,6 +120,10 @@ def get_settings() -> Settings:
         llm_log_raw_response=_bool("SOORIN_LLM_LOG_RAW_RESPONSE", False),
         chat_store_history=_bool("SOORIN_CHAT_STORE_HISTORY", True),
         chat_max_history_messages=_int("SOORIN_CHAT_MAX_HISTORY_MESSAGES", 20),
+        conversation_max_messages=_int(
+            "SOORIN_CONVERSATION_MAX_MESSAGES",
+            _int("SOORIN_CHAT_MAX_HISTORY_MESSAGES", 10),
+        ),
         system_prompt_path=os.getenv("SOORIN_SYSTEM_PROMPT_PATH", "app/prompts/system_prompt.md").strip(),
         product_api_base_url=os.getenv("SOORIN_PRODUCT_API_BASE_URL", "").strip().rstrip("/"),
         product_topology_path=os.getenv("SOORIN_PRODUCT_TOPOLOGY_PATH", "/zeek/connections/unique-ip-pairs").strip(),

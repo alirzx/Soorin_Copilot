@@ -12,6 +12,7 @@ from src.core.context import ContextComposer, EntityResolver, GraphContextRouter
 from src.core.context.models import CopilotContextPackage, ProviderProvenance, approx_tokens
 from src.core.context.providers import GraphContextProvider
 from src.core.llm.client import LLMClient
+from src.core.memory.routing_state import SessionRoutingState, SessionRoutingStateStore
 from src.core.memory.store import MemoryStore
 
 
@@ -32,10 +33,17 @@ def _preview(text: str) -> str:
 
 
 class CopilotService:
-    def __init__(self, settings: Settings, llm_client: LLMClient, memory_store: MemoryStore) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        llm_client: LLMClient,
+        memory_store: MemoryStore,
+        routing_state_store: SessionRoutingStateStore | None = None,
+    ) -> None:
         self.settings = settings
         self.llm_client = llm_client
         self.memory_store = memory_store
+        self.routing_state_store = routing_state_store or SessionRoutingStateStore()
         self.system_prompt = self._load_system_prompt()
         self.entity_resolver = EntityResolver()
         self.graph_router = GraphContextRouter()
@@ -84,9 +92,17 @@ class CopilotService:
         session = (session_id or "").strip() or uuid4().hex
         user_text = message.strip()
 
+        routing_state = self.routing_state_store.get(session)
+        logger.info(
+            "event=session_routing_state_loaded request_id=%s session_id=%s active_ip=%s last_provider=%s",
+            request_id,
+            session,
+            routing_state.active_ip or "",
+            routing_state.last_provider or "",
+        )
         history = self.memory_store.get(session) if self.settings.chat_store_history else []
-        entities = self.entity_resolver.resolve(user_text, ui_context, request_id=request_id)
-        route = self.graph_router.route(user_text, entities, request_id=request_id)
+        entities = self.entity_resolver.resolve(user_text, ui_context, routing_state, request_id=request_id)
+        route = self.graph_router.route(user_text, entities, routing_state, request_id=request_id)
 
         graph_result = None
         provenance: list[ProviderProvenance] = []
@@ -126,7 +142,7 @@ class CopilotService:
         conversation_chars = sum(len(item.get("content", "")) for item in history) + len(user_text)
         total_chars = sum(len(item.get("content", "")) for item in messages)
         logger.info(
-            "event=model_input_prepared request_id=%s provider=%s model=%s message_count=%s roles=%s system_chars=%s system_approx_tokens=%s dynamic_context_chars=%s dynamic_context_approx_tokens=%s conversation_chars=%s conversation_approx_tokens=%s total_chars=%s total_approx_tokens=%s",
+            "event=model_input_prepared request_id=%s provider=%s model=%s message_count=%s roles=%s system_chars=%s system_approx_tokens=%s dynamic_context_chars=%s dynamic_context_approx_tokens=%s conversation_chars=%s conversation_approx_tokens=%s total_input_chars=%s total_input_approx_tokens=%s",
             request_id,
             self.settings.llm_provider,
             self.settings.arvan_model,
@@ -164,6 +180,44 @@ class CopilotService:
         if self.settings.chat_store_history:
             self.memory_store.append(session, "user", user_text)
             self.memory_store.append(session, "assistant", result.text)
+
+        updated_active_ip = routing_state.active_ip
+        update_reason = "none"
+        if entities.status == "resolved" and entities.primary_entity:
+            if entities.primary_entity.source == "message":
+                updated_active_ip = entities.primary_entity.value
+                update_reason = "explicit_message_entity"
+            elif entities.primary_entity.source == "ui":
+                updated_active_ip = entities.primary_entity.value
+                update_reason = "ui_selected_reference"
+            elif entities.primary_entity.source == "conversation":
+                update_reason = "conversation_reference"
+
+        updated_last_provider = "graph" if graph_result and route.use_graph else None
+        new_routing_state = SessionRoutingState(
+            active_ip=updated_active_ip,
+            last_provider=updated_last_provider,
+        )
+        self.routing_state_store.set(session, new_routing_state)
+        if new_routing_state != routing_state:
+            logger.info(
+                "event=session_routing_state_updated request_id=%s session_id=%s previous_active_ip=%s active_ip=%s previous_last_provider=%s last_provider=%s update_reason=%s",
+                request_id,
+                session,
+                routing_state.active_ip or "",
+                new_routing_state.active_ip or "",
+                routing_state.last_provider or "",
+                new_routing_state.last_provider or "",
+                update_reason,
+            )
+        else:
+            logger.info(
+                "event=session_routing_state_unchanged request_id=%s session_id=%s active_ip=%s last_provider=%s",
+                request_id,
+                session,
+                new_routing_state.active_ip or "",
+                new_routing_state.last_provider or "",
+            )
 
         return {
             "session_id": session,

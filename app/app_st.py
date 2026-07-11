@@ -1,7 +1,9 @@
-"""Streamlit UI for the Soorin Cyber Copilot — with Topology page."""
+"""Unified Streamlit investigation workspace for Soorin Cyber Copilot."""
 
 from __future__ import annotations
 
+import logging
+import time
 from uuid import uuid4
 
 import requests
@@ -9,17 +11,19 @@ import streamlit as st
 
 from src.config.settings import get_settings
 from src.core.graph.loader import set_graph_path, load_graph
+from src.web.pages.topology import show_topology_page
 
+logger = logging.getLogger(__name__)
 settings = get_settings()
 API_BASE_URL = settings.api_base_url
 CHAT_URL = f"{API_BASE_URL}/chat"
 HEALTH_URL = f"{API_BASE_URL}/health"
 REQUEST_TIMEOUT_SECONDS = settings.api_timeout_seconds
+SELECTED_COPILOT_IP_KEY = "selected_copilot_ip"
+LEGACY_SELECTED_IP_KEY = "copilot_graph_context_ip"
 
 # ============================================================
-# PAGE CONFIG
-# ============================================================
-st.set_page_config(page_title="Soorin Cyber Copilot", layout="centered")
+st.set_page_config(page_title="Soorin Cyber Copilot", layout="wide")
 
 # ============================================================
 # INIT GRAPH (Load once at startup)
@@ -47,8 +51,9 @@ def init_session_state() -> None:
         st.session_state.session_id = uuid4().hex
     if "messages" not in st.session_state:
         st.session_state.messages = []
-    if "copilot_graph_context_ip" not in st.session_state:
-        st.session_state.copilot_graph_context_ip = None
+    if SELECTED_COPILOT_IP_KEY not in st.session_state:
+        st.session_state[SELECTED_COPILOT_IP_KEY] = st.session_state.get(LEGACY_SELECTED_IP_KEY)
+    st.session_state.pop(LEGACY_SELECTED_IP_KEY, None)
 
 def clear_chat() -> None:
     st.session_state.messages = []
@@ -68,10 +73,19 @@ def get_backend_health() -> tuple[bool, str]:
     return False, "Backend health check did not return ok."
 
 def ask_copilot(message: str) -> tuple[str | None, str | None]:
+    started = time.perf_counter()
     payload = {"session_id": st.session_state.session_id, "message": message}
-    if st.session_state.get("copilot_graph_context_ip"):
-        payload["ui_context"] = {"selected_ip": st.session_state.copilot_graph_context_ip}
+    selected_ip = st.session_state.get(SELECTED_COPILOT_IP_KEY)
+    if selected_ip:
+        payload["ui_context"] = {"selected_ip": selected_ip}
 
+    logger.info(
+        "event=ui_chat_request session_id=%s message_chars=%s selected_ip_present=%s selected_ip=%s",
+        st.session_state.session_id,
+        len(message),
+        bool((payload.get("ui_context") or {}).get("selected_ip")),
+        (payload.get("ui_context") or {}).get("selected_ip") or "",
+    )
     try:
         response = requests.post(
             CHAT_URL,
@@ -91,29 +105,22 @@ def ask_copilot(message: str) -> tuple[str | None, str | None]:
     answer = ((payload.get("data") or {}).get("answer") or "").strip()
     if payload.get("status") != "ok" or not answer:
         return None, "The Copilot could not produce an answer."
+    latency_ms = int((time.perf_counter() - started) * 1000)
+    logger.info(
+        "event=ui_chat_response session_id=%s status=%s answer_chars=%s latency_ms=%s",
+        st.session_state.session_id,
+        payload.get("status"),
+        len(answer),
+        latency_ms,
+    )
     return answer, None
 
 init_session_state()
 
-# ============================================================
-# NAVIGATION
-# ============================================================
-pages = {
-    "Copilot Chat": "chat",
-    "Network Topology": "topology",
-}
-page = st.sidebar.radio("Navigation", list(pages.keys()))
-
-# ============================================================
-# SIDEBAR
-# ============================================================
 with st.sidebar:
-    st.divider()
-    st.subheader("Connection")
+    st.subheader("Workspace Status")
     st.caption("API URL")
     st.code(API_BASE_URL, language=None)
-    st.caption("Request timeout")
-    st.write(f"{REQUEST_TIMEOUT_SECONDS} seconds")
 
     if st.button("Check health", use_container_width=True):
         healthy, health_message = get_backend_health()
@@ -122,29 +129,34 @@ with st.sidebar:
         else:
             st.error(health_message)
 
-    if page == "Copilot Chat":
-        if st.button("Clear chat", use_container_width=True):
-            clear_chat()
-            st.rerun()
+    if st.button("Clear chat", use_container_width=True):
+        clear_chat()
+        st.rerun()
 
     st.divider()
-    st.subheader("Status")
     st.write(f"Backend: {'ready' if get_backend_health()[0] else 'offline'}")
     st.write("LLM: GLM-5.2 (Arvan)")
     st.write(f"Graph: {'loaded' if graph_loaded else 'not found'} ({graph_node_count} nodes)")
-    if st.session_state.get("copilot_graph_context_ip"):
-        st.caption(f"Copilot graph context: {st.session_state.copilot_graph_context_ip}")
+    if st.session_state.get(SELECTED_COPILOT_IP_KEY):
+        st.caption(f"Selected topology target: {st.session_state[SELECTED_COPILOT_IP_KEY]}")
+    else:
+        st.caption("Selected topology target: none")
     st.write("RAG: planned")
 
-# ============================================================
-# COPILOT CHAT PAGE
-# ============================================================
-if page == "Copilot Chat":
+st.title("Soorin Copilot")
+st.caption("Asset Intelligence Investigation Workspace")
+
+left_col, right_col = st.columns([0.42, 0.58], gap="large")
+
+with left_col:
     st.title("Soorin Cyber Copilot")
     st.write(
         "A baseline cybersecurity copilot for general Q&A. "
         "Asset, RAG, and graph context will be added later."
     )
+    selected_ip = st.session_state.get(SELECTED_COPILOT_IP_KEY)
+    st.caption(f"Selected topology target: {selected_ip or 'none'}")
+    st.caption("Graph context is used only on relevant graph or follow-up questions.")
 
     for item in st.session_state.messages:
         with st.chat_message(item["role"]):
@@ -164,9 +176,5 @@ if page == "Copilot Chat":
                 st.markdown(answer)
                 st.session_state.messages.append({"role": "assistant", "content": answer})
 
-# ============================================================
-# TOPOLOGY PAGE
-# ============================================================
-elif page == "Network Topology":
-    from src.web.pages.topology import show_topology_page
-    show_topology_page()
+with right_col:
+    show_topology_page(embedded=True)
