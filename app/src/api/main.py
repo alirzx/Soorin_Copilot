@@ -22,6 +22,7 @@ def create_app() -> FastAPI:
     @app.on_event("startup")
     def on_startup() -> None:
         settings = get_settings()
+        logger.info("==================== API STARTUP ====================")
         logger.info(
             "event=application_startup host=%s port=%s provider=%s model=%s",
             settings.api_host,

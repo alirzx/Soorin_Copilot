@@ -62,7 +62,7 @@ def envelope(
 
 @router.get("/health")
 def health() -> dict[str, str]:
-    logger.info("event=http_health status=ok")
+    logger.debug("event=http_health status=ok")
     return {"status": "ok"}
 
 
@@ -84,14 +84,11 @@ def chat(request: ChatRequest) -> dict[str, Any]:
     started = time.perf_counter()
     selected_ip_present = bool(request.ui_context and request.ui_context.selected_ip)
     session_for_log = (request.session_id or "").strip()
-    separator = "=" * 80
-    logger.info("%s", separator)
     logger.info(
         "event=copilot_request_begin request_id=%s session_id=%s",
         request_id,
         session_for_log,
     )
-    logger.info("%s", separator)
     logger.info(
         "event=http_chat_request request_id=%s session_id=%s message_chars=%s approx_tokens=%s ui_context_present=%s selected_ip_present=%s user_preview=%r",
         request_id,
@@ -123,7 +120,6 @@ def chat(request: ChatRequest) -> dict[str, Any]:
             request_id,
             latency_ms,
         )
-        logger.info("%s", separator)
         return envelope(
             "error",
             errors=[
@@ -149,5 +145,4 @@ def chat(request: ChatRequest) -> dict[str, Any]:
         request_id,
         latency_ms,
     )
-    logger.info("%s", separator)
     return envelope("ok", result)

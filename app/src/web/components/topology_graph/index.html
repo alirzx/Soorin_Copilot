@@ -1,0 +1,69 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <style>
+      html,
+      body {
+        margin: 0;
+        padding: 0;
+        overflow: hidden;
+        background: #ffffff;
+      }
+
+      #graph-frame {
+        border: 0;
+        display: block;
+        width: 100%;
+      }
+    </style>
+  </head>
+  <body>
+    <iframe id="graph-frame" title="Soorin topology graph"></iframe>
+
+    <script>
+      const graphFrame = document.getElementById("graph-frame");
+
+      function sendStreamlitMessage(type, payload) {
+        window.parent.postMessage(
+          {
+            isStreamlitMessage: true,
+            type: type,
+            ...payload,
+          },
+          "*"
+        );
+      }
+
+      function setFrameHeight(height) {
+        graphFrame.style.height = `${height}px`;
+        sendStreamlitMessage("streamlit:setFrameHeight", { height: height });
+      }
+
+      function setComponentValue(value) {
+        sendStreamlitMessage("streamlit:setComponentValue", {
+          value: value,
+          dataType: "json",
+        });
+      }
+
+      window.addEventListener("message", (event) => {
+        const message = event.data || {};
+
+        if (message.type === "streamlit:render") {
+          const args = message.args || {};
+          const height = Number(args.height || 680);
+          setFrameHeight(height);
+          graphFrame.srcdoc = args.html || "";
+          return;
+        }
+
+        if (message.type === "soorin_node_click") {
+          setComponentValue(String(message.node || ""));
+        }
+      });
+
+      sendStreamlitMessage("streamlit:componentReady", { apiVersion: 1 });
+    </script>
+  </body>
+</html>

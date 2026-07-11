@@ -54,7 +54,17 @@ class ArvanProvider:
             "missing": missing,
         }
 
-    def chat(self, messages: list[dict[str, str]], *, request_id: str = "") -> LLMProviderResult:
+    def chat(
+        self,
+        messages: list[dict[str, str]],
+        *,
+        request_id: str = "",
+        max_tokens: int | None = None,
+        temperature: float | None = None,
+        top_p: float | None = None,
+        timeout_seconds: int | None = None,
+        purpose: str = "chat",
+    ) -> LLMProviderResult:
         readiness = self.health()
         if not readiness["ready"]:
             raise LLMError("Arvan provider is not configured.", reason="provider_not_ready")
@@ -62,9 +72,9 @@ class ArvanProvider:
         payload = {
             "model": self.settings.arvan_model,
             "messages": messages,
-            "max_tokens": self.settings.arvan_max_tokens,
-            "temperature": self.settings.arvan_temperature,
-            "top_p": self.settings.arvan_top_p,
+            "max_tokens": max_tokens if max_tokens is not None else self.settings.arvan_max_tokens,
+            "temperature": temperature if temperature is not None else self.settings.arvan_temperature,
+            "top_p": top_p if top_p is not None else self.settings.arvan_top_p,
         }
         headers = {
             "Authorization": f"{self.settings.arvan_auth_scheme} {self.settings.arvan_api_key}",
@@ -72,16 +82,17 @@ class ArvanProvider:
         }
         timeout = (
             self.settings.arvan_connect_timeout_seconds,
-            self.settings.arvan_timeout_seconds,
+            timeout_seconds if timeout_seconds is not None else self.settings.arvan_timeout_seconds,
         )
 
         logger.info(
-            "event=provider_request_start request_id=%s provider=%s model=%s message_count=%s chat_path=%s",
+            "event=provider_request_start request_id=%s provider=%s model=%s message_count=%s chat_path=%s purpose=%s",
             request_id,
             self.provider_name,
             self.settings.arvan_model,
             len(messages),
             self.settings.arvan_chat_path,
+            purpose,
         )
         started = time.perf_counter()
         try:
@@ -97,12 +108,13 @@ class ArvanProvider:
 
         latency_ms = int((time.perf_counter() - started) * 1000)
         logger.info(
-            "event=provider_response request_id=%s provider=%s model=%s status_code=%s latency_ms=%s",
+            "event=provider_response request_id=%s provider=%s model=%s status_code=%s latency_ms=%s purpose=%s",
             request_id,
             self.provider_name,
             self.settings.arvan_model,
             response.status_code,
             latency_ms,
+            purpose,
         )
         if response.status_code >= 400:
             logger.warning(
@@ -158,11 +170,12 @@ class ArvanProvider:
             if isinstance(value, (int, float)) and ("token" in str(key).lower() or "cache" in str(key).lower())
         )
         logger.info(
-            "event=provider_latency request_id=%s provider=%s model=%s latency_ms=%s assistant_chars=%s output_approx_tokens=%s provider_prompt_tokens=%s provider_completion_tokens=%s provider_total_tokens=%s usage_keys=%s numeric_usage_fields=%s assistant_preview=%r reasoning_present=%s",
+            "event=provider_latency request_id=%s provider=%s model=%s latency_ms=%s purpose=%s assistant_chars=%s output_approx_tokens=%s provider_prompt_tokens=%s provider_completion_tokens=%s provider_total_tokens=%s usage_keys=%s numeric_usage_fields=%s assistant_preview=%r reasoning_present=%s",
             request_id,
             self.provider_name,
             str(data.get("model") or self.settings.arvan_model),
             latency_ms,
+            purpose,
             len(text),
             approx_tokens(text),
             prompt_tokens if prompt_tokens is not None else "",

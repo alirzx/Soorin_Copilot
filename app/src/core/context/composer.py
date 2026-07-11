@@ -34,7 +34,9 @@ class ContextComposer:
         degree = context.get("degree") or {}
         lines = [
             "[SOORIN GRAPH EVIDENCE]",
+            "Active UI-selected investigation entity." if graph.target_entity and graph.target_entity.source == "ui" else "Active investigation entity.",
             "Use this section as bounded product evidence. Do not infer beyond it.",
+            "Use this evidence only when relevant to the current question.",
             "Describe graph structure as observed communication relationships.",
             f"Evidence source: {graph.provenance.source if graph.provenance else 'observed_communication_graph'}",
             f"Target IP: {context.get('target_ip') or (graph.target_entity.value if graph.target_entity else '')}",

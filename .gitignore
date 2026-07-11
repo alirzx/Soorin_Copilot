@@ -8,3 +8,6 @@ data/processed/*.pkl
 data/processed/*.graphml
 data/processed/*.gexf
 /lib
+
+# Local GLM router test outputs
+script/router_test_results/

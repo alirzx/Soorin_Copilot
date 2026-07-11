@@ -10,6 +10,17 @@ EntitySource = Literal["message", "ui", "conversation"]
 EntityType = Literal["ip"]
 ProviderStatus = Literal["available", "not_found", "unavailable", "skipped"]
 ResolutionStatus = Literal["resolved", "none", "ambiguous"]
+IntentName = Literal[
+    "general_knowledge",
+    "asset_investigation",
+    "graph_neighbors",
+    "graph_relationships",
+    "graph_path",
+    "graph_followup",
+    "unrelated",
+    "unclear",
+]
+IntentDecisionSource = Literal["deterministic", "glm", "fallback", "disabled"]
 
 
 def compact_preview(text: str, limit: int = 120) -> str:
@@ -39,6 +50,22 @@ class EntityResolution:
     valid_entity_count: int = 0
     reference_detected: bool = False
     reference_type: str | None = None
+    reference_suppressed: bool = False
+    suppression_reason: str | None = None
+
+
+@dataclass(frozen=True)
+class IntentDecision:
+    intent: IntentName
+    use_graph: bool
+    is_followup: bool = False
+    target_reference: str = "none"
+    confidence: float = 0.0
+    reason: str = ""
+    decision_source: IntentDecisionSource = "deterministic"
+    router_called: bool = False
+    latency_ms: int = 0
+    error_reason: str | None = None
 
 
 @dataclass(frozen=True)
@@ -50,6 +77,13 @@ class RouteDecision:
     graph_intent_detected: bool = False
     asset_investigation_detected: bool = False
     followup_detected: bool = False
+    intent: IntentName = "unclear"
+    intent_confidence: float = 0.0
+    decision_source: IntentDecisionSource = "deterministic"
+    glm_router_called: bool = False
+    glm_router_latency_ms: int = 0
+    glm_router_error: str | None = None
+    should_call_intent_router: bool = False
 
 
 @dataclass(frozen=True)
@@ -67,6 +101,7 @@ class GraphProviderResult:
     provenance: ProviderProvenance | None = None
     limitations: list[str] = field(default_factory=list)
     error_reason: str | None = None
+    latency_ms: int = 0
 
 
 @dataclass(frozen=True)

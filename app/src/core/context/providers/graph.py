@@ -43,6 +43,7 @@ class GraphContextProvider:
                 provenance=provenance,
                 limitations=[],
                 error_reason="artifact_missing",
+                latency_ms=latency_ms,
             )
         except Exception:
             latency_ms = int((time.perf_counter() - started) * 1000)
@@ -59,6 +60,7 @@ class GraphContextProvider:
                 provenance=provenance,
                 limitations=[],
                 error_reason="provider_exception",
+                latency_ms=latency_ms,
             )
 
         status = "available" if context.get("node_found") else "not_found"
@@ -89,4 +91,5 @@ class GraphContextProvider:
             context=context,
             provenance=provenance,
             limitations=list(context.get("limitations") or []),
+            latency_ms=latency_ms,
         )

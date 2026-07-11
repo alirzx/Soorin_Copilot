@@ -50,6 +50,8 @@ def generate_pyvis_graph(
     subnet_filter: str = "",
     height: str = "700px",
     width: str = "100%",
+    cdn_resources: str = "local",
+    enable_node_click_bridge: bool = False,
 ) -> str:
     """Generate an interactive PyVis graph visualization as HTML.
 
@@ -86,6 +88,7 @@ def generate_pyvis_graph(
         notebook=False,
         bgcolor="#ffffff",
         font_color="#333333",
+        cdn_resources=cdn_resources,
     )
     net.set_options("""
     {
@@ -150,6 +153,8 @@ def generate_pyvis_graph(
     try:
         net.save_graph(str(html_path))
         html = html_path.read_text(encoding="utf-8")
+        if enable_node_click_bridge:
+            html = _inject_node_click_bridge(html)
         logger.info(
             "event=graph_visualization_completed rendered_nodes=%s rendered_edges=%s html_chars=%s",
             subgraph.number_of_nodes(),
@@ -159,3 +164,69 @@ def generate_pyvis_graph(
         return html
     finally:
         html_path.unlink(missing_ok=True)
+
+
+def _inject_node_click_bridge(html: str) -> str:
+    """Add a tiny PyVis/vis-network click bridge for the Streamlit wrapper.
+
+    PyVis exposes the rendered vis-network instance as a global ``network``
+    variable. The bridge posts only the selected node ID to the parent iframe;
+    Python validates the value before using it as Copilot context.
+    """
+    bridge_script = """
+        <script type="text/javascript">
+        (function () {
+            var lastNode = null;
+            var lastSentAt = 0;
+
+            function sendNode(nodeId) {
+                if (nodeId === null || nodeId === undefined) {
+                    return;
+                }
+
+                var clickedNode = String(nodeId);
+                var now = Date.now();
+                if (clickedNode === lastNode && now - lastSentAt < 150) {
+                    return;
+                }
+
+                lastNode = clickedNode;
+                lastSentAt = now;
+                window.parent.postMessage({
+                    type: "soorin_node_click",
+                    node: clickedNode
+                }, "*");
+            }
+
+            function bindNetworkClickBridge() {
+                if (window.__soorinNodeClickBridgeBound) {
+                    return;
+                }
+
+                if (!window.network || typeof window.network.on !== "function") {
+                    window.setTimeout(bindNetworkClickBridge, 100);
+                    return;
+                }
+
+                window.__soorinNodeClickBridgeBound = true;
+                window.network.on("click", function (params) {
+                    if (params && params.nodes && params.nodes.length === 1) {
+                        sendNode(params.nodes[0]);
+                    }
+                });
+                window.network.on("selectNode", function (params) {
+                    if (params && params.nodes && params.nodes.length === 1) {
+                        sendNode(params.nodes[0]);
+                    }
+                });
+            }
+
+            bindNetworkClickBridge();
+        }());
+        </script>
+    """
+    body_index = html.lower().rfind("</body>")
+    if body_index == -1:
+        logger.warning("event=graph_click_bridge_injection_anchor_missing")
+        return html + bridge_script
+    return html[:body_index] + bridge_script + html[body_index:]

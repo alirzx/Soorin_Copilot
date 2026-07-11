@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+from ipaddress import ip_address
+from typing import Any
 import streamlit as st
-import streamlit.components.v1 as components
 import pandas as pd
 import logging
 import time
@@ -18,9 +19,34 @@ from src.core.graph.service import (
     get_subnet_list,
 )
 from src.core.graph.visualization import generate_pyvis_graph, get_color
+from src.web.components.topology_graph import topology_graph_component
 
 logger = logging.getLogger(__name__)
 SELECTED_COPILOT_IP_KEY = "selected_copilot_ip"
+
+
+def _validated_clicked_graph_ip(clicked_node: str | None, graph: Any) -> str | None:
+    if not clicked_node:
+        return None
+
+    node = str(clicked_node).strip()
+    try:
+        parsed_ip = ip_address(node)
+    except ValueError:
+        logger.warning("event=ui_graph_node_click_rejected reason=invalid_ip clicked_node=%r", node)
+        return None
+
+    if parsed_ip.version != 4:
+        logger.warning("event=ui_graph_node_click_rejected reason=not_ipv4 clicked_node=%r", node)
+        return None
+
+    normalized_ip = str(parsed_ip)
+    if normalized_ip not in graph:
+        logger.warning("event=ui_graph_node_click_rejected reason=node_not_in_graph clicked_node=%r", node)
+        return None
+
+    return normalized_ip
+
 
 def show_topology_page(*, embedded: bool = False) -> None:
     """Display the network topology analysis page."""
@@ -91,10 +117,32 @@ def show_topology_page(*, embedded: bool = False) -> None:
                 subnet_filter=subnet_value,
                 height="650px",
                 width="100%",
+                cdn_resources="in_line",
+                enable_node_click_bridge=True,
             )
 
         # Display
-        components.html(html_graph, height=680, scrolling=False)
+        clicked_node = topology_graph_component(
+            html=html_graph,
+            height=680,
+            key=f"topology_graph_{max_nodes}_{min_degree}_{subnet_value or 'all'}",
+        )
+        clicked_ip = _validated_clicked_graph_ip(clicked_node, G)
+        if clicked_ip and clicked_ip != st.session_state.get(SELECTED_COPILOT_IP_KEY):
+            previous_ip = st.session_state.get(SELECTED_COPILOT_IP_KEY) or ""
+            logger.info(
+                "event=ui_graph_node_clicked session_id=%s clicked_node=%s",
+                st.session_state.get("session_id", ""),
+                clicked_ip,
+            )
+            st.session_state[SELECTED_COPILOT_IP_KEY] = clicked_ip
+            logger.info(
+                "event=ui_investigation_target_updated session_id=%s previous_ip=%s selected_ip=%s source=graph_node_click",
+                st.session_state.get("session_id", ""),
+                previous_ip,
+                clicked_ip,
+            )
+            st.rerun()
 
         # Legend
         st.divider()

@@ -91,6 +91,10 @@ class Settings:
     graph_max_ui_nodes: int
     graph_default_min_degree: int
     graph_api_max_neighbors: int
+    intent_router_enabled: bool
+    intent_router_timeout_seconds: int
+    intent_router_min_confidence: float
+    copilot_human_trace_enabled: bool
 
 
 @lru_cache(maxsize=1)
@@ -141,4 +145,8 @@ def get_settings() -> Settings:
         graph_max_ui_nodes=_int("SOORIN_GRAPH_MAX_UI_NODES", 200),
         graph_default_min_degree=_int("SOORIN_GRAPH_DEFAULT_MIN_DEGREE", 1),
         graph_api_max_neighbors=_int("SOORIN_GRAPH_API_MAX_NEIGHBORS", 100),
+        intent_router_enabled=_bool("SOORIN_INTENT_ROUTER_ENABLED", True),
+        intent_router_timeout_seconds=_int("SOORIN_INTENT_ROUTER_TIMEOUT_SECONDS", 20),
+        intent_router_min_confidence=_float("SOORIN_INTENT_ROUTER_MIN_CONFIDENCE", 0.65),
+        copilot_human_trace_enabled=_bool("SOORIN_COPILOT_HUMAN_TRACE_ENABLED", True),
     )
