@@ -8,6 +8,10 @@ from dataclasses import dataclass
 @dataclass(frozen=True)
 class SessionRoutingState:
     active_ip: str | None = None
+    active_entities: tuple[str, ...] = ()
+    last_resolved_entities: tuple[str, ...] = ()
+    previous_entity_count: int = 0
+    previous_entity_mode: str | None = None
     last_provider: str | None = None
     previous_intent: str | None = None
     previous_scope: str | None = None

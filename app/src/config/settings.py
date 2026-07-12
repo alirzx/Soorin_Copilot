@@ -69,6 +69,7 @@ class Settings:
     arvan_max_tokens: int
     arvan_temperature: float
     arvan_top_p: float
+    chat_max_tokens: int
     llm_context_window_tokens: int
     llm_reserved_output_tokens: int
     llm_context_safety_margin_tokens: int
@@ -77,6 +78,12 @@ class Settings:
     chat_store_history: bool
     chat_max_history_messages: int
     conversation_max_messages: int
+    conversation_recent_raw_messages: int
+    conversation_summary_enabled: bool
+    conversation_summary_trigger_tokens: int
+    conversation_summary_max_tokens: int
+    conversation_summary_temperature: float
+    conversation_summary_timeout_seconds: int
     system_prompt_path: str
     product_api_base_url: str
     product_topology_path: str
@@ -104,7 +111,10 @@ class Settings:
     graph_full_enumeration_max_peers: int
     graph_context_max_enumerated_nodes: int
     graph_context_max_enumerated_edges: int
+    graph_comparison_max_peers_per_entity: int
+    graph_comparison_max_shared_peers: int
     intent_router_enabled: bool
+    intent_router_system_prompt_path: str
     intent_router_timeout_seconds: int
     intent_router_min_confidence: float
     intent_router_retry_enabled: bool
@@ -151,6 +161,7 @@ def get_settings() -> Settings:
         arvan_max_tokens=_int("SOORIN_ARVAN_MAX_TOKENS", 12288),
         arvan_temperature=_float("SOORIN_ARVAN_TEMPERATURE", 0.2),
         arvan_top_p=_float("SOORIN_ARVAN_TOP_P", 0.9),
+        chat_max_tokens=_int("SOORIN_CHAT_MAX_TOKENS", 4096),
         llm_context_window_tokens=_int("SOORIN_LLM_CONTEXT_WINDOW_TOKENS", 32768),
         llm_reserved_output_tokens=_int("SOORIN_LLM_RESERVED_OUTPUT_TOKENS", 12288),
         llm_context_safety_margin_tokens=_int("SOORIN_LLM_CONTEXT_SAFETY_MARGIN_TOKENS", 2048),
@@ -162,6 +173,12 @@ def get_settings() -> Settings:
             "SOORIN_CONVERSATION_MAX_MESSAGES",
             _int("SOORIN_CHAT_MAX_HISTORY_MESSAGES", 10),
         ),
+        conversation_recent_raw_messages=_int("SOORIN_CONVERSATION_RECENT_RAW_MESSAGES", 4),
+        conversation_summary_enabled=_bool("SOORIN_CONVERSATION_SUMMARY_ENABLED", True),
+        conversation_summary_trigger_tokens=_int("SOORIN_CONVERSATION_SUMMARY_TRIGGER_TOKENS", 1800),
+        conversation_summary_max_tokens=_int("SOORIN_CONVERSATION_SUMMARY_MAX_TOKENS", 700),
+        conversation_summary_temperature=_float("SOORIN_CONVERSATION_SUMMARY_TEMPERATURE", 0.0),
+        conversation_summary_timeout_seconds=_int("SOORIN_CONVERSATION_SUMMARY_TIMEOUT_SECONDS", 30),
         system_prompt_path=os.getenv("SOORIN_SYSTEM_PROMPT_PATH", "app/prompts/system_prompt.md").strip(),
         product_api_base_url=os.getenv("SOORIN_PRODUCT_API_BASE_URL", "").strip().rstrip("/"),
         product_topology_path=os.getenv("SOORIN_PRODUCT_TOPOLOGY_PATH", "/zeek/connections/unique-ip-pairs").strip(),
@@ -189,7 +206,13 @@ def get_settings() -> Settings:
         graph_full_enumeration_max_peers=_int("SOORIN_GRAPH_FULL_ENUMERATION_MAX_PEERS", 100),
         graph_context_max_enumerated_nodes=_int("SOORIN_GRAPH_CONTEXT_MAX_ENUMERATED_NODES", 250),
         graph_context_max_enumerated_edges=_int("SOORIN_GRAPH_CONTEXT_MAX_ENUMERATED_EDGES", 500),
+        graph_comparison_max_peers_per_entity=_int("SOORIN_GRAPH_COMPARISON_MAX_PEERS_PER_ENTITY", 100),
+        graph_comparison_max_shared_peers=_int("SOORIN_GRAPH_COMPARISON_MAX_SHARED_PEERS", 100),
         intent_router_enabled=_bool("SOORIN_INTENT_ROUTER_ENABLED", True),
+        intent_router_system_prompt_path=os.getenv(
+            "SOORIN_INTENT_ROUTER_SYSTEM_PROMPT_PATH",
+            "app/prompts/intent_router_system_prompt.md",
+        ).strip(),
         intent_router_timeout_seconds=_int("SOORIN_INTENT_ROUTER_TIMEOUT_SECONDS", 45),
         intent_router_min_confidence=_float("SOORIN_INTENT_ROUTER_MIN_CONFIDENCE", 0.65),
         intent_router_retry_enabled=_bool("SOORIN_INTENT_ROUTER_RETRY_ENABLED", True),

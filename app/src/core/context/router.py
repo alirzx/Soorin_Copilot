@@ -18,6 +18,8 @@ INBOUND_WORDS = re.compile(r"\b(?:inbound|incoming|sources?|connects?\s+to\s+thi
 OUTBOUND_WORDS = re.compile(r"\b(?:outbound|outgoing|destinations?|reaches|sends?\s+to)\b", re.IGNORECASE)
 PATH_WORDS = re.compile(r"\b(?:path|shortest\s+path|route|reachability|chain|intermediate)\b", re.IGNORECASE)
 RELATIONSHIP_WORDS = re.compile(r"\b(?:directly\s+connected|adjacent|relationship|edge\s+between)\b", re.IGNORECASE)
+DIRECT_RELATIONSHIP_WORDS = re.compile(r"\b(?:directly\s+connected|direct\s+connection|adjacent|edge\s+between|a\s*->\s*b|b\s*->\s*a)\b", re.IGNORECASE)
+COMPARISON_WORDS = re.compile(r"\b(?:compare|comparison|both\s+assets|both\s+ips|positions?|shared\s+peers?|common\s+peers?|broader\s+outbound|relationship)\b", re.IGNORECASE)
 TWO_HOP_WORDS = re.compile(r"\b(?:two\s+hops?|2\s+hops?|surrounding\s+network|expand\s+the\s+network|wider)\b", re.IGNORECASE)
 ASSET_WORDS = re.compile(r"\b(?:tell|show|explain|investigate|analy[sz]e|what\s+about|how\s+about|what\s+.*know|all\s+you\s+know)\b", re.IGNORECASE)
 FOLLOWUP_WORDS = re.compile(r"\b(?:go\s+deeper|continue|more\s+details|what\s+else|expand)\b", re.IGNORECASE)
@@ -61,22 +63,28 @@ class DeterministicFallbackRouter:
 
         if entities.reference_suppressed:
             reason = "fallback_topic_detachment"
+        elif entity_count > 2:
+            intent, scope, direction, depth = "unclear", "none", "none", 0
+            use_graph, reason = False, "fallback_too_many_entities"
         elif PATH_WORDS.search(message or "") and entity_count == 2:
             intent, scope, direction, depth = "graph_path", "path", "both", 0
             use_graph, requires_multiple, reason = True, True, "fallback_path"
+        elif COMPARISON_WORDS.search(message or "") and entity_count == 2 and not DIRECT_RELATIONSHIP_WORDS.search(message or ""):
+            intent, scope, direction, depth = "graph_relationships", "multi_entity_comparison", "both", 1
+            use_graph, requires_multiple, reason = True, True, "fallback_comparison"
         elif RELATIONSHIP_WORDS.search(message or "") and entity_count == 2:
             intent, scope, direction, depth = "graph_relationships", "one_hop", "both", 1
             use_graph, requires_multiple, reason = True, True, "fallback_relationship"
-        elif target and TWO_HOP_WORDS.search(message or ""):
+        elif target and entity_count == 1 and TWO_HOP_WORDS.search(message or ""):
             intent, scope, direction, depth = "graph_neighbors", "two_hop", _direction(message), 2
             use_graph, reason = True, "fallback_two_hop"
-        elif target and GRAPH_WORDS.search(message or ""):
+        elif target and entity_count == 1 and GRAPH_WORDS.search(message or ""):
             intent = "graph_neighbors"
             scope = "full_neighbors" if FULL_WORDS.search(message or "") else "one_hop"
             direction = _direction(message)
             depth = 1
             use_graph, reason = True, "fallback_graph_neighbors"
-        elif target and ASSET_WORDS.search(message or ""):
+        elif target and entity_count == 1 and ASSET_WORDS.search(message or ""):
             intent, scope, direction, depth = "asset_investigation", "node_summary", "both", 0
             use_graph, reason = True, "fallback_asset_investigation"
         elif target and FOLLOWUP_WORDS.search(message or "") and last_provider == "graph":
@@ -104,6 +112,7 @@ class DeterministicFallbackRouter:
             direction=direction,
             depth=depth,
             requires_multiple_entities=requires_multiple,
+            relationship_mode="compare" if scope == "multi_entity_comparison" else "direct" if intent == "graph_relationships" else "none",
             intent_confidence=1.0 if use_graph else 0.8,
             decision_source="fallback",
             fallback_used=True,
@@ -133,13 +142,22 @@ GraphContextRouter = DeterministicFallbackRouter
 def normalize_intent_route(decision: IntentDecision, entities: EntityResolution) -> RouteDecision:
     """Convert a validated router decision into an executable safe route."""
     target_entities = entities.entities
-    target_entity = target_entities[0] if target_entities else entities.primary_entity
+    target_entity = target_entities[0] if len(target_entities) == 1 else entities.primary_entity
     requires_graph = bool(decision.requires_graph and target_entity)
-    if decision.requires_multiple_entities and len(target_entities) != 2:
+    if decision.requires_multiple_entities:
+        requires_graph = len(target_entities) == 2
+        target_entity = None
+    if decision.intent in {"graph_relationships", "graph_path"}:
+        requires_graph = len(target_entities) == 2
+        target_entity = None
+    if decision.intent in {"graph_neighbors", "asset_investigation"}:
+        requires_graph = bool(decision.requires_graph and len(target_entities) == 1)
+        target_entity = target_entities[0] if target_entities else None
+    if len(target_entities) > 2:
         requires_graph = False
     return RouteDecision(
         use_graph=requires_graph,
-        reason="glm_semantic_route" if decision.decision_source == "glm" else decision.fallback_reason or "router_no_graph",
+        reason=decision.route_normalization_reason or ("glm_semantic_route" if decision.decision_source == "glm" else decision.fallback_reason or "router_no_graph"),
         target_entity=target_entity,
         target_entities=target_entities,
         matched_signals=[decision.intent, decision.scope, decision.direction],
@@ -151,6 +169,7 @@ def normalize_intent_route(decision: IntentDecision, entities: EntityResolution)
         direction=decision.direction,
         depth=decision.depth,
         requires_multiple_entities=decision.requires_multiple_entities,
+        relationship_mode=decision.relationship_mode,
         intent_confidence=decision.classification_confidence,
         decision_source=decision.decision_source,
         glm_router_called=decision.router_called,
@@ -161,4 +180,6 @@ def normalize_intent_route(decision: IntentDecision, entities: EntityResolution)
         glm_router_error=decision.error_reason,
         fallback_used=decision.fallback_used,
         fallback_reason=decision.fallback_reason,
+        route_normalized=decision.route_normalized,
+        route_normalization_reason=decision.route_normalization_reason,
     )

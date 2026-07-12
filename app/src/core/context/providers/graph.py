@@ -21,21 +21,22 @@ class GraphContextProvider:
 
     def provide(
         self,
-        entity: ResolvedEntity,
+        entity: ResolvedEntity | None,
         *,
         route: RouteDecision | None = None,
         request_id: str = "",
     ) -> GraphProviderResult:
         started = time.perf_counter()
-        entities = route.target_entities if route and route.target_entities else [entity]
+        entities = route.target_entities if route and route.target_entities else ([entity] if entity else [])
         scope = route.scope if route else "node_summary"
         direction = route.direction if route else "both"
         depth = route.depth if route else 0
+        target_label = entity.value if entity else ",".join(item.value for item in entities[:2])
         logger.info(
             "event=graph_context_provider_start request_id=%s target_ip=%s source=%s scope=%s direction=%s depth=%s entity_count=%s",
             request_id,
-            entity.value,
-            entity.source,
+            target_label,
+            entity.source if entity else "multi",
             scope,
             direction,
             depth,
@@ -45,7 +46,14 @@ class GraphContextProvider:
 
         try:
             context = retrieve_graph_context(
-                GraphRetrievalSpec(scope=scope, direction=direction, depth=depth, entities=entities),
+                GraphRetrievalSpec(
+                    scope=scope,
+                    direction=direction,
+                    depth=depth,
+                    entities=entities,
+                    intent=route.intent if route else "graph_neighbors",
+                    relationship_mode=route.relationship_mode if route else "none",
+                ),
                 self.settings,
             )
         except FileNotFoundError:
@@ -53,7 +61,7 @@ class GraphContextProvider:
             logger.warning(
                 "event=graph_context_provider_complete request_id=%s target_ip=%s status=unavailable reason=artifact_missing latency_ms=%s",
                 request_id,
-                entity.value,
+                target_label,
                 latency_ms,
             )
             return GraphProviderResult(
@@ -70,7 +78,7 @@ class GraphContextProvider:
             logger.exception(
                 "event=graph_context_provider_exception request_id=%s target_ip=%s latency_ms=%s",
                 request_id,
-                entity.value,
+                target_label,
                 latency_ms,
             )
             return GraphProviderResult(
@@ -90,7 +98,7 @@ class GraphContextProvider:
         logger.info(
             "event=graph_context_provider_complete request_id=%s target_ip=%s status=%s scope=%s direction=%s depth=%s inbound_total=%s inbound_retrieved=%s outbound_total=%s outbound_retrieved=%s bidirectional_total=%s bidirectional_retrieved=%s candidate_nodes=%s retrieved_nodes=%s candidate_edges=%s retrieved_edges=%s retrieval_truncated=%s retrieval_truncation_reason=%s context_chars=%s context_approx_tokens=%s latency_ms=%s",
             request_id,
-            entity.value,
+            target_label,
             status,
             context.get("scope", ""),
             context.get("direction", ""),

@@ -115,6 +115,8 @@ class CopilotService:
         trace.put(
             "ROUTING STATE",
             active_ip_before=routing_state.active_ip or "",
+            active_entities_before=", ".join(routing_state.active_entities),
+            active_entity_count_before=len(routing_state.active_entities),
             last_provider_before=routing_state.last_provider or "",
             previous_intent=routing_state.previous_intent or "",
             previous_scope=routing_state.previous_scope or "",
@@ -128,11 +130,12 @@ class CopilotService:
             routing_state.active_ip or "",
             routing_state.last_provider or "",
         )
-        history = self.memory_store.get(session) if self.settings.chat_store_history else []
         entities = self.entity_resolver.resolve(user_text, ui_context, routing_state, request_id=request_id)
         trace.put(
             "ENTITY",
             status=entities.status,
+            entity_mode=entities.entity_mode,
+            entity_count=len(entities.entities),
             value=entities.primary_entity.value if entities.primary_entity else "",
             source=entities.primary_entity.source if entities.primary_entity else "",
             reference_detected=entities.reference_detected,
@@ -195,6 +198,9 @@ class CopilotService:
             glm_router_error=route.glm_router_error or "",
             fallback_used=route.fallback_used,
             fallback_reason=route.fallback_reason or "",
+            route_normalized=route.route_normalized,
+            route_normalization_reason=route.route_normalization_reason or "",
+            relationship_mode=route.relationship_mode,
         )
         trace.put(
             "ROUTING",
@@ -209,7 +215,7 @@ class CopilotService:
         graph_result = None
         provenance: list[ProviderProvenance] = []
         limitations: list[str] = []
-        if route.use_graph and route.target_entity:
+        if route.use_graph and (route.target_entity or route.target_entities):
             graph_result = self.graph_provider.provide(route.target_entity, route=route, request_id=request_id)
             if graph_result.provenance:
                 provenance.append(graph_result.provenance)
@@ -217,10 +223,23 @@ class CopilotService:
         graph_context = graph_result.context if graph_result else {}
         graph_metadata = get_graph_metadata()
         refresh_status = get_refresh_status()
+        graph_target_ips = [
+            str(item)
+            for item in (graph_context.get("target_ips", []) if isinstance(graph_context, dict) else [])
+            if item
+        ]
+        graph_target_label = ", ".join(graph_target_ips)
+        if not graph_target_label:
+            graph_target_label = (
+                graph_result.target_entity.value
+                if graph_result and graph_result.target_entity
+                else graph_context.get("target_ip", "") if isinstance(graph_context, dict) else ""
+            )
         trace.put(
             "GRAPH RETRIEVAL",
             status=graph_result.status if graph_result else "skipped",
-            target_ip=graph_result.target_entity.value if graph_result and graph_result.target_entity else "",
+            target_ip=graph_target_label,
+            target_ips=graph_target_label,
             scope=graph_context.get("scope", route.scope) if isinstance(graph_context, dict) else route.scope,
             direction=graph_context.get("direction", route.direction) if isinstance(graph_context, dict) else route.direction,
             depth=graph_context.get("depth", route.depth) if isinstance(graph_context, dict) else route.depth,
@@ -242,6 +261,14 @@ class CopilotService:
             graph_source=graph_metadata.get("active_graph_source", ""),
             graph_refresh_last_success_at=refresh_status.get("last_success_at", ""),
             provider_latency_ms=graph_result.latency_ms if graph_result else 0,
+            relationship_source_present=graph_context.get("source_present", "") if isinstance(graph_context, dict) else "",
+            relationship_target_present=graph_context.get("target_present", "") if isinstance(graph_context, dict) else "",
+            relationship_forward_edge=graph_context.get("forward_edge", "") if isinstance(graph_context, dict) else "",
+            relationship_reverse_edge=graph_context.get("reverse_edge", "") if isinstance(graph_context, dict) else "",
+            relationship_status=graph_context.get("relationship_status", graph_context.get("relationship", "")) if isinstance(graph_context, dict) else "",
+            comparison_shared_peer_total=graph_context.get("shared_peer_total", "") if isinstance(graph_context, dict) else "",
+            comparison_entity_a_unique_peer_total=graph_context.get("entity_a_unique_peer_total", "") if isinstance(graph_context, dict) else "",
+            comparison_entity_b_unique_peer_total=graph_context.get("entity_b_unique_peer_total", "") if isinstance(graph_context, dict) else "",
         )
 
         context_package = CopilotContextPackage(
@@ -271,6 +298,24 @@ class CopilotService:
             context_truncation_reason=graph_context.get("context_truncation_reason", "") if isinstance(graph_context, dict) else "",
             context_chars=len(dynamic_context),
             context_tokens_approx=approx_tokens(dynamic_context),
+        )
+
+        conversation_snapshot = (
+            self.memory_store.prepare_for_model(session, self.settings, routing_state, request_id=request_id)
+            if self.settings.chat_store_history
+            else None
+        )
+        history = conversation_snapshot.messages if conversation_snapshot else []
+        trace.put(
+            "MEMORY",
+            conversation_raw_message_count=conversation_snapshot.raw_message_count if conversation_snapshot else 0,
+            conversation_recent_message_count=conversation_snapshot.recent_message_count if conversation_snapshot else 0,
+            conversation_summary_present=conversation_snapshot.summary_present if conversation_snapshot else False,
+            conversation_summary_tokens_approx=conversation_snapshot.summary_tokens_approx if conversation_snapshot else 0,
+            conversation_tokens_before_compaction=conversation_snapshot.tokens_before_compaction if conversation_snapshot else 0,
+            conversation_tokens_after_compaction=conversation_snapshot.tokens_after_compaction if conversation_snapshot else 0,
+            conversation_summary_updated=conversation_snapshot.summary_updated if conversation_snapshot else False,
+            conversation_summary_error=conversation_snapshot.summary_error if conversation_snapshot else "",
         )
 
         messages = [
@@ -320,7 +365,12 @@ class CopilotService:
             _preview(user_text),
         )
         try:
-            result = self.llm_client.chat(messages, request_id=request_id)
+            result = self.llm_client.chat(
+                messages,
+                request_id=request_id,
+                max_tokens=min(self.settings.chat_max_tokens, self.settings.arvan_max_tokens),
+                purpose="chat",
+            )
         except LLMError:
             trace.status = "error"
             trace.errors = 1
@@ -362,35 +412,67 @@ class CopilotService:
             self.memory_store.append(session, "assistant", result.text)
 
         updated_active_ip = routing_state.active_ip
+        updated_active_entities = routing_state.active_entities
+        last_resolved_entities = routing_state.last_resolved_entities
         update_reason = "none"
-        if entities.status == "resolved" and entities.primary_entity:
-            if entities.primary_entity.source == "message":
-                updated_active_ip = entities.primary_entity.value
-                update_reason = "explicit_message_entity"
-            elif entities.primary_entity.source == "ui":
-                updated_active_ip = entities.primary_entity.value
-                update_reason = "ui_selected_reference"
-            elif entities.primary_entity.source == "conversation":
-                update_reason = "conversation_reference"
+        entity_state_update_intents = {
+            "asset_investigation",
+            "graph_neighbors",
+            "graph_relationships",
+            "graph_path",
+            "graph_followup",
+        }
+        can_update_entity_state = (
+            entities.status == "resolved"
+            and bool(entities.entities)
+            and route.intent in entity_state_update_intents
+            and not entities.reference_suppressed
+        )
+        if can_update_entity_state:
+            resolved_values = tuple(entity.value for entity in entities.entities)
+            last_resolved_entities = resolved_values
+            if len(resolved_values) == 1 and entities.primary_entity:
+                updated_active_ip = resolved_values[0]
+                updated_active_entities = ()
+                if entities.primary_entity.source == "message":
+                    update_reason = "explicit_message_entity"
+                elif entities.primary_entity.source == "ui":
+                    update_reason = "ui_selected_reference"
+                elif entities.primary_entity.source == "conversation":
+                    update_reason = "conversation_reference"
+            elif len(resolved_values) == 2:
+                updated_active_ip = None
+                updated_active_entities = resolved_values
+                update_reason = "entity_pair_resolved"
 
         graph_execution_succeeded = bool(graph_result and graph_result.status in {"available", "not_found"})
-        updated_last_provider = "graph" if graph_execution_succeeded and route.use_graph else None
+        updated_last_provider = "graph" if graph_execution_succeeded and route.use_graph else routing_state.last_provider
+        updated_previous_intent = route.intent if graph_execution_succeeded else routing_state.previous_intent
+        updated_previous_scope = route.scope if graph_execution_succeeded else routing_state.previous_scope
+        updated_previous_direction = route.direction if graph_execution_succeeded else routing_state.previous_direction
+        updated_previous_depth = route.depth if graph_execution_succeeded else routing_state.previous_depth
         new_routing_state = SessionRoutingState(
             active_ip=updated_active_ip,
+            active_entities=updated_active_entities,
+            last_resolved_entities=last_resolved_entities,
+            previous_entity_count=len(entities.entities) if can_update_entity_state else routing_state.previous_entity_count,
+            previous_entity_mode=entities.entity_mode if can_update_entity_state else routing_state.previous_entity_mode,
             last_provider=updated_last_provider,
-            previous_intent=route.intent if graph_execution_succeeded or route.intent != "unclear" else routing_state.previous_intent,
-            previous_scope=route.scope if graph_execution_succeeded else routing_state.previous_scope,
-            previous_direction=route.direction if graph_execution_succeeded else routing_state.previous_direction,
-            previous_depth=route.depth if graph_execution_succeeded else routing_state.previous_depth,
+            previous_intent=updated_previous_intent,
+            previous_scope=updated_previous_scope,
+            previous_direction=updated_previous_direction,
+            previous_depth=updated_previous_depth,
         )
         self.routing_state_store.set(session, new_routing_state)
         if new_routing_state != routing_state:
             logger.info(
-                "event=session_routing_state_updated request_id=%s session_id=%s previous_active_ip=%s active_ip=%s previous_last_provider=%s last_provider=%s previous_intent=%s previous_scope=%s previous_direction=%s previous_depth=%s update_reason=%s",
+                "event=session_routing_state_updated request_id=%s session_id=%s previous_active_ip=%s active_ip=%s previous_active_entities=%s active_entities=%s previous_last_provider=%s last_provider=%s previous_intent=%s previous_scope=%s previous_direction=%s previous_depth=%s update_reason=%s",
                 request_id,
                 session,
                 routing_state.active_ip or "",
                 new_routing_state.active_ip or "",
+                ",".join(routing_state.active_entities),
+                ",".join(new_routing_state.active_entities),
                 routing_state.last_provider or "",
                 new_routing_state.last_provider or "",
                 new_routing_state.previous_intent or "",
@@ -411,6 +493,8 @@ class CopilotService:
         trace.put(
             "STATE UPDATE",
             active_ip_after=new_routing_state.active_ip or "",
+            active_entities_after=", ".join(new_routing_state.active_entities),
+            active_entity_count_after=len(new_routing_state.active_entities),
             last_provider_after=new_routing_state.last_provider or "",
             previous_intent_after=new_routing_state.previous_intent or "",
             previous_scope_after=new_routing_state.previous_scope or "",
@@ -418,6 +502,25 @@ class CopilotService:
             previous_depth_after=new_routing_state.previous_depth if new_routing_state.previous_depth is not None else "",
             update_reason=update_reason,
         )
+        if self.settings.chat_store_history:
+            try:
+                post_summary_updated = self.memory_store.compact_if_needed(
+                    session,
+                    self.settings,
+                    new_routing_state,
+                    route=route,
+                    graph_context=graph_context if isinstance(graph_context, dict) else {},
+                    request_id=request_id,
+                )
+                trace.put("MEMORY", conversation_summary_updated_after_response=post_summary_updated)
+            except Exception as exc:
+                logger.warning(
+                    "event=conversation_summary_failed request_id=%s session_id=%s error_type=%s",
+                    request_id,
+                    session,
+                    type(exc).__name__,
+                )
+                trace.put("MEMORY", conversation_summary_error=type(exc).__name__)
         trace.status = "ok"
         trace.total_latency_ms = int((time.perf_counter() - request_started) * 1000)
         trace.put(

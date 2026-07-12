@@ -52,18 +52,17 @@ class ContextComposer:
         context["context_edge_count"] = len(edges)
         context["context_truncated"] = context_truncated
         context["context_truncation_reason"] = truncation_reason
-        context["inbound_context_included"] = self._included_peer_count(nodes, graph.target_entity.value if graph.target_entity else "", "inbound")
-        context["outbound_context_included"] = self._included_peer_count(nodes, graph.target_entity.value if graph.target_entity else "", "outbound")
-        context["bidirectional_context_included"] = min(
-            context.get("bidirectional_retrieved", 0) or 0,
-            context.get("inbound_context_included", 0) or 0,
-            context.get("outbound_context_included", 0) or 0,
-        )
+        direction_counts = self._included_direction_counts(nodes, context.get("target_ip", ""))
+        context["inbound_context_included"] = direction_counts["inbound"]
+        context["outbound_context_included"] = direction_counts["outbound"]
+        context["bidirectional_context_included"] = direction_counts["bidirectional"]
 
         peer_subnets = Counter(str(node.get("subnet") or "other") for node in nodes if node.get("hop") != 0)
         subnet_summary = ", ".join(f"{subnet}{count}" for subnet, count in peer_subnets.most_common(12)) or "none"
         scope = str(context.get("scope", "node_summary"))
         direction = str(context.get("direction", "both"))
+        relationship_mode = str(context.get("relationship_mode", "none"))
+        target_ips = [str(item) for item in (context.get("target_ips") or []) if item]
 
         lines = [
             "[SOORIN GRAPH EVIDENCE]",
@@ -73,12 +72,42 @@ class ContextComposer:
             "Describe graph structure as observed communication relationships.",
             "Distinguish observed graph evidence from structural interpretation and unknown evidence.",
             f"Evidence source: {graph.provenance.source if graph.provenance else 'observed_communication_graph'}",
-            f"Target IP: {context.get('target_ip') or (graph.target_entity.value if graph.target_entity else '')}",
+            f"Target IPs: {_list_values(target_ips, limit=2)}"
+            if target_ips
+            else f"Target IP: {context.get('target_ip') or (graph.target_entity.value if graph.target_entity else '')}",
             f"Node found: {bool(context.get('node_found'))}",
             f"Scope: {context.get('scope', 'node_summary')}, direction={context.get('direction', 'both')}, depth={context.get('depth', 0)}",
         ]
 
         if graph.status == "available":
+            if relationship_mode == "direct":
+                lines.extend(
+                    [
+                        f"Relationship source: {context.get('source', '')}; present={context.get('source_present', False)}",
+                        f"Relationship target: {context.get('target', '')}; present={context.get('target_present', False)}",
+                        f"Forward edge source_to_target: {context.get('forward_edge', False)}",
+                        f"Reverse edge target_to_source: {context.get('reverse_edge', False)}",
+                        f"Direct relationship: {context.get('relationship_status', context.get('relationship', 'unknown'))}; bidirectional={context.get('bidirectional', False)}",
+                    ]
+                )
+            if relationship_mode == "compare":
+                entity_a = dict(context.get("entity_a") or {})
+                entity_b = dict(context.get("entity_b") or {})
+                direct = dict(context.get("direct_relationship") or {})
+                degree_comparison = dict(context.get("degree_comparison") or {})
+                subnet_comparison = dict(context.get("subnet_comparison") or {})
+                lines.extend(
+                    [
+                        f"Comparison entities: {_list_values([str(item) for item in context.get('entities', [])], limit=2)}",
+                        f"Entity A summary: ip={entity_a.get('ip', '')}, present={entity_a.get('present', False)}, inbound_total={entity_a.get('inbound_total', 0)}, outbound_total={entity_a.get('outbound_total', 0)}, bidirectional_total={entity_a.get('bidirectional_total', 0)}",
+                        f"Entity B summary: ip={entity_b.get('ip', '')}, present={entity_b.get('present', False)}, inbound_total={entity_b.get('inbound_total', 0)}, outbound_total={entity_b.get('outbound_total', 0)}, bidirectional_total={entity_b.get('bidirectional_total', 0)}",
+                        f"Direct relationship A->B={direct.get('a_to_b', False)}, B->A={direct.get('b_to_a', False)}, relationship={direct.get('relationship_status', direct.get('relationship', 'unknown'))}",
+                        f"Degree comparison: entity_a_total_peers={degree_comparison.get('entity_a_total_peer_count', 0)}, entity_b_total_peers={degree_comparison.get('entity_b_total_peer_count', 0)}, broader_outbound={degree_comparison.get('broader_outbound_entity', 'unknown')}, broader_inbound={degree_comparison.get('broader_inbound_entity', 'unknown')}",
+                        f"Subnet comparison: shared={_list_values([str(item) for item in subnet_comparison.get('shared_subnets', [])], limit=8)}, entity_a_unique={_list_values([str(item) for item in subnet_comparison.get('entity_a_unique_subnets', [])], limit=8)}, entity_b_unique={_list_values([str(item) for item in subnet_comparison.get('entity_b_unique_subnets', [])], limit=8)}",
+                        f"Shared peers: total={context.get('shared_peer_total', 0)}, retrieved={context.get('shared_peers_retrieved_count', 0)}, values={_list_values([str(item) for item in context.get('shared_peers_retrieved', [])], limit=self.settings.graph_comparison_max_shared_peers)}",
+                        f"Unique peer totals: entity_a={context.get('entity_a_unique_peer_total', 0)}, entity_b={context.get('entity_b_unique_peer_total', 0)}",
+                    ]
+                )
             lines.extend(
                 [
                     f"Inbound peers: observed_total={context.get('inbound_total', 0)}, graph_retrieved={context.get('inbound_retrieved', context.get('inbound_returned', 0))}, model_context_included={context.get('inbound_context_included', 0)}",
@@ -104,7 +133,7 @@ class ContextComposer:
                 lines.append(f"Path edges: {_list_edges(edges, limit=40)}")
             else:
                 matching_peers = self._matching_peer_count(context, direction)
-                included_peers = self._included_peer_count(nodes, context.get("target_ip", ""), direction)
+                included_peers = direction_counts.get(direction, direction_counts["union"])
                 if scope == "full_neighbors" and matching_peers <= self.settings.graph_full_enumeration_max_peers and not context_truncated:
                     lines.append(f"All {matching_peers} requested {direction} peers were retrieved and explicitly included.")
                 elif scope == "full_neighbors":
@@ -179,7 +208,11 @@ class ContextComposer:
             node_limit = min(node_limit, 1)
             edge_limit = 0
 
-        selected_nodes = nodes[:node_limit]
+        if scope == "node_summary":
+            target_ip = str(context.get("target_ip") or "")
+            selected_nodes = [node for node in nodes if str(node.get("id") or "") == target_ip][:1]
+        else:
+            selected_nodes = nodes[:node_limit]
         selected_node_ids = {str(node.get("id")) for node in selected_nodes if node.get("id")}
         selected_edges = [
             edge for edge in edges
@@ -221,6 +254,23 @@ class ContextComposer:
         )
 
     @staticmethod
-    def _included_peer_count(nodes: list[dict[str, object]], target_ip: object, direction: str) -> int:
+    def _included_direction_counts(nodes: list[dict[str, object]], target_ip: object) -> dict[str, int]:
         target = str(target_ip or "")
-        return len([node for node in nodes if str(node.get("id", "")) != target and node.get("id")])
+        inbound = {
+            str(node.get("id"))
+            for node in nodes
+            if node.get("id") and str(node.get("id")) != target and bool(node.get("inbound"))
+        }
+        outbound = {
+            str(node.get("id"))
+            for node in nodes
+            if node.get("id") and str(node.get("id")) != target and bool(node.get("outbound"))
+        }
+        bidirectional = inbound.intersection(outbound)
+        return {
+            "inbound": len(inbound),
+            "outbound": len(outbound),
+            "bidirectional": len(bidirectional),
+            "both": len(inbound.union(outbound)),
+            "union": len(inbound.union(outbound)),
+        }

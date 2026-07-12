@@ -6,6 +6,7 @@ import json
 import logging
 import re
 import time
+from pathlib import Path
 from typing import Any
 
 from src.config.settings import Settings
@@ -33,42 +34,15 @@ ALLOWED_INTENTS: set[str] = {
     "graph_followup",
     "unclear",
 }
-ALLOWED_SCOPES: set[str] = {"none", "node_summary", "one_hop", "full_neighbors", "two_hop", "path"}
+ALLOWED_SCOPES: set[str] = {"none", "node_summary", "one_hop", "full_neighbors", "two_hop", "path", "multi_entity_comparison"}
 ALLOWED_DIRECTIONS: set[str] = {"none", "inbound", "outbound", "both"}
 
-ROUTER_SYSTEM_PROMPT = """You are the Soorin Copilot semantic graph router.
-Return exactly one JSON object. No markdown. No explanation outside JSON.
-Do not answer the user. Do not invent, extract, replace, or override entities.
-Use only deterministic entity fields supplied by the backend.
-Use only allowed enums. Return a final concrete scope. Never return inherit.
-Respect previous routing state. Distinguish direct adjacency from path.
-Distinguish full direct neighbors from bounded summaries.
-Distinguish general knowledge from selected-entity context.
-Treat explicit topic detachment as graph-irrelevant for the current turn.
-Never request depth greater than 2. Avoid long reasoning. Return JSON immediately.
-
-Allowed intents: general_knowledge, asset_investigation, graph_neighbors, graph_relationships, graph_path, graph_followup, unclear.
-Allowed scopes: none, node_summary, one_hop, full_neighbors, two_hop, path.
-Allowed directions: none, inbound, outbound, both.
-
-Semantics:
-General asset investigation -> asset_investigation, node_summary, depth 0.
-Direct neighbors -> graph_neighbors, one_hop, depth 1.
-All/every/full/complete direct neighbors -> graph_neighbors, full_neighbors, depth 1.
-Wider surrounding topology or two hops -> graph_neighbors, two_hop, depth 2.
-Direct edge or immediate adjacency between two entities -> graph_relationships, one_hop, depth 1.
-Route, shortest path, reachability, chain, or intermediate nodes -> graph_path, path, depth 0.
-Conceptual question -> general_knowledge, none, requires_graph=false.
-Vague request without usable context -> unclear, none, requires_graph=false.
-
-Direction:
-incoming, connects to this, sources, send toward -> inbound.
-outgoing, destinations, reaches, sends to -> outbound.
-communicates with, surrounding, connected with -> both.
-
-Schema:
-{"intent":"graph_neighbors","scope":"full_neighbors","direction":"inbound","depth":1,"requires_graph":true,"requires_multiple_entities":false,"is_followup":false,"classification_confidence":0.95,"reason":"short reason"}
-"""
+ROUTER_SYSTEM_PROMPT_FALLBACK = (
+    "You classify Soorin Copilot routing only. Return exactly one JSON object. "
+    "Do not answer the user. Use only supplied deterministic entities. "
+    "Allowed scopes include none, node_summary, one_hop, full_neighbors, two_hop, path, "
+    "and multi_entity_comparison. Never request depth greater than 2."
+)
 
 
 def _json_from_text(text: str) -> dict[str, Any]:
@@ -98,6 +72,7 @@ def build_routing_context(
     return {
         "message": compact_preview(message, limit=360),
         "entity_status": entities.status,
+        "entity_mode": entities.entity_mode,
         "entity_types": sorted({entity.type for entity in entities.entities}),
         "entity_count": len(entities.entities),
         "resolved_entity_count": len(entities.entities),
@@ -107,6 +82,8 @@ def build_routing_context(
             for entity in entities.entities[:2]
         ],
         "active_entity_present": bool(routing_state.active_ip),
+        "active_entities_present": bool(routing_state.active_entities),
+        "active_entity_count": len(routing_state.active_entities),
         "ui_selected_entity_present": bool((ui_context or {}).get("selected_ip")),
         "previous_provider": routing_state.last_provider,
         "previous_intent": routing_state.previous_intent,
@@ -140,6 +117,9 @@ def validate_router_payload(
     intent = str(payload["intent"])
     scope = str(payload["scope"])
     direction = str(payload["direction"])
+    entity_count = len(entities.entities)
+    route_normalized = False
+    route_normalization_reason = None
     if intent not in ALLOWED_INTENTS:
         raise ValueError("unsupported_enum:intent")
     if scope not in ALLOWED_SCOPES or scope == "inherit":
@@ -165,22 +145,66 @@ def validate_router_payload(
 
     requires_graph = bool(payload["requires_graph"])
     requires_multiple = bool(payload["requires_multiple_entities"])
+    if intent == "asset_investigation" and entity_count == 1:
+        if (
+            scope != "node_summary"
+            or direction != "both"
+            or depth != 0
+            or not requires_graph
+            or requires_multiple
+        ):
+            route_normalized = True
+            route_normalization_reason = "node_summary_requires_graph"
+        scope = "node_summary"
+        direction = "both"
+        depth = 0
+        requires_graph = True
+        requires_multiple = False
+    if intent == "graph_neighbors" and (requires_multiple or entity_count == 2):
+        intent = "graph_relationships"
+        scope = "multi_entity_comparison"
+        direction = "both"
+        depth = 1
+        requires_graph = True
+        requires_multiple = True
+        route_normalized = True
+        route_normalization_reason = "multi_entity_neighbors_to_relationship"
     if scope == "full_neighbors" and depth != 1:
         raise ValueError("schema_validation_failed:full_neighbors_depth")
     if scope == "two_hop" and depth != 2:
         raise ValueError("schema_validation_failed:two_hop_depth")
     if scope == "path" and depth != 0:
         raise ValueError("schema_validation_failed:path_depth")
+    if scope == "multi_entity_comparison" and depth != 1:
+        raise ValueError("schema_validation_failed:comparison_depth")
     if intent == "general_knowledge" and scope != "none":
         raise ValueError("schema_validation_failed:general_scope")
+    if intent == "general_knowledge" and requires_graph:
+        raise ValueError("schema_validation_failed:general_requires_graph")
     if intent == "graph_path" and scope != "path":
         raise ValueError("schema_validation_failed:path_scope")
-    if intent == "graph_relationships" and len(entities.entities) != 2:
+    if intent == "graph_path" and not requires_multiple:
+        raise ValueError("schema_validation_failed:path_requires_multiple")
+    if intent == "graph_path" and entity_count != 2:
         raise ValueError("entity_requirement_failed")
-    if requires_multiple and len(entities.entities) != 2:
+    if intent == "graph_neighbors" and requires_multiple:
+        raise ValueError("schema_validation_failed:neighbors_multi_entity")
+    if intent == "graph_neighbors" and entity_count != 1:
+        raise ValueError("entity_requirement_failed")
+    if intent == "asset_investigation" and entity_count != 1:
+        raise ValueError("entity_requirement_failed")
+    if intent == "graph_relationships" and entity_count != 2:
+        raise ValueError("entity_requirement_failed")
+    if intent == "graph_relationships" and not requires_multiple:
+        raise ValueError("schema_validation_failed:relationship_requires_multiple")
+    if intent == "graph_relationships" and scope not in {"one_hop", "multi_entity_comparison"}:
+        raise ValueError("schema_validation_failed:relationship_scope")
+    if requires_multiple and entity_count != 2:
         raise ValueError("entity_requirement_failed")
     if requires_graph and not entities.entities:
         raise ValueError("entity_requirement_failed")
+    if entity_count > 2 and requires_graph:
+        raise ValueError("entity_requirement_failed:too_many_entities")
 
     return IntentDecision(
         intent=intent,  # type: ignore[arg-type]
@@ -189,12 +213,15 @@ def validate_router_payload(
         depth=depth,
         requires_graph=requires_graph,
         requires_multiple_entities=requires_multiple,
+        relationship_mode="compare" if scope == "multi_entity_comparison" else "direct" if intent == "graph_relationships" else "none",
         is_followup=bool(payload["is_followup"]),
         classification_confidence=confidence,
         reason=str(payload.get("reason") or "")[:220],
         decision_source="glm",
         router_called=True,
         content_present=True,
+        route_normalized=route_normalized,
+        route_normalization_reason=route_normalization_reason,
     )
 
 
@@ -204,6 +231,34 @@ class GLMIntentRouter:
     def __init__(self, settings: Settings, llm_client: LLMClient) -> None:
         self.settings = settings
         self.llm_client = llm_client
+        self.system_prompt = self._load_system_prompt()
+
+    def _load_system_prompt(self) -> str:
+        prompt_path = Path(self.settings.intent_router_system_prompt_path)
+        if not prompt_path.is_absolute():
+            prompt_path = Path.cwd() / prompt_path
+        try:
+            prompt = prompt_path.read_text(encoding="utf-8").strip()
+        except OSError:
+            logger.warning(
+                "event=intent_router_prompt_missing path=%s fallback=true chars=%s",
+                self.settings.intent_router_system_prompt_path,
+                len(ROUTER_SYSTEM_PROMPT_FALLBACK),
+            )
+            return ROUTER_SYSTEM_PROMPT_FALLBACK
+        if not prompt:
+            logger.warning(
+                "event=intent_router_prompt_empty path=%s fallback=true chars=%s",
+                self.settings.intent_router_system_prompt_path,
+                len(ROUTER_SYSTEM_PROMPT_FALLBACK),
+            )
+            return ROUTER_SYSTEM_PROMPT_FALLBACK
+        logger.info(
+            "event=intent_router_prompt_loaded path=%s chars=%s",
+            self.settings.intent_router_system_prompt_path,
+            len(prompt),
+        )
+        return prompt
 
     def disabled_decision(self, reason: str = "router_disabled") -> IntentDecision:
         return IntentDecision(
@@ -253,7 +308,7 @@ class GLMIntentRouter:
 
         for attempt in range(attempts):
             messages = [
-                {"role": "system", "content": ROUTER_SYSTEM_PROMPT},
+                {"role": "system", "content": self.system_prompt},
                 {"role": "user", "content": json.dumps(routing_context, sort_keys=True)},
             ]
             if attempt:

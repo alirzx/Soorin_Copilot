@@ -8,7 +8,7 @@ from dataclasses import dataclass
 import networkx as nx
 
 from src.config.settings import Settings
-from src.core.context.models import GraphDirection, GraphScope, ResolvedEntity
+from src.core.context.models import GraphDirection, GraphScope, IntentName, RelationshipMode, ResolvedEntity
 from src.core.graph.loader import get_graph
 from src.core.graph.service import get_subnet
 
@@ -26,6 +26,8 @@ class GraphRetrievalSpec:
     direction: GraphDirection
     depth: int
     entities: list[ResolvedEntity]
+    intent: IntentName = "graph_neighbors"
+    relationship_mode: RelationshipMode = "none"
 
 
 def _empty_result(spec: GraphRetrievalSpec, target_ip: str, *, node_found: bool) -> dict[str, object]:
@@ -73,6 +75,17 @@ def _edge_dict(src: str, dst: str, graph: nx.DiGraph) -> dict[str, object]:
     return {"source": src, "target": dst, "weight": graph[src][dst].get("weight", 1)}
 
 
+def _node_dict(node: str, *, target: str = "", hop: int = 1, inbound: bool = False, outbound: bool = False) -> dict[str, object]:
+    return {
+        "id": node,
+        "hop": 0 if node == target else hop,
+        "subnet": get_subnet(node),
+        "inbound": inbound,
+        "outbound": outbound,
+        "bidirectional": inbound and outbound,
+    }
+
+
 def _neighbors(graph: nx.DiGraph, target: str, direction: GraphDirection) -> tuple[list[str], list[str], list[str]]:
     inbound = sorted(graph.predecessors(target))
     outbound = sorted(graph.successors(target))
@@ -105,12 +118,17 @@ def _reason_string(reasons: list[dict[str, object]]) -> str | None:
 
 def retrieve_graph_context(spec: GraphRetrievalSpec, settings: Settings) -> dict[str, object]:
     graph = get_graph()
+    if spec.intent == "graph_relationships" and len(spec.entities) == 2:
+        if spec.scope == "multi_entity_comparison" or spec.relationship_mode == "compare":
+            return _comparison_context(graph, spec, settings)
+        return _relationship_context(graph, spec)
+    if spec.scope == "path":
+        return _path_context(graph, spec, settings)
+
     target_ip = spec.entities[0].value if spec.entities else ""
     if not target_ip or target_ip not in graph:
         return _empty_result(spec, target_ip, node_found=False)
 
-    if spec.scope == "path":
-        return _path_context(graph, spec, settings)
     if spec.scope == "two_hop":
         return _two_hop_context(graph, spec, settings)
     return _neighbor_context(graph, spec, settings)
@@ -178,7 +196,15 @@ def _neighbor_context(graph: nx.DiGraph, spec: GraphRetrievalSpec, settings: Set
         "retrieved_edge_count": len(retrieved_edges),
         "returned_edge_count": len(retrieved_edges),
         "context_edge_count": 0,
-        "nodes": [{"id": node, "hop": 0 if node == target else 1, "subnet": get_subnet(node)} for node in retrieved_nodes],
+        "nodes": [
+            _node_dict(
+                node,
+                target=target,
+                inbound=node in inbound,
+                outbound=node in outbound,
+            )
+            for node in retrieved_nodes
+        ],
         "edges": retrieved_edges,
         "top_inbound_peers": inbound[: min(20, len(inbound))],
         "top_outbound_peers": outbound[: min(20, len(outbound))],
@@ -262,7 +288,16 @@ def _two_hop_context(graph: nx.DiGraph, spec: GraphRetrievalSpec, settings: Sett
         "retrieved_edge_count": len(edges),
         "returned_edge_count": len(edges),
         "context_edge_count": 0,
-        "nodes": [{"id": node, "hop": hops[node], "subnet": get_subnet(node)} for node in sorted(seen, key=lambda n: (hops[n], n))],
+        "nodes": [
+            _node_dict(
+                node,
+                target=target,
+                hop=hops[node],
+                inbound=node in inbound_all,
+                outbound=node in outbound_all,
+            )
+            for node in sorted(seen, key=lambda n: (hops[n], n))
+        ],
         "edges": edges,
         "retrieval_truncated": retrieval_truncated,
         "retrieval_truncation_reasons": retrieval_reasons,
@@ -278,8 +313,23 @@ def _two_hop_context(graph: nx.DiGraph, spec: GraphRetrievalSpec, settings: Sett
 def _path_context(graph: nx.DiGraph, spec: GraphRetrievalSpec, settings: Settings) -> dict[str, object]:
     source = spec.entities[0].value if spec.entities else ""
     target = spec.entities[1].value if len(spec.entities) > 1 else ""
-    base = _empty_result(spec, source, node_found=bool(source in graph))
-    base.update({"source_ip": source, "destination_ip": target, "path_exists": False, "path_nodes": [], "path_edges": [], "hop_count": None})
+    source_present = source in graph
+    target_present = target in graph
+    base = _empty_result(spec, source, node_found=source_present and target_present)
+    base.update(
+        {
+            "source_ip": source,
+            "destination_ip": target,
+            "target_ips": [source, target],
+            "source_present": source_present,
+            "target_present": target_present,
+            "path_exists": False,
+            "path_found": False,
+            "path_nodes": [],
+            "path_edges": [],
+            "hop_count": None,
+        }
+    )
     if source not in graph or target not in graph:
         return base
     try:
@@ -302,6 +352,7 @@ def _path_context(graph: nx.DiGraph, spec: GraphRetrievalSpec, settings: Setting
             "direction": spec.direction,
             "depth": 0,
             "path_exists": True,
+            "path_found": True,
             "path_nodes": path_nodes,
             "path_edges": path_edges,
             "hop_count": len(path_nodes) - 1,
@@ -313,7 +364,7 @@ def _path_context(graph: nx.DiGraph, spec: GraphRetrievalSpec, settings: Setting
             "retrieved_edge_count": len(path_edges),
             "returned_edge_count": len(path_edges),
             "context_edge_count": 0,
-            "nodes": [{"id": node, "hop": index, "subnet": get_subnet(node)} for index, node in enumerate(path_nodes)],
+            "nodes": [_node_dict(node, target=source, hop=index) for index, node in enumerate(path_nodes)],
             "edges": path_edges,
             "retrieval_truncated": truncated,
             "retrieval_truncation_reasons": [_reason("path_length_limit", settings.graph_max_path_length, len(path_nodes), len(path_nodes))] if truncated else [],
@@ -325,3 +376,195 @@ def _path_context(graph: nx.DiGraph, spec: GraphRetrievalSpec, settings: Setting
         }
     )
     return base
+
+
+def _relationship_context(graph: nx.DiGraph, spec: GraphRetrievalSpec) -> dict[str, object]:
+    source = spec.entities[0].value
+    target = spec.entities[1].value
+    source_present = source in graph
+    target_present = target in graph
+    forward_edge = bool(source_present and target_present and graph.has_edge(source, target))
+    reverse_edge = bool(source_present and target_present and graph.has_edge(target, source))
+    edges = []
+    if forward_edge:
+        edges.append(_edge_dict(source, target, graph))
+    if reverse_edge:
+        edges.append(_edge_dict(target, source, graph))
+    if forward_edge and reverse_edge:
+        relationship = "bidirectional_direct_relationship"
+    elif forward_edge:
+        relationship = "forward_direct_relationship"
+    elif reverse_edge:
+        relationship = "reverse_direct_relationship"
+    elif source_present and target_present:
+        relationship = "no_direct_relationship"
+    else:
+        relationship = "entity_missing_from_active_graph"
+    return {
+        "target_ip": source,
+        "target_ips": [source, target],
+        "node_found": source_present and target_present,
+        "scope": "one_hop",
+        "direction": "both",
+        "depth": 1,
+        "relationship_mode": "direct",
+        "source": source,
+        "target": target,
+        "source_present": source_present,
+        "target_present": target_present,
+        "forward_edge": forward_edge,
+        "reverse_edge": reverse_edge,
+        "relationship": relationship,
+        "relationship_status": relationship,
+        "bidirectional": forward_edge and reverse_edge,
+        "candidate_node_count": 2,
+        "retrieved_node_count": int(source_present) + int(target_present),
+        "returned_node_count": int(source_present) + int(target_present),
+        "context_node_count": 0,
+        "candidate_edge_count": int(forward_edge) + int(reverse_edge),
+        "retrieved_edge_count": len(edges),
+        "returned_edge_count": len(edges),
+        "context_edge_count": 0,
+        "nodes": [_node_dict(node, target=source, hop=0 if node == source else 1) for node in (source, target) if node in graph],
+        "edges": edges,
+        "retrieval_truncated": False,
+        "retrieval_truncation_reasons": [],
+        "retrieval_truncation_reason": None,
+        "context_truncated": False,
+        "context_truncation_reason": None,
+        "limitations": GRAPH_CONTEXT_LIMITATIONS,
+    }
+
+
+def _direct_peer_sets(graph: nx.DiGraph, node: str) -> tuple[set[str], set[str], set[str]]:
+    if node not in graph:
+        return set(), set(), set()
+    inbound = set(graph.predecessors(node))
+    outbound = set(graph.successors(node))
+    return inbound, outbound, inbound.intersection(outbound)
+
+
+def _entity_summary(graph: nx.DiGraph, node: str, settings: Settings) -> dict[str, object]:
+    inbound, outbound, bidirectional = _direct_peer_sets(graph, node)
+    peers = sorted(inbound.union(outbound))
+    limited_peers = peers[: settings.graph_comparison_max_peers_per_entity]
+    return {
+        "ip": node,
+        "present": node in graph,
+        "inbound_total": len(inbound),
+        "outbound_total": len(outbound),
+        "bidirectional_total": len(bidirectional),
+        "total_peer_count": len(peers),
+        "peers_retrieved": limited_peers,
+        "peer_retrieved_count": len(limited_peers),
+        "subnets": sorted({get_subnet(peer) for peer in peers}),
+        "retrieval_truncated": len(limited_peers) < len(peers),
+    }
+
+
+def _comparison_context(graph: nx.DiGraph, spec: GraphRetrievalSpec, settings: Settings) -> dict[str, object]:
+    entity_a = spec.entities[0].value
+    entity_b = spec.entities[1].value
+    a_summary = _entity_summary(graph, entity_a, settings)
+    b_summary = _entity_summary(graph, entity_b, settings)
+    a_inbound, a_outbound, _ = _direct_peer_sets(graph, entity_a)
+    b_inbound, b_outbound, _ = _direct_peer_sets(graph, entity_b)
+    a_peers = a_inbound.union(a_outbound)
+    b_peers = b_inbound.union(b_outbound)
+    shared = sorted(a_peers.intersection(b_peers))
+    shared_limited = shared[: settings.graph_comparison_max_shared_peers]
+    a_unique = sorted(a_peers.difference(b_peers))
+    b_unique = sorted(b_peers.difference(a_peers))
+    direct = _relationship_context(graph, spec)
+    a_subnets = set(a_summary["subnets"])
+    b_subnets = set(b_summary["subnets"])
+    degree_comparison = {
+        "entity_a_total_peer_count": a_summary["total_peer_count"],
+        "entity_b_total_peer_count": b_summary["total_peer_count"],
+        "entity_a_inbound_total": a_summary["inbound_total"],
+        "entity_b_inbound_total": b_summary["inbound_total"],
+        "entity_a_outbound_total": a_summary["outbound_total"],
+        "entity_b_outbound_total": b_summary["outbound_total"],
+        "entity_a_bidirectional_total": a_summary["bidirectional_total"],
+        "entity_b_bidirectional_total": b_summary["bidirectional_total"],
+        "higher_total_peer_entity": entity_a
+        if int(a_summary["total_peer_count"]) > int(b_summary["total_peer_count"])
+        else entity_b
+        if int(b_summary["total_peer_count"]) > int(a_summary["total_peer_count"])
+        else "tie",
+        "broader_outbound_entity": entity_a
+        if int(a_summary["outbound_total"]) > int(b_summary["outbound_total"])
+        else entity_b
+        if int(b_summary["outbound_total"]) > int(a_summary["outbound_total"])
+        else "tie",
+        "broader_inbound_entity": entity_a
+        if int(a_summary["inbound_total"]) > int(b_summary["inbound_total"])
+        else entity_b
+        if int(b_summary["inbound_total"]) > int(a_summary["inbound_total"])
+        else "tie",
+    }
+    subnet_comparison = {
+        "entity_a_subnets": sorted(a_subnets),
+        "entity_b_subnets": sorted(b_subnets),
+        "shared_subnets": sorted(a_subnets.intersection(b_subnets)),
+        "entity_a_unique_subnets": sorted(a_subnets.difference(b_subnets)),
+        "entity_b_unique_subnets": sorted(b_subnets.difference(a_subnets)),
+    }
+    nodes = [
+        _node_dict(node, target=entity_a, hop=0 if node in {entity_a, entity_b} else 1)
+        for node in [entity_a, entity_b, *shared_limited]
+        if node in graph
+    ]
+    edges = list(direct.get("edges") or [])
+    retrieval_truncated = (
+        bool(a_summary["retrieval_truncated"])
+        or bool(b_summary["retrieval_truncated"])
+        or len(shared_limited) < len(shared)
+    )
+    reasons = []
+    if a_summary["retrieval_truncated"] or b_summary["retrieval_truncated"]:
+        reasons.append(_reason("comparison_peer_limit", settings.graph_comparison_max_peers_per_entity, len(a_peers) + len(b_peers), len(a_summary["peers_retrieved"]) + len(b_summary["peers_retrieved"])))
+    if len(shared_limited) < len(shared):
+        reasons.append(_reason("comparison_shared_peer_limit", settings.graph_comparison_max_shared_peers, len(shared), len(shared_limited)))
+    return {
+        "target_ip": entity_a,
+        "target_ips": [entity_a, entity_b],
+        "node_found": bool(a_summary["present"] or b_summary["present"]),
+        "scope": "multi_entity_comparison",
+        "direction": "both",
+        "depth": 1,
+        "relationship_mode": "compare",
+        "entities": [entity_a, entity_b],
+        "entity_a": a_summary,
+        "entity_b": b_summary,
+        "direct_relationship": {
+            "a_to_b": direct["forward_edge"],
+            "b_to_a": direct["reverse_edge"],
+            "relationship": direct["relationship"],
+            "relationship_status": direct["relationship_status"],
+            "bidirectional": direct["bidirectional"],
+        },
+        "degree_comparison": degree_comparison,
+        "subnet_comparison": subnet_comparison,
+        "shared_peer_total": len(shared),
+        "shared_peers_retrieved": shared_limited,
+        "shared_peers_retrieved_count": len(shared_limited),
+        "entity_a_unique_peer_total": len(a_unique),
+        "entity_b_unique_peer_total": len(b_unique),
+        "candidate_node_count": 2 + len(shared),
+        "retrieved_node_count": len(nodes),
+        "returned_node_count": len(nodes),
+        "context_node_count": 0,
+        "candidate_edge_count": len(edges),
+        "retrieved_edge_count": len(edges),
+        "returned_edge_count": len(edges),
+        "context_edge_count": 0,
+        "nodes": nodes,
+        "edges": edges,
+        "retrieval_truncated": retrieval_truncated,
+        "retrieval_truncation_reasons": reasons,
+        "retrieval_truncation_reason": _reason_string(reasons),
+        "context_truncated": False,
+        "context_truncation_reason": None,
+        "limitations": GRAPH_CONTEXT_LIMITATIONS,
+    }

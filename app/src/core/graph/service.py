@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ipaddress
 import logging
 from collections import Counter
 from dataclasses import dataclass
@@ -346,10 +347,14 @@ def get_node_list(page: int = 1, page_size: int = 50) -> dict[str, Any]:
     }
 
 def get_subnet(ip: str) -> str:
-    """Extract /24 subnet from IP."""
-    parts = ip.split(".")
-    if len(parts) == 4:
-        return f"{parts[0]}.{parts[1]}.{parts[2]}."
+    """Return the IPv4 /24 subnet in canonical CIDR notation."""
+    try:
+        address = ipaddress.ip_address(ip)
+    except ValueError:
+        return "other"
+    if address.version == 4:
+        network = ipaddress.ip_network(f"{address}/24", strict=False)
+        return str(network)
     return "other"
 
 

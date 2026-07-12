@@ -9,7 +9,8 @@ from typing import Any, Literal
 EntitySource = Literal["message", "ui", "conversation"]
 EntityType = Literal["ip"]
 ProviderStatus = Literal["available", "not_found", "unavailable", "skipped"]
-ResolutionStatus = Literal["resolved", "none", "ambiguous"]
+ResolutionStatus = Literal["resolved", "none", "ambiguous", "invalid"]
+EntityMode = Literal["none", "single", "multiple", "ambiguous", "invalid"]
 IntentName = Literal[
     "general_knowledge",
     "asset_investigation",
@@ -20,8 +21,9 @@ IntentName = Literal[
     "unclear",
 ]
 IntentDecisionSource = Literal["deterministic", "glm", "fallback", "disabled"]
-GraphScope = Literal["none", "node_summary", "one_hop", "full_neighbors", "two_hop", "path"]
+GraphScope = Literal["none", "node_summary", "one_hop", "full_neighbors", "two_hop", "path", "multi_entity_comparison"]
 GraphDirection = Literal["none", "inbound", "outbound", "both"]
+RelationshipMode = Literal["none", "direct", "compare"]
 
 
 def compact_preview(text: str, limit: int = 120) -> str:
@@ -46,6 +48,7 @@ class EntityResolution:
     status: ResolutionStatus
     entities: list[ResolvedEntity] = field(default_factory=list)
     primary_entity: ResolvedEntity | None = None
+    entity_mode: EntityMode = "none"
     candidate_count: int = 0
     explicit_candidate_count: int = 0
     valid_entity_count: int = 0
@@ -63,6 +66,7 @@ class IntentDecision:
     depth: int
     requires_graph: bool
     requires_multiple_entities: bool = False
+    relationship_mode: RelationshipMode = "none"
     is_followup: bool = False
     classification_confidence: float = 0.0
     reason: str = ""
@@ -75,6 +79,8 @@ class IntentDecision:
     error_reason: str | None = None
     fallback_used: bool = False
     fallback_reason: str | None = None
+    route_normalized: bool = False
+    route_normalization_reason: str | None = None
 
     @property
     def use_graph(self) -> bool:
@@ -100,6 +106,7 @@ class RouteDecision:
     direction: GraphDirection = "none"
     depth: int = 0
     requires_multiple_entities: bool = False
+    relationship_mode: RelationshipMode = "none"
     intent_confidence: float = 0.0
     decision_source: IntentDecisionSource = "deterministic"
     glm_router_called: bool = False
@@ -110,6 +117,8 @@ class RouteDecision:
     glm_router_error: str | None = None
     fallback_used: bool = False
     fallback_reason: str | None = None
+    route_normalized: bool = False
+    route_normalization_reason: str | None = None
 
 
 @dataclass(frozen=True)
