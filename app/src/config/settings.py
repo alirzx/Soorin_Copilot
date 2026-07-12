@@ -87,6 +87,7 @@ class Settings:
     system_prompt_path: str
     product_api_base_url: str
     product_topology_path: str
+    product_asset_detection_path: str
     product_api_token: str
     product_hwid: str
     product_connect_timeout_seconds: int
@@ -182,6 +183,7 @@ def get_settings() -> Settings:
         system_prompt_path=os.getenv("SOORIN_SYSTEM_PROMPT_PATH", "app/prompts/system_prompt.md").strip(),
         product_api_base_url=os.getenv("SOORIN_PRODUCT_API_BASE_URL", "").strip().rstrip("/"),
         product_topology_path=os.getenv("SOORIN_PRODUCT_TOPOLOGY_PATH", "/zeek/connections/unique-ip-pairs").strip(),
+        product_asset_detection_path=os.getenv("SOORIN_PRODUCT_ASSET_DETECTION_PATH", "/asset-detection/test/{ip}").strip(),
         product_api_token=os.getenv("SOORIN_PRODUCT_API_TOKEN", "").strip(),
         product_hwid=os.getenv("SOORIN_PRODUCT_HWID", "").strip(),
         product_connect_timeout_seconds=_int("SOORIN_PRODUCT_CONNECT_TIMEOUT_SECONDS", 60),

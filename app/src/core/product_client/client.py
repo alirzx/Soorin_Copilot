@@ -3,14 +3,17 @@
 from __future__ import annotations
 
 import logging
+import ipaddress
 import time
 from typing import Any
+from urllib.parse import quote
 
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 from src.config.settings import Settings
+from src.core.detection.models import RawAssetDetectionResponse
 from src.core.product_client.errors import ProductApiConfigError, ProductApiError, ProductApiHTTPError
 from src.core.product_client.schemas import ProductTopologyResponse
 
@@ -71,13 +74,13 @@ class ProductApiClient:
             "Accept": "application/json",
         }
 
-    def get_json(self, endpoint_path: str) -> tuple[Any, int, float]:
+    def get_json(self, endpoint_path: str, *, request_id: str = "") -> tuple[Any, int, float]:
         """Fetch JSON from a product endpoint without logging sensitive data."""
         if not endpoint_path.startswith("/"):
             endpoint_path = f"/{endpoint_path}"
         url = f"{self.base_url}{endpoint_path}"
 
-        logger.info("event=product_request_started endpoint_path=%s", endpoint_path)
+        logger.info("event=product_request_started request_id=%s endpoint_path=%s", request_id, endpoint_path)
         started = time.perf_counter()
         try:
             response = self.session.get(
@@ -86,12 +89,13 @@ class ProductApiClient:
                 timeout=(self.connect_timeout, self.read_timeout),
             )
         except requests.RequestException as exc:
-            logger.exception("event=product_request_exception endpoint_path=%s", endpoint_path)
+            logger.exception("event=product_request_exception request_id=%s endpoint_path=%s", request_id, endpoint_path)
             raise ProductApiError("Product API request failed.") from exc
 
         elapsed = time.perf_counter() - started
         logger.info(
-            "event=product_response_received endpoint_path=%s status_code=%s elapsed_ms=%s",
+            "event=product_response_received request_id=%s endpoint_path=%s status_code=%s elapsed_ms=%s",
+            request_id,
             endpoint_path,
             response.status_code,
             int(elapsed * 1000),
@@ -122,3 +126,44 @@ class ProductApiClient:
             status_code=status_code,
             elapsed_seconds=elapsed,
         )
+
+    def get_asset_detection(self, ip: str, *, request_id: str = "") -> RawAssetDetectionResponse:
+        """Fetch and validate raw asset-detection evidence for one IP address."""
+        try:
+            normalized_ip = str(ipaddress.ip_address(str(ip).strip()))
+        except ValueError as exc:
+            logger.info("event=product_asset_detection_invalid_ip request_id=%s", request_id)
+            raise ProductApiError("Invalid IP address for asset detection.") from exc
+
+        safe_ip = quote(normalized_ip, safe="")
+        endpoint_path = self.settings.product_asset_detection_path.format(ip=safe_ip)
+        payload, status_code, elapsed = self.get_json(endpoint_path, request_id=request_id)
+        try:
+            response = RawAssetDetectionResponse.model_validate(payload)
+        except ValueError as exc:
+            logger.info(
+                "event=product_asset_detection_validation_failed request_id=%s endpoint_path=%s status_code=%s elapsed_ms=%s",
+                request_id,
+                endpoint_path,
+                status_code,
+                int(elapsed * 1000),
+            )
+            raise ProductApiError("Product asset-detection response failed validation.") from exc
+
+        signal_sections = []
+        if response.signals:
+            if response.signals.extended is not None:
+                signal_sections.append("extended")
+            if response.signals.normalized is not None:
+                signal_sections.append("normalized")
+        logger.info(
+            "event=product_asset_detection_validated request_id=%s endpoint_path=%s status_code=%s elapsed_ms=%s asset_found=%s matched_rules=%s signal_sections=%s",
+            request_id,
+            endpoint_path,
+            status_code,
+            int(elapsed * 1000),
+            response.asset_found,
+            len(response.matched_rules),
+            ",".join(signal_sections),
+        )
+        return response
