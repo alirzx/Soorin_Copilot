@@ -249,7 +249,7 @@ def render_copilot_help_button() -> str:
         if st.button(
             "How to ask Copilot",
             key="copilot_help_button",
-            use_container_width=True,
+            width="stretch",
             help="Examples and tips for better Copilot questions",
         ):
             _show_help_dialog()
@@ -258,9 +258,8 @@ def render_copilot_help_button() -> str:
 
     with st.popover(
         "How to ask Copilot",
-        use_container_width=True,
+        width="stretch",
     ):
         render_copilot_help_content()
 
     return pattern
-

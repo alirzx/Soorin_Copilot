@@ -269,7 +269,7 @@ def show_topology_page(*, embedded: bool = False) -> None:
                     neighbors["total_degree"],
                     latency_ms,
                 )
-                if st.button("Use as Copilot target", use_container_width=True):
+                if st.button("Use as Copilot target", width="stretch"):
                     previous_ip = st.session_state.get(SELECTED_COPILOT_IP_KEY) or ""
                     st.session_state[SELECTED_COPILOT_IP_KEY] = ip_input.strip()
                     logger.info(
@@ -294,7 +294,7 @@ def show_topology_page(*, embedded: bool = False) -> None:
                     if neighbors["outgoing"]:
                         st.dataframe(
                             pd.DataFrame(neighbors["outgoing"], columns=["IP"]),
-                            use_container_width=True,
+                            width="stretch",
                             height=300,
                         )
                     else:
@@ -305,7 +305,7 @@ def show_topology_page(*, embedded: bool = False) -> None:
                     if neighbors["incoming"]:
                         st.dataframe(
                             pd.DataFrame(neighbors["incoming"], columns=["IP"]),
-                            use_container_width=True,
+                            width="stretch",
                             height=300,
                         )
                     else:
@@ -327,7 +327,7 @@ def show_topology_page(*, embedded: bool = False) -> None:
                 "Destination IP", placeholder="e.g., 192.168.0.125", key="path_dst"
             )
 
-        if src and dst and st.button("Find Shortest Path", use_container_width=True):
+        if src and dst and st.button("Find Shortest Path", width="stretch"):
             result = get_path(src, dst)
 
             if "error" in result:
@@ -351,4 +351,4 @@ def show_topology_page(*, embedded: bool = False) -> None:
         df_nodes.index = range(
             (page - 1) * 50 + 1, (page - 1) * 50 + len(df_nodes) + 1
         )
-        st.dataframe(df_nodes, use_container_width=True, height=500)
+        st.dataframe(df_nodes, width="stretch", height=500)

@@ -123,14 +123,14 @@ with st.sidebar:
     st.caption("API URL")
     st.code(API_BASE_URL, language=None)
 
-    if st.button("Check health", use_container_width=True):
+    if st.button("Check health", width="stretch"):
         healthy, health_message = get_backend_health()
         if healthy:
             st.success(health_message)
         else:
             st.error(health_message)
 
-    if st.button("Clear chat", use_container_width=True):
+    if st.button("Clear chat", width="stretch"):
         clear_chat()
         st.rerun()
 
