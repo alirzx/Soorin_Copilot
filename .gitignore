@@ -1,15 +1,128 @@
-app/.env
-app/.env.backup.*
-__pycache__/
-*.pyc
-.venv
-data/raw/*.json
-data/processed/*.json
-data/processed/*.pkl
-data/processed/*.graphml
-data/processed/*.gexf
-/lib
+# ============================================================
+# Python environments
+# ============================================================
 
-# Local GLM router test outputs
-script/router_test_results/
+.venv/
+venv/
+env/
+ENV/
+
+# ============================================================
+# Python cache, tests, coverage, and build output
+# ============================================================
+
+__pycache__/
+*.py[cod]
+*$py.class
+
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.pytype/
+.pyre/
+.hypothesis/
+
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+
+build/
+dist/
+*.egg-info/
+.eggs/
+wheels/
+
+# ============================================================
+# Secrets and local environment configuration
+# ============================================================
+
+.env
+.env.*
+!.env.example
+
+app/.env
+app/.env.*
+!app/.env.example
+
+# Certificates and private keys
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+
+# ============================================================
+# Local runtime and test output
+# ============================================================
+
+copilot_test_results/
+logs/
+*.log
+
+tmp/
+temp/
+.cache/
 script/router_e2e_results/
+data/
+
+# ============================================================
+# Local graph/generated data
+# ============================================================
+
+# Keep tracked project data unless these directories are generated.
+# Uncomment only when appropriate:
+# data/raw/
+# data/processed/
+# data/generated/
+# data/cache/
+
+# ============================================================
+# Docker local overrides
+# ============================================================
+
+compose.override.yaml
+compose.local.yaml
+docker-compose.override.yml
+docker-compose.local.yml
+
+# Root Compose environment file
+/.env
+
+# ============================================================
+# IDE and editor files
+# ============================================================
+
+.vscode/
+.idea/
+*.code-workspace
+
+*.swp
+*.swo
+*~
+.project
+.pydevproject
+
+# ============================================================
+# Operating-system files
+# ============================================================
+
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ============================================================
+# Local agent and Codex state
+# ============================================================
+
+.codex/
+.agent/
+.agents/
+
+# ============================================================
+# Miscellaneous local files
+# ============================================================
+
+*.bak
+*.tmp
+*.temp

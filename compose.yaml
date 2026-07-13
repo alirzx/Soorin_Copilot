@@ -1,0 +1,159 @@
+name: soorin-copilot
+
+services:
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        PYTHON_VERSION: "3.12"
+        APP_UID: "${APP_UID:-10001}"
+        APP_GID: "${APP_GID:-10001}"
+
+    image: soorin-copilot:${SOORIN_IMAGE_TAG:-local}
+
+    container_name: soorin-copilot-api
+
+    command:
+      - python
+      - -m
+      - uvicorn
+      - src.api.main:app
+      - --host
+      - 0.0.0.0
+      - --port
+      - "6998"
+      - --workers
+      - "${SOORIN_API_WORKERS:-1}"
+
+    env_file:
+      - ./app/.env
+
+    environment:
+      PYTHONPATH: /workspace/app
+      SOORIN_HOST: 0.0.0.0
+      SOORIN_PORT: "6998"
+
+    ports:
+      - "${SOORIN_API_BIND_IP:-127.0.0.1}:${SOORIN_API_PORT:-6998}:6998"
+
+    volumes:
+      - ./data:/workspace/data
+      - copilot-cache:/home/soorin/.cache
+
+    restart: unless-stopped
+
+    init: true
+
+    stop_grace_period: 30s
+
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - >-
+          import urllib.request;
+          urllib.request.urlopen(
+          'http://127.0.0.1:6998/health', timeout=3
+          )
+      interval: 20s
+      timeout: 5s
+      start_period: 25s
+      retries: 5
+
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "5"
+
+    security_opt:
+      - no-new-privileges:true
+
+    networks:
+      - copilot-network
+
+  ui:
+    image: soorin-copilot:${SOORIN_IMAGE_TAG:-local}
+
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        PYTHON_VERSION: "3.12"
+        APP_UID: "${APP_UID:-10001}"
+        APP_GID: "${APP_GID:-10001}"
+
+    container_name: soorin-copilot-ui
+
+    command:
+      - python
+      - -m
+      - streamlit
+      - run
+      - app/app_st.py
+      - --server.address=0.0.0.0
+      - --server.port=8501
+      - --server.headless=true
+      - --browser.gatherUsageStats=false
+
+    env_file:
+      - ./app/.env
+
+    environment:
+      PYTHONPATH: /workspace/app
+
+      # Change this only if the Streamlit code supports an API base URL env.
+      SOORIN_COPILOT_API_URL: http://api:6998
+
+    ports:
+      - "${SOORIN_UI_BIND_IP:-127.0.0.1}:${SOORIN_UI_PORT:-8501}:8501"
+
+    volumes:
+      - ./data:/workspace/data
+      - copilot-cache:/home/soorin/.cache
+
+    depends_on:
+      api:
+        condition: service_healthy
+
+    restart: unless-stopped
+
+    init: true
+
+    stop_grace_period: 20s
+
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - >-
+          import urllib.request;
+          urllib.request.urlopen(
+          'http://127.0.0.1:8501/_stcore/health', timeout=3
+          )
+      interval: 20s
+      timeout: 5s
+      start_period: 30s
+      retries: 5
+
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "5"
+
+    security_opt:
+      - no-new-privileges:true
+
+    networks:
+      - copilot-network
+
+networks:
+  copilot-network:
+    driver: bridge
+
+volumes:
+  copilot-cache:

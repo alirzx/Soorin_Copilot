@@ -1,0 +1,62 @@
+# Git
+.git/
+.gitattributes
+
+# Local Python environments
+.venv/
+venv/
+env/
+ENV/
+
+# Python cache and build artifacts
+**/__pycache__/
+**/*.py[cod]
+**/*.pyo
+**/*.pyd
+**/.pytest_cache/
+**/.mypy_cache/
+**/.ruff_cache/
+**/.coverage
+**/htmlcov/
+build/
+dist/
+*.egg-info/
+
+# Secrets
+.env
+.env.*
+!.env.example
+
+app/.env
+app/.env.*
+!app/.env.example
+
+# Local tests and runtime output
+copilot_test_results/
+logs/
+*.log
+tmp/
+temp/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Docker files not required inside the image
+compose.yaml
+compose.override.yaml
+compose.local.yaml
+docker-compose.yml
+docker-compose.override.yml
+
+# Agent state
+.codex/
+.agent/
+.agents/
