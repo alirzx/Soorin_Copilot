@@ -118,6 +118,7 @@ desktop.ini
 .codex/
 .agent/
 .agents/
+.agents/skills
 
 # ============================================================
 # Miscellaneous local files
