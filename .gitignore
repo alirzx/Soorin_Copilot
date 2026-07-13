@@ -126,3 +126,6 @@ desktop.ini
 *.bak
 *.tmp
 *.temp
+# Python virtual environments
+.venv/
+venv/
