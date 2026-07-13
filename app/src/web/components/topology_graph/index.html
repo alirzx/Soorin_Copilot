@@ -47,6 +47,15 @@
         });
       }
 
+      function setGraphSelection(message) {
+        const action = message.action || (message.node === null ? "clear" : "select");
+        setComponentValue({
+          action: action,
+          node: message.node === null || message.node === undefined ? null : String(message.node),
+          event_id: String(message.event_id || Date.now()),
+        });
+      }
+
       window.addEventListener("message", (event) => {
         const message = event.data || {};
 
@@ -58,8 +67,13 @@
           return;
         }
 
+        if (message.type === "soorin_graph_selection") {
+          setGraphSelection(message);
+          return;
+        }
+
         if (message.type === "soorin_node_click") {
-          setComponentValue(String(message.node || ""));
+          setGraphSelection({ action: "select", node: message.node });
         }
       });
 

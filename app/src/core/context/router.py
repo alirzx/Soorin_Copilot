@@ -6,7 +6,7 @@ import logging
 import re
 import time
 
-from src.core.context.models import EntityResolution, GraphDirection, GraphScope, IntentDecision, IntentName, RouteDecision, compact_preview
+from src.core.context.models import EntityBinding, EntityResolution, GraphDirection, GraphScope, IntentDecision, IntentName, RouteDecision, compact_preview
 from src.core.memory.routing_state import SessionRoutingState
 
 
@@ -23,6 +23,11 @@ COMPARISON_WORDS = re.compile(r"\b(?:compare|comparison|both\s+assets|both\s+ips
 TWO_HOP_WORDS = re.compile(r"\b(?:two\s+hops?|2\s+hops?|surrounding\s+network|expand\s+the\s+network|wider)\b", re.IGNORECASE)
 ASSET_WORDS = re.compile(r"\b(?:tell|show|explain|investigate|analy[sz]e|what\s+about|how\s+about|what\s+.*know|all\s+you\s+know)\b", re.IGNORECASE)
 FOLLOWUP_WORDS = re.compile(r"\b(?:go\s+deeper|continue|more\s+details|what\s+else|expand)\b", re.IGNORECASE)
+DETECTION_COMPACT_WORDS = re.compile(
+    r"\b(?:classified|classification|detect(?:ion|ed)?|evidence|rules?|matched\s+rules?|conflicts?|full\s+details?|all\s+available\s+detection|why\s+was)\b",
+    re.IGNORECASE,
+)
+IDENTITY_WORDS = re.compile(r"\b(?:what\s+is|tell\s+me\s+about|summary|asset|device|role|identity|behaviou?r|agree)\b", re.IGNORECASE)
 
 
 def _direction(message: str, default: GraphDirection = "both") -> GraphDirection:
@@ -58,8 +63,15 @@ class DeterministicFallbackRouter:
         direction: GraphDirection = "none"
         depth = 0
         use_graph = False
+        use_detection = False
+        detection_detail = "summary"
         requires_multiple = False
         reason = "fallback_general_knowledge"
+        entity_binding: EntityBinding = "none"
+        if target and entity_count == 1:
+            entity_binding = "active_single" if target.source == "conversation" else "explicit" if target.source == "message" else "ui"
+        elif entity_count == 2:
+            entity_binding = "active_pair" if all(entity.source == "conversation" for entity in entities.entities) else "explicit"
 
         if entities.reference_suppressed:
             reason = "fallback_topic_detachment"
@@ -78,6 +90,12 @@ class DeterministicFallbackRouter:
         elif target and entity_count == 1 and TWO_HOP_WORDS.search(message or ""):
             intent, scope, direction, depth = "graph_neighbors", "two_hop", _direction(message), 2
             use_graph, reason = True, "fallback_two_hop"
+        elif target and entity_count == 1 and DETECTION_COMPACT_WORDS.search(message or ""):
+            intent, scope, direction, depth = "asset_investigation", "none", "none", 0
+            use_detection, detection_detail, reason = True, "compact_full", "fallback_detection_compact_full"
+            if GRAPH_WORDS.search(message or "") and IDENTITY_WORDS.search(message or ""):
+                scope, direction = "node_summary", "both"
+                use_graph, detection_detail, reason = True, "summary", "fallback_combined_identity_topology"
         elif target and entity_count == 1 and GRAPH_WORDS.search(message or ""):
             intent = "graph_neighbors"
             scope = "full_neighbors" if FULL_WORDS.search(message or "") else "one_hop"
@@ -86,7 +104,7 @@ class DeterministicFallbackRouter:
             use_graph, reason = True, "fallback_graph_neighbors"
         elif target and entity_count == 1 and ASSET_WORDS.search(message or ""):
             intent, scope, direction, depth = "asset_investigation", "node_summary", "both", 0
-            use_graph, reason = True, "fallback_asset_investigation"
+            use_graph, use_detection, detection_detail, reason = True, True, "summary", "fallback_asset_investigation"
         elif target and FOLLOWUP_WORDS.search(message or "") and last_provider == "graph":
             intent = "graph_followup"
             if previous_scope == "node_summary":
@@ -101,6 +119,15 @@ class DeterministicFallbackRouter:
         decision = RouteDecision(
             use_graph=use_graph,
             reason=reason,
+            use_detection=use_detection if entity_count == 1 else False,
+            detection_detail=detection_detail if use_detection and entity_count == 1 else "summary",  # type: ignore[arg-type]
+            entity_binding=entity_binding,
+            requested_entity_binding=entity_binding,
+            resolved_entity_binding=entity_binding,
+            binding_source=target.source if target else ("conversation" if entity_binding == "active_pair" else "none"),
+            binding_available=bool(entity_count),
+            materialized_entity_count=entity_count,
+            materialized_entities=tuple(entity.value for entity in entities.entities),
             target_entity=target,
             target_entities=entities.entities,
             matched_signals=[],
@@ -120,9 +147,11 @@ class DeterministicFallbackRouter:
         )
         latency_ms = int((time.perf_counter() - started) * 1000)
         logger.info(
-            "event=deterministic_fallback_route_decided request_id=%s use_graph=%s reason=%s intent=%s scope=%s direction=%s depth=%s entity_count=%s fallback_reason=%s latency_ms=%s message_preview=%r",
+            "event=deterministic_fallback_route_decided request_id=%s use_graph=%s use_detection=%s detection_detail=%s reason=%s intent=%s scope=%s direction=%s depth=%s entity_count=%s fallback_reason=%s latency_ms=%s message_preview=%r",
             request_id,
             decision.use_graph,
+            decision.use_detection,
+            decision.detection_detail,
             decision.reason,
             decision.intent,
             decision.scope,
@@ -144,20 +173,41 @@ def normalize_intent_route(decision: IntentDecision, entities: EntityResolution)
     target_entities = entities.entities
     target_entity = target_entities[0] if len(target_entities) == 1 else entities.primary_entity
     requires_graph = bool(decision.requires_graph and target_entity)
+    requires_detection = bool(decision.requires_detection and len(target_entities) == 1 and target_entity)
+    detection_detail = decision.detection_detail if requires_detection else "summary"
     if decision.requires_multiple_entities:
         requires_graph = len(target_entities) == 2
+        requires_detection = False
+        detection_detail = "summary"
         target_entity = None
     if decision.intent in {"graph_relationships", "graph_path"}:
         requires_graph = len(target_entities) == 2
+        requires_detection = False
+        detection_detail = "summary"
         target_entity = None
     if decision.intent in {"graph_neighbors", "asset_investigation"}:
         requires_graph = bool(decision.requires_graph and len(target_entities) == 1)
+        requires_detection = bool(decision.requires_detection and len(target_entities) == 1)
+        detection_detail = decision.detection_detail if requires_detection else "summary"
         target_entity = target_entities[0] if target_entities else None
     if len(target_entities) > 2:
         requires_graph = False
+        requires_detection = False
+        detection_detail = "summary"
     return RouteDecision(
         use_graph=requires_graph,
         reason=decision.route_normalization_reason or ("glm_semantic_route" if decision.decision_source == "glm" else decision.fallback_reason or "router_no_graph"),
+        use_detection=requires_detection,
+        detection_detail=detection_detail,
+        entity_binding=decision.entity_binding,
+        requested_entity_binding=decision.requested_entity_binding,
+        resolved_entity_binding=decision.entity_binding,
+        binding_source=decision.binding_source,
+        binding_available=decision.binding_available,
+        binding_normalized=decision.binding_normalized,
+        binding_normalization_reason=decision.binding_normalization_reason,
+        materialized_entity_count=len(target_entities),
+        materialized_entities=tuple(entity.value for entity in target_entities),
         target_entity=target_entity,
         target_entities=target_entities,
         matched_signals=[decision.intent, decision.scope, decision.direction],

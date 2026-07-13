@@ -5,6 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
+from src.core.detection.models import AssetDetectionEvidence
+
 
 EntitySource = Literal["message", "ui", "conversation"]
 EntityType = Literal["ip"]
@@ -24,6 +26,8 @@ IntentDecisionSource = Literal["deterministic", "glm", "fallback", "disabled"]
 GraphScope = Literal["none", "node_summary", "one_hop", "full_neighbors", "two_hop", "path", "multi_entity_comparison"]
 GraphDirection = Literal["none", "inbound", "outbound", "both"]
 RelationshipMode = Literal["none", "direct", "compare"]
+DetectionDetail = Literal["summary", "compact_full"]
+EntityBinding = Literal["explicit", "ui", "active_single", "active_pair", "none"]
 
 
 def compact_preview(text: str, limit: int = 120) -> str:
@@ -65,6 +69,16 @@ class IntentDecision:
     direction: GraphDirection
     depth: int
     requires_graph: bool
+    requires_detection: bool = False
+    detection_detail: DetectionDetail = "summary"
+    entity_binding: EntityBinding = "none"
+    requested_entity_binding: str = "none"
+    binding_source: str = ""
+    binding_available: bool = False
+    binding_normalized: bool = False
+    binding_normalization_reason: str | None = None
+    materialized_entity_count: int = 0
+    materialized_entities: tuple[str, ...] = ()
     requires_multiple_entities: bool = False
     relationship_mode: RelationshipMode = "none"
     is_followup: bool = False
@@ -87,6 +101,10 @@ class IntentDecision:
         return self.requires_graph
 
     @property
+    def use_detection(self) -> bool:
+        return self.requires_detection
+
+    @property
     def confidence(self) -> float:
         return self.classification_confidence
 
@@ -95,6 +113,17 @@ class IntentDecision:
 class RouteDecision:
     use_graph: bool
     reason: str
+    use_detection: bool = False
+    detection_detail: DetectionDetail = "summary"
+    entity_binding: EntityBinding = "none"
+    requested_entity_binding: str = "none"
+    resolved_entity_binding: EntityBinding = "none"
+    binding_source: str = ""
+    binding_available: bool = False
+    binding_normalized: bool = False
+    binding_normalization_reason: str | None = None
+    materialized_entity_count: int = 0
+    materialized_entities: tuple[str, ...] = ()
     target_entity: ResolvedEntity | None = None
     target_entities: list[ResolvedEntity] = field(default_factory=list)
     matched_signals: list[str] = field(default_factory=list)
@@ -140,12 +169,33 @@ class GraphProviderResult:
 
 
 @dataclass(frozen=True)
+class DetectionProviderResult:
+    provider: Literal["detection"]
+    status: ProviderStatus
+    detail: DetectionDetail
+    ip: str = ""
+    evidence: AssetDetectionEvidence | None = None
+    rendered_context: str = ""
+    provenance: ProviderProvenance | None = None
+    cache_hit: bool = False
+    cache_age_seconds: int | None = None
+    stale: bool = False
+    latency_ms: int = 0
+    error_type: str | None = None
+    safe_error: str | None = None
+
+
+@dataclass(frozen=True)
 class CopilotContextPackage:
     entities: EntityResolution
     graph: GraphProviderResult | None = None
+    detection: DetectionProviderResult | None = None
     provenance: list[ProviderProvenance] = field(default_factory=list)
     limitations: list[str] = field(default_factory=list)
 
     @property
     def has_model_context(self) -> bool:
-        return bool(self.graph and self.graph.status in {"available", "not_found"})
+        return bool(
+            (self.graph and self.graph.status in {"available", "not_found"})
+            or (self.detection and self.detection.status in {"available", "not_found"})
+        )

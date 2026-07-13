@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import logging
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
@@ -10,11 +11,12 @@ from pathlib import Path
 
 APP_DIR = Path(__file__).resolve().parents[2]
 ENV_PATH = APP_DIR / ".env"
+logger = logging.getLogger(__name__)
 
 
-def _load_env_file(path: Path) -> None:
+def _load_env_file(path: Path) -> bool:
     if not path.exists():
-        return
+        return False
 
     for raw_line in path.read_text(encoding="utf-8").splitlines():
         line = raw_line.strip()
@@ -25,6 +27,7 @@ def _load_env_file(path: Path) -> None:
         value = value.strip().strip('"').strip("'")
         if key:
             os.environ.setdefault(key, value)
+    return True
 
 
 def _bool(name: str, default: bool) -> bool:
@@ -88,12 +91,20 @@ class Settings:
     product_api_base_url: str
     product_topology_path: str
     product_asset_detection_path: str
+    product_login_path: str
     product_api_token: str
+    product_username: str
+    product_password: str
+    product_captcha_bypass: str
+    product_token_refresh_seconds: int
     product_hwid: str
     product_connect_timeout_seconds: int
     product_read_timeout_seconds: int
     product_max_retries: int
     product_retry_backoff_seconds: float
+    detection_cache_enabled: bool
+    detection_cache_ttl_seconds: int
+    detection_stale_on_error: bool
     graph_raw_path: str
     graph_pickle_path: str
     graph_stats_path: str
@@ -141,8 +152,8 @@ class Settings:
 
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:
-    _load_env_file(ENV_PATH)
-    return Settings(
+    env_file_loaded = _load_env_file(ENV_PATH)
+    settings = Settings(
         api_host=os.getenv("API_HOST", "0.0.0.0"),
         api_port=_int("API_PORT", 6998),
         api_reload=_bool("API_RELOAD", True),
@@ -184,12 +195,20 @@ def get_settings() -> Settings:
         product_api_base_url=os.getenv("SOORIN_PRODUCT_API_BASE_URL", "").strip().rstrip("/"),
         product_topology_path=os.getenv("SOORIN_PRODUCT_TOPOLOGY_PATH", "/zeek/connections/unique-ip-pairs").strip(),
         product_asset_detection_path=os.getenv("SOORIN_PRODUCT_ASSET_DETECTION_PATH", "/asset-detection/test/{ip}").strip(),
+        product_login_path=os.getenv("SOORIN_PRODUCT_LOGIN_PATH", "/auth/login").strip(),
         product_api_token=os.getenv("SOORIN_PRODUCT_API_TOKEN", "").strip(),
+        product_username=os.getenv("SOORIN_PRODUCT_USERNAME", "").strip(),
+        product_password=os.getenv("SOORIN_PRODUCT_PASSWORD", "").strip(),
+        product_captcha_bypass=os.getenv("SOORIN_PRODUCT_CAPTCHA_BYPASS", "").strip(),
+        product_token_refresh_seconds=_int("SOORIN_PRODUCT_TOKEN_REFRESH_SECONDS", 600),
         product_hwid=os.getenv("SOORIN_PRODUCT_HWID", "").strip(),
         product_connect_timeout_seconds=_int("SOORIN_PRODUCT_CONNECT_TIMEOUT_SECONDS", 60),
         product_read_timeout_seconds=_int("SOORIN_PRODUCT_READ_TIMEOUT_SECONDS", 300),
         product_max_retries=_int("SOORIN_PRODUCT_MAX_RETRIES", 5),
         product_retry_backoff_seconds=_float("SOORIN_PRODUCT_RETRY_BACKOFF_SECONDS", 3.0),
+        detection_cache_enabled=_bool("SOORIN_DETECTION_CACHE_ENABLED", True),
+        detection_cache_ttl_seconds=_int("SOORIN_DETECTION_CACHE_TTL_SECONDS", 300),
+        detection_stale_on_error=_bool("SOORIN_DETECTION_STALE_ON_ERROR", True),
         graph_raw_path=os.getenv("SOORIN_GRAPH_RAW_PATH", "data/raw/topology_raw.json").strip(),
         graph_pickle_path=os.getenv("SOORIN_GRAPH_PICKLE_PATH", "data/processed/topology_graph.pkl").strip(),
         graph_stats_path=os.getenv("SOORIN_GRAPH_STATS_PATH", "data/processed/topology_stats.json").strip(),
@@ -237,3 +256,15 @@ def get_settings() -> Settings:
         graph_refresh_max_edge_drop_ratio=_float("SOORIN_GRAPH_REFRESH_MAX_EDGE_DROP_RATIO", 0.90),
         copilot_human_trace_enabled=_bool("SOORIN_COPILOT_HUMAN_TRACE_ENABLED", True),
     )
+    logger.info(
+        "event=settings_loaded env_file_path=%s env_file_loaded=%s product_base_url_configured=%s product_token_present=%s product_hwid_present=%s product_username_present=%s product_password_present=%s product_captcha_bypass_present=%s",
+        ENV_PATH,
+        env_file_loaded,
+        bool(settings.product_api_base_url),
+        bool(settings.product_api_token),
+        bool(settings.product_hwid),
+        bool(settings.product_username),
+        bool(settings.product_password),
+        bool(settings.product_captcha_bypass),
+    )
+    return settings

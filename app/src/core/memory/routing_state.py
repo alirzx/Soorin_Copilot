@@ -17,6 +17,8 @@ class SessionRoutingState:
     previous_scope: str | None = None
     previous_direction: str | None = None
     previous_depth: int | None = None
+    previous_requires_detection: bool = False
+    previous_detection_detail: str | None = None
 
 
 class SessionRoutingStateStore:

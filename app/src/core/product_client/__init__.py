@@ -1,5 +1,6 @@
 """Shared authenticated client for Soorin product API endpoints."""
 
+from src.core.product_client.auth import ProductAuthManager
 from src.core.product_client.client import ProductApiClient
 from src.core.detection.models import RawAssetDetectionResponse
 from src.core.product_client.errors import ProductApiConfigError, ProductApiError, ProductApiHTTPError
@@ -7,6 +8,7 @@ from src.core.product_client.schemas import ProductTopologyResponse, TopologyCon
 
 __all__ = [
     "ProductApiClient",
+    "ProductAuthManager",
     "ProductApiConfigError",
     "ProductApiError",
     "ProductApiHTTPError",

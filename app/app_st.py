@@ -11,7 +11,8 @@ import streamlit as st
 
 from src.config.settings import get_settings
 from src.core.graph.loader import set_graph_path, load_graph
-from src.web.pages.topology import show_topology_page
+from src.web.copilot_help import render_copilot_help_button
+from src.web.pages.topology import build_copilot_ui_context, show_topology_page
 
 logger = logging.getLogger(__name__)
 settings = get_settings()
@@ -75,9 +76,9 @@ def get_backend_health() -> tuple[bool, str]:
 def ask_copilot(message: str) -> tuple[str | None, str | None]:
     started = time.perf_counter()
     payload = {"session_id": st.session_state.session_id, "message": message}
-    selected_ip = st.session_state.get(SELECTED_COPILOT_IP_KEY)
-    if selected_ip:
-        payload["ui_context"] = {"selected_ip": selected_ip}
+    ui_context = build_copilot_ui_context(st.session_state.get(SELECTED_COPILOT_IP_KEY))
+    if ui_context:
+        payload["ui_context"] = ui_context
 
     logger.info(
         "event=ui_chat_request session_id=%s message_chars=%s selected_ip_present=%s selected_ip=%s",
@@ -161,6 +162,8 @@ with left_col:
     for item in st.session_state.messages:
         with st.chat_message(item["role"]):
             st.markdown(item["content"])
+
+    render_copilot_help_button()
 
     if prompt := st.chat_input("Ask a cybersecurity question"):
         st.session_state.messages.append({"role": "user", "content": prompt})

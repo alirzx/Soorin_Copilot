@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import hashlib
+import ipaddress
 import logging
 import tempfile
 from pathlib import Path
+from typing import Any
 
 from pyvis.network import Network
 
@@ -44,6 +46,30 @@ def _get_node_size(degree: int, max_degree: int) -> int:
     return int(10 + normalized * 40)
 
 
+def _filter_graph_by_subnet(graph: Any, subnet_filter: str):
+    """Return a subgraph containing only valid IP nodes inside the CIDR filter."""
+    selected = str(subnet_filter or "").strip()
+    if not selected:
+        return graph.copy()
+
+    try:
+        network = ipaddress.ip_network(selected, strict=False)
+    except ValueError:
+        logger.warning("event=graph_visualization_subnet_filter_invalid subnet_filter=%r", selected)
+        return graph.subgraph([]).copy()
+
+    nodes_to_keep = []
+    for node in graph.nodes():
+        try:
+            node_ip = ipaddress.ip_address(str(node).strip())
+        except ValueError:
+            continue
+        if node_ip.version == network.version and node_ip in network:
+            nodes_to_keep.append(node)
+
+    return graph.subgraph(nodes_to_keep).copy()
+
+
 def generate_pyvis_graph(
     max_nodes: int = 200,
     min_degree: int = 0,
@@ -67,11 +93,7 @@ def generate_pyvis_graph(
         subnet_filter or "all",
     )
 
-    if subnet_filter:
-        nodes_to_keep = [node for node in graph.nodes() if node.startswith(subnet_filter)]
-        subgraph = graph.subgraph(nodes_to_keep).copy()
-    else:
-        subgraph = graph.copy()
+    subgraph = _filter_graph_by_subnet(graph, subnet_filter)
 
     if min_degree > 0:
         nodes_to_keep = [node for node in subgraph.nodes() if subgraph.degree(node) >= min_degree]
@@ -170,14 +192,29 @@ def _inject_node_click_bridge(html: str) -> str:
     """Add a tiny PyVis/vis-network click bridge for the Streamlit wrapper.
 
     PyVis exposes the rendered vis-network instance as a global ``network``
-    variable. The bridge posts only the selected node ID to the parent iframe;
-    Python validates the value before using it as Copilot context.
+    variable. The bridge posts select/clear events to the parent iframe;
+    Python validates selected node IDs before using them as Copilot context.
     """
     bridge_script = """
         <script type="text/javascript">
         (function () {
             var lastNode = null;
             var lastSentAt = 0;
+            var graphSelectionEventCounter = 0;
+            var lastViewportInteractionAt = 0;
+
+            function nextEventId() {
+                graphSelectionEventCounter += 1;
+                return String(Date.now()) + "-" + String(graphSelectionEventCounter);
+            }
+
+            function markViewportInteraction() {
+                lastViewportInteractionAt = Date.now();
+            }
+
+            function recentViewportInteraction() {
+                return Date.now() - lastViewportInteractionAt < 250;
+            }
 
             function sendNode(nodeId) {
                 if (nodeId === null || nodeId === undefined) {
@@ -193,8 +230,29 @@ def _inject_node_click_bridge(html: str) -> str:
                 lastNode = clickedNode;
                 lastSentAt = now;
                 window.parent.postMessage({
-                    type: "soorin_node_click",
+                    type: "soorin_graph_selection",
+                    action: "select",
+                    event_id: nextEventId(),
                     node: clickedNode
+                }, "*");
+            }
+
+            function sendClearSelection() {
+                var now = Date.now();
+                if (lastNode === null && now - lastSentAt < 150) {
+                    return;
+                }
+
+                lastNode = null;
+                lastSentAt = now;
+                if (window.network && typeof window.network.unselectAll === "function") {
+                    window.network.unselectAll();
+                }
+                window.parent.postMessage({
+                    type: "soorin_graph_selection",
+                    action: "clear",
+                    event_id: nextEventId(),
+                    node: null
                 }, "*");
             }
 
@@ -212,6 +270,8 @@ def _inject_node_click_bridge(html: str) -> str:
                 window.network.on("click", function (params) {
                     if (params && params.nodes && params.nodes.length === 1) {
                         sendNode(params.nodes[0]);
+                    } else if (params && params.nodes && params.nodes.length === 0 && !recentViewportInteraction()) {
+                        sendClearSelection();
                     }
                 });
                 window.network.on("selectNode", function (params) {
@@ -219,6 +279,10 @@ def _inject_node_click_bridge(html: str) -> str:
                         sendNode(params.nodes[0]);
                     }
                 });
+                window.network.on("dragStart", markViewportInteraction);
+                window.network.on("dragging", markViewportInteraction);
+                window.network.on("dragEnd", markViewportInteraction);
+                window.network.on("zoom", markViewportInteraction);
             }
 
             bindNetworkClickBridge();

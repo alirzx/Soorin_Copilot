@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from ipaddress import ip_address
+from ipaddress import ip_address, ip_network
 from typing import Any
 import streamlit as st
 import pandas as pd
@@ -19,10 +19,19 @@ from src.core.graph.service import (
     get_subnet_list,
 )
 from src.core.graph.visualization import generate_pyvis_graph, get_color
-from src.web.components.topology_graph import topology_graph_component
+from src.web.components.topology_graph import NO_GRAPH_SELECTION_EVENT, topology_graph_component
 
 logger = logging.getLogger(__name__)
 SELECTED_COPILOT_IP_KEY = "selected_copilot_ip"
+LAST_GRAPH_SELECTION_EVENT_KEY = "topology_graph_last_selection_event_id"
+
+
+def build_copilot_ui_context(selected_ip: str | None) -> dict[str, str] | None:
+    """Build optional Copilot UI context from the current topology selection."""
+    normalized = str(selected_ip or "").strip()
+    if not normalized:
+        return None
+    return {"selected_ip": normalized}
 
 
 def _validated_clicked_graph_ip(clicked_node: str | None, graph: Any) -> str | None:
@@ -46,6 +55,28 @@ def _validated_clicked_graph_ip(clicked_node: str | None, graph: Any) -> str | N
         return None
 
     return normalized_ip
+
+
+def _resolve_graph_selection_event(selection_event: object, graph: Any) -> tuple[str, str | None, str]:
+    """Normalize a component event into one of: none, select, or clear."""
+    if selection_event == NO_GRAPH_SELECTION_EVENT:
+        return "none", None, ""
+
+    if selection_event is None:
+        return "clear", None, ""
+
+    if isinstance(selection_event, dict):
+        action = str(selection_event.get("action") or "").strip().lower()
+        event_id = str(selection_event.get("event_id") or "").strip()
+        if action == "clear":
+            return "clear", None, event_id
+        if action == "select":
+            selected_ip = _validated_clicked_graph_ip(selection_event.get("node"), graph)
+            return ("select", selected_ip, event_id) if selected_ip else ("none", None, event_id)
+        return "none", None, event_id
+
+    selected_ip = _validated_clicked_graph_ip(str(selection_event), graph)
+    return ("select", selected_ip, "") if selected_ip else ("none", None, "")
 
 
 def show_topology_page(*, embedded: bool = False) -> None:
@@ -122,27 +153,50 @@ def show_topology_page(*, embedded: bool = False) -> None:
             )
 
         # Display
-        clicked_node = topology_graph_component(
+        selection_event = topology_graph_component(
             html=html_graph,
             height=680,
             key=f"topology_graph_{max_nodes}_{min_degree}_{subnet_value or 'all'}",
         )
-        clicked_ip = _validated_clicked_graph_ip(clicked_node, G)
-        if clicked_ip and clicked_ip != st.session_state.get(SELECTED_COPILOT_IP_KEY):
+        selection_action, clicked_ip, selection_event_id = _resolve_graph_selection_event(selection_event, G)
+        if (
+            selection_event_id
+            and st.session_state.get(LAST_GRAPH_SELECTION_EVENT_KEY) == selection_event_id
+        ):
+            selection_action = "none"
+
+        if selection_action == "clear":
+            if selection_event_id:
+                st.session_state[LAST_GRAPH_SELECTION_EVENT_KEY] = selection_event_id
             previous_ip = st.session_state.get(SELECTED_COPILOT_IP_KEY) or ""
-            logger.info(
-                "event=ui_graph_node_clicked session_id=%s clicked_node=%s",
-                st.session_state.get("session_id", ""),
-                clicked_ip,
-            )
-            st.session_state[SELECTED_COPILOT_IP_KEY] = clicked_ip
-            logger.info(
-                "event=ui_investigation_target_updated session_id=%s previous_ip=%s selected_ip=%s source=graph_node_click",
-                st.session_state.get("session_id", ""),
-                previous_ip,
-                clicked_ip,
-            )
-            st.rerun()
+            if previous_ip:
+                logger.info(
+                    "event=ui_graph_selection_cleared session_id=%s previous_ip=%s source=graph_background_click",
+                    st.session_state.get("session_id", ""),
+                    previous_ip,
+                )
+                st.session_state[SELECTED_COPILOT_IP_KEY] = None
+                st.rerun()
+        elif selection_action == "select" and clicked_ip:
+            if selection_event_id:
+                st.session_state[LAST_GRAPH_SELECTION_EVENT_KEY] = selection_event_id
+            if clicked_ip == st.session_state.get(SELECTED_COPILOT_IP_KEY):
+                pass
+            else:
+                previous_ip = st.session_state.get(SELECTED_COPILOT_IP_KEY) or ""
+                logger.info(
+                    "event=ui_graph_node_clicked session_id=%s clicked_node=%s",
+                    st.session_state.get("session_id", ""),
+                    clicked_ip,
+                )
+                st.session_state[SELECTED_COPILOT_IP_KEY] = clicked_ip
+                logger.info(
+                    "event=ui_investigation_target_updated session_id=%s previous_ip=%s selected_ip=%s source=graph_node_click",
+                    st.session_state.get("session_id", ""),
+                    previous_ip,
+                    clicked_ip,
+                )
+                st.rerun()
 
         # Legend
         st.divider()
@@ -154,10 +208,15 @@ def show_topology_page(*, embedded: bool = False) -> None:
             col = legend_cols[i % 4]
             subnet = info["subnet"]
             count = info["count"]
-            sample_ip = next(
-                (n for n in G.nodes() if n.startswith(subnet.rstrip("."))),
-                subnet + "0",
-            )
+            try:
+                sample_network = ip_network(str(subnet).strip(), strict=False)
+                sample_ip = str(
+                    sample_network.network_address + 1
+                    if sample_network.num_addresses > 1
+                    else sample_network.network_address
+                )
+            except (ValueError, TypeError):
+                sample_ip = subnet
             color = get_color(sample_ip)
             col.markdown(
                 f'<span style="display:inline-block;width:12px;height:12px;'
@@ -166,11 +225,6 @@ def show_topology_page(*, embedded: bool = False) -> None:
                 unsafe_allow_html=True,
             )
 
-    # ================================================================
-    # TAB 1: OVERVIEW STATS
-    # ================================================================
-    # (Moved stats into the graph tab as metrics)
-    with tab_graph:
         st.divider()
         stats = get_stats()
 

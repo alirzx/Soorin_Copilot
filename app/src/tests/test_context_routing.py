@@ -7,6 +7,7 @@ import tempfile
 import unittest
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import networkx as nx
@@ -24,11 +25,14 @@ from src.core.graph.loader import get_cached_graph, load_graph, replace_active_g
 from src.core.graph.refresh import GraphRefreshService
 from src.core.graph.retrieval import GraphRetrievalSpec, retrieve_graph_context
 from src.core.graph.service import get_subnet
+from src.core.graph.visualization import _filter_graph_by_subnet, _inject_node_click_bridge, generate_pyvis_graph
 from src.core.llm.errors import LLMError
 from src.core.llm.providers.base import LLMProviderResult
 from src.core.memory.routing_state import SessionRoutingState, SessionRoutingStateStore
 from src.core.memory.store import MemoryStore
 from src.core.product_client.schemas import ProductTopologyResponse, TopologyConnectionRecord
+from src.web.copilot_help import choose_help_ui_pattern, get_copilot_help_content
+from src.web.pages.topology import build_copilot_ui_context, _resolve_graph_selection_event
 
 
 class FakeLLMClient:
@@ -59,15 +63,21 @@ def fake_result(text: str, *, finish_reason: str | None = "stop") -> LLMProvider
 
 
 def make_settings(**overrides):
+    values = {
+        "llm_provider": "fake",
+        "arvan_model": "fake",
+        "copilot_human_trace_enabled": False,
+        "intent_router_enabled": True,
+        "intent_router_min_confidence": 0.65,
+        "intent_router_retry_enabled": True,
+        "product_api_base_url": "",
+        "product_api_token": "",
+        "product_hwid": "",
+    }
+    values.update(overrides)
     return replace(
         get_settings(),
-        llm_provider="fake",
-        arvan_model="fake",
-        copilot_human_trace_enabled=False,
-        intent_router_enabled=True,
-        intent_router_min_confidence=0.65,
-        intent_router_retry_enabled=True,
-        **overrides,
+        **values,
     )
 
 
@@ -200,6 +210,9 @@ class RouterSchemaTests(unittest.TestCase):
             "direction": "both",
             "depth": 1,
             "requires_graph": True,
+            "requires_detection": False,
+            "detection_detail": "summary",
+            "entity_binding": "explicit",
             "requires_multiple_entities": False,
             "is_followup": False,
             "classification_confidence": 0.9,
@@ -278,7 +291,501 @@ class RouterSchemaTests(unittest.TestCase):
         self.assertTrue(decision.route_normalized)
         self.assertEqual(decision.route_normalization_reason, "node_summary_requires_graph")
         self.assertTrue(route.use_graph)
+        self.assertTrue(route.use_detection)
+        self.assertEqual(route.detection_detail, "summary")
         self.assertEqual(route.decision_source, "glm")
+
+    def test_default_asset_investigation_requests_graph_and_detection_summary(self) -> None:
+        decision = validate_router_payload(
+            self.payload(intent="asset_investigation", scope="node_summary", direction="both", depth=0),
+            self.entities,
+            min_confidence=0.65,
+            message="Tell me about 192.168.30.115.",
+        )
+        route = normalize_intent_route(decision, self.entities)
+        self.assertTrue(route.use_graph)
+        self.assertTrue(route.use_detection)
+        self.assertEqual(route.detection_detail, "summary")
+
+    def test_classification_explanation_requests_detection_compact_full_only(self) -> None:
+        decision = validate_router_payload(
+            self.payload(intent="asset_investigation", scope="node_summary", direction="both", depth=0),
+            self.entities,
+            min_confidence=0.65,
+            message="Why is 192.168.30.115 classified as a Windows workstation?",
+        )
+        route = normalize_intent_route(decision, self.entities)
+        self.assertFalse(route.use_graph)
+        self.assertTrue(route.use_detection)
+        self.assertEqual(route.detection_detail, "compact_full")
+        self.assertEqual(route.scope, "none")
+
+    def test_pure_graph_request_skips_detection(self) -> None:
+        decision = validate_router_payload(
+            self.payload(intent="graph_neighbors", scope="one_hop", direction="outbound", depth=1, requires_detection=True),
+            self.entities,
+            min_confidence=0.65,
+            message="Find its outbound peers.",
+        )
+        route = normalize_intent_route(decision, self.entities)
+        self.assertTrue(route.use_graph)
+        self.assertFalse(route.use_detection)
+
+    def test_combined_role_topology_requests_both(self) -> None:
+        decision = validate_router_payload(
+            self.payload(
+                intent="asset_investigation",
+                scope="node_summary",
+                direction="both",
+                depth=0,
+                requires_graph=True,
+                requires_detection=False,
+            ),
+            self.entities,
+            min_confidence=0.65,
+            message="Does its detected role agree with its topology?",
+        )
+        route = normalize_intent_route(decision, self.entities)
+        self.assertTrue(route.use_graph)
+        self.assertTrue(route.use_detection)
+        self.assertEqual(route.detection_detail, "summary")
+
+    def test_general_knowledge_requests_no_providers(self) -> None:
+        decision = validate_router_payload(
+            self.payload(
+                intent="general_knowledge",
+                scope="none",
+                direction="none",
+                depth=0,
+                requires_graph=False,
+                requires_detection=True,
+            ),
+            self.entities,
+            min_confidence=0.65,
+            message="What is a domain-joined workstation?",
+        )
+        route = normalize_intent_route(decision, self.entities)
+        self.assertFalse(route.use_graph)
+        self.assertFalse(route.use_detection)
+
+    def test_multiple_entities_skip_detection(self) -> None:
+        decision = validate_router_payload(
+            self.payload(
+                intent="graph_path",
+                scope="path",
+                direction="both",
+                depth=0,
+                requires_graph=True,
+                requires_detection=True,
+                detection_detail="compact_full",
+                requires_multiple_entities=True,
+            ),
+            self.two_entities,
+            min_confidence=0.65,
+            message="Find path from 192.168.30.115 to 192.168.0.149",
+        )
+        route = normalize_intent_route(decision, self.two_entities)
+        self.assertTrue(route.use_graph)
+        self.assertFalse(route.use_detection)
+        self.assertEqual(route.detection_detail, "summary")
+
+    def test_active_single_binding_allows_detection_followup_without_pre_resolved_entity(self) -> None:
+        no_entities = EntityResolver().resolve("Show me more detection evidence.")
+        self.assertEqual(no_entities.status, "none")
+        decision = validate_router_payload(
+            self.payload(
+                intent="asset_investigation",
+                scope="none",
+                direction="none",
+                depth=0,
+                requires_graph=False,
+                requires_detection=True,
+                detection_detail="compact_full",
+                entity_binding="active_single",
+                is_followup=True,
+            ),
+            no_entities,
+            min_confidence=0.65,
+            message="Show me more detection evidence.",
+            routing_state=SessionRoutingState(active_ip="192.168.30.111"),
+        )
+        route = normalize_intent_route(decision, EntityResolver().resolve("unused", routing_state=SessionRoutingState(active_ip="192.168.30.111")))
+        self.assertEqual(decision.entity_binding, "active_single")
+        self.assertEqual(decision.materialized_entities, ("192.168.30.111",))
+        self.assertTrue(decision.requires_detection)
+        self.assertEqual(decision.detection_detail, "compact_full")
+        self.assertEqual(route.decision_source, "glm")
+
+    def test_general_knowledge_binds_none(self) -> None:
+        decision = validate_router_payload(
+            self.payload(
+                intent="general_knowledge",
+                scope="none",
+                direction="none",
+                depth=0,
+                requires_graph=False,
+                requires_detection=False,
+                entity_binding="active_single",
+            ),
+            EntityResolver().resolve("What is Kerberos?"),
+            min_confidence=0.65,
+            message="What is Kerberos?",
+            routing_state=SessionRoutingState(active_ip="192.168.30.111"),
+        )
+        self.assertEqual(decision.entity_binding, "none")
+        self.assertEqual(decision.materialized_entities, ())
+        self.assertTrue(decision.binding_normalized)
+        self.assertEqual(decision.binding_normalization_reason, "general_requires_no_entity_binding")
+
+    def test_topic_detachment_forbids_active_binding(self) -> None:
+        detached = EntityResolver().resolve(
+            "Not about this asset; explain Kerberos.",
+            routing_state=SessionRoutingState(active_ip="192.168.30.111"),
+        )
+        decision = validate_router_payload(
+            self.payload(
+                intent="general_knowledge",
+                scope="none",
+                direction="none",
+                depth=0,
+                requires_graph=False,
+                requires_detection=False,
+                entity_binding="active_single",
+            ),
+            detached,
+            min_confidence=0.65,
+            message="Not about this asset; explain Kerberos.",
+            routing_state=SessionRoutingState(active_ip="192.168.30.111"),
+        )
+        self.assertEqual(decision.entity_binding, "none")
+
+    def test_explicit_entity_overrides_active_binding(self) -> None:
+        explicit = EntityResolver().resolve(
+            "Show detection evidence for 192.168.30.112.",
+            routing_state=SessionRoutingState(active_ip="192.168.30.111"),
+        )
+        decision = validate_router_payload(
+            self.payload(
+                intent="asset_investigation",
+                scope="none",
+                direction="none",
+                depth=0,
+                requires_graph=False,
+                requires_detection=True,
+                detection_detail="compact_full",
+                entity_binding="active_single",
+            ),
+            explicit,
+            min_confidence=0.65,
+            message="Show detection evidence for 192.168.30.112.",
+            routing_state=SessionRoutingState(active_ip="192.168.30.111"),
+        )
+        self.assertEqual(decision.entity_binding, "explicit")
+        self.assertEqual(decision.materialized_entities, ("192.168.30.112",))
+        self.assertEqual(decision.binding_normalization_reason, "explicit_entity_takes_authority")
+
+    def test_ui_binding_overrides_active_when_no_explicit_entity(self) -> None:
+        ui_entities = EntityResolver().resolve(
+            "Tell me about this asset.",
+            ui_context={"selected_ip": "192.168.30.113"},
+            routing_state=SessionRoutingState(active_ip="192.168.30.111"),
+        )
+        decision = validate_router_payload(
+            self.payload(
+                intent="asset_investigation",
+                scope="node_summary",
+                direction="both",
+                depth=0,
+                requires_graph=True,
+                requires_detection=True,
+                entity_binding="ui",
+            ),
+            ui_entities,
+            min_confidence=0.65,
+            message="Tell me about this asset.",
+            ui_context={"selected_ip": "192.168.30.113"},
+            routing_state=SessionRoutingState(active_ip="192.168.30.111"),
+        )
+        self.assertEqual(decision.entity_binding, "ui")
+        self.assertEqual(decision.materialized_entities, ("192.168.30.113",))
+
+    def test_ui_selected_ip_overrides_active_single_even_when_glm_binds_none_general(self) -> None:
+        ui_entities = EntityResolver().resolve(
+            "What is selected?",
+            ui_context={"selected_ip": "192.168.30.113"},
+            routing_state=SessionRoutingState(active_ip="192.168.30.111"),
+        )
+        decision = validate_router_payload(
+            self.payload(
+                intent="general_knowledge",
+                scope="none",
+                direction="none",
+                depth=0,
+                requires_graph=False,
+                requires_detection=False,
+                entity_binding="none",
+            ),
+            ui_entities,
+            min_confidence=0.65,
+            message="What is selected?",
+            ui_context={"selected_ip": "192.168.30.113"},
+            routing_state=SessionRoutingState(active_ip="192.168.30.111"),
+        )
+        self.assertEqual(decision.intent, "asset_investigation")
+        self.assertEqual(decision.entity_binding, "ui")
+        self.assertEqual(decision.materialized_entities, ("192.168.30.113",))
+        self.assertEqual(decision.binding_normalization_reason, "ui_entity_takes_authority")
+        self.assertEqual(decision.route_normalization_reason, "ui_subject_requires_asset_route")
+        self.assertTrue(decision.requires_graph)
+        self.assertTrue(decision.requires_detection)
+
+    def test_explicit_ip_overrides_ui_and_active_state(self) -> None:
+        explicit = EntityResolver().resolve(
+            "Show detection evidence for 192.168.30.112.",
+            ui_context={"selected_ip": "192.168.30.113"},
+            routing_state=SessionRoutingState(active_ip="192.168.30.111"),
+        )
+        decision = validate_router_payload(
+            self.payload(
+                intent="asset_investigation",
+                scope="none",
+                direction="none",
+                depth=0,
+                requires_graph=False,
+                requires_detection=True,
+                detection_detail="compact_full",
+                entity_binding="ui",
+            ),
+            explicit,
+            min_confidence=0.65,
+            message="Show detection evidence for 192.168.30.112.",
+            ui_context={"selected_ip": "192.168.30.113"},
+            routing_state=SessionRoutingState(active_ip="192.168.30.111"),
+        )
+        self.assertEqual(decision.entity_binding, "explicit")
+        self.assertEqual(decision.materialized_entities, ("192.168.30.112",))
+        self.assertEqual(decision.binding_normalization_reason, "explicit_entity_takes_authority")
+
+    def test_requested_explicit_single_ip_wins_over_conflicting_ui_ip(self) -> None:
+        explicit = EntityResolver().resolve(
+            "Tell me about 192.168.3.137.",
+            ui_context={"selected_ip": "192.168.3.103"},
+        )
+        decision = validate_router_payload(
+            self.payload(
+                intent="asset_investigation",
+                scope="node_summary",
+                direction="both",
+                depth=0,
+                requires_graph=True,
+                requires_detection=True,
+                entity_binding="explicit",
+            ),
+            explicit,
+            min_confidence=0.65,
+            message="Tell me about 192.168.3.137.",
+            ui_context={"selected_ip": "192.168.3.103"},
+        )
+
+        self.assertEqual(decision.requested_entity_binding, "explicit")
+        self.assertEqual(decision.entity_binding, "explicit")
+        self.assertEqual(decision.binding_source, "message")
+        self.assertEqual(decision.materialized_entities, ("192.168.3.137",))
+
+    def test_requested_explicit_pair_wins_over_conflicting_ui_ip(self) -> None:
+        explicit_pair = EntityResolver().resolve(
+            "Find path between 192.168.3.137 and 192.168.3.138.",
+            ui_context={"selected_ip": "192.168.3.103"},
+        )
+        decision = validate_router_payload(
+            self.payload(
+                intent="graph_path",
+                scope="path",
+                direction="both",
+                depth=0,
+                requires_graph=True,
+                requires_detection=False,
+                entity_binding="explicit",
+                requires_multiple_entities=True,
+            ),
+            explicit_pair,
+            min_confidence=0.65,
+            message="Find path between 192.168.3.137 and 192.168.3.138.",
+            ui_context={"selected_ip": "192.168.3.103"},
+        )
+
+        self.assertEqual(decision.requested_entity_binding, "explicit")
+        self.assertEqual(decision.entity_binding, "explicit")
+        self.assertEqual(decision.binding_source, "message")
+        self.assertEqual(decision.materialized_entities, ("192.168.3.137", "192.168.3.138"))
+        self.assertTrue(decision.requires_multiple_entities)
+
+    def test_no_explicit_ip_ui_reference_still_uses_ui_entity(self) -> None:
+        ui_entities = EntityResolver().resolve(
+            "What is this?",
+            ui_context={"selected_ip": "192.168.3.103"},
+            routing_state=SessionRoutingState(active_ip="192.168.3.99"),
+        )
+        decision = validate_router_payload(
+            self.payload(
+                intent="general_knowledge",
+                scope="none",
+                direction="none",
+                depth=0,
+                requires_graph=False,
+                requires_detection=False,
+                entity_binding="none",
+            ),
+            ui_entities,
+            min_confidence=0.65,
+            message="What is this?",
+            ui_context={"selected_ip": "192.168.3.103"},
+            routing_state=SessionRoutingState(active_ip="192.168.3.99"),
+        )
+
+        self.assertEqual(decision.entity_binding, "ui")
+        self.assertEqual(decision.binding_source, "ui")
+        self.assertEqual(decision.materialized_entities, ("192.168.3.103",))
+
+    def test_explicit_ip_wins_over_active_previous_ip(self) -> None:
+        explicit = EntityResolver().resolve(
+            "Tell me about 192.168.3.137.",
+            routing_state=SessionRoutingState(active_ip="192.168.3.99"),
+        )
+        decision = validate_router_payload(
+            self.payload(
+                intent="asset_investigation",
+                scope="node_summary",
+                direction="both",
+                depth=0,
+                requires_graph=True,
+                requires_detection=True,
+                entity_binding="active_single",
+            ),
+            explicit,
+            min_confidence=0.65,
+            message="Tell me about 192.168.3.137.",
+            routing_state=SessionRoutingState(active_ip="192.168.3.99"),
+        )
+
+        self.assertEqual(decision.entity_binding, "explicit")
+        self.assertEqual(decision.binding_source, "message")
+        self.assertEqual(decision.materialized_entities, ("192.168.3.137",))
+        self.assertEqual(decision.binding_normalization_reason, "explicit_entity_takes_authority")
+
+    def test_missing_binding_infers_active_pair_for_pair_route(self) -> None:
+        no_entities = EntityResolver().resolve("Find their path.")
+        decision = validate_router_payload(
+            self.payload(
+                intent="graph_path",
+                scope="path",
+                direction="both",
+                depth=0,
+                requires_graph=True,
+                requires_detection=False,
+                entity_binding="",
+                requires_multiple_entities=True,
+            ),
+            no_entities,
+            min_confidence=0.65,
+            message="Find their path.",
+            routing_state=SessionRoutingState(
+                active_ip="192.168.30.111",
+                active_entities=("192.168.30.112", "192.168.30.113"),
+            ),
+        )
+        self.assertEqual(decision.entity_binding, "active_pair")
+        self.assertEqual(decision.materialized_entities, ("192.168.30.112", "192.168.30.113"))
+
+    def test_missing_binding_infers_active_single_for_single_route(self) -> None:
+        no_entities = EntityResolver().resolve("Show more detail.")
+        decision = validate_router_payload(
+            self.payload(
+                intent="asset_investigation",
+                scope="node_summary",
+                direction="both",
+                depth=0,
+                requires_graph=True,
+                requires_detection=True,
+                entity_binding="",
+            ),
+            no_entities,
+            min_confidence=0.65,
+            message="Show more detail.",
+            routing_state=SessionRoutingState(
+                active_ip="192.168.30.111",
+                active_entities=("192.168.30.112", "192.168.30.113"),
+            ),
+        )
+        self.assertEqual(decision.entity_binding, "active_single")
+        self.assertEqual(decision.materialized_entities, ("192.168.30.111",))
+
+    def test_missing_active_single_binding_raises_entity_requirement_failed(self) -> None:
+        with self.assertRaisesRegex(ValueError, "entity_requirement_failed"):
+            validate_router_payload(
+                self.payload(
+                    intent="asset_investigation",
+                    scope="none",
+                    direction="none",
+                    depth=0,
+                    requires_graph=False,
+                    requires_detection=True,
+                    detection_detail="compact_full",
+                    entity_binding="active_single",
+                ),
+                EntityResolver().resolve("Show detection evidence."),
+                min_confidence=0.65,
+                message="Show detection evidence.",
+                routing_state=SessionRoutingState(),
+            )
+
+    def test_invalid_entity_binding_is_rejected(self) -> None:
+        with self.assertRaisesRegex(ValueError, "unsupported_enum:entity_binding"):
+            validate_router_payload(
+                self.payload(entity_binding="memory_magic"),
+                self.entities,
+                min_confidence=0.65,
+            )
+
+    def test_invalid_detection_detail_normalizes_safely(self) -> None:
+        decision = validate_router_payload(
+            self.payload(detection_detail="verbose"),
+            self.entities,
+            min_confidence=0.65,
+            message="Show all connections of 192.168.30.115.",
+        )
+        route = normalize_intent_route(decision, self.entities)
+        self.assertEqual(route.detection_detail, "summary")
+        self.assertTrue(route.route_normalized)
+
+    def test_followup_show_more_evidence_uses_active_ip_and_compact_full(self) -> None:
+        entities = EntityResolver().resolve(
+            "show more evidence",
+            routing_state=SessionRoutingState(active_ip="192.168.30.115"),
+        )
+        self.assertEqual(entities.status, "none")
+        decision = validate_router_payload(
+            self.payload(
+                intent="asset_investigation",
+                scope="none",
+                direction="none",
+                depth=0,
+                requires_graph=False,
+                requires_detection=True,
+                detection_detail="compact_full",
+                entity_binding="active_single",
+                is_followup=True,
+            ),
+            entities,
+            min_confidence=0.65,
+            message="show more evidence",
+            routing_state=SessionRoutingState(active_ip="192.168.30.115", last_provider="detection"),
+        )
+        self.assertEqual(decision.entity_binding, "active_single")
+        self.assertEqual(decision.binding_source, "conversation")
+        self.assertEqual(decision.materialized_entities, ("192.168.30.115",))
+        self.assertTrue(decision.requires_detection)
+        self.assertEqual(decision.detection_detail, "compact_full")
 
     def test_three_entities_are_rejected_for_graph_routes(self) -> None:
         three = EntityResolver().resolve("Compare 192.168.1.1 192.168.1.2 192.168.1.3")
@@ -321,13 +828,14 @@ class LLMPrimaryRouterTests(unittest.TestCase):
     def test_valid_glm_decision_normalizes_without_fallback(self) -> None:
         router = GLMIntentRouter(
             self.settings,
-            FakeLLMClient([fake_result('{"intent":"asset_investigation","scope":"node_summary","direction":"both","depth":0,"requires_graph":true,"requires_multiple_entities":false,"is_followup":false,"classification_confidence":0.92,"reason":"asset question"}')]),  # type: ignore[arg-type]
+            FakeLLMClient([fake_result('{"intent":"asset_investigation","scope":"node_summary","direction":"both","depth":0,"requires_graph":true,"requires_detection":true,"detection_detail":"summary","requires_multiple_entities":false,"is_followup":false,"classification_confidence":0.92,"reason":"asset question"}')]),  # type: ignore[arg-type]
         )
         decision = router.classify("Tell me about 192.168.30.115", self.entities, SessionRoutingState())
         route = normalize_intent_route(decision, self.entities)
         self.assertEqual(route.decision_source, "glm")
         self.assertFalse(route.fallback_used)
         self.assertEqual(route.scope, "node_summary")
+        self.assertTrue(route.use_detection)
 
     def test_malformed_json_retries_once_then_falls_back(self) -> None:
         router = GLMIntentRouter(self.settings, FakeLLMClient([fake_result("not json"), fake_result("still bad")]))  # type: ignore[arg-type]
@@ -385,6 +893,119 @@ class LLMPrimaryRouterTests(unittest.TestCase):
         )
         self.assertEqual(missing.system_prompt, ROUTER_SYSTEM_PROMPT_FALLBACK)
         self.assertLess(len(ROUTER_SYSTEM_PROMPT_FALLBACK), 400)
+
+
+class TopologyGraphSelectionTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.graph = nx.DiGraph()
+        self.graph.add_edge("192.168.0.125", "192.168.0.126")
+        self.graph.add_node("192.168.30.115")
+
+    def test_graph_node_click_selects_ip(self) -> None:
+        action, selected_ip, event_id = _resolve_graph_selection_event(
+            {"action": "select", "node": "192.168.0.125", "event_id": "evt-1"},
+            self.graph,
+        )
+
+        self.assertEqual(action, "select")
+        self.assertEqual(selected_ip, "192.168.0.125")
+        self.assertEqual(event_id, "evt-1")
+
+    def test_graph_background_click_clears_selection(self) -> None:
+        action, selected_ip, event_id = _resolve_graph_selection_event(
+            {"action": "clear", "node": None, "event_id": "evt-2"},
+            self.graph,
+        )
+
+        self.assertEqual(action, "clear")
+        self.assertIsNone(selected_ip)
+        self.assertEqual(event_id, "evt-2")
+
+    def test_pyvis_bridge_emits_background_clear_event(self) -> None:
+        html = _inject_node_click_bridge("<html><body></body></html>")
+
+        self.assertIn('action: "clear"', html)
+        self.assertIn("sendClearSelection", html)
+        self.assertIn("unselectAll", html)
+
+    def test_copilot_request_context_omits_selected_ip_after_clear(self) -> None:
+        action, selected_ip, _ = _resolve_graph_selection_event(
+            {"action": "clear", "node": None, "event_id": "evt-3"},
+            self.graph,
+        )
+
+        self.assertEqual(action, "clear")
+        self.assertIsNone(build_copilot_ui_context(selected_ip))
+
+    def test_graph_node_click_after_clear_selects_new_ip(self) -> None:
+        clear_action, cleared_ip, _ = _resolve_graph_selection_event(
+            {"action": "clear", "node": None, "event_id": "evt-4"},
+            self.graph,
+        )
+        select_action, selected_ip, event_id = _resolve_graph_selection_event(
+            {"action": "select", "node": "192.168.30.115", "event_id": "evt-5"},
+            self.graph,
+        )
+
+        self.assertEqual(clear_action, "clear")
+        self.assertIsNone(cleared_ip)
+        self.assertEqual(select_action, "select")
+        self.assertEqual(selected_ip, "192.168.30.115")
+        self.assertEqual(event_id, "evt-5")
+
+
+class CopilotHelpContentTests(unittest.TestCase):
+    def test_help_prefers_dialog_when_streamlit_supports_it(self) -> None:
+        self.assertEqual(choose_help_ui_pattern(SimpleNamespace(dialog=object())), "dialog")
+        self.assertEqual(choose_help_ui_pattern(SimpleNamespace()), "popover")
+
+    def test_help_explains_authority_and_evidence_sources(self) -> None:
+        content = get_copilot_help_content()
+        authority = " ".join(content.authority)
+        evidence = " ".join(content.evidence)
+
+        self.assertIn("Explicit IP", authority)
+        self.assertIn("selected graph node", authority)
+        self.assertIn("previous active asset", authority)
+        self.assertIn("Clicking empty graph space clears", authority)
+        self.assertIn("asset-detection evidence", evidence)
+        self.assertIn("graph evidence", evidence)
+        self.assertIn("General cybersecurity questions", evidence)
+
+    def test_help_examples_cover_current_route_shapes(self) -> None:
+        content = get_copilot_help_content()
+        groups = {group.title: group for group in content.examples}
+
+        for title in (
+            "Identify an asset",
+            "Get detailed evidence",
+            "Explore connections",
+            "Combine identity and topology",
+            "Compare assets",
+            "Find a path",
+            "Ask general questions",
+            "Use follow-ups",
+        ):
+            self.assertIn(title, groups)
+
+        examples = "\n".join(example for group in content.examples for example in group.examples)
+        self.assertIn("Show all inbound peers", examples)
+        self.assertIn("Show all outbound peers", examples)
+        self.assertIn("two-hop neighborhood", examples)
+        self.assertIn("directly connected", examples)
+        self.assertIn("shortest graph path", examples)
+        self.assertIn("Tell me more about it", examples)
+        self.assertIn("Compare them", examples)
+
+    def test_help_content_does_not_change_copilot_selected_ip_payload(self) -> None:
+        before = build_copilot_ui_context("192.168.21.1")
+        get_copilot_help_content()
+        choose_help_ui_pattern(SimpleNamespace(dialog=object()))
+        after = build_copilot_ui_context("192.168.21.1")
+
+        self.assertEqual(before, {"selected_ip": "192.168.21.1"})
+        self.assertEqual(after, before)
+        self.assertIsNone(build_copilot_ui_context(None))
 
 
 class GraphRetrievalTests(unittest.TestCase):
@@ -461,6 +1082,55 @@ class GraphRetrievalTests(unittest.TestCase):
         self.assertEqual(get_subnet("192.168.0.149"), "192.168.0.0/24")
         self.assertEqual(get_subnet("192.168.21.1"), "192.168.21.0/24")
         self.assertEqual(get_subnet("not-an-ip"), "other")
+
+    def test_cidr_subnet_filter_includes_matching_node(self) -> None:
+        graph = nx.DiGraph()
+        graph.add_edge("192.168.0.125", "192.168.0.126")
+        graph.add_edge("192.168.0.125", "192.168.30.115")
+
+        filtered = _filter_graph_by_subnet(graph, "192.168.0.0/24")
+
+        self.assertIn("192.168.0.125", filtered.nodes)
+        self.assertIn(("192.168.0.125", "192.168.0.126"), filtered.edges)
+
+    def test_cidr_subnet_filter_excludes_outside_node(self) -> None:
+        graph = nx.DiGraph()
+        graph.add_edge("192.168.0.125", "192.168.30.115")
+
+        filtered = _filter_graph_by_subnet(graph, "192.168.0.0/24")
+
+        self.assertNotIn("192.168.30.115", filtered.nodes)
+        self.assertNotIn(("192.168.0.125", "192.168.30.115"), filtered.edges)
+
+    def test_cidr_subnet_filter_normalizes_whitespace(self) -> None:
+        graph = nx.DiGraph()
+        graph.add_node("192.168.0.125")
+
+        filtered = _filter_graph_by_subnet(graph, " 192.168.0.0/24 ")
+
+        self.assertEqual(list(filtered.nodes), ["192.168.0.125"])
+
+    def test_cidr_subnet_filter_skips_non_ip_nodes_safely(self) -> None:
+        graph = nx.DiGraph()
+        graph.add_edge("not-an-ip", "192.168.0.125")
+        graph.add_edge("192.168.0.125", "192.168.0.126")
+
+        filtered = _filter_graph_by_subnet(graph, "192.168.0.0/24")
+
+        self.assertNotIn("not-an-ip", filtered.nodes)
+        self.assertEqual(set(filtered.nodes), {"192.168.0.125", "192.168.0.126"})
+
+    def test_cidr_filtered_visualization_is_non_empty_when_nodes_match(self) -> None:
+        graph = nx.DiGraph()
+        graph.add_edge("192.168.0.125", "192.168.0.126")
+        graph.add_edge("192.168.0.125", "192.168.30.115")
+        replace_active_graph(graph, {"active_graph_source": "test"})
+
+        html = generate_pyvis_graph(max_nodes=20, min_degree=0, subnet_filter="192.168.0.0/24", cdn_resources="in_line")
+
+        self.assertIn("192.168.0.125", html)
+        self.assertIn("192.168.0.126", html)
+        self.assertNotIn("192.168.30.115", html)
 
     def test_full_inbound_and_outbound_return_direct_neighbors(self) -> None:
         inbound = self.provider.provide(self.entity, route=self.route("full_neighbors", "inbound", 1))

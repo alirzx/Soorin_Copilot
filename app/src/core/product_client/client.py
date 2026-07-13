@@ -14,17 +14,12 @@ from urllib3.util.retry import Retry
 
 from src.config.settings import Settings
 from src.core.detection.models import RawAssetDetectionResponse
+from src.core.product_client.auth import ProductAuthManager
 from src.core.product_client.errors import ProductApiConfigError, ProductApiError, ProductApiHTTPError
 from src.core.product_client.schemas import ProductTopologyResponse
 
 
 logger = logging.getLogger(__name__)
-
-def _normalize_bearer_token(token: str) -> str:
-    token = token.strip()
-    if token.lower().startswith("bearer "):
-        return token.split(" ", 1)[1].strip()
-    return token
 
 
 class ProductApiClient:
@@ -34,12 +29,16 @@ class ProductApiClient:
     logged. Future product endpoint methods should call `get_json()`.
     """
 
-    def __init__(self, settings: Settings) -> None:
+    def __init__(self, settings: Settings, auth_manager: ProductAuthManager | None = None) -> None:
         self.settings = settings
         self.base_url = settings.product_api_base_url
         self.connect_timeout = settings.product_connect_timeout_seconds
         self.read_timeout = settings.product_read_timeout_seconds
         self.session = requests.Session()
+        self.auth_manager = auth_manager or ProductAuthManager(settings, self.session)
+        self.last_auth_source = "none"
+        self.last_token_refreshed = False
+        self.last_auth_retry_count = 0
 
         retry_strategy = Retry(
             total=settings.product_max_retries,
@@ -52,22 +51,25 @@ class ProductApiClient:
         self.session.mount("https://", adapter)
 
         logger.info(
-            "event=product_client_initialized base_url_configured=%s hwid_present=%s connect_timeout=%s read_timeout=%s max_retries=%s",
+            "event=product_client_initialized base_url_configured=%s hwid_present=%s username_present=%s password_present=%s captcha_bypass_present=%s connect_timeout=%s read_timeout=%s max_retries=%s",
             bool(settings.product_api_base_url),
             bool(settings.product_hwid),
+            bool(settings.product_username),
+            bool(settings.product_password),
+            bool(settings.product_captcha_bypass),
             self.connect_timeout,
             self.read_timeout,
             settings.product_max_retries,
         )
 
-    def _headers(self) -> dict[str, str]:
-        token = _normalize_bearer_token(self.settings.product_api_token)
+    def _headers(self, *, request_id: str = "", reason: str = "request") -> dict[str, str]:
         if not self.base_url:
             raise ProductApiConfigError("SOORIN_PRODUCT_API_BASE_URL is not configured.")
-        if not token:
-            raise ProductApiConfigError("SOORIN_PRODUCT_API_TOKEN is not configured.")
         if not self.settings.product_hwid:
             raise ProductApiConfigError("SOORIN_PRODUCT_HWID is not configured.")
+        token = self.auth_manager.get_token(request_id=request_id, reason=reason)
+        self.last_auth_source = self.auth_manager.last_auth_source
+        self.last_token_refreshed = self.auth_manager.last_token_refreshed
         return {
             "Authorization": f"Bearer {token}",
             "x-hwid": self.settings.product_hwid,
@@ -82,23 +84,48 @@ class ProductApiClient:
 
         logger.info("event=product_request_started request_id=%s endpoint_path=%s", request_id, endpoint_path)
         started = time.perf_counter()
-        try:
-            response = self.session.get(
-                url,
-                headers=self._headers(),
-                timeout=(self.connect_timeout, self.read_timeout),
+        response = None
+        self.last_auth_retry_count = 0
+        for attempt in range(2):
+            try:
+                response = self.session.get(
+                    url,
+                    headers=self._headers(
+                        request_id=request_id,
+                        reason="retry_after_401" if attempt else "request",
+                    ),
+                    timeout=(self.connect_timeout, self.read_timeout),
+                )
+            except requests.RequestException as exc:
+                logger.exception("event=product_request_exception request_id=%s endpoint_path=%s", request_id, endpoint_path)
+                raise ProductApiError("Product API request failed.") from exc
+
+            if response.status_code != 401 or attempt == 1:
+                break
+
+            self.last_auth_retry_count = 1
+            logger.info(
+                "event=product_auth_retry_after_401 request_id=%s reason=unauthorized status_code=%s token_age_seconds=%s retry_count=%s",
+                request_id,
+                response.status_code,
+                self.auth_manager.token_age_seconds,
+                self.last_auth_retry_count,
             )
-        except requests.RequestException as exc:
-            logger.exception("event=product_request_exception request_id=%s endpoint_path=%s", request_id, endpoint_path)
-            raise ProductApiError("Product API request failed.") from exc
+            self.auth_manager.invalidate()
+
+        if response is None:
+            raise ProductApiError("Product API request did not produce a response.")
 
         elapsed = time.perf_counter() - started
         logger.info(
-            "event=product_response_received request_id=%s endpoint_path=%s status_code=%s elapsed_ms=%s",
+            "event=product_response_received request_id=%s endpoint_path=%s status_code=%s elapsed_ms=%s auth_source=%s token_refreshed=%s auth_retry_count=%s",
             request_id,
             endpoint_path,
             response.status_code,
             int(elapsed * 1000),
+            self.last_auth_source,
+            self.last_token_refreshed,
+            self.last_auth_retry_count,
         )
 
         if response.status_code == 401:

@@ -36,8 +36,42 @@ class ContextComposer:
 
     def __init__(self, settings: Settings | None = None) -> None:
         self.settings = settings or get_settings()
+        self.last_parts: dict[str, str] = {"graph": "", "detection": "", "fusion": ""}
 
     def compose(self, package: CopilotContextPackage, *, request_id: str = "") -> str:
+        detection = package.detection
+        detection_text = (
+            detection.rendered_context
+            if detection and detection.status in {"available", "not_found"} and detection.rendered_context
+            else ""
+        )
+        graph_text = self._compose_graph(package, request_id=request_id)
+        fusion_text = self._compose_alignment(package)
+        self.last_parts = {"graph": graph_text, "detection": detection_text, "fusion": fusion_text}
+        parts = [part for part in [detection_text, graph_text, fusion_text] if part]
+        text = "\n\n".join(parts)
+        logger.info(
+            "event=context_composed request_id=%s providers=%s graph_chars=%s detection_chars=%s fusion_chars=%s total_dynamic_chars=%s total_dynamic_approx_tokens=%s",
+            request_id,
+            ",".join(
+                name
+                for name, part in [
+                    ("graph", graph_text),
+                    ("detection", detection_text),
+                    ("fusion", fusion_text),
+                ]
+                if part
+            )
+            or "none",
+            len(graph_text),
+            len(detection_text),
+            len(fusion_text),
+            len(text),
+            approx_tokens(text),
+        )
+        return text
+
+    def _compose_graph(self, package: CopilotContextPackage, *, request_id: str = "") -> str:
         graph = package.graph
         if not graph or graph.status not in {"available", "not_found"}:
             logger.info(
@@ -188,6 +222,57 @@ class ContextComposer:
             context.get("context_truncated", False),
         )
         return text
+
+    @staticmethod
+    def _compose_alignment(package: CopilotContextPackage) -> str:
+        graph = package.graph
+        detection = package.detection
+        if not graph or not detection or graph.status != "available" or detection.status != "available" or not detection.evidence:
+            return ""
+
+        context = graph.context or {}
+        evidence = detection.evidence
+        role_text = " ".join(
+            str(item or "")
+            for item in [
+                evidence.classification.primary_role,
+                evidence.classification.inferred_device_type,
+                evidence.tagging.stored_tag,
+                evidence.tagging.stored_sub_tag,
+                evidence.tagging.tag,
+                evidence.tagging.sub_tag,
+            ]
+        ).lower()
+        inbound_total = int(context.get("inbound_total", 0) or 0)
+        outbound_total = int(context.get("outbound_total", 0) or 0)
+        agreement: list[str] = []
+        conflicts: list[str] = []
+        unknowns: list[str] = []
+
+        if "workstation" in role_text and outbound_total > inbound_total:
+            agreement.append("Detected workstation role and outbound-heavy graph behavior may align.")
+        if "workstation" in role_text and inbound_total > max(1, outbound_total * 2):
+            conflicts.append("Detected workstation role may conflict with heavy server-like inbound exposure.")
+        if "network" in role_text and not any(
+            key in evidence.signals.metrics
+            for key in ["snmp", "snmp_seen", "network_os", "network_device_evidence"]
+        ):
+            conflicts.append("Detected network-device wording has weak or missing SNMP/network-OS evidence.")
+        if not agreement:
+            unknowns.append("No deterministic agreement signal was found; this is not negative proof.")
+        if not conflicts:
+            unknowns.append("No deterministic conflict signal was found in the bounded evidence.")
+
+        lines = [
+            "[SOORIN EVIDENCE ALIGNMENT]",
+            "agreement:",
+            *[f"- {item}" for item in agreement],
+            "conflicts:",
+            *[f"- {item}" for item in conflicts],
+            "unknowns:",
+            *[f"- {item}" for item in unknowns],
+        ]
+        return "\n".join(lines)
 
     def _select_context_records(self, context: dict[str, Any]) -> tuple[list[dict[str, object]], list[dict[str, object]], bool, str | None]:
         nodes = list(context.get("nodes") or [])

@@ -12,12 +12,14 @@ _COMPONENT = components.declare_component(
     path=str(Path(__file__).parent),
 )
 
+NO_GRAPH_SELECTION_EVENT = "__soorin_graph_selection_no_event__"
+
 
 def topology_graph_component(
     *,
     html: str,
     height: int = 680,
     key: str | None = None,
-) -> str | None:
-    """Render graph HTML and return a clicked node ID when the browser emits one."""
-    return _COMPONENT(html=html, height=height, default=None, key=key)
+) -> object:
+    """Render graph HTML and return a graph selection event when one is emitted."""
+    return _COMPONENT(html=html, height=height, default=NO_GRAPH_SELECTION_EVENT, key=key)

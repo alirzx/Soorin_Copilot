@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import unittest
+import time
 from dataclasses import replace
 from datetime import datetime, timezone
 from typing import Any
@@ -12,7 +13,7 @@ import requests
 from src.config.settings import get_settings
 from src.core.detection import adapt_asset_detection, compact_full, summary
 from src.core.detection.models import RawAssetDetectionResponse
-from src.core.product_client import ProductApiClient
+from src.core.product_client import ProductApiClient, ProductAuthManager
 from src.core.product_client.errors import ProductApiError, ProductApiHTTPError
 
 
@@ -26,9 +27,16 @@ class FakeResponse:
 
 
 class FakeSession:
-    def __init__(self, responses: list[FakeResponse | Exception]) -> None:
+    def __init__(
+        self,
+        responses: list[FakeResponse | Exception],
+        *,
+        post_responses: list[FakeResponse | Exception] | None = None,
+    ) -> None:
         self.responses = list(responses)
+        self.post_responses = list(post_responses or [])
         self.calls: list[dict[str, Any]] = []
+        self.post_calls: list[dict[str, Any]] = []
 
     def mount(self, *_args: Any, **_kwargs: Any) -> None:
         return None
@@ -40,19 +48,34 @@ class FakeSession:
             raise response
         return response
 
+    def post(self, url: str, *, headers: dict[str, str], json: dict[str, Any], timeout: tuple[int, int]) -> FakeResponse:
+        self.post_calls.append({"url": url, "headers": headers, "json": json, "timeout": timeout})
+        response = self.post_responses.pop(0)
+        if isinstance(response, Exception):
+            raise response
+        return response
+
 
 def make_settings(**overrides: Any):
+    values = {
+        "product_api_base_url": "http://product.local",
+        "product_asset_detection_path": "/asset-detection/test/{ip}",
+        "product_login_path": "/auth/login",
+        "product_api_token": "Bearer secret-token",
+        "product_username": "admin",
+        "product_password": "secret-password",
+        "product_captcha_bypass": "captcha-secret",
+        "product_token_refresh_seconds": 600,
+        "product_hwid": "secret-hwid",
+        "product_connect_timeout_seconds": 7,
+        "product_read_timeout_seconds": 11,
+        "product_max_retries": 1,
+        "product_retry_backoff_seconds": 0.0,
+    }
+    values.update(overrides)
     return replace(
         get_settings(),
-        product_api_base_url="http://product.local",
-        product_asset_detection_path="/asset-detection/test/{ip}",
-        product_api_token="Bearer secret-token",
-        product_hwid="secret-hwid",
-        product_connect_timeout_seconds=7,
-        product_read_timeout_seconds=11,
-        product_max_retries=1,
-        product_retry_backoff_seconds=0.0,
-        **overrides,
+        **values,
     )
 
 
@@ -132,6 +155,88 @@ class ProductAssetDetectionClientTests(unittest.TestCase):
         self.assertNotIn("secret-token", log_text)
         self.assertNotIn("secret-hwid", log_text)
         self.assertNotIn("Authorization", log_text)
+
+    def test_login_request_uses_expected_headers_and_body_without_logging_secrets(self) -> None:
+        session = FakeSession([], post_responses=[FakeResponse(200, {"accessToken": "login-token"})])
+        manager = ProductAuthManager(make_settings(product_api_token=""), session)  # type: ignore[arg-type]
+        with self.assertLogs("src.core.product_client.auth", level="INFO") as logs:
+            token = manager.get_token(request_id="auth-1")
+        self.assertEqual(token, "login-token")
+        self.assertEqual(session.post_calls[0]["url"], "http://product.local/auth/login")
+        self.assertEqual(session.post_calls[0]["headers"]["x-hwid"], "secret-hwid")
+        self.assertEqual(session.post_calls[0]["headers"]["x-captcha-bypass"], "captcha-secret")
+        self.assertEqual(session.post_calls[0]["json"], {"username": "admin", "password": "secret-password"})
+        log_text = "\n".join(logs.output)
+        self.assertIn("product_auth_login_started", log_text)
+        self.assertIn("product_auth_login_succeeded", log_text)
+        self.assertNotIn("login-token", log_text)
+        self.assertNotIn("secret-password", log_text)
+        self.assertNotIn("secret-hwid", log_text)
+        self.assertNotIn("captcha-secret", log_text)
+
+    def test_token_reuse_before_expiry_and_refresh_after_configured_age(self) -> None:
+        session = FakeSession(
+            [],
+            post_responses=[
+                FakeResponse(200, {"accessToken": "token-1"}),
+                FakeResponse(200, {"accessToken": "token-2"}),
+            ],
+        )
+        manager = ProductAuthManager(make_settings(product_api_token="", product_token_refresh_seconds=1), session)  # type: ignore[arg-type]
+        self.assertEqual(manager.get_token(request_id="auth-2"), "token-1")
+        self.assertEqual(manager.get_token(request_id="auth-3"), "token-1")
+        manager._token_created_at = time.time() - 5
+        self.assertEqual(manager.get_token(request_id="auth-4"), "token-2")
+        self.assertEqual(len(session.post_calls), 2)
+
+    def test_401_invalidates_token_logins_once_and_retries_original_request(self) -> None:
+        session = FakeSession(
+            [FakeResponse(401, {"error": "expired"}), FakeResponse(200, sample_payload())],
+            post_responses=[
+                FakeResponse(200, {"accessToken": "token-1"}),
+                FakeResponse(200, {"accessToken": "token-2"}),
+            ],
+        )
+        client = ProductApiClient(make_settings(product_api_token=""))
+        client.session = session  # type: ignore[assignment]
+        client.auth_manager = ProductAuthManager(make_settings(product_api_token=""), session)  # type: ignore[assignment]
+        response = client.get_asset_detection("192.168.21.1", request_id="auth-5")
+        self.assertEqual(response.ip, "192.168.21.1")
+        self.assertEqual(len(session.calls), 2)
+        self.assertEqual(len(session.post_calls), 2)
+        self.assertEqual(client.last_auth_retry_count, 1)
+
+    def test_second_401_raises_typed_unauthorized_error(self) -> None:
+        session = FakeSession(
+            [FakeResponse(401, {"error": "expired"}), FakeResponse(401, {"error": "expired"})],
+            post_responses=[
+                FakeResponse(200, {"accessToken": "token-1"}),
+                FakeResponse(200, {"accessToken": "token-2"}),
+            ],
+        )
+        client = ProductApiClient(make_settings(product_api_token=""))
+        client.session = session  # type: ignore[assignment]
+        client.auth_manager = ProductAuthManager(make_settings(product_api_token=""), session)  # type: ignore[assignment]
+        with self.assertRaises(ProductApiHTTPError) as caught:
+            client.get_asset_detection("192.168.21.1", request_id="auth-6")
+        self.assertEqual(caught.exception.status_code, 401)
+        self.assertEqual(len(session.calls), 2)
+        self.assertEqual(len(session.post_calls), 2)
+
+    def test_graph_and_detection_clients_can_share_one_token_manager(self) -> None:
+        auth_session = FakeSession([], post_responses=[FakeResponse(200, {"accessToken": "shared-token"})])
+        manager = ProductAuthManager(make_settings(product_api_token=""), auth_session)  # type: ignore[arg-type]
+        graph_session = FakeSession([FakeResponse(200, [{"src_ip": "192.168.1.1", "dst_ip": "192.168.1.2"}])])
+        detection_session = FakeSession([FakeResponse(200, sample_payload())])
+        graph_client = ProductApiClient(make_settings(product_api_token=""), manager)
+        detection_client = ProductApiClient(make_settings(product_api_token=""), manager)
+        graph_client.session = graph_session  # type: ignore[assignment]
+        detection_client.session = detection_session  # type: ignore[assignment]
+        graph_client.fetch_topology_unique_ip_pairs()
+        detection_client.get_asset_detection("192.168.21.1")
+        self.assertEqual(len(auth_session.post_calls), 1)
+        self.assertEqual(graph_session.calls[0]["headers"]["Authorization"], "Bearer shared-token")
+        self.assertEqual(detection_session.calls[0]["headers"]["Authorization"], "Bearer shared-token")
 
     def test_invalid_ip_is_rejected_before_http_call(self) -> None:
         session = FakeSession([FakeResponse(200, sample_payload())])
