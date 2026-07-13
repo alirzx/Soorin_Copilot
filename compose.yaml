@@ -11,7 +11,6 @@ services:
         APP_GID: "${APP_GID:-10001}"
 
     image: soorin-copilot:${SOORIN_IMAGE_TAG:-local}
-
     container_name: soorin-copilot-api
 
     command:
@@ -38,13 +37,11 @@ services:
       - "${SOORIN_API_BIND_IP:-127.0.0.1}:${SOORIN_API_PORT:-6998}:6998"
 
     volumes:
-      - ./data:/workspace/data
+      - copilot-data:/workspace/data
       - copilot-cache:/home/soorin/.cache
 
     restart: unless-stopped
-
     init: true
-
     stop_grace_period: 30s
 
     healthcheck:
@@ -55,12 +52,13 @@ services:
         - >-
           import urllib.request;
           urllib.request.urlopen(
-          'http://127.0.0.1:6998/health', timeout=3
+          "http://127.0.0.1:6998/health",
+          timeout=3
           )
       interval: 20s
       timeout: 5s
-      start_period: 25s
-      retries: 5
+      start_period: 40s
+      retries: 8
 
     logging:
       driver: json-file
@@ -75,8 +73,6 @@ services:
       - copilot-network
 
   ui:
-    image: soorin-copilot:${SOORIN_IMAGE_TAG:-local}
-
     build:
       context: .
       dockerfile: Dockerfile
@@ -85,7 +81,13 @@ services:
         APP_UID: "${APP_UID:-10001}"
         APP_GID: "${APP_GID:-10001}"
 
+    image: soorin-copilot:${SOORIN_IMAGE_TAG:-local}
     container_name: soorin-copilot-ui
+
+# command:
+#   - python
+#   - app/run.py
+#   - --api
 
     command:
       - python
@@ -104,14 +106,17 @@ services:
     environment:
       PYTHONPATH: /workspace/app
 
-      # Change this only if the Streamlit code supports an API base URL env.
+      # Inside the UI container, localhost would refer to the UI itself.
+      SOORIN_API_BASE_URL: http://api:6998
       SOORIN_COPILOT_API_URL: http://api:6998
 
     ports:
       - "${SOORIN_UI_BIND_IP:-127.0.0.1}:${SOORIN_UI_PORT:-8501}:8501"
 
     volumes:
-      - ./data:/workspace/data
+      # Keep this shared because the current Streamlit topology UI may
+      # directly read generated graph artifacts.
+      - copilot-data:/workspace/data
       - copilot-cache:/home/soorin/.cache
 
     depends_on:
@@ -119,9 +124,7 @@ services:
         condition: service_healthy
 
     restart: unless-stopped
-
     init: true
-
     stop_grace_period: 20s
 
     healthcheck:
@@ -132,12 +135,13 @@ services:
         - >-
           import urllib.request;
           urllib.request.urlopen(
-          'http://127.0.0.1:8501/_stcore/health', timeout=3
+          "http://127.0.0.1:8501/_stcore/health",
+          timeout=3
           )
       interval: 20s
       timeout: 5s
-      start_period: 30s
-      retries: 5
+      start_period: 40s
+      retries: 8
 
     logging:
       driver: json-file
@@ -156,4 +160,5 @@ networks:
     driver: bridge
 
 volumes:
+  copilot-data:
   copilot-cache:

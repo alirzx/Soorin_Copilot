@@ -57,24 +57,21 @@ RUN python -m pip install \
     && rm -rf /tmp/wheels /tmp/requirements.txt
 
 COPY --chown=soorin:soorin app ./app
-COPY --chown=soorin:soorin data ./data
 COPY --chown=soorin:soorin lib ./lib
 COPY --chown=soorin:soorin script ./script
+
+# Graph artifacts are generated/fetched at runtime.
+# These directories seed the named Docker volume with correct ownership.
+RUN mkdir -p \
+        /workspace/data/raw \
+        /workspace/data/processed \
+    && chown -R soorin:soorin \
+        /workspace/data \
+        /home/soorin
 
 USER soorin
 
 EXPOSE 6998 8501
 
-HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
-    CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:6998/health', timeout=3)" || exit 1
+CMD ["python", "-m", "uvicorn", "src.api.main:app", "--host", "0.0.0.0", "--port", "6998"]
 
-CMD [
-    "python",
-    "-m",
-    "uvicorn",
-    "src.api.main:app",
-    "--host",
-    "0.0.0.0",
-    "--port",
-    "6998"
-]
