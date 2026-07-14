@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import time
+from pathlib import Path
 from uuid import uuid4
 
 import requests
@@ -22,6 +23,8 @@ HEALTH_URL = f"{API_BASE_URL}/health"
 REQUEST_TIMEOUT_SECONDS = settings.api_timeout_seconds
 SELECTED_COPILOT_IP_KEY = "selected_copilot_ip"
 LEGACY_SELECTED_IP_KEY = "copilot_graph_context_ip"
+APP_DIR = Path(__file__).resolve().parent
+SIDEBAR_LOGO_PATH = APP_DIR / "assets" / "branding" / "soorinsec-logo2.png"
 
 # ============================================================
 st.set_page_config(page_title="Soorin Cyber Copilot", layout="wide")
@@ -59,6 +62,13 @@ def init_session_state() -> None:
 def clear_chat() -> None:
     st.session_state.messages = []
     st.session_state.session_id = uuid4().hex
+
+
+def render_sidebar_branding() -> None:
+    """Render the canonical company logo at the top of the sidebar."""
+    if SIDEBAR_LOGO_PATH.exists():
+        st.image(str(SIDEBAR_LOGO_PATH), width=180)
+
 
 def get_backend_health() -> tuple[bool, str]:
     try:
@@ -119,6 +129,7 @@ def ask_copilot(message: str) -> tuple[str | None, str | None]:
 init_session_state()
 
 with st.sidebar:
+    render_sidebar_branding()
     st.subheader("Workspace Status")
     st.caption("API URL")
     st.code(API_BASE_URL, language=None)
