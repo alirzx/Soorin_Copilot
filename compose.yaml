@@ -13,23 +13,25 @@ services:
     image: soorin-copilot:${SOORIN_IMAGE_TAG:-local}
     container_name: soorin-copilot-api
 
+    # Use the project launcher so configure_logging() runs before Uvicorn.
     command:
       - python
-      - -m
-      - uvicorn
-      - src.api.main:app
-      - --host
-      - 0.0.0.0
-      - --port
-      - "6998"
-      - --workers
-      - "${SOORIN_API_WORKERS:-1}"
+      - app/run.py
+      - --api
 
     env_file:
       - ./app/.env
 
     environment:
       PYTHONPATH: /workspace/app
+
+      # Settings consumed by app/run.py.
+      API_HOST: 0.0.0.0
+      API_PORT: "6998"
+      API_RELOAD: "false"
+      LOG_LEVEL: "${SOORIN_LOG_LEVEL:-INFO}"
+
+      # Retained for components that use the SOORIN-prefixed settings.
       SOORIN_HOST: 0.0.0.0
       SOORIN_PORT: "6998"
 
@@ -84,21 +86,17 @@ services:
     image: soorin-copilot:${SOORIN_IMAGE_TAG:-local}
     container_name: soorin-copilot-ui
 
+    # Keep explicit Streamlit startup so it binds correctly inside Docker.
     command:
       - python
-      - app/run.py
-      - --api
-
-    # command:
-    #   - python
-    #   - -m
-    #   - streamlit
-    #   - run
-    #   - app/app_st.py
-    #   - --server.address=0.0.0.0
-    #   - --server.port=8501
-    #   - --server.headless=true
-    #   - --browser.gatherUsageStats=false
+      - -m
+      - streamlit
+      - run
+      - app/app_st.py
+      - --server.address=0.0.0.0
+      - --server.port=8501
+      - --server.headless=true
+      - --browser.gatherUsageStats=false
 
     env_file:
       - ./app/.env
@@ -106,16 +104,21 @@ services:
     environment:
       PYTHONPATH: /workspace/app
 
-      # Inside the UI container, localhost would refer to the UI itself.
+      # The UI must call the API by its Docker service name.
       SOORIN_API_BASE_URL: http://api:6998
       SOORIN_COPILOT_API_URL: http://api:6998
+
+      # Keep internal Streamlit configuration consistent with the command.
+      STREAMLIT_SERVER_ADDRESS: 0.0.0.0
+      STREAMLIT_SERVER_PORT: "8501"
+      STREAMLIT_SERVER_HEADLESS: "true"
+      STREAMLIT_BROWSER_GATHER_USAGE_STATS: "false"
 
     ports:
       - "${SOORIN_UI_BIND_IP:-127.0.0.1}:${SOORIN_UI_PORT:-8501}:8501"
 
     volumes:
-      # Keep this shared because the current Streamlit topology UI may
-      # directly read generated graph artifacts.
+      # Shared because the current topology UI may directly read graph artifacts.
       - copilot-data:/workspace/data
       - copilot-cache:/home/soorin/.cache
 
