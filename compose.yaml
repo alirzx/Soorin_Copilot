@@ -84,21 +84,21 @@ services:
     image: soorin-copilot:${SOORIN_IMAGE_TAG:-local}
     container_name: soorin-copilot-ui
 
-# command:
-#   - python
-#   - app/run.py
-#   - --api
-
     command:
       - python
-      - -m
-      - streamlit
-      - run
-      - app/app_st.py
-      - --server.address=0.0.0.0
-      - --server.port=8501
-      - --server.headless=true
-      - --browser.gatherUsageStats=false
+      - app/run.py
+      - --api
+
+    # command:
+    #   - python
+    #   - -m
+    #   - streamlit
+    #   - run
+    #   - app/app_st.py
+    #   - --server.address=0.0.0.0
+    #   - --server.port=8501
+    #   - --server.headless=true
+    #   - --browser.gatherUsageStats=false
 
     env_file:
       - ./app/.env
