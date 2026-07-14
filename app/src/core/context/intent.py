@@ -638,6 +638,7 @@ class GLMIntentRouter:
                     top_p=self.settings.intent_router_top_p,
                     timeout_seconds=self.settings.intent_router_timeout_seconds,
                     purpose="intent_router",
+                    transient_retries=0,
                 )
             except LLMError as exc:
                 last_error = "provider_error"

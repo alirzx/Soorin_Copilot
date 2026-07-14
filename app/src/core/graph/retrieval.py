@@ -52,10 +52,12 @@ def _empty_result(spec: GraphRetrievalSpec, target_ip: str, *, node_found: bool)
         "candidate_node_count": 0,
         "retrieved_node_count": 0,
         "returned_node_count": 0,
+        "included_node_count": 0,
         "context_node_count": 0,
         "candidate_edge_count": 0,
         "retrieved_edge_count": 0,
         "returned_edge_count": 0,
+        "included_edge_count": 0,
         "context_edge_count": 0,
         "nodes": [],
         "edges": [],
@@ -191,10 +193,12 @@ def _neighbor_context(graph: nx.DiGraph, spec: GraphRetrievalSpec, settings: Set
         "candidate_node_count": len(all_candidate_nodes),
         "retrieved_node_count": len(retrieved_nodes),
         "returned_node_count": len(retrieved_nodes),
+        "included_node_count": 0,
         "context_node_count": 0,
         "candidate_edge_count": len(candidate_edges),
         "retrieved_edge_count": len(retrieved_edges),
         "returned_edge_count": len(retrieved_edges),
+        "included_edge_count": 0,
         "context_edge_count": 0,
         "nodes": [
             _node_dict(
@@ -227,8 +231,9 @@ def _two_hop_context(graph: nx.DiGraph, spec: GraphRetrievalSpec, settings: Sett
     hops = {target: 0}
     queue: deque[tuple[str, int]] = deque([(target, 0)])
     edges: list[dict[str, object]] = []
-    candidate_node_count = 1
-    candidate_edge_count = 0
+    candidate_nodes = {target}
+    candidate_edge_keys: set[tuple[str, str]] = set()
+    eligible_edge_count = 0
 
     while queue:
         node, hop = queue.popleft()
@@ -240,25 +245,31 @@ def _two_hop_context(graph: nx.DiGraph, spec: GraphRetrievalSpec, settings: Sett
         if spec.direction in {"outbound", "both"}:
             next_nodes.extend((node, peer) for peer in sorted(graph.successors(node)))
         for src, dst in next_nodes:
-            candidate_edge_count += 1
+            edge_key = (src, dst)
+            if edge_key in candidate_edge_keys:
+                continue
+            candidate_edge_keys.add(edge_key)
             peer = dst if src == node else src
-            if peer not in seen:
-                candidate_node_count += 1
-            if len(edges) < settings.graph_max_edges:
-                edges.append(_edge_dict(src, dst, graph))
+            candidate_nodes.add(peer)
             if peer not in seen and len(seen) < settings.graph_two_hop_max_nodes:
                 seen.add(peer)
                 hops[peer] = hop + 1
                 queue.append((peer, hop + 1))
+            if src in seen and dst in seen:
+                eligible_edge_count += 1
+                if len(edges) < settings.graph_max_edges:
+                    edges.append(_edge_dict(src, dst, graph))
 
     inbound_all = sorted(graph.predecessors(target))
     outbound_all = sorted(graph.successors(target))
     bidirectional_all = sorted(set(inbound_all).intersection(outbound_all))
     retrieval_reasons = []
+    candidate_node_count = len(candidate_nodes)
+    candidate_edge_count = len(candidate_edge_keys)
     if candidate_node_count > settings.graph_two_hop_max_nodes:
         retrieval_reasons.append(_reason("node_limit", settings.graph_two_hop_max_nodes, candidate_node_count, len(seen)))
-    if candidate_edge_count > settings.graph_max_edges:
-        retrieval_reasons.append(_reason("edge_limit", settings.graph_max_edges, candidate_edge_count, len(edges)))
+    if eligible_edge_count > settings.graph_max_edges:
+        retrieval_reasons.append(_reason("edge_limit", settings.graph_max_edges, eligible_edge_count, len(edges)))
     retrieval_truncated = bool(retrieval_reasons)
     retrieval_reason = _reason_string(retrieval_reasons)
 
@@ -283,10 +294,12 @@ def _two_hop_context(graph: nx.DiGraph, spec: GraphRetrievalSpec, settings: Sett
         "candidate_node_count": candidate_node_count,
         "retrieved_node_count": len(seen),
         "returned_node_count": len(seen),
+        "included_node_count": 0,
         "context_node_count": 0,
         "candidate_edge_count": candidate_edge_count,
         "retrieved_edge_count": len(edges),
         "returned_edge_count": len(edges),
+        "included_edge_count": 0,
         "context_edge_count": 0,
         "nodes": [
             _node_dict(
@@ -333,15 +346,18 @@ def _path_context(graph: nx.DiGraph, spec: GraphRetrievalSpec, settings: Setting
     if source not in graph or target not in graph:
         return base
     try:
-        path_nodes = nx.shortest_path(graph, source=source, target=target)
+        candidate_path_nodes = nx.shortest_path(graph, source=source, target=target)
     except (nx.NetworkXNoPath, nx.NodeNotFound):
         base.update({"node_found": True})
         return base
-    if len(path_nodes) - 1 > settings.graph_max_path_length:
-        path_nodes = path_nodes[: settings.graph_max_path_length + 1]
+    candidate_node_count = len(candidate_path_nodes)
+    candidate_edge_count = max(0, candidate_node_count - 1)
+    if candidate_edge_count > settings.graph_max_path_length:
+        path_nodes = candidate_path_nodes[: settings.graph_max_path_length + 1]
         truncated = True
         truncation_reason = f"path_length_limit:{settings.graph_max_path_length}"
     else:
+        path_nodes = candidate_path_nodes
         truncated = False
         truncation_reason = None
     path_edges = [_edge_dict(path_nodes[i], path_nodes[i + 1], graph) for i in range(len(path_nodes) - 1)]
@@ -356,18 +372,20 @@ def _path_context(graph: nx.DiGraph, spec: GraphRetrievalSpec, settings: Setting
             "path_nodes": path_nodes,
             "path_edges": path_edges,
             "hop_count": len(path_nodes) - 1,
-            "candidate_node_count": len(path_nodes),
+            "candidate_node_count": candidate_node_count,
             "retrieved_node_count": len(path_nodes),
             "returned_node_count": len(path_nodes),
+            "included_node_count": 0,
             "context_node_count": 0,
-            "candidate_edge_count": len(path_edges),
+            "candidate_edge_count": candidate_edge_count,
             "retrieved_edge_count": len(path_edges),
             "returned_edge_count": len(path_edges),
+            "included_edge_count": 0,
             "context_edge_count": 0,
             "nodes": [_node_dict(node, target=source, hop=index) for index, node in enumerate(path_nodes)],
             "edges": path_edges,
             "retrieval_truncated": truncated,
-            "retrieval_truncation_reasons": [_reason("path_length_limit", settings.graph_max_path_length, len(path_nodes), len(path_nodes))] if truncated else [],
+            "retrieval_truncation_reasons": [_reason("path_length_limit", settings.graph_max_path_length, candidate_node_count, len(path_nodes))] if truncated else [],
             "retrieval_truncation_reason": truncation_reason,
             "context_truncated": False,
             "context_truncation_reason": None,
@@ -420,10 +438,12 @@ def _relationship_context(graph: nx.DiGraph, spec: GraphRetrievalSpec) -> dict[s
         "candidate_node_count": 2,
         "retrieved_node_count": int(source_present) + int(target_present),
         "returned_node_count": int(source_present) + int(target_present),
+        "included_node_count": 0,
         "context_node_count": 0,
         "candidate_edge_count": int(forward_edge) + int(reverse_edge),
         "retrieved_edge_count": len(edges),
         "returned_edge_count": len(edges),
+        "included_edge_count": 0,
         "context_edge_count": 0,
         "nodes": [_node_dict(node, target=source, hop=0 if node == source else 1) for node in (source, target) if node in graph],
         "edges": edges,
@@ -554,10 +574,12 @@ def _comparison_context(graph: nx.DiGraph, spec: GraphRetrievalSpec, settings: S
         "candidate_node_count": 2 + len(shared),
         "retrieved_node_count": len(nodes),
         "returned_node_count": len(nodes),
+        "included_node_count": 0,
         "context_node_count": 0,
         "candidate_edge_count": len(edges),
         "retrieved_edge_count": len(edges),
         "returned_edge_count": len(edges),
+        "included_edge_count": 0,
         "context_edge_count": 0,
         "nodes": nodes,
         "edges": edges,

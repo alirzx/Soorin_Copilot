@@ -895,6 +895,90 @@ class LLMPrimaryRouterTests(unittest.TestCase):
         self.assertLess(len(ROUTER_SYSTEM_PROMPT_FALLBACK), 400)
 
 
+class DeterministicFallbackPolicyTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.router = DeterministicFallbackRouter()
+        self.resolver = EntityResolver()
+
+    def test_explicit_combined_provider_request_uses_graph_and_detection(self) -> None:
+        message = "Analyze 192.168.20.149 using both detection and graph evidence."
+        route = self.router.route(message, self.resolver.resolve(message), fallback_reason="provider_error")
+
+        self.assertTrue(route.use_graph)
+        self.assertTrue(route.use_detection)
+        self.assertEqual(route.intent, "asset_investigation")
+        self.assertEqual(route.matched_signals, ["combined_provider_request"])
+
+    def test_entity_bound_anomaly_network_request_is_graph_aware(self) -> None:
+        state = SessionRoutingState(
+            active_ip="192.168.20.149",
+            last_provider="graph",
+            previous_intent="asset_investigation",
+            previous_scope="node_summary",
+            previous_direction="both",
+            previous_depth=0,
+        )
+        message = "get anomaly network for this asset"
+        entities = self.resolver.resolve(message, {"selected_ip": "192.168.20.149"}, state)
+        route = self.router.route(message, entities, state, fallback_reason="provider_error")
+
+        self.assertNotEqual(route.intent, "general_knowledge")
+        self.assertTrue(route.use_graph)
+        self.assertFalse(route.use_detection)
+        self.assertIn(route.matched_signals[0], {"graph_topology", "security_or_anomaly"})
+        self.assertIn("security_or_anomaly", route.matched_signals)
+
+    def test_graph_only_inbound_request_uses_graph(self) -> None:
+        state = SessionRoutingState(active_ip="192.168.20.149")
+        message = "show inbound connections for this asset"
+        entities = self.resolver.resolve(message, None, state)
+        route = self.router.route(message, entities, state, fallback_reason="provider_error")
+
+        self.assertTrue(route.use_graph)
+        self.assertFalse(route.use_detection)
+        self.assertEqual(route.direction, "inbound")
+
+    def test_general_knowledge_without_entity_uses_no_live_provider(self) -> None:
+        message = "What is defense in depth?"
+        route = self.router.route(message, self.resolver.resolve(message), fallback_reason="provider_error")
+
+        self.assertEqual(route.intent, "general_knowledge")
+        self.assertFalse(route.use_graph)
+        self.assertFalse(route.use_detection)
+
+    def test_entity_followup_inherits_previous_operational_route(self) -> None:
+        state = SessionRoutingState(
+            active_ip="192.168.20.149",
+            last_provider="graph",
+            previous_intent="graph_neighbors",
+            previous_scope="one_hop",
+            previous_direction="outbound",
+            previous_depth=1,
+        )
+        message = "What else about it?"
+        entities = self.resolver.resolve(message, None, state)
+        route = self.router.route(message, entities, state, fallback_reason="provider_error")
+
+        self.assertTrue(route.use_graph)
+        self.assertEqual(route.scope, "one_hop")
+        self.assertEqual(route.matched_signals, ["previous_operational_route"])
+
+    def test_explicit_topic_detachment_does_not_inherit_asset_route(self) -> None:
+        state = SessionRoutingState(
+            active_ip="192.168.20.149",
+            last_provider="graph",
+            previous_intent="asset_investigation",
+            previous_scope="node_summary",
+        )
+        message = "Explain phishing in general."
+        entities = self.resolver.resolve(message, None, state)
+        route = self.router.route(message, entities, state, fallback_reason="provider_error")
+
+        self.assertFalse(route.use_graph)
+        self.assertFalse(route.use_detection)
+        self.assertEqual(route.reason, "fallback_topic_detachment")
+
+
 class TopologyGraphSelectionTests(unittest.TestCase):
     def setUp(self) -> None:
         self.graph = nx.DiGraph()
@@ -1073,10 +1157,54 @@ class GraphRetrievalTests(unittest.TestCase):
         self.assertIn("bidirectional_returned", result.context)
         self.assertEqual(result.context["context_node_count"], 1)
         self.assertEqual(result.context["context_edge_count"], 0)
+        self.assertEqual(result.context["included_node_count"], 1)
+        self.assertEqual(result.context["included_edge_count"], 0)
+        self.assertEqual(result.context["context_mode"], "aggregate_only")
+        self.assertTrue(result.context["aggregate_only_context"])
+        self.assertFalse(result.context["context_truncated"])
+        self.assertIsNone(result.context["context_truncation_reason"])
         self.assertEqual(result.context["inbound_context_included"], 0)
         self.assertEqual(result.context["outbound_context_included"], 0)
         self.assertEqual(result.context["bidirectional_context_included"], 0)
         self.assertIn("model_context_included=0", text)
+
+    def test_single_node_zero_edge_context_preserves_counter_invariants(self) -> None:
+        context = {
+            "target_ip": "10.0.0.1",
+            "node_found": True,
+            "scope": "node_summary",
+            "direction": "both",
+            "candidate_node_count": 1,
+            "retrieved_node_count": 1,
+            "candidate_edge_count": 0,
+            "retrieved_edge_count": 0,
+            "nodes": [{"id": "10.0.0.1", "hop": 0}],
+            "edges": [],
+        }
+        graph_result = GraphProviderResult(provider="graph", status="available", context=context)
+
+        ContextComposer(make_settings()).compose(
+            CopilotContextPackage(entities=EntityResolver().resolve("10.0.0.1"), graph=graph_result)
+        )
+
+        self.assertEqual(context["included_node_count"], 1)
+        self.assertEqual(context["included_edge_count"], 0)
+        self.assertFalse(context["context_truncated"])
+
+    def test_security_fallback_graph_context_discloses_missing_anomaly_provider(self) -> None:
+        route = replace(
+            self.route("node_summary", "both", 0),
+            matched_signals=["security_or_anomaly"],
+        )
+        result = self.provider.provide(self.entity, route=route)
+
+        text = ContextComposer(self.settings).compose(
+            CopilotContextPackage(entities=EntityResolver().resolve(self.entity.value), graph=result)
+        )
+
+        self.assertFalse(result.context["formal_anomaly_evidence_available"])
+        self.assertTrue(result.context["graph_structural_analysis_available"])
+        self.assertIn("Formal anomaly evidence: unavailable", text)
 
     def test_subnet_formatter_returns_canonical_cidr(self) -> None:
         self.assertEqual(get_subnet("192.168.0.149"), "192.168.0.0/24")
@@ -1281,7 +1409,100 @@ class GraphRetrievalTests(unittest.TestCase):
             make_settings(graph_two_hop_max_nodes=4, graph_max_edges=3),
         )
         reason_types = [reason["type"] for reason in combined["retrieval_truncation_reasons"]]
-        self.assertEqual(reason_types, ["node_limit", "edge_limit"])
+        self.assertEqual(reason_types, ["node_limit"])
+
+    def test_five_nodes_and_five_edges_below_context_limits_are_not_truncated(self) -> None:
+        nodes = [{"id": f"10.0.0.{index}", "hop": index} for index in range(1, 6)]
+        edges = [
+            {"source": f"10.0.0.{index}", "target": f"10.0.0.{index + 1}"}
+            for index in range(1, 5)
+        ]
+        edges.append({"source": "10.0.0.5", "target": "10.0.0.1"})
+        context = {
+            "target_ip": "10.0.0.1",
+            "node_found": True,
+            "scope": "one_hop",
+            "direction": "both",
+            "candidate_node_count": 5,
+            "retrieved_node_count": 5,
+            "candidate_edge_count": 5,
+            "retrieved_edge_count": 5,
+            "nodes": nodes,
+            "edges": edges,
+        }
+        graph_result = GraphProviderResult(
+            provider="graph",
+            status="available",
+            target_entity=ResolvedEntity(type="ip", value="10.0.0.1", source="message"),
+            context=context,
+        )
+
+        ContextComposer(make_settings(graph_context_max_enumerated_nodes=10, graph_context_max_enumerated_edges=10)).compose(
+            CopilotContextPackage(entities=EntityResolver().resolve("10.0.0.1"), graph=graph_result)
+        )
+
+        self.assertEqual(context["included_node_count"], 5)
+        self.assertEqual(context["included_edge_count"], 5)
+        self.assertFalse(context["context_truncated"])
+        self.assertIsNone(context["context_truncation_reason"])
+
+    def test_context_limits_remove_records_and_preserve_counter_invariants(self) -> None:
+        nodes = [{"id": f"10.0.0.{index}", "hop": index} for index in range(1, 7)]
+        edges = [
+            {"source": "10.0.0.1", "target": f"10.0.0.{index}"}
+            for index in range(2, 7)
+        ]
+        context = {
+            "target_ip": "10.0.0.1",
+            "node_found": True,
+            "scope": "one_hop",
+            "direction": "outbound",
+            "candidate_node_count": 6,
+            "retrieved_node_count": 6,
+            "candidate_edge_count": 5,
+            "retrieved_edge_count": 5,
+            "nodes": nodes,
+            "edges": edges,
+        }
+        graph_result = GraphProviderResult(provider="graph", status="available", context=context)
+
+        ContextComposer(make_settings(graph_context_max_enumerated_nodes=4, graph_context_max_enumerated_edges=2)).compose(
+            CopilotContextPackage(entities=EntityResolver().resolve("10.0.0.1"), graph=graph_result)
+        )
+
+        self.assertLessEqual(context["included_node_count"], context["retrieved_node_count"])
+        self.assertLessEqual(context["retrieved_node_count"], context["candidate_node_count"])
+        self.assertLessEqual(context["included_edge_count"], context["retrieved_edge_count"])
+        self.assertLessEqual(context["retrieved_edge_count"], context["candidate_edge_count"])
+        self.assertTrue(context["context_truncated"])
+        self.assertIn("graph_context_node_limit", context["context_truncation_reasons"])
+        self.assertIn("graph_context_edge_limit", context["context_truncation_reasons"])
+
+    def test_edges_with_excluded_endpoint_are_not_counted_as_included(self) -> None:
+        context = {
+            "target_ip": "10.0.0.1",
+            "node_found": True,
+            "scope": "one_hop",
+            "direction": "outbound",
+            "candidate_node_count": 3,
+            "retrieved_node_count": 3,
+            "candidate_edge_count": 2,
+            "retrieved_edge_count": 2,
+            "nodes": [{"id": "10.0.0.1"}, {"id": "10.0.0.2"}, {"id": "10.0.0.3"}],
+            "edges": [
+                {"source": "10.0.0.1", "target": "10.0.0.2"},
+                {"source": "10.0.0.1", "target": "10.0.0.3"},
+            ],
+        }
+        result = GraphProviderResult(provider="graph", status="available", context=context)
+
+        ContextComposer(make_settings(graph_context_max_enumerated_nodes=2, graph_context_max_enumerated_edges=10)).compose(
+            CopilotContextPackage(entities=EntityResolver().resolve("10.0.0.1"), graph=result)
+        )
+
+        self.assertEqual(context["included_node_count"], 2)
+        self.assertEqual(context["included_edge_count"], 1)
+        self.assertEqual(context["context_truncation_reasons"], ["graph_context_node_limit"])
 
     def test_no_truncation_below_limits(self) -> None:
         graph = nx.DiGraph()

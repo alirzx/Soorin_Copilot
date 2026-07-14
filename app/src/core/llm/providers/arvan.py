@@ -7,6 +7,7 @@ import time
 from typing import Any
 
 import requests
+from urllib3.exceptions import ProtocolError
 
 from src.config.settings import Settings
 from src.core.context.models import approx_tokens
@@ -15,6 +16,16 @@ from src.core.llm.providers.base import LLMProviderResult
 
 
 logger = logging.getLogger(__name__)
+
+RETRYABLE_HTTP_STATUS_CODES = {429, 502, 503, 504}
+RETRYABLE_REQUEST_EXCEPTIONS = (
+    requests.exceptions.ConnectTimeout,
+    requests.exceptions.ReadTimeout,
+    requests.exceptions.ConnectionError,
+    requests.exceptions.ChunkedEncodingError,
+    ProtocolError,
+)
+PROVIDER_REQUEST_EXCEPTIONS = (requests.exceptions.RequestException, ProtocolError)
 
 
 class ArvanProvider:
@@ -97,14 +108,22 @@ class ArvanProvider:
         started = time.perf_counter()
         try:
             response = requests.post(self.endpoint, json=payload, headers=headers, timeout=timeout)
-        except requests.RequestException as exc:
-            logger.exception(
-                "event=provider_request_exception request_id=%s provider=%s model=%s",
+        except PROVIDER_REQUEST_EXCEPTIONS as exc:
+            retryable = isinstance(exc, RETRYABLE_REQUEST_EXCEPTIONS)
+            logger.warning(
+                "event=provider_request_exception request_id=%s provider=%s model=%s purpose=%s error_type=%s retryable=%s",
                 request_id,
                 self.provider_name,
                 self.settings.arvan_model,
+                purpose,
+                type(exc).__name__,
+                retryable,
             )
-            raise LLMError("Arvan request failed.", reason="provider_request_failed") from exc
+            raise LLMError(
+                "Arvan request failed.",
+                reason="provider_transport_error",
+                details={"error_type": type(exc).__name__, "retryable": retryable},
+            ) from exc
 
         latency_ms = int((time.perf_counter() - started) * 1000)
         logger.info(
@@ -118,17 +137,23 @@ class ArvanProvider:
         )
         if response.status_code >= 400:
             logger.warning(
-                "event=provider_http_error request_id=%s provider=%s model=%s status_code=%s latency_ms=%s",
+                "event=provider_http_error request_id=%s provider=%s model=%s status_code=%s latency_ms=%s retryable=%s",
                 request_id,
                 self.provider_name,
                 self.settings.arvan_model,
                 response.status_code,
                 latency_ms,
+                response.status_code in RETRYABLE_HTTP_STATUS_CODES,
             )
+            retryable = response.status_code in RETRYABLE_HTTP_STATUS_CODES
             raise LLMError(
                 "Arvan provider returned an error.",
                 reason="provider_http_error",
-                details={"status_code": response.status_code},
+                details={
+                    "status_code": response.status_code,
+                    "error_type": f"HTTP_{response.status_code}",
+                    "retryable": retryable,
+                },
             )
 
         try:

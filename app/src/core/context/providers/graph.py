@@ -91,6 +91,17 @@ class GraphContextProvider:
                 latency_ms=latency_ms,
             )
 
+        if route and "security_or_anomaly" in route.matched_signals:
+            context["formal_anomaly_evidence_available"] = False
+            context["graph_structural_analysis_available"] = True
+            limitations = list(context.get("limitations") or [])
+            anomaly_limitation = (
+                "No dedicated anomaly provider evidence is available; only bounded graph structural analysis is supplied."
+            )
+            if anomaly_limitation not in limitations:
+                limitations.append(anomaly_limitation)
+            context["limitations"] = limitations
+
         status = "available" if context.get("node_found") else "not_found"
         provenance = ProviderProvenance(source="observed_communication_graph", status=status)
         context_chars = len(str(context))

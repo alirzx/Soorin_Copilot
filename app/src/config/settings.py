@@ -72,6 +72,9 @@ class Settings:
     arvan_max_tokens: int
     arvan_temperature: float
     arvan_top_p: float
+    llm_max_transient_retries: int
+    llm_retry_base_delay_seconds: float
+    llm_retry_max_delay_seconds: float
     chat_max_tokens: int
     llm_context_window_tokens: int
     llm_reserved_output_tokens: int
@@ -173,6 +176,9 @@ def get_settings() -> Settings:
         arvan_max_tokens=_int("SOORIN_ARVAN_MAX_TOKENS", 12288),
         arvan_temperature=_float("SOORIN_ARVAN_TEMPERATURE", 0.2),
         arvan_top_p=_float("SOORIN_ARVAN_TOP_P", 0.9),
+        llm_max_transient_retries=_int("SOORIN_LLM_MAX_TRANSIENT_RETRIES", 1),
+        llm_retry_base_delay_seconds=_float("SOORIN_LLM_RETRY_BASE_DELAY_SECONDS", 0.25),
+        llm_retry_max_delay_seconds=_float("SOORIN_LLM_RETRY_MAX_DELAY_SECONDS", 1.0),
         chat_max_tokens=_int("SOORIN_CHAT_MAX_TOKENS", 4096),
         llm_context_window_tokens=_int("SOORIN_LLM_CONTEXT_WINDOW_TOKENS", 32768),
         llm_reserved_output_tokens=_int("SOORIN_LLM_RESERVED_OUTPUT_TOKENS", 12288),

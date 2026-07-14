@@ -81,11 +81,32 @@ class ContextComposer:
             return ""
 
         context = graph.context or {}
-        nodes, edges, context_truncated, truncation_reason = self._select_context_records(context)
+        nodes, edges, truncation_reasons = self._select_context_records(context)
+        context_truncated = bool(truncation_reasons)
+        truncation_reason = truncation_reasons[0] if truncation_reasons else None
+        retrieved_nodes = list(context.get("nodes") or [])
+        retrieved_edges = list(context.get("edges") or context.get("path_edges") or [])
+        retrieved_node_count = int(context.get("retrieved_node_count", len(retrieved_nodes)) or 0)
+        retrieved_edge_count = int(context.get("retrieved_edge_count", len(retrieved_edges)) or 0)
+        context["candidate_node_count"] = max(
+            int(context.get("candidate_node_count", retrieved_node_count) or 0),
+            retrieved_node_count,
+        )
+        context["candidate_edge_count"] = max(
+            int(context.get("candidate_edge_count", retrieved_edge_count) or 0),
+            retrieved_edge_count,
+        )
+        context["retrieved_node_count"] = retrieved_node_count
+        context["retrieved_edge_count"] = retrieved_edge_count
+        context["included_node_count"] = len(nodes)
+        context["included_edge_count"] = len(edges)
         context["context_node_count"] = len(nodes)
         context["context_edge_count"] = len(edges)
         context["context_truncated"] = context_truncated
+        context["context_truncation_reasons"] = truncation_reasons
         context["context_truncation_reason"] = truncation_reason
+        context["context_mode"] = "aggregate_only" if context.get("scope") == "node_summary" else "enumerated"
+        context["aggregate_only_context"] = context.get("scope") == "node_summary"
         direction_counts = self._included_direction_counts(nodes, context.get("target_ip", ""))
         context["inbound_context_included"] = direction_counts["inbound"]
         context["outbound_context_included"] = direction_counts["outbound"]
@@ -149,6 +170,7 @@ class ContextComposer:
                     f"Bidirectional peers: observed_total={context.get('bidirectional_total', 0)}, graph_retrieved={context.get('bidirectional_retrieved', context.get('bidirectional_returned', 0))}, model_context_included={context.get('bidirectional_context_included', 0)}",
                     f"Nodes: candidate={context.get('candidate_node_count', 0)}, graph_retrieved={context.get('retrieved_node_count', context.get('returned_node_count', 0))}, model_context_included={context.get('context_node_count', 0)}",
                     f"Edges: candidate={context.get('candidate_edge_count', 0)}, graph_retrieved={context.get('retrieved_edge_count', context.get('returned_edge_count', 0))}, model_context_included={context.get('context_edge_count', 0)}",
+                    f"Context mode: {context.get('context_mode', 'enumerated')}",
                     f"Peer subnet distribution in this prompt: {subnet_summary}",
                     f"Outbound subnets reached: {_list_values(list(context.get('subnets_reached') or []), limit=12)}",
                 ]
@@ -177,6 +199,9 @@ class ContextComposer:
                     lines.append("The full machine-readable graph retrieval result exists outside the model context.")
                 lines.append(f"Included node IDs: {_list_node_ids(nodes, limit=self.settings.graph_context_max_enumerated_nodes)}")
                 lines.append(f"Included edges: {_list_edges(edges, limit=self.settings.graph_context_max_enumerated_edges)}")
+            if context.get("formal_anomaly_evidence_available") is False:
+                lines.append("Formal anomaly evidence: unavailable; no dedicated anomaly provider was used.")
+                lines.append("Available analysis: bounded structural interpretation of the supplied graph evidence only.")
             if context.get("path_exists") is not None:
                 lines.append(f"Path exists: {bool(context.get('path_exists'))}; hop_count={context.get('hop_count')}")
             if context.get("retrieval_truncated"):
@@ -274,12 +299,20 @@ class ContextComposer:
         ]
         return "\n".join(lines)
 
-    def _select_context_records(self, context: dict[str, Any]) -> tuple[list[dict[str, object]], list[dict[str, object]], bool, str | None]:
+    def _select_context_records(
+        self,
+        context: dict[str, Any],
+    ) -> tuple[list[dict[str, object]], list[dict[str, object]], list[str]]:
         nodes = list(context.get("nodes") or [])
         edges = list(context.get("edges") or context.get("path_edges") or [])
         scope = str(context.get("scope", "node_summary"))
         direction = str(context.get("direction", "both"))
         peer_count = self._matching_peer_count(context, direction)
+        target_ip = str(context.get("target_ip") or "")
+
+        if scope == "node_summary":
+            selected_nodes = [node for node in nodes if str(node.get("id") or "") == target_ip][:1]
+            return selected_nodes, [], []
 
         node_limit = self.settings.graph_context_max_enumerated_nodes
         edge_limit = self.settings.graph_context_max_enumerated_edges
@@ -289,35 +322,51 @@ class ContextComposer:
         if scope == "path":
             node_limit = max(node_limit, len(nodes))
             edge_limit = max(edge_limit, len(edges))
-        if scope == "node_summary":
-            node_limit = min(node_limit, 1)
-            edge_limit = 0
-
-        if scope == "node_summary":
-            target_ip = str(context.get("target_ip") or "")
-            selected_nodes = [node for node in nodes if str(node.get("id") or "") == target_ip][:1]
-        else:
-            selected_nodes = nodes[:node_limit]
+        ordered_nodes = nodes
+        if target_ip:
+            ordered_nodes = [
+                *[node for node in nodes if str(node.get("id") or "") == target_ip],
+                *[node for node in nodes if str(node.get("id") or "") != target_ip],
+            ]
+        selected_nodes = ordered_nodes[:node_limit]
         selected_node_ids = {str(node.get("id")) for node in selected_nodes if node.get("id")}
-        selected_edges = [
+        eligible_edges = [
             edge for edge in edges
-            if not selected_node_ids or (str(edge.get("source")) in selected_node_ids and str(edge.get("target")) in selected_node_ids)
-        ][:edge_limit]
+            if selected_node_ids
+            and str(edge.get("source")) in selected_node_ids
+            and str(edge.get("target")) in selected_node_ids
+        ]
+        selected_edges = eligible_edges[:edge_limit]
+        truncation_reasons: list[str] = []
+        if len(selected_nodes) < len(nodes):
+            truncation_reasons.append("graph_context_node_limit")
+        if len(selected_edges) < len(eligible_edges):
+            truncation_reasons.append("graph_context_edge_limit")
 
-        text_probe = "\n".join(
-            [
+        def probe_tokens() -> int:
+            text_probe = "\n".join([
                 _list_node_ids(selected_nodes, limit=len(selected_nodes) or 1),
                 _list_edges(selected_edges, limit=len(selected_edges) or 1),
-            ]
-        )
+            ])
+            return approx_tokens(text_probe)
+
         context_token_budget = max(256, min(self.settings.graph_max_context_tokens, self._available_graph_context_tokens()))
-        truncated = len(selected_nodes) < len(nodes) or len(selected_edges) < len(edges) or approx_tokens(text_probe) > context_token_budget
-        reason = "graph_context_token_budget" if truncated else None
-        if len(selected_nodes) < len(nodes):
-            reason = "graph_context_node_limit"
-        if len(selected_edges) < len(edges):
-            reason = "graph_context_edge_limit"
-        return selected_nodes, selected_edges, truncated, reason
+        token_records_removed = False
+        while selected_edges and probe_tokens() > context_token_budget:
+            selected_edges.pop()
+            token_records_removed = True
+        while len(selected_nodes) > 1 and probe_tokens() > context_token_budget:
+            selected_nodes.pop()
+            selected_node_ids = {str(node.get("id")) for node in selected_nodes if node.get("id")}
+            selected_edges = [
+                edge
+                for edge in selected_edges
+                if str(edge.get("source")) in selected_node_ids and str(edge.get("target")) in selected_node_ids
+            ]
+            token_records_removed = True
+        if token_records_removed:
+            truncation_reasons.append("graph_context_token_budget")
+        return selected_nodes, selected_edges, truncation_reasons
 
     def _available_graph_context_tokens(self) -> int:
         return (
