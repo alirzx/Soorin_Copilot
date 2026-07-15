@@ -245,11 +245,21 @@ class ProductAssetDetectionClientTests(unittest.TestCase):
             client.get_asset_detection("999.999.999.999")
         self.assertEqual(session.calls, [])
 
-    def test_non_retryable_4xx_raises_typed_http_error(self) -> None:
+    def test_detection_404_returns_typed_not_found_payload(self) -> None:
+        session = FakeSession([FakeResponse(404, {"error": "missing"})])
+        client = self.client(session)
+
+        response = client.get_asset_detection("192.168.21.1", request_id="missing-asset")
+
+        self.assertEqual(response.ip, "192.168.21.1")
+        self.assertFalse(response.asset_found)
+        self.assertEqual(len(session.calls), 1)
+
+    def test_unrelated_404_retains_typed_http_error(self) -> None:
         session = FakeSession([FakeResponse(404, {"error": "missing"})])
         client = self.client(session)
         with self.assertRaises(ProductApiHTTPError) as caught:
-            client.get_asset_detection("192.168.21.1")
+            client.get_json("/unknown-endpoint")
         self.assertEqual(caught.exception.status_code, 404)
         self.assertEqual(len(session.calls), 1)
 

@@ -130,6 +130,14 @@ class DetectionContextProvider:
         rendered = self._render(evidence, detail)
         status = "not_found" if evidence.found is False else "available"
         latency_ms = int((time.perf_counter() - started) * 1000)
+        if status == "not_found":
+            logger.info(
+                "event=detection_not_found request_id=%s session_id=%s ip=%s source=product_asset_detection latency_ms=%s",
+                request_id,
+                session_id,
+                normalized_ip,
+                latency_ms,
+            )
         logger.info(
             "event=detection_provider_completed request_id=%s status=%s asset_found=%s detail=%s matched_rules=%s conflicts=%s context_chars=%s context_approx_tokens=%s latency_ms=%s",
             request_id,
@@ -148,6 +156,7 @@ class DetectionContextProvider:
             ip=normalized_ip,
             evidence=evidence,
             rendered_context=rendered,
+            limitations=evidence.limitations,
             cache_hit=False,
             cache_age_seconds=0,
             stale=False,
@@ -185,6 +194,7 @@ class DetectionContextProvider:
             status="unavailable",
             detail=detail,
             ip=ip,
+            limitations=["Detection evidence was unavailable for this request."],
             latency_ms=int((time.perf_counter() - started) * 1000),
             error_type=error_type,
             safe_error=safe_error,
@@ -198,6 +208,7 @@ class DetectionContextProvider:
         ip: str,
         evidence: AssetDetectionEvidence | None = None,
         rendered_context: str = "",
+        limitations: list[str] | None = None,
         cache_hit: bool = False,
         cache_age_seconds: int | None = None,
         stale: bool = False,
@@ -213,6 +224,7 @@ class DetectionContextProvider:
             evidence=evidence,
             rendered_context=rendered_context,
             provenance=ProviderProvenance(source="product_asset_detection", status=status),  # type: ignore[arg-type]
+            limitations=list(limitations or (evidence.limitations if evidence else [])),
             cache_hit=cache_hit,
             cache_age_seconds=cache_age_seconds,
             stale=stale,

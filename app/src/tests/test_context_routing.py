@@ -15,7 +15,13 @@ import networkx as nx
 from src.config.settings import get_settings
 from src.core.context.composer import ContextComposer
 from src.core.context.entities import EntityResolver
-from src.core.context.intent import GLMIntentRouter, ROUTER_SYSTEM_PROMPT_FALLBACK, validate_router_payload
+from src.core.context.intent import (
+    GLMIntentRouter,
+    ROUTER_SYSTEM_PROMPT_FALLBACK,
+    _extract_first_json_object,
+    _json_from_text,
+    validate_router_payload,
+)
 from src.core.context.models import CopilotContextPackage, GraphProviderResult, ProviderProvenance, ResolvedEntity
 from src.core.context.providers.graph import GraphContextProvider
 from src.core.context.router import DeterministicFallbackRouter, normalize_intent_route
@@ -58,8 +64,20 @@ class FakeProductClient:
         return self.response
 
 
-def fake_result(text: str, *, finish_reason: str | None = "stop") -> LLMProviderResult:
-    return LLMProviderResult(text=text, provider="fake", model="fake", finish_reason=finish_reason, status_code=200)
+def fake_result(
+    text: str,
+    *,
+    finish_reason: str | None = "stop",
+    usage: dict[str, int] | None = None,
+) -> LLMProviderResult:
+    return LLMProviderResult(
+        text=text,
+        provider="fake",
+        model="fake",
+        finish_reason=finish_reason,
+        usage=usage or {},
+        status_code=200,
+    )
 
 
 def make_settings(**overrides):
@@ -349,6 +367,55 @@ class RouterSchemaTests(unittest.TestCase):
         self.assertTrue(route.use_graph)
         self.assertTrue(route.use_detection)
         self.assertEqual(route.detection_detail, "summary")
+
+    def test_combined_asset_scopes_preserve_graph_and_detection(self) -> None:
+        cases = [("node_summary", 0), ("full_neighbors", 1), ("two_hop", 2)]
+        for scope, depth in cases:
+            with self.subTest(scope=scope):
+                decision = validate_router_payload(
+                    self.payload(
+                        intent="asset_investigation",
+                        scope=scope,
+                        direction="both",
+                        depth=depth,
+                        requires_graph=True,
+                        requires_detection=True,
+                        detection_detail="summary",
+                    ),
+                    self.entities,
+                    min_confidence=0.65,
+                    message="Analyze this asset using all evidence.",
+                )
+                route = normalize_intent_route(decision, self.entities)
+                self.assertEqual(route.scope, scope)
+                self.assertEqual(route.depth, depth)
+                self.assertEqual(route.direction, "both")
+                self.assertTrue(route.use_graph)
+                self.assertTrue(route.use_detection)
+                self.assertEqual(route.detection_detail, "summary")
+
+    def test_combined_compact_full_normalizes_detail_without_removing_graph(self) -> None:
+        decision = validate_router_payload(
+            self.payload(
+                intent="asset_investigation",
+                scope="full_neighbors",
+                direction="both",
+                depth=1,
+                requires_graph=True,
+                requires_detection=True,
+                detection_detail="compact_full",
+            ),
+            self.entities,
+            min_confidence=0.65,
+            message="Show conflicts for this combined assessment.",
+        )
+        route = normalize_intent_route(decision, self.entities)
+        self.assertEqual(route.scope, "full_neighbors")
+        self.assertEqual(route.depth, 1)
+        self.assertTrue(route.use_graph)
+        self.assertTrue(route.use_detection)
+        self.assertEqual(route.detection_detail, "summary")
+        self.assertEqual(decision.route_normalization_reason, "combined_route_detection_detail_normalized")
 
     def test_general_knowledge_requests_no_providers(self) -> None:
         decision = validate_router_payload(
@@ -820,6 +887,35 @@ class RouterSchemaTests(unittest.TestCase):
             )
 
 
+class RouterJSONExtractionTests(unittest.TestCase):
+    def test_extracts_pure_fenced_and_surrounded_json(self) -> None:
+        expected = {"intent": "general_knowledge", "reason": "ok"}
+        cases = [
+            '{"intent":"general_knowledge","reason":"ok"}',
+            '```json\n{"intent":"general_knowledge","reason":"ok"}\n```',
+            'Here is the route: {"intent":"general_knowledge","reason":"ok"}',
+            '{"intent":"general_knowledge","reason":"ok"} trailing prose',
+        ]
+        for content in cases:
+            with self.subTest(content=content):
+                self.assertEqual(_json_from_text(content), expected)
+
+    def test_balancing_ignores_braces_and_escaped_quotes_inside_strings(self) -> None:
+        content = 'prefix {"reason":"literal { brace } and \\"quoted\\" text","intent":"unclear"} suffix'
+        payload = _json_from_text(content)
+        self.assertEqual(payload["intent"], "unclear")
+        self.assertIn("{ brace }", payload["reason"])
+        self.assertIn('"quoted"', payload["reason"])
+
+    def test_unterminated_object_is_rejected(self) -> None:
+        with self.assertRaisesRegex(ValueError, "unbalanced_object"):
+            _extract_first_json_object('reason {"intent":"unclear"')
+
+    def test_only_first_of_two_objects_is_used(self) -> None:
+        payload = _json_from_text('{"intent":"general_knowledge"} {"intent":"graph_path"}')
+        self.assertEqual(payload["intent"], "general_knowledge")
+
+
 class LLMPrimaryRouterTests(unittest.TestCase):
     def setUp(self) -> None:
         self.settings = make_settings()
@@ -856,10 +952,12 @@ class LLMPrimaryRouterTests(unittest.TestCase):
         self.assertEqual(decision.retry_count, 1)
 
     def test_provider_error_and_low_confidence_fall_back(self) -> None:
-        router = GLMIntentRouter(self.settings, FakeLLMClient([LLMError("boom", reason="timeout")]))  # type: ignore[arg-type]
+        llm = FakeLLMClient([LLMError("boom", reason="timeout")])
+        router = GLMIntentRouter(self.settings, llm)  # type: ignore[arg-type]
         self.assertTrue(router.classify("x", self.entities, SessionRoutingState()).fallback_used)
+        self.assertEqual(len(llm.calls), 1)
         low = GLMIntentRouter(
-            self.settings,
+            make_settings(intent_router_retry_enabled=False),
             FakeLLMClient([fake_result('{"intent":"asset_investigation","scope":"node_summary","direction":"both","depth":0,"requires_graph":true,"requires_multiple_entities":false,"is_followup":false,"classification_confidence":0.2,"reason":"low"}')]),  # type: ignore[arg-type]
         )
         self.assertTrue(low.classify("x", self.entities, SessionRoutingState()).fallback_used)
@@ -870,6 +968,7 @@ class LLMPrimaryRouterTests(unittest.TestCase):
             intent_router_top_p=0.1,
             intent_router_max_tokens=77,
             intent_router_retry_max_tokens=155,
+            intent_router_timeout_seconds=13,
         )
         llm = FakeLLMClient([
             fake_result("", finish_reason="length"),
@@ -882,6 +981,110 @@ class LLMPrimaryRouterTests(unittest.TestCase):
         self.assertEqual(llm.calls[0]["top_p"], 0.1)
         self.assertEqual(llm.calls[0]["max_tokens"], 77)
         self.assertEqual(llm.calls[1]["max_tokens"], 155)
+        self.assertEqual(llm.calls[0]["timeout_seconds"], 13)
+        self.assertEqual(llm.calls[1]["timeout_seconds"], 13)
+        self.assertEqual(llm.calls[0]["transient_retries"], 0)
+        self.assertLess(len(llm.calls[1]["messages"][0]["content"]), len(router.system_prompt))
+
+    def test_invalid_enum_and_missing_fields_use_one_content_repair(self) -> None:
+        valid = (
+            '{"intent":"asset_investigation","scope":"node_summary","direction":"both","depth":0,'
+            '"requires_graph":true,"requires_multiple_entities":false,"is_followup":false,'
+            '"classification_confidence":0.9,"reason":"repaired"}'
+        )
+        invalid_outputs = [
+            valid.replace('"asset_investigation"', '"invalid_intent"'),
+            '{"intent":"asset_investigation"}',
+        ]
+        for invalid in invalid_outputs:
+            with self.subTest(invalid=invalid):
+                llm = FakeLLMClient([fake_result(invalid), fake_result(valid)])
+                router = GLMIntentRouter(self.settings, llm)  # type: ignore[arg-type]
+                decision = router.classify("Tell me about 192.168.30.115", self.entities, SessionRoutingState())
+                self.assertFalse(decision.fallback_used)
+                self.assertEqual(decision.retry_count, 1)
+                self.assertEqual(len(llm.calls), 2)
+
+    def test_repair_failure_uses_deterministic_fallback(self) -> None:
+        llm = FakeLLMClient([fake_result('{"intent":"invalid"}'), fake_result('{"scope":"still-invalid"}')])
+        router = GLMIntentRouter(self.settings, llm)  # type: ignore[arg-type]
+        decision = router.classify("Tell me about 192.168.30.115", self.entities, SessionRoutingState())
+        self.assertTrue(decision.fallback_used)
+        self.assertEqual(decision.retry_count, 1)
+        self.assertEqual(len(llm.calls), 2)
+
+    def test_router_logs_actual_completion_tokens(self) -> None:
+        valid = (
+            '{"intent":"asset_investigation","scope":"node_summary","direction":"both","depth":0,'
+            '"requires_graph":true,"requires_multiple_entities":false,"is_followup":false,'
+            '"classification_confidence":0.9,"reason":"ok"}'
+        )
+        router = GLMIntentRouter(
+            self.settings,
+            FakeLLMClient([fake_result(valid, usage={"completion_tokens": 37})]),  # type: ignore[arg-type]
+        )
+        with self.assertLogs("src.core.context.intent", level="INFO") as logs:
+            router.classify("Tell me about 192.168.30.115", self.entities, SessionRoutingState())
+        self.assertIn("completion_tokens=37", "\n".join(logs.output))
+
+    def test_exact_prompt_a_accepts_combined_node_summary_from_glm(self) -> None:
+        prompt = (
+            "this is one of our asset 192.168.0.125 , i want you analyze this deeply and give me analytical "
+            "report based on all evidence."
+        )
+        entities = EntityResolver().resolve(prompt)
+        payload = (
+            '{"intent":"asset_investigation","scope":"node_summary","direction":"both","depth":0,'
+            '"requires_graph":true,"requires_detection":true,"detection_detail":"summary",'
+            '"entity_binding":"explicit","requires_multiple_entities":false,"is_followup":false,'
+            '"classification_confidence":0.97,"reason":"combined analysis"}'
+        )
+        router = GLMIntentRouter(self.settings, FakeLLMClient([fake_result(payload)]))  # type: ignore[arg-type]
+
+        decision = router.classify(prompt, entities, SessionRoutingState())
+
+        self.assertEqual(decision.decision_source, "glm")
+        self.assertEqual(decision.scope, "node_summary")
+        self.assertTrue(decision.requires_graph)
+        self.assertTrue(decision.requires_detection)
+        self.assertEqual(decision.detection_detail, "summary")
+        self.assertEqual(decision.entity_binding, "explicit")
+
+    def test_exact_prompt_b_repair_preserves_combined_full_neighbors(self) -> None:
+        prompt = (
+            "now give me all of its connections ,its impacts on another assets ,and make complete your analysis , "
+            "at the end give me comprehensive analytical report based on all evidence."
+        )
+        state = SessionRoutingState(
+            active_ip="192.168.0.125",
+            last_provider="detection",
+            previous_intent="asset_investigation",
+            previous_scope="none",
+            previous_direction="none",
+            previous_depth=0,
+            previous_requires_detection=True,
+            previous_detection_detail="compact_full",
+        )
+        entities = EntityResolver().resolve(prompt, routing_state=state)
+        repaired = (
+            '{"intent":"asset_investigation","scope":"full_neighbors","direction":"both","depth":1,'
+            '"requires_graph":true,"requires_detection":true,"detection_detail":"summary",'
+            '"entity_binding":"active_single","requires_multiple_entities":false,"is_followup":true,'
+            '"classification_confidence":0.97,"reason":"combined follow-up"}'
+        )
+        llm = FakeLLMClient([fake_result('{"intent":"asset_investigation"', finish_reason="length"), fake_result(repaired)])
+        router = GLMIntentRouter(self.settings, llm)  # type: ignore[arg-type]
+
+        decision = router.classify(prompt, entities, state)
+
+        self.assertEqual(decision.decision_source, "glm")
+        self.assertEqual(decision.retry_count, 1)
+        self.assertEqual(decision.scope, "full_neighbors")
+        self.assertEqual(decision.depth, 1)
+        self.assertTrue(decision.requires_graph)
+        self.assertTrue(decision.requires_detection)
+        self.assertEqual(decision.detection_detail, "summary")
+        self.assertEqual(decision.entity_binding, "active_single")
 
     def test_router_prompt_loads_from_file_and_missing_file_falls_back(self) -> None:
         router = GLMIntentRouter(self.settings, FakeLLMClient([fake_result("{}")]))  # type: ignore[arg-type]
@@ -908,6 +1111,75 @@ class DeterministicFallbackPolicyTests(unittest.TestCase):
         self.assertTrue(route.use_detection)
         self.assertEqual(route.intent, "asset_investigation")
         self.assertEqual(route.matched_signals, ["combined_provider_request"])
+
+    def test_exact_prompt_a_fallback_uses_combined_node_summary(self) -> None:
+        message = (
+            "this is one of our asset 192.168.0.125 , i want you analyze this deeply and give me analytical "
+            "report based on all evidence."
+        )
+        route = self.router.route(message, self.resolver.resolve(message), fallback_reason="provider_error")
+        self.assertEqual(route.scope, "node_summary")
+        self.assertEqual(route.direction, "both")
+        self.assertEqual(route.depth, 0)
+        self.assertTrue(route.use_graph)
+        self.assertTrue(route.use_detection)
+        self.assertEqual(route.detection_detail, "summary")
+        self.assertEqual(route.entity_binding, "explicit")
+
+    def test_exact_prompt_b_fallback_uses_combined_full_neighbors(self) -> None:
+        message = (
+            "now give me all of its connections ,its impacts on another assets ,and make complete your analysis , "
+            "at the end give me comprehensive analytical report based on all evidence."
+        )
+        state = SessionRoutingState(
+            active_ip="192.168.0.125",
+            last_provider="detection",
+            previous_intent="asset_investigation",
+            previous_scope="none",
+            previous_direction="none",
+            previous_depth=0,
+            previous_requires_detection=True,
+            previous_detection_detail="compact_full",
+        )
+        route = self.router.route(
+            message,
+            self.resolver.resolve(message, routing_state=state),
+            state,
+            fallback_reason="provider_error",
+        )
+        self.assertEqual(route.scope, "full_neighbors")
+        self.assertEqual(route.direction, "both")
+        self.assertEqual(route.depth, 1)
+        self.assertTrue(route.use_graph)
+        self.assertTrue(route.use_detection)
+        self.assertEqual(route.detection_detail, "summary")
+        self.assertEqual(route.entity_binding, "active_single")
+
+    def test_explicit_graph_detail_phrases_map_to_full_and_two_hop(self) -> None:
+        cases = [
+            ("Show all direct connections for 192.168.0.125.", "full_neighbors", 1),
+            ("Show second-degree connections for 192.168.0.125.", "two_hop", 2),
+        ]
+        for message, scope, depth in cases:
+            with self.subTest(message=message):
+                entities = self.resolver.resolve(message)
+                route = self.router.route(message, entities, fallback_reason="provider_error")
+                self.assertEqual(route.scope, scope)
+                self.assertEqual(route.depth, depth)
+                self.assertTrue(route.use_graph)
+                self.assertFalse(route.use_detection)
+
+    def test_dependency_and_destination_phrases_set_direction(self) -> None:
+        cases = [
+            ("Which systems depend on 192.168.0.125?", "inbound"),
+            ("What destinations does 192.168.0.125 reach?", "outbound"),
+            ("Show connections for 192.168.0.125.", "both"),
+        ]
+        for message, direction in cases:
+            with self.subTest(message=message):
+                route = self.router.route(message, self.resolver.resolve(message), fallback_reason="provider_error")
+                self.assertTrue(route.use_graph)
+                self.assertEqual(route.direction, direction)
 
     def test_entity_bound_anomaly_network_request_is_graph_aware(self) -> None:
         state = SessionRoutingState(

@@ -46,6 +46,12 @@ DETECTION_COMPACT_WORDS = re.compile(
     r"\b(?:classified|classification|detect(?:ion|ed)?|evidence|rules?|matched\s+rules?|conflicts?|full\s+details?|all\s+available\s+detection|why\s+was)\b",
     re.IGNORECASE,
 )
+DETECTION_ONLY_DETAIL_WORDS = re.compile(
+    r"\b(?:all\s+matched\s+rules?|all\s+classification\s+evidence|show\s+(?:all\s+)?conflicts?|"
+    r"confidence\s+and\s+supporting\s+signals?|complete\s+detection\s+evidence|"
+    r"why\s+(?:is|was)\s+.+\s+classif(?:ied|ication))\b",
+    re.IGNORECASE,
+)
 
 
 def _valid_ipv4(value: str | None) -> str | None:
@@ -196,6 +202,12 @@ IDENTITY_WORDS = re.compile(
     r"\b(?:what\s+is|tell\s+me\s+about|summary|asset|device|role|identity|classified|classification|detected\s+role|behaviou?r)\b",
     re.IGNORECASE,
 )
+COMBINED_ANALYSIS_WORDS = re.compile(
+    r"\b(?:analy[sz]e\s+(?:this\s+)?asset\s+deeply|all\s+(?:available\s+)?evidence|"
+    r"complete\s+(?:the\s+)?analysis|comprehensive\s+(?:analytical\s+)?report|"
+    r"full\s+asset\s+assessment|identity\s+and\s+connections|classification\s+and\s+topology)\b",
+    re.IGNORECASE,
+)
 
 ROUTER_SYSTEM_PROMPT_FALLBACK = (
     "You classify Soorin Copilot routing only. Return exactly one JSON object. "
@@ -204,19 +216,51 @@ ROUTER_SYSTEM_PROMPT_FALLBACK = (
     "Allowed scopes include none, node_summary, one_hop, full_neighbors, two_hop, path, "
     "and multi_entity_comparison. Never request depth greater than 2."
 )
+ROUTER_REPAIR_SYSTEM_PROMPT = (
+    "Repair one Soorin routing object. Return JSON only. Required keys: intent, scope, direction, depth, "
+    "requires_graph, requires_detection, detection_detail, entity_binding, requires_multiple_entities, "
+    "is_followup, classification_confidence, reason. Allowed intents: general_knowledge, asset_investigation, "
+    "graph_neighbors, graph_relationships, graph_path, graph_followup, unclear. Allowed scopes: none, "
+    "node_summary, one_hop, full_neighbors, two_hop, path, multi_entity_comparison. Allowed directions: none, "
+    "inbound, outbound, both. Never invent entities."
+)
+
+
+def _extract_first_json_object(text: str) -> str:
+    """Return the first balanced JSON object, respecting strings and escapes."""
+    start = -1
+    depth = 0
+    in_string = False
+    escaped = False
+    for index, char in enumerate(text):
+        if start < 0:
+            if char == "{":
+                start = index
+                depth = 1
+            continue
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+        elif char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start : index + 1]
+    if start < 0:
+        raise ValueError("malformed_json:no_object")
+    raise ValueError("malformed_json:unbalanced_object")
 
 
 def _json_from_text(text: str) -> dict[str, Any]:
-    stripped = text.strip()
-    if stripped.startswith("```"):
-        stripped = re.sub(r"^```(?:json)?", "", stripped, flags=re.IGNORECASE).strip()
-        stripped = re.sub(r"```$", "", stripped).strip()
-    if not stripped.startswith("{"):
-        match = re.search(r"\{.*\}", stripped, re.DOTALL)
-        if not match:
-            raise ValueError("malformed_json")
-        stripped = match.group(0)
-    payload = json.loads(stripped)
+    payload = json.loads(_extract_first_json_object(text))
     if not isinstance(payload, dict):
         raise ValueError("malformed_json")
     return payload
@@ -331,6 +375,8 @@ def validate_router_payload(
     requires_detection = bool(payload.get("requires_detection", False))
     message_text = message or ""
     compact_detection_requested = bool(DETECTION_COMPACT_WORDS.search(message_text))
+    detection_only_requested = bool(DETECTION_ONLY_DETAIL_WORDS.search(message_text))
+    combined_analysis_requested = bool(COMBINED_ANALYSIS_WORDS.search(message_text))
     graph_word_present = bool(PURE_GRAPH_WORDS.search(message_text))
     identity_word_present = bool(IDENTITY_WORDS.search(message_text))
 
@@ -393,8 +439,37 @@ def validate_router_payload(
     )
     entity_count = len(materialized_entities.entities)
     if intent == "asset_investigation" and entity_count == 1:
+        combined_route_requested = requires_graph and requires_detection
         requires_detection = True
-        if compact_detection_requested and not (graph_word_present and identity_word_present):
+        if (
+            detection_only_requested
+            and not combined_route_requested
+            and not combined_analysis_requested
+            and not graph_word_present
+        ):
+            if scope != "none" or direction != "none" or depth != 0 or requires_graph or detection_detail != "compact_full":
+                normalize("detection_compact_full_requested", prefer=True)
+            scope = "none"
+            direction = "none"
+            depth = 0
+            requires_graph = False
+            detection_detail = "compact_full"
+            requires_multiple = False
+        elif requires_graph:
+            if scope == "none":
+                scope = "node_summary"
+                direction = "both"
+                depth = 0
+                normalize("node_summary_requires_graph", prefer=True)
+            elif scope == "node_summary" and (direction != "both" or depth != 0):
+                direction = "both"
+                depth = 0
+                normalize("node_summary_requires_graph", prefer=True)
+            if detection_detail == "compact_full":
+                detection_detail = "summary"
+                normalize("combined_route_detection_detail_normalized", prefer=True)
+            requires_multiple = False
+        elif compact_detection_requested and not combined_analysis_requested:
             if scope != "none" or direction != "none" or depth != 0 or requires_graph or detection_detail != "compact_full":
                 normalize("detection_compact_full_requested", prefer=True)
             scope = "none"
@@ -428,7 +503,7 @@ def validate_router_payload(
         requires_multiple = True
         normalize("multi_entity_neighbors_to_relationship")
     if intent in {"graph_neighbors", "graph_path", "graph_relationships"} and entity_count == 1:
-        if compact_detection_requested:
+        if detection_only_requested and not graph_word_present:
             requires_detection = True
             detection_detail = "compact_full"
             if not identity_word_present:
@@ -603,110 +678,248 @@ class GLMIntentRouter:
         request_id: str = "",
     ) -> IntentDecision:
         started = time.perf_counter()
-        retry_count = 0
-        last_error = ""
-        finish_reason = None
-        content_present = False
-        max_tokens = self.settings.intent_router_max_tokens
-        attempts = 2 if self.settings.intent_router_retry_enabled else 1
-
-        for attempt in range(attempts):
-            messages = [
-                {"role": "system", "content": self.system_prompt},
-                {"role": "user", "content": json.dumps(routing_context, sort_keys=True)},
-            ]
-            if attempt:
-                messages[0]["content"] += "\nRetry: return JSON immediately. No reasoning text. No markdown."
-            logger.info(
-                "event=intent_router_start request_id=%s attempt=%s entity_status=%s entity_count=%s previous_scope=%s router_temperature=%s router_top_p=%s router_max_tokens=%s router_retry_max_tokens=%s",
-                request_id,
-                attempt + 1,
-                routing_context.get("entity_status"),
-                routing_context.get("entity_count"),
-                routing_context.get("previous_scope") or "",
-                self.settings.intent_router_temperature,
-                self.settings.intent_router_top_p,
-                max_tokens,
-                self.settings.intent_router_retry_max_tokens,
+        messages = [
+            {"role": "system", "content": self.system_prompt},
+            {"role": "user", "content": json.dumps(routing_context, sort_keys=True)},
+        ]
+        logger.info(
+            "event=intent_router_start request_id=%s entity_status=%s entity_count=%s previous_scope=%s router_timeout_seconds=%s router_max_tokens=%s",
+            request_id,
+            routing_context.get("entity_status"),
+            routing_context.get("entity_count"),
+            routing_context.get("previous_scope") or "",
+            self.settings.intent_router_timeout_seconds,
+            self.settings.intent_router_max_tokens,
+        )
+        try:
+            result = self.llm_client.chat(
+                messages,
+                request_id=request_id,
+                max_tokens=self.settings.intent_router_max_tokens,
+                temperature=self.settings.intent_router_temperature,
+                top_p=self.settings.intent_router_top_p,
+                timeout_seconds=self.settings.intent_router_timeout_seconds,
+                purpose="intent_router",
+                transient_retries=0,
             )
-            try:
-                result = self.llm_client.chat(
-                    messages,
-                    request_id=request_id,
-                    max_tokens=max_tokens,
-                    temperature=self.settings.intent_router_temperature,
-                    top_p=self.settings.intent_router_top_p,
-                    timeout_seconds=self.settings.intent_router_timeout_seconds,
-                    purpose="intent_router",
-                    transient_retries=0,
-                )
-            except LLMError as exc:
-                last_error = "provider_error"
-                latency_ms = int((time.perf_counter() - started) * 1000)
-                return self._failure("provider_error", latency_ms, retry_count, finish_reason, content_present, str(exc))
+        except LLMError as exc:
+            logger.warning(
+                "event=intent_router_transport_failure request_id=%s error_type=%s repair_attempted=false",
+                request_id,
+                type(exc).__name__,
+            )
+            return self._failure(
+                "provider_error",
+                int((time.perf_counter() - started) * 1000),
+                0,
+                None,
+                False,
+                str(exc),
+            )
 
-            finish_reason = result.finish_reason
-            content = (result.text or "").strip()
-            content_present = bool(content)
-            try:
-                if not content:
-                    raise ValueError("missing_content")
-                if finish_reason == "length":
-                    raise ValueError("finish_reason_length")
-                payload = _json_from_text(content)
-                decision = validate_router_payload(
-                    payload,
-                    entities,
-                    min_confidence=self.settings.intent_router_min_confidence,
-                    message=str(routing_context.get("message") or ""),
-                    routing_state=routing_state,
-                    ui_context=ui_context,
-                )
-                decision = IntentDecision(
-                    **{
-                        **decision.__dict__,
-                        "latency_ms": int((time.perf_counter() - started) * 1000),
-                        "retry_count": retry_count,
-                        "finish_reason": finish_reason,
-                        "content_present": content_present,
-                    }
-                )
-                logger.info(
-                    "event=intent_router_complete request_id=%s decision_source=glm intent=%s scope=%s direction=%s depth=%s requires_graph=%s requires_detection=%s detection_detail=%s entity_binding=%s binding_source=%s binding_available=%s binding_normalized=%s binding_normalization_reason=%s materialized_entity_count=%s route_normalized=%s route_normalization_reason=%s confidence=%s retry_count=%s latency_ms=%s finish_reason=%s content_present=%s",
-                    request_id,
-                    decision.intent,
-                    decision.scope,
-                    decision.direction,
-                    decision.depth,
-                    decision.requires_graph,
-                    decision.requires_detection,
-                    decision.detection_detail,
-                    decision.entity_binding,
-                    decision.binding_source,
-                    decision.binding_available,
-                    decision.binding_normalized,
-                    decision.binding_normalization_reason or "",
-                    decision.materialized_entity_count,
-                    decision.route_normalized,
-                    decision.route_normalization_reason or "",
-                    decision.classification_confidence,
-                    retry_count,
-                    decision.latency_ms,
-                    finish_reason or "",
-                    content_present,
-                )
-                return decision
-            except (ValueError, TypeError, json.JSONDecodeError) as exc:
-                last_error = str(exc)
-                retryable = last_error in {"missing_content", "finish_reason_length", "malformed_json"} or "malformed_json" in last_error
-                if attempt == 0 and retryable and attempts > 1:
-                    retry_count = 1
-                    max_tokens = self.settings.intent_router_retry_max_tokens
-                    continue
-                break
+        finish_reason = result.finish_reason
+        content = (result.text or "").strip()
+        completion_tokens = (result.usage or {}).get("completion_tokens", "")
+        try:
+            decision = self._decision_from_content(
+                content,
+                finish_reason,
+                entities,
+                routing_context,
+                routing_state,
+                ui_context,
+                request_id,
+            )
+            return self._complete(decision, started, 0, finish_reason, bool(content), completion_tokens, request_id)
+        except (ValueError, TypeError, json.JSONDecodeError) as exc:
+            last_error = str(exc) or "schema_validation_failed"
 
-        latency_ms = int((time.perf_counter() - started) * 1000)
-        return self._failure(last_error or "schema_validation_failed", latency_ms, retry_count, finish_reason, content_present)
+        if not self.settings.intent_router_retry_enabled:
+            return self._failure(
+                last_error,
+                int((time.perf_counter() - started) * 1000),
+                0,
+                finish_reason,
+                bool(content),
+            )
+
+        logger.info(
+            "event=intent_router_repair_started request_id=%s reason=%s router_max_tokens=%s",
+            request_id,
+            last_error[:120],
+            self.settings.intent_router_retry_max_tokens,
+        )
+        repair_payload = {
+            "invalid_output": content[:1200],
+            "routing_context": routing_context,
+            "validation_error": last_error[:160],
+        }
+        repair_messages = [
+            {"role": "system", "content": ROUTER_REPAIR_SYSTEM_PROMPT},
+            {"role": "user", "content": json.dumps(repair_payload, sort_keys=True)},
+        ]
+        try:
+            repair_result = self.llm_client.chat(
+                repair_messages,
+                request_id=request_id,
+                max_tokens=self.settings.intent_router_retry_max_tokens,
+                temperature=self.settings.intent_router_temperature,
+                top_p=self.settings.intent_router_top_p,
+                timeout_seconds=self.settings.intent_router_timeout_seconds,
+                purpose="intent_router",
+                transient_retries=0,
+            )
+        except LLMError as exc:
+            logger.warning(
+                "event=intent_router_repair_failed request_id=%s reason=transport_failure error_type=%s",
+                request_id,
+                type(exc).__name__,
+            )
+            return self._failure(
+                "provider_error",
+                int((time.perf_counter() - started) * 1000),
+                1,
+                finish_reason,
+                bool(content),
+                str(exc),
+            )
+
+        repair_content = (repair_result.text or "").strip()
+        repair_finish_reason = repair_result.finish_reason
+        repair_completion_tokens = (repair_result.usage or {}).get("completion_tokens", "")
+        try:
+            decision = self._decision_from_content(
+                repair_content,
+                repair_finish_reason,
+                entities,
+                routing_context,
+                routing_state,
+                ui_context,
+                request_id,
+            )
+        except (ValueError, TypeError, json.JSONDecodeError) as exc:
+            last_error = str(exc) or "schema_validation_failed"
+            logger.warning(
+                "event=intent_router_repair_failed request_id=%s reason=%s completion_tokens=%s",
+                request_id,
+                last_error[:120],
+                repair_completion_tokens,
+            )
+            return self._failure(
+                last_error,
+                int((time.perf_counter() - started) * 1000),
+                1,
+                repair_finish_reason,
+                bool(repair_content),
+            )
+
+        logger.info(
+            "event=intent_router_repair_succeeded request_id=%s completion_tokens=%s",
+            request_id,
+            repair_completion_tokens,
+        )
+        return self._complete(
+            decision,
+            started,
+            1,
+            repair_finish_reason,
+            bool(repair_content),
+            repair_completion_tokens,
+            request_id,
+        )
+
+    def _decision_from_content(
+        self,
+        content: str,
+        finish_reason: str | None,
+        entities: EntityResolution,
+        routing_context: dict[str, Any],
+        routing_state: SessionRoutingState | None,
+        ui_context: dict[str, Any] | None,
+        request_id: str,
+    ) -> IntentDecision:
+        if not content:
+            logger.warning("event=intent_router_json_parse_failed request_id=%s reason=missing_content", request_id)
+            raise ValueError("missing_content")
+        if finish_reason == "length":
+            logger.warning("event=intent_router_json_parse_failed request_id=%s reason=finish_reason_length", request_id)
+            raise ValueError("finish_reason_length")
+        try:
+            extracted = _extract_first_json_object(content)
+            logger.info("event=intent_router_json_extracted request_id=%s chars=%s", request_id, len(extracted))
+            payload = json.loads(extracted)
+        except (ValueError, json.JSONDecodeError) as exc:
+            logger.warning(
+                "event=intent_router_json_parse_failed request_id=%s reason=%s",
+                request_id,
+                str(exc)[:120] or type(exc).__name__,
+            )
+            raise
+        if not isinstance(payload, dict):
+            logger.warning("event=intent_router_json_parse_failed request_id=%s reason=not_object", request_id)
+            raise ValueError("malformed_json:not_object")
+        try:
+            return validate_router_payload(
+                payload,
+                entities,
+                min_confidence=self.settings.intent_router_min_confidence,
+                message=str(routing_context.get("message") or ""),
+                routing_state=routing_state,
+                ui_context=ui_context,
+            )
+        except (ValueError, TypeError) as exc:
+            logger.warning(
+                "event=intent_router_schema_validation_failed request_id=%s reason=%s",
+                request_id,
+                str(exc)[:120] or type(exc).__name__,
+            )
+            raise
+
+    @staticmethod
+    def _complete(
+        decision: IntentDecision,
+        started: float,
+        retry_count: int,
+        finish_reason: str | None,
+        content_present: bool,
+        completion_tokens: object,
+        request_id: str,
+    ) -> IntentDecision:
+        decision = IntentDecision(
+            **{
+                **decision.__dict__,
+                "latency_ms": int((time.perf_counter() - started) * 1000),
+                "retry_count": retry_count,
+                "finish_reason": finish_reason,
+                "content_present": content_present,
+            }
+        )
+        logger.info(
+            "event=intent_router_complete request_id=%s decision_source=glm intent=%s scope=%s direction=%s depth=%s requires_graph=%s requires_detection=%s detection_detail=%s entity_binding=%s binding_source=%s binding_available=%s binding_normalized=%s binding_normalization_reason=%s materialized_entity_count=%s route_normalized=%s route_normalization_reason=%s confidence=%s retry_count=%s latency_ms=%s finish_reason=%s content_present=%s completion_tokens=%s",
+            request_id,
+            decision.intent,
+            decision.scope,
+            decision.direction,
+            decision.depth,
+            decision.requires_graph,
+            decision.requires_detection,
+            decision.detection_detail,
+            decision.entity_binding,
+            decision.binding_source,
+            decision.binding_available,
+            decision.binding_normalized,
+            decision.binding_normalization_reason or "",
+            decision.materialized_entity_count,
+            decision.route_normalized,
+            decision.route_normalization_reason or "",
+            decision.classification_confidence,
+            retry_count,
+            decision.latency_ms,
+            finish_reason or "",
+            content_present,
+            completion_tokens,
+        )
+        return decision
 
     def _failure(
         self,
@@ -726,6 +939,7 @@ class GLMIntentRouter:
             content_present,
             detail[:120],
         )
+        logger.warning("event=intent_router_fallback_used reason=%s retry_count=%s", reason, retry_count)
         return IntentDecision(
             intent="unclear",
             scope="none",

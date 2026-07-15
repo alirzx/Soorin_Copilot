@@ -7,7 +7,9 @@ import unittest
 from dataclasses import replace
 from datetime import datetime, timezone
 from typing import Any
+from unittest.mock import patch
 
+from src.api.routes import ChatRequest, chat as api_chat
 from src.config.settings import get_settings
 from src.core.context.composer import ContextComposer
 from src.core.context.models import (
@@ -18,10 +20,12 @@ from src.core.context.models import (
     ResolvedEntity,
 )
 from src.core.context.providers.detection import DetectionContextProvider
-from src.core.copilot.service import CopilotService
+from src.core.copilot.service import CopilotService, _answer_truncated
 from src.core.detection import adapt_asset_detection
 from src.core.detection.models import RawAssetDetectionResponse
 from src.core.llm.providers.base import LLMProviderResult
+from src.core.llm.client import LLMClient
+from src.core.llm.errors import LLMError
 from src.core.memory.store import MemoryStore
 from src.core.memory.routing_state import SessionRoutingState, SessionRoutingStateStore
 from src.core.product_client.errors import ProductApiError
@@ -98,17 +102,41 @@ class FakeProductClient:
 
 
 class FakeLLMClient:
-    def __init__(self, responses: list[LLMProviderResult]) -> None:
+    def __init__(self, responses: list[LLMProviderResult | Exception]) -> None:
         self.responses = list(responses)
         self.calls: list[dict[str, Any]] = []
 
     def chat(self, messages, **kwargs) -> LLMProviderResult:
         self.calls.append({"messages": messages, **kwargs})
-        return self.responses.pop(0)
+        response = self.responses.pop(0)
+        if isinstance(response, Exception):
+            raise response
+        return response
 
 
-def fake_result(text: str) -> LLMProviderResult:
-    return LLMProviderResult(text=text, provider="fake", model="fake", finish_reason="stop", status_code=200)
+def fake_result(
+    text: str,
+    *,
+    finish_reason: str | None = "stop",
+    usage: dict[str, int] | None = None,
+) -> LLMProviderResult:
+    return LLMProviderResult(
+        text=text,
+        provider="fake",
+        model="fake",
+        finish_reason=finish_reason,
+        usage=usage or {},
+        status_code=200,
+    )
+
+
+class FakeHTTPResponse:
+    def __init__(self, status_code: int, payload: dict[str, Any] | None = None) -> None:
+        self.status_code = status_code
+        self.payload = payload or {}
+
+    def json(self) -> dict[str, Any]:
+        return self.payload
 
 
 class FakeGraphProvider:
@@ -143,18 +171,29 @@ class FakeDetectionProvider:
         return self.result
 
 
-def detection_result(status: str = "available", *, detail: str = "summary") -> DetectionProviderResult:
-    item = evidence()
+def detection_result(
+    status: str = "available",
+    *,
+    detail: str = "summary",
+    target_ip: str = "192.168.21.1",
+) -> DetectionProviderResult:
+    item = replace(evidence(asset_found=status != "not_found"), ip=target_ip)
+    limitations = item.limitations if status in {"available", "not_found"} else ["Detection evidence was unavailable for this request."]
     return DetectionProviderResult(
         provider="detection",
         status=status,  # type: ignore[arg-type]
         detail=detail,  # type: ignore[arg-type]
         ip=item.ip,
         evidence=item if status in {"available", "not_found"} else None,
-        rendered_context="[SOORIN ASSET DETECTION EVIDENCE]\nPrimary role: Domain Joined Workstation"
-        if status in {"available", "not_found"}
-        else "",
+        rendered_context=(
+            "[SOORIN ASSET DETECTION EVIDENCE]\nAsset found: false\nNo asset-detection record was found for this IP."
+            if status == "not_found"
+            else "[SOORIN ASSET DETECTION EVIDENCE]\nPrimary role: Domain Joined Workstation"
+            if status == "available"
+            else ""
+        ),
         provenance=ProviderProvenance(source="product_asset_detection", status=status),  # type: ignore[arg-type]
+        limitations=limitations,
         cache_hit=True,
         cache_age_seconds=12,
         stale=False,
@@ -162,8 +201,24 @@ def detection_result(status: str = "available", *, detail: str = "summary") -> D
     )
 
 
-def graph_result(status: str = "available") -> GraphProviderResult:
-    entity = ResolvedEntity(type="ip", value="192.168.21.1", source="message")
+def graph_result(
+    status: str = "available",
+    *,
+    target_ip: str = "192.168.21.1",
+    inbound_total: int = 1,
+    outbound_total: int = 4,
+    bidirectional_total: int = 0,
+    scope: str = "node_summary",
+    retrieval_truncated: bool = False,
+    context_truncated: bool = False,
+) -> GraphProviderResult:
+    entity = ResolvedEntity(type="ip", value=target_ip, source="message")
+    nodes = [{"id": entity.value, "hop": 0}]
+    if context_truncated:
+        nodes.extend(
+            {"id": f"10.20.{index // 254}.{index % 254 + 1}", "hop": 1, "direction": "inbound"}
+            for index in range(260)
+        )
     return GraphProviderResult(
         provider="graph",
         status=status,  # type: ignore[arg-type]
@@ -172,21 +227,23 @@ def graph_result(status: str = "available") -> GraphProviderResult:
             "target_ip": entity.value,
             "target_ips": [entity.value],
             "node_found": status == "available",
-            "scope": "node_summary",
+            "scope": scope,
             "direction": "both",
             "depth": 0,
-            "inbound_total": 1,
-            "outbound_total": 4,
-            "bidirectional_total": 0,
-            "inbound_retrieved": 1,
-            "outbound_retrieved": 4,
-            "bidirectional_retrieved": 0,
-            "candidate_node_count": 5,
-            "retrieved_node_count": 5,
-            "candidate_edge_count": 5,
-            "retrieved_edge_count": 5,
-            "nodes": [{"id": entity.value, "hop": 0}],
+            "inbound_total": inbound_total,
+            "outbound_total": outbound_total,
+            "bidirectional_total": bidirectional_total,
+            "inbound_retrieved": inbound_total,
+            "outbound_retrieved": outbound_total,
+            "bidirectional_retrieved": bidirectional_total,
+            "candidate_node_count": 1 + inbound_total + outbound_total,
+            "retrieved_node_count": 1 + inbound_total + outbound_total,
+            "candidate_edge_count": inbound_total + outbound_total,
+            "retrieved_edge_count": inbound_total + outbound_total,
+            "nodes": nodes,
             "edges": [],
+            "retrieval_truncated": retrieval_truncated,
+            "context_truncated": context_truncated,
         },
         provenance=ProviderProvenance(source="observed_communication_graph", status=status),  # type: ignore[arg-type]
         latency_ms=2,
@@ -255,8 +312,15 @@ class DetectionProviderCacheTests(unittest.TestCase):
 
 
 class CopilotDetectionIntegrationTests(unittest.TestCase):
-    def service(self, router_json: str, graph: GraphProviderResult | Exception, detection: DetectionProviderResult | Exception) -> CopilotService:
-        llm = FakeLLMClient([fake_result(router_json), fake_result("grounded answer")])
+    def service(
+        self,
+        router_json: str,
+        graph: GraphProviderResult | Exception,
+        detection: DetectionProviderResult | Exception,
+        *,
+        answer: str = "grounded answer",
+    ) -> CopilotService:
+        llm = FakeLLMClient([fake_result(router_json), fake_result(answer)])
         service = CopilotService(make_settings(), llm, MemoryStore(max_messages=4))
         service.graph_provider = FakeGraphProvider(graph)  # type: ignore[assignment]
         service.detection_provider = FakeDetectionProvider(detection)  # type: ignore[assignment]
@@ -291,7 +355,10 @@ class CopilotDetectionIntegrationTests(unittest.TestCase):
     def test_graph_available_detection_unavailable_still_answers(self) -> None:
         service = self.service(self.asset_route(), graph_result(), detection_result("unavailable"))
         response = service.chat("Tell me about 192.168.21.1.", request_id="req-2")
+        context_message = service.llm_client.calls[1]["messages"][1]["content"]  # type: ignore[index]
         self.assertEqual(response["answer"], "grounded answer")
+        self.assertIn("Detection evidence: status=unavailable", context_message)
+        self.assertIn("Graph evidence: status=available", context_message)
 
     def test_detection_available_graph_unavailable_still_answers(self) -> None:
         service = self.service(self.asset_route(), graph_result("unavailable"), detection_result())
@@ -299,6 +366,236 @@ class CopilotDetectionIntegrationTests(unittest.TestCase):
         context_message = service.llm_client.calls[1]["messages"][1]["content"]  # type: ignore[index]
         self.assertEqual(response["answer"], "grounded answer")
         self.assertIn("[SOORIN ASSET DETECTION EVIDENCE]", context_message)
+        self.assertIn("Graph evidence: status=unavailable", context_message)
+        self.assertIn("Detection evidence: status=available", context_message)
+
+    def test_graph_available_detection_not_found_runs_grounded_synthesis(self) -> None:
+        answer = (
+            "10.196.133.19 is present in the communication graph, but no asset-detection record was found. "
+            "One inbound relationship is observed; identity remains unconfirmed."
+        )
+        service = self.service(
+            self.asset_route(),
+            graph_result(target_ip="10.196.133.19", inbound_total=1, outbound_total=0),
+            detection_result("not_found", target_ip="10.196.133.19"),
+            answer=answer,
+        )
+        service.settings = make_settings(copilot_human_trace_enabled=True)
+
+        with self.assertLogs(level="INFO") as logs:
+            with patch("src.api.routes.copilot_service", service):
+                response = api_chat(
+                    ChatRequest(
+                        session_id="missing-detection-e2e",
+                        message="tell me about this asset 10.196.133.19",
+                    )
+                )
+
+        context_message = service.llm_client.calls[1]["messages"][1]["content"]  # type: ignore[index]
+        self.assertEqual(response["status"], "ok")
+        self.assertEqual(response["data"]["answer"], answer)
+        self.assertEqual(len(service.llm_client.calls), 2)
+        self.assertIn("Graph evidence: status=available", context_message)
+        self.assertIn("Detection evidence: status=not_found; asset_found=false", context_message)
+        self.assertIn("No asset-detection record was found", context_message)
+        self.assertIn("Inbound peers: observed_total=1", context_message)
+        self.assertIn("Outbound peers: observed_total=0", context_message)
+        log_text = "\n".join(logs.output)
+        self.assertIn("event=provider_statuses", log_text)
+        self.assertIn("event=partial_provider_result", log_text)
+        self.assertIn("providers_available", log_text)
+        self.assertIn("providers_not_found", log_text)
+        self.assertIn("detection", log_text)
+        self.assertNotIn("provider_http_error", log_text)
+
+    def test_both_not_found_still_runs_safe_synthesis(self) -> None:
+        answer = "No graph or asset-detection evidence was found; the asset identity cannot be confirmed."
+        service = self.service(
+            self.asset_route(),
+            graph_result("not_found"),
+            detection_result("not_found"),
+            answer=answer,
+        )
+        response = service.chat("Tell me about 192.168.21.1.", request_id="both-missing")
+        context_message = service.llm_client.calls[1]["messages"][1]["content"]  # type: ignore[index]
+        self.assertEqual(response["answer"], answer)
+        self.assertIn("Graph evidence: status=not_found", context_message)
+        self.assertIn("Detection evidence: status=not_found", context_message)
+
+    def test_final_synthesis_uses_chat_timeout_and_unchanged_token_budget(self) -> None:
+        settings = make_settings(chat_timeout_seconds=287, chat_max_tokens=321, arvan_max_tokens=999)
+        llm = FakeLLMClient([fake_result(self.asset_route()), fake_result("grounded answer")])
+        service = CopilotService(settings, llm, MemoryStore(max_messages=4))
+        service.graph_provider = FakeGraphProvider(graph_result())  # type: ignore[assignment]
+        service.detection_provider = FakeDetectionProvider(detection_result())  # type: ignore[assignment]
+
+        service.chat("Tell me about 192.168.21.1.", request_id="chat-timeout")
+
+        self.assertEqual(llm.calls[1]["timeout_seconds"], 287)
+        self.assertEqual(llm.calls[1]["max_tokens"], 321)
+
+    def test_prompt_b_selects_graph_and_detection_with_full_neighbors(self) -> None:
+        prompt = (
+            "now give me all of its connections ,its impacts on another assets ,and make complete your analysis , "
+            "at the end give me comprehensive analytical report based on all evidence."
+        )
+        router_json = (
+            '{"intent":"asset_investigation","scope":"full_neighbors","direction":"both","depth":1,'
+            '"requires_graph":true,"requires_detection":true,"detection_detail":"summary",'
+            '"entity_binding":"active_single","requires_multiple_entities":false,"is_followup":true,'
+            '"classification_confidence":0.96,"reason":"combined follow-up"}'
+        )
+        llm = FakeLLMClient([fake_result(router_json), fake_result("combined answer")])
+        state_store = SessionRoutingStateStore()
+        state_store.set(
+            "prompt-b",
+            SessionRoutingState(
+                active_ip="192.168.0.125",
+                last_provider="detection",
+                previous_intent="asset_investigation",
+                previous_scope="none",
+                previous_direction="none",
+                previous_depth=0,
+                previous_requires_detection=True,
+                previous_detection_detail="compact_full",
+            ),
+        )
+        service = CopilotService(make_settings(), llm, MemoryStore(max_messages=4), state_store)
+        graph_provider = FakeGraphProvider(graph_result(target_ip="192.168.0.125", scope="full_neighbors"))
+        detection_provider = FakeDetectionProvider(detection_result(target_ip="192.168.0.125"))
+        service.graph_provider = graph_provider  # type: ignore[assignment]
+        service.detection_provider = detection_provider  # type: ignore[assignment]
+
+        response = service.chat(prompt, "prompt-b", request_id="prompt-b")
+
+        self.assertEqual(response["answer"], "combined answer")
+        self.assertEqual(graph_provider.calls, 1)
+        self.assertEqual(detection_provider.calls, 1)
+        self.assertEqual(graph_provider.last_route.scope, "full_neighbors")
+        self.assertTrue(graph_provider.last_route.use_graph)
+        self.assertTrue(graph_provider.last_route.use_detection)
+        self.assertEqual(graph_provider.last_route.detection_detail, "summary")
+
+    @patch("src.core.llm.providers.arvan.requests.post")
+    def test_graph_evidence_survives_router_502_and_two_final_502_responses(self, post) -> None:
+        post.side_effect = [FakeHTTPResponse(502), FakeHTTPResponse(502), FakeHTTPResponse(502)]
+        settings = make_settings(
+            llm_enabled=True,
+            llm_provider="arvan",
+            arvan_base_url="https://example.invalid",
+            arvan_api_key="fake-key",
+            llm_max_transient_retries=1,
+            llm_retry_base_delay_seconds=0.0,
+            llm_retry_max_delay_seconds=0.0,
+        )
+        llm = LLMClient(settings)
+        service = CopilotService(settings, llm, MemoryStore(max_messages=4))
+        service.graph_provider = FakeGraphProvider(
+            graph_result(
+                target_ip="192.168.0.125",
+                inbound_total=253,
+                outbound_total=19,
+                bidirectional_total=18,
+                scope="full_neighbors",
+                context_truncated=True,
+            )
+        )  # type: ignore[assignment]
+        service.detection_provider = FakeDetectionProvider(detection_result("unavailable"))  # type: ignore[assignment]
+
+        response = service.chat(
+            "Show all direct connections for 192.168.0.125 and identify which systems depend on it.",
+            request_id="final-502-fallback",
+        )
+
+        self.assertEqual(post.call_count, 3)
+        self.assertEqual(response["provider"], "deterministic")
+        self.assertIn("253 observed inbound relationships", response["answer"])
+        self.assertIn("19 observed outbound relationships", response["answer"])
+        self.assertIn("bounded subset", response["answer"])
+        self.assertIn("do not by themselves prove formal service dependency", response["answer"])
+        self.assertNotIn("Arvan", response["answer"])
+        self.assertNotIn("HTTP", response["answer"])
+        self.assertNotIn("provider", response["answer"].lower())
+
+    def test_detection_evidence_returns_fallback_after_final_transport_failure(self) -> None:
+        llm = FakeLLMClient([
+            fake_result(self.asset_route(requires_graph=False, detail="compact_full")),
+            LLMError("transport failed", reason="provider_transport_error"),
+        ])
+        service = CopilotService(make_settings(), llm, MemoryStore(max_messages=4))
+        service.graph_provider = FakeGraphProvider(graph_result("unavailable"))  # type: ignore[assignment]
+        service.detection_provider = FakeDetectionProvider(detection_result())  # type: ignore[assignment]
+
+        response = service.chat("Show all matched rules for 192.168.21.1.", request_id="detection-fallback")
+
+        self.assertEqual(response["provider"], "deterministic")
+        self.assertIn("tag/sub-tag", response["answer"])
+        self.assertIn("1 matched rules", response["answer"])
+        self.assertNotIn("provider", response["answer"].lower())
+
+    def test_combined_evidence_returns_compact_fallback_after_final_failure(self) -> None:
+        llm = FakeLLMClient([fake_result(self.asset_route()), LLMError("failed", reason="provider_http_error")])
+        service = CopilotService(make_settings(copilot_human_trace_enabled=True), llm, MemoryStore(max_messages=4))
+        service.graph_provider = FakeGraphProvider(graph_result())  # type: ignore[assignment]
+        service.detection_provider = FakeDetectionProvider(detection_result())  # type: ignore[assignment]
+
+        with self.assertLogs(level="INFO") as logs:
+            response = service.chat("Tell me about 192.168.21.1 using all evidence.", request_id="combined-fallback")
+
+        self.assertIn("Detection evidence", response["answer"])
+        self.assertIn("observed inbound relationships", response["answer"])
+        self.assertIn("Evidence agreement cannot be established deterministically", response["answer"])
+        text = "\n".join(logs.output)
+        self.assertIn("final_synthesis_status", text)
+        self.assertIn("fallback_answer_used", text)
+        self.assertIn("warnings", text)
+
+    def test_no_usable_evidence_preserves_final_model_error(self) -> None:
+        llm = FakeLLMClient([fake_result(self.asset_route()), LLMError("failed", reason="provider_http_error")])
+        service = CopilotService(make_settings(), llm, MemoryStore(max_messages=4))
+        service.graph_provider = FakeGraphProvider(graph_result("unavailable"))  # type: ignore[assignment]
+        service.detection_provider = FakeDetectionProvider(detection_result("unavailable"))  # type: ignore[assignment]
+
+        with self.assertRaises(LLMError):
+            service.chat("Tell me about 192.168.21.1.", request_id="no-evidence-failure")
+
+    def test_both_not_found_return_clear_fallback_after_final_failure(self) -> None:
+        llm = FakeLLMClient([fake_result(self.asset_route()), LLMError("failed", reason="provider_http_error")])
+        service = CopilotService(make_settings(), llm, MemoryStore(max_messages=4))
+        service.graph_provider = FakeGraphProvider(graph_result("not_found"))  # type: ignore[assignment]
+        service.detection_provider = FakeDetectionProvider(detection_result("not_found"))  # type: ignore[assignment]
+
+        response = service.chat("Tell me about 192.168.21.1.", request_id="both-not-found-fallback")
+
+        self.assertEqual(response["provider"], "deterministic")
+        self.assertIn("No matching graph or asset-detection evidence was found", response["answer"])
+        self.assertNotIn("provider", response["answer"].lower())
+
+    def test_final_response_trace_records_budget_finish_reason_and_truncation(self) -> None:
+        settings = make_settings(copilot_human_trace_enabled=True, chat_max_tokens=256, arvan_max_tokens=512)
+        llm = FakeLLMClient([
+            fake_result(self.asset_route()),
+            fake_result("bounded answer", finish_reason="length", usage={"completion_tokens": 256, "output_tokens": 256}),
+        ])
+        service = CopilotService(settings, llm, MemoryStore(max_messages=4))
+        service.graph_provider = FakeGraphProvider(graph_result())  # type: ignore[assignment]
+        service.detection_provider = FakeDetectionProvider(detection_result())  # type: ignore[assignment]
+
+        with self.assertLogs(level="INFO") as logs:
+            service.chat("Tell me about 192.168.21.1.", request_id="truncated-answer")
+
+        text = "\n".join(logs.output)
+        self.assertIn("requested_max_tokens=256", text)
+        self.assertIn("finish_reason=length", text)
+        self.assertIn("completion_tokens=256", text)
+        self.assertIn("output_tokens=256", text)
+        self.assertIn("answer_truncated=true", text)
+        self.assertIn("fallback_answer_used=false", text)
+
+    def test_missing_finish_reason_uses_requested_budget_for_truncation(self) -> None:
+        self.assertTrue(_answer_truncated(None, 256, 256))
+        self.assertFalse(_answer_truncated(None, 255, 256))
+        self.assertFalse(_answer_truncated("stop", 256, 256))
 
     def test_both_skipped_for_general_question(self) -> None:
         router = (

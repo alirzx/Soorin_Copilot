@@ -49,6 +49,9 @@ class LLMTransientRetryTests(unittest.TestCase):
             llm_max_transient_retries=1,
             llm_retry_base_delay_seconds=0.0,
             llm_retry_max_delay_seconds=0.0,
+            llm_connect_timeout_seconds=8,
+            intent_router_timeout_seconds=15,
+            chat_timeout_seconds=300,
         )
         self.client = LLMClient(self.settings)
         self.messages = [{"role": "user", "content": "hello"}]
@@ -126,6 +129,35 @@ class LLMTransientRetryTests(unittest.TestCase):
         self.assertTrue(decision.fallback_used)
         self.assertEqual(decision.fallback_reason, "provider_error")
         self.assertEqual(post.call_count, 1)
+
+    @patch("src.core.llm.providers.arvan.requests.post")
+    def test_provider_uses_purpose_specific_connect_and_read_timeouts(self, post) -> None:
+        post.side_effect = [success_response("router"), success_response("answer")]
+
+        self.client.chat(
+            self.messages,
+            request_id="router-timeout",
+            timeout_seconds=self.settings.intent_router_timeout_seconds,
+            purpose="intent_router",
+            transient_retries=0,
+        )
+        self.client.chat(
+            self.messages,
+            request_id="chat-timeout",
+            timeout_seconds=self.settings.chat_timeout_seconds,
+            purpose="chat",
+        )
+
+        self.assertEqual(post.call_args_list[0].kwargs["timeout"], (8, 15))
+        self.assertEqual(post.call_args_list[1].kwargs["timeout"], (8, 300))
+
+    @patch("src.core.llm.providers.arvan.requests.post")
+    def test_provider_receives_exact_requested_max_tokens(self, post) -> None:
+        post.return_value = success_response("bounded")
+
+        self.client.chat(self.messages, request_id="max-tokens", max_tokens=321, purpose="chat")
+
+        self.assertEqual(post.call_args.kwargs["json"]["max_tokens"], 321)
 
     @patch("src.core.llm.providers.arvan.requests.post")
     def test_retry_logs_reason_and_count_without_secret(self, post) -> None:

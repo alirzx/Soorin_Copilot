@@ -177,6 +177,7 @@ class DetectionProviderResult:
     evidence: AssetDetectionEvidence | None = None
     rendered_context: str = ""
     provenance: ProviderProvenance | None = None
+    limitations: list[str] = field(default_factory=list)
     cache_hit: bool = False
     cache_age_seconds: int | None = None
     stale: bool = False

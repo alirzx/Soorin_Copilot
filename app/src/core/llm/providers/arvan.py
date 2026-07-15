@@ -92,18 +92,20 @@ class ArvanProvider:
             "Content-Type": "application/json",
         }
         timeout = (
-            self.settings.arvan_connect_timeout_seconds,
-            timeout_seconds if timeout_seconds is not None else self.settings.arvan_timeout_seconds,
+            self.settings.llm_connect_timeout_seconds,
+            timeout_seconds if timeout_seconds is not None else self.settings.chat_timeout_seconds,
         )
 
         logger.info(
-            "event=provider_request_start request_id=%s provider=%s model=%s message_count=%s chat_path=%s purpose=%s",
+            "event=provider_request_start request_id=%s provider=%s model=%s message_count=%s chat_path=%s purpose=%s connect_timeout_seconds=%s read_timeout_seconds=%s",
             request_id,
             self.provider_name,
             self.settings.arvan_model,
             len(messages),
             self.settings.arvan_chat_path,
             purpose,
+            timeout[0],
+            timeout[1],
         )
         started = time.perf_counter()
         try:

@@ -36,7 +36,7 @@ class ContextComposer:
 
     def __init__(self, settings: Settings | None = None) -> None:
         self.settings = settings or get_settings()
-        self.last_parts: dict[str, str] = {"graph": "", "detection": "", "fusion": ""}
+        self.last_parts: dict[str, str] = {"status": "", "graph": "", "detection": "", "fusion": ""}
 
     def compose(self, package: CopilotContextPackage, *, request_id: str = "") -> str:
         detection = package.detection
@@ -45,17 +45,24 @@ class ContextComposer:
             if detection and detection.status in {"available", "not_found"} and detection.rendered_context
             else ""
         )
+        status_text = self._compose_provider_statuses(package)
         graph_text = self._compose_graph(package, request_id=request_id)
         fusion_text = self._compose_alignment(package)
-        self.last_parts = {"graph": graph_text, "detection": detection_text, "fusion": fusion_text}
-        parts = [part for part in [detection_text, graph_text, fusion_text] if part]
+        self.last_parts = {
+            "status": status_text,
+            "graph": graph_text,
+            "detection": detection_text,
+            "fusion": fusion_text,
+        }
+        parts = [part for part in [status_text, detection_text, graph_text, fusion_text] if part]
         text = "\n\n".join(parts)
         logger.info(
-            "event=context_composed request_id=%s providers=%s graph_chars=%s detection_chars=%s fusion_chars=%s total_dynamic_chars=%s total_dynamic_approx_tokens=%s",
+            "event=context_composed request_id=%s providers=%s status_chars=%s graph_chars=%s detection_chars=%s fusion_chars=%s total_dynamic_chars=%s total_dynamic_approx_tokens=%s",
             request_id,
             ",".join(
                 name
                 for name, part in [
+                    ("status", status_text),
                     ("graph", graph_text),
                     ("detection", detection_text),
                     ("fusion", fusion_text),
@@ -63,6 +70,7 @@ class ContextComposer:
                 if part
             )
             or "none",
+            len(status_text),
             len(graph_text),
             len(detection_text),
             len(fusion_text),
@@ -70,6 +78,31 @@ class ContextComposer:
             approx_tokens(text),
         )
         return text
+
+    @staticmethod
+    def _compose_provider_statuses(package: CopilotContextPackage) -> str:
+        lines = ["[SOORIN PROVIDER STATUS]", "Treat unavailable or missing evidence as a limitation, not as evidence about the asset."]
+        graph = package.graph
+        if graph:
+            source = graph.provenance.source if graph.provenance else "observed_communication_graph"
+            lines.append(f"Graph evidence: status={graph.status}; source={source}")
+            if graph.limitations:
+                lines.append(f"Graph limitation: {graph.limitations[0]}")
+            elif graph.status == "unavailable":
+                lines.append("Graph limitation: Graph evidence was unavailable for this request.")
+
+        detection = package.detection
+        if detection:
+            source = detection.provenance.source if detection.provenance else "product_asset_detection"
+            found = detection.evidence.found if detection.evidence else False if detection.status == "not_found" else "unknown"
+            lines.append(f"Detection evidence: status={detection.status}; asset_found={str(found).lower()}; source={source}")
+            limitation = next(iter(detection.limitations), "")
+            if limitation:
+                lines.append(f"Detection limitation: {limitation}")
+            elif detection.status == "unavailable":
+                lines.append("Detection limitation: Detection evidence was unavailable for this request.")
+
+        return "\n".join(lines) if graph or detection else ""
 
     def _compose_graph(self, package: CopilotContextPackage, *, request_id: str = "") -> str:
         graph = package.graph

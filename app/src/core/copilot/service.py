@@ -11,13 +11,22 @@ from uuid import uuid4
 from src.config.settings import Settings
 from src.core.context import ContextComposer, DeterministicFallbackRouter, EntityResolver, GLMIntentRouter, normalize_intent_route
 from src.core.context.intent import build_routing_context, resolution_from_materialized_decision
-from src.core.context.models import CopilotContextPackage, DetectionProviderResult, ProviderProvenance, approx_tokens, compact_preview
+from src.core.context.models import (
+    CopilotContextPackage,
+    DetectionProviderResult,
+    GraphProviderResult,
+    ProviderProvenance,
+    approx_tokens,
+    compact_preview,
+)
 from src.core.context.providers import DetectionContextProvider, GraphContextProvider
 from src.core.llm.client import LLMClient
 from src.core.llm.errors import LLMError
+from src.core.llm.providers.base import LLMProviderResult
 from src.core.memory.routing_state import SessionRoutingState, SessionRoutingStateStore
 from src.core.memory.store import MemoryStore
 from src.core.copilot.trace import CopilotRequestTrace, render_human_copilot_trace
+from src.core.copilot.fallback_answer import build_evidence_fallback_answer
 from src.core.graph.loader import get_graph_metadata
 from src.core.graph.refresh import get_refresh_status
 
@@ -36,6 +45,12 @@ FALLBACK_SYSTEM_PROMPT = (
 
 def _preview(text: str) -> str:
     return text.strip().replace("\n", " ")[:120]
+
+
+def _answer_truncated(finish_reason: str | None, completion_tokens: Any, requested_max_tokens: int) -> bool:
+    if finish_reason:
+        return finish_reason == "length"
+    return isinstance(completion_tokens, (int, float)) and completion_tokens >= requested_max_tokens
 
 
 class CopilotService:
@@ -266,8 +281,14 @@ class CopilotService:
                     request_id,
                     type(exc).__name__,
                 )
-                graph_result = None
-                trace.warnings += 1
+                graph_result = GraphProviderResult(
+                    provider="graph",
+                    status="unavailable",
+                    target_entity=route.target_entity,
+                    provenance=ProviderProvenance(source="observed_communication_graph", status="unavailable"),
+                    limitations=["Graph evidence was unavailable for this request."],
+                    error_reason=type(exc).__name__,
+                )
             if graph_result and graph_result.provenance:
                 provenance.append(graph_result.provenance)
             if graph_result:
@@ -296,12 +317,12 @@ class CopilotService:
                     latency_ms=0,
                     error_type=type(exc).__name__,
                     safe_error="Detection provider failed.",
+                    limitations=["Detection evidence was unavailable for this request."],
                 )
             if detection_result.provenance:
                 provenance.append(detection_result.provenance)
-            if detection_result.evidence:
-                limitations.extend(detection_result.evidence.limitations)
-            if detection_result.status == "unavailable":
+            limitations.extend(detection_result.limitations)
+            if detection_result.status in {"not_found", "unavailable"}:
                 trace.warnings += 1
         graph_context = graph_result.context if graph_result else {}
         graph_metadata = get_graph_metadata()
@@ -351,6 +372,7 @@ class CopilotService:
             fetched_at=detection_result.evidence.fetched_at.isoformat() if detection_result and detection_result.evidence else "",
             error_type=detection_result.error_type if detection_result else "",
             safe_error=detection_result.safe_error if detection_result else "",
+            limitation=detection_result.limitations[0] if detection_result and detection_result.limitations else "",
         )
         trace.put(
             "GRAPH RETRIEVAL",
@@ -395,6 +417,28 @@ class CopilotService:
             provenance=provenance,
             limitations=limitations,
         )
+        provider_statuses = {
+            "graph": graph_result.status if graph_result else "skipped",
+            "detection": detection_result.status if detection_result else "skipped",
+        }
+        logger.info(
+            "event=provider_statuses request_id=%s graph=%s detection=%s",
+            request_id,
+            provider_statuses["graph"],
+            provider_statuses["detection"],
+        )
+        requested_statuses = [
+            provider_statuses[name]
+            for name, requested in (("graph", route.use_graph), ("detection", route.use_detection))
+            if requested
+        ]
+        if "available" in requested_statuses and any(status != "available" for status in requested_statuses):
+            logger.info(
+                "event=partial_provider_result request_id=%s graph=%s detection=%s synthesis_continues=true",
+                request_id,
+                provider_statuses["graph"],
+                provider_statuses["detection"],
+            )
         logger.info(
             "event=context_package_created request_id=%s entity_status=%s entity_count=%s graph_status=%s detection_status=%s provenance_count=%s limitation_count=%s",
             request_id,
@@ -492,27 +536,66 @@ class CopilotService:
             len(messages),
             _preview(user_text),
         )
+        requested_max_tokens = min(self.settings.chat_max_tokens, self.settings.arvan_max_tokens)
+        final_synthesis_status = "ok"
+        fallback_answer_used = False
         try:
             result = self.llm_client.chat(
                 messages,
                 request_id=request_id,
-                max_tokens=min(self.settings.chat_max_tokens, self.settings.arvan_max_tokens),
+                max_tokens=requested_max_tokens,
+                timeout_seconds=self.settings.chat_timeout_seconds,
                 purpose="chat",
             )
-        except LLMError:
-            trace.status = "error"
-            trace.errors = 1
-            trace.total_latency_ms = int((time.perf_counter() - request_started) * 1000)
-            trace.put(
-                "RESULT",
-                status="error",
-                total_latency_ms=trace.total_latency_ms,
-                warnings=trace.warnings,
-                errors=trace.errors,
+        except LLMError as exc:
+            fallback_answer = build_evidence_fallback_answer(graph_result, detection_result)
+            if not fallback_answer:
+                trace.status = "error"
+                trace.errors = 1
+                trace.total_latency_ms = int((time.perf_counter() - request_started) * 1000)
+                trace.put(
+                    "MODEL RESPONSE",
+                    requested_max_tokens=requested_max_tokens,
+                    finish_reason="",
+                    completion_tokens="",
+                    output_tokens="",
+                    answer_truncated=False,
+                    final_synthesis_status="failed",
+                    fallback_answer_used=False,
+                )
+                trace.put(
+                    "RESULT",
+                    status="error",
+                    total_latency_ms=trace.total_latency_ms,
+                    warnings=trace.warnings,
+                    errors=trace.errors,
+                    final_synthesis_status="failed",
+                    fallback_answer_used=False,
+                )
+                logger.warning(
+                    "event=final_synthesis_failed request_id=%s reason=%s requested_max_tokens=%s fallback_answer_used=false",
+                    request_id,
+                    exc.reason,
+                    requested_max_tokens,
+                )
+                if self.settings.copilot_human_trace_enabled:
+                    render_human_copilot_trace(trace)
+                raise
+            result = LLMProviderResult(
+                text=fallback_answer,
+                provider="deterministic",
+                model="evidence-fallback",
+                finish_reason=None,
             )
-            if self.settings.copilot_human_trace_enabled:
-                render_human_copilot_trace(trace)
-            raise
+            final_synthesis_status = "failed"
+            fallback_answer_used = True
+            trace.warnings += 1
+            logger.warning(
+                "event=final_synthesis_failed request_id=%s reason=%s requested_max_tokens=%s fallback_answer_used=true",
+                request_id,
+                exc.reason,
+                requested_max_tokens,
+            )
         logger.info(
             "event=conversation_response request_id=%s session_id=%s provider=%s model=%s assistant_chars=%s assistant_approx_tokens=%s assistant_preview=%r",
             request_id,
@@ -524,13 +607,33 @@ class CopilotService:
             _preview(result.text),
         )
         usage = result.usage or {}
+        completion_tokens = usage.get("completion_tokens", "")
+        output_tokens = usage.get("output_tokens", "")
+        answer_truncated = _answer_truncated(result.finish_reason, completion_tokens, requested_max_tokens)
+        logger.info(
+            "event=final_synthesis_result request_id=%s requested_max_tokens=%s finish_reason=%s completion_tokens=%s output_tokens=%s answer_truncated=%s final_synthesis_status=%s fallback_answer_used=%s",
+            request_id,
+            requested_max_tokens,
+            result.finish_reason or "",
+            completion_tokens,
+            output_tokens,
+            str(answer_truncated).lower(),
+            final_synthesis_status,
+            str(fallback_answer_used).lower(),
+        )
         trace.put(
             "MODEL RESPONSE",
             provider_status=result.status_code or "",
             provider_latency_ms=result.latency_ms,
             prompt_tokens=usage.get("prompt_tokens", ""),
-            completion_tokens=usage.get("completion_tokens", ""),
+            requested_max_tokens=requested_max_tokens,
+            finish_reason=result.finish_reason or "",
+            completion_tokens=completion_tokens,
+            output_tokens=output_tokens,
             total_tokens=usage.get("total_tokens", ""),
+            answer_truncated=answer_truncated,
+            final_synthesis_status=final_synthesis_status,
+            fallback_answer_used=fallback_answer_used,
             answer_chars=len(result.text),
             answer_tokens_approx=approx_tokens(result.text),
         )
@@ -575,6 +678,8 @@ class CopilotService:
 
         graph_execution_succeeded = bool(graph_result and graph_result.status in {"available", "not_found"})
         detection_execution_succeeded = bool(detection_result and detection_result.status in {"available", "not_found"})
+        graph_available = bool(graph_result and graph_result.status == "available")
+        detection_available = bool(detection_result and detection_result.status == "available")
         evidence_execution_succeeded = graph_execution_succeeded or detection_execution_succeeded
         updated_last_provider = (
             "graph"
@@ -684,10 +789,19 @@ class CopilotService:
             providers_available=", ".join(
                 provider
                 for provider, available in [
-                    ("graph", graph_execution_succeeded),
-                    ("detection", detection_execution_succeeded),
+                    ("graph", graph_available),
+                    ("detection", detection_available),
                 ]
                 if available
+            )
+            or "none",
+            providers_not_found=", ".join(
+                provider
+                for provider, not_found in [
+                    ("graph", bool(route.use_graph and graph_result and graph_result.status == "not_found")),
+                    ("detection", bool(route.use_detection and detection_result and detection_result.status == "not_found")),
+                ]
+                if not_found
             )
             or "none",
             providers_unavailable=", ".join(
@@ -699,6 +813,8 @@ class CopilotService:
                 if unavailable
             )
             or "none",
+            final_synthesis_status=final_synthesis_status,
+            fallback_answer_used=fallback_answer_used,
         )
         if self.settings.copilot_human_trace_enabled:
             render_human_copilot_trace(trace)

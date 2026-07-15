@@ -164,7 +164,18 @@ class ProductApiClient:
 
         safe_ip = quote(normalized_ip, safe="")
         endpoint_path = self.settings.product_asset_detection_path.format(ip=safe_ip)
-        payload, status_code, elapsed = self.get_json(endpoint_path, request_id=request_id)
+        try:
+            payload, status_code, elapsed = self.get_json(endpoint_path, request_id=request_id)
+        except ProductApiHTTPError as exc:
+            if exc.status_code != 404:
+                raise
+            logger.info(
+                "event=detection_not_found request_id=%s endpoint_path=%s ip=%s status_code=404",
+                request_id,
+                endpoint_path,
+                normalized_ip,
+            )
+            return RawAssetDetectionResponse(ip=normalized_ip, assetFound=False)
         try:
             response = RawAssetDetectionResponse.model_validate(payload)
         except ValueError as exc:

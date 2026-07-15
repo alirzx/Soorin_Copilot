@@ -67,8 +67,8 @@ class Settings:
     arvan_api_key: str
     arvan_auth_scheme: str
     arvan_chat_path: str
-    arvan_timeout_seconds: int
-    arvan_connect_timeout_seconds: int
+    llm_connect_timeout_seconds: int
+    chat_timeout_seconds: int
     arvan_max_tokens: int
     arvan_temperature: float
     arvan_top_p: float
@@ -171,8 +171,8 @@ def get_settings() -> Settings:
         arvan_api_key=os.getenv("SOORIN_ARVAN_API_KEY", "").strip(),
         arvan_auth_scheme=os.getenv("SOORIN_ARVAN_AUTH_SCHEME", "apikey").strip(),
         arvan_chat_path=os.getenv("SOORIN_ARVAN_CHAT_PATH", "/chat/completions").strip(),
-        arvan_timeout_seconds=_int("SOORIN_ARVAN_TIMEOUT_SECONDS", 300),
-        arvan_connect_timeout_seconds=_int("SOORIN_ARVAN_CONNECT_TIMEOUT_SECONDS", 30),
+        llm_connect_timeout_seconds=_int("SOORIN_LLM_CONNECT_TIMEOUT_SECONDS", 8),
+        chat_timeout_seconds=_int("SOORIN_CHAT_TIMEOUT_SECONDS", 300),
         arvan_max_tokens=_int("SOORIN_ARVAN_MAX_TOKENS", 12288),
         arvan_temperature=_float("SOORIN_ARVAN_TEMPERATURE", 0.2),
         arvan_top_p=_float("SOORIN_ARVAN_TOP_P", 0.9),
@@ -240,13 +240,13 @@ def get_settings() -> Settings:
             "SOORIN_INTENT_ROUTER_SYSTEM_PROMPT_PATH",
             "app/prompts/intent_router_system_prompt.md",
         ).strip(),
-        intent_router_timeout_seconds=_int("SOORIN_INTENT_ROUTER_TIMEOUT_SECONDS", 45),
+        intent_router_timeout_seconds=_int("SOORIN_INTENT_ROUTER_TIMEOUT_SECONDS", 15),
         intent_router_min_confidence=_float("SOORIN_INTENT_ROUTER_MIN_CONFIDENCE", 0.65),
         intent_router_retry_enabled=_bool("SOORIN_INTENT_ROUTER_RETRY_ENABLED", True),
         intent_router_temperature=_float("SOORIN_INTENT_ROUTER_TEMPERATURE", 0.0),
         intent_router_top_p=_float("SOORIN_INTENT_ROUTER_TOP_P", 0.1),
-        intent_router_max_tokens=_int("SOORIN_INTENT_ROUTER_MAX_TOKENS", 768),
-        intent_router_retry_max_tokens=_int("SOORIN_INTENT_ROUTER_RETRY_MAX_TOKENS", 1536),
+        intent_router_max_tokens=_int("SOORIN_INTENT_ROUTER_MAX_TOKENS", 384),
+        intent_router_retry_max_tokens=_int("SOORIN_INTENT_ROUTER_RETRY_MAX_TOKENS", 640),
         graph_auto_refresh_enabled=_bool("SOORIN_GRAPH_AUTO_REFRESH_ENABLED", True),
         graph_refresh_interval_seconds=_int("SOORIN_GRAPH_REFRESH_INTERVAL_SECONDS", 900),
         graph_refresh_on_startup=_bool("SOORIN_GRAPH_REFRESH_ON_STARTUP", True),

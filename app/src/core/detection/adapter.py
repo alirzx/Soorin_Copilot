@@ -162,6 +162,8 @@ def adapt_asset_detection(
         "Missing fields mean the backend did not return that evidence section.",
         "Null values mean the backend returned an unknown or unavailable value.",
     ]
+    if raw.asset_found is False:
+        limitations.insert(0, "No asset-detection record was found for this IP.")
     return AssetDetectionEvidence(
         ip=raw.ip,
         found=raw.asset_found,

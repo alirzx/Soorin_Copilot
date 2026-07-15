@@ -14,17 +14,33 @@ logger = logging.getLogger(__name__)
 
 GRAPH_WORDS = re.compile(
     r"\b(?:graph|topolog(?:y|ies)|network|connections?|communicat(?:e|es|ion)|"
-    r"neighbors?|peers?|inbound|outbound|linked|relationships?|talks\s+to|interacts?\s+with)\b",
+    r"neighbors?|peers?|inbound|outbound|incoming|outgoing|destinations?|reaches?|depends?\s+on|"
+    r"linked|relationships?|talks\s+to|interacts?\s+with)\b",
     re.IGNORECASE,
 )
 FULL_WORDS = re.compile(r"\b(?:all|every|full|complete|entire)\b", re.IGNORECASE)
-INBOUND_WORDS = re.compile(r"\b(?:inbound|incoming|sources?|connects?\s+to\s+this|toward)\b", re.IGNORECASE)
-OUTBOUND_WORDS = re.compile(r"\b(?:outbound|outgoing|destinations?|reaches|sends?\s+to)\b", re.IGNORECASE)
+FULL_DIRECT_WORDS = re.compile(
+    r"\b(?:all(?:\s+of)?\s+(?:its\s+)?(?:direct\s+)?connections?|every\s+direct\s+neighbor|"
+    r"all\s+first[-\s]hop\s+peers?|complete\s+(?:direct\s+)?neighbor\s+list)\b",
+    re.IGNORECASE,
+)
+INBOUND_WORDS = re.compile(
+    r"\b(?:inbound|incoming|sources?|connects?\s+to\s+this|toward|systems?\s+depend(?:s|ing)?\s+on)\b",
+    re.IGNORECASE,
+)
+OUTBOUND_WORDS = re.compile(
+    r"\b(?:outbound|outgoing|destinations?|reaches|sends?\s+to|systems?\s+(?:does\s+it\s+)?reach)\b",
+    re.IGNORECASE,
+)
 PATH_WORDS = re.compile(r"\b(?:path|shortest\s+path|route|reachability|chain|intermediate)\b", re.IGNORECASE)
 RELATIONSHIP_WORDS = re.compile(r"\b(?:directly\s+connected|adjacent|relationship|edge\s+between)\b", re.IGNORECASE)
 DIRECT_RELATIONSHIP_WORDS = re.compile(r"\b(?:directly\s+connected|direct\s+connection|adjacent|edge\s+between|a\s*->\s*b|b\s*->\s*a)\b", re.IGNORECASE)
 COMPARISON_WORDS = re.compile(r"\b(?:compare|comparison|both\s+assets|both\s+ips|positions?|shared\s+peers?|common\s+peers?|broader\s+outbound|relationship)\b", re.IGNORECASE)
-TWO_HOP_WORDS = re.compile(r"\b(?:two\s+hops?|2\s+hops?|surrounding\s+network|expand\s+the\s+network|wider)\b", re.IGNORECASE)
+TWO_HOP_WORDS = re.compile(
+    r"\b(?:two[-\s]hops?|2\s+hops?|neighbors?\s+of\s+neighbors?|second[-\s]degree(?:\s+connections?|\s+impact)?|"
+    r"surrounding\s+network|expand\s+the\s+network|wider\s+local\s+impact|connections?\s+through\s+direct\s+neighbors?)\b",
+    re.IGNORECASE,
+)
 ASSET_WORDS = re.compile(r"\b(?:tell|show|explain|investigate|analy[sz]e|what\s+about|how\s+about|what\s+.*know|all\s+you\s+know)\b", re.IGNORECASE)
 FOLLOWUP_WORDS = re.compile(r"\b(?:go\s+deeper|continue|more\s+details|what\s+else|expand)\b", re.IGNORECASE)
 ENTITY_REFERENCE_WORDS = re.compile(
@@ -40,6 +56,12 @@ SECURITY_ANALYSIS_WORDS = re.compile(
     r"\b(?:anomal(?:y|ies|ous)|suspicious|unusual|abnormal|security|risk|threat|compromise[ds]?)\b",
     re.IGNORECASE,
 )
+COMBINED_ANALYSIS_WORDS = re.compile(
+    r"\b(?:analy[sz]e\s+(?:this\s+)?asset\s+deeply|all\s+(?:available\s+)?evidence|"
+    r"complete\s+(?:the\s+)?analysis|comprehensive\s+(?:analytical\s+)?report|"
+    r"full\s+asset\s+assessment|identity\s+and\s+connections|classification\s+and\s+topology)\b",
+    re.IGNORECASE,
+)
 OPERATIONAL_INTENTS = {
     "asset_investigation",
     "graph_neighbors",
@@ -50,6 +72,8 @@ OPERATIONAL_INTENTS = {
 
 
 def _direction(message: str, default: GraphDirection = "both") -> GraphDirection:
+    if FULL_DIRECT_WORDS.search(message or ""):
+        return "both"
     inbound = bool(INBOUND_WORDS.search(message or ""))
     outbound = bool(OUTBOUND_WORDS.search(message or ""))
     if inbound and not outbound:
@@ -100,6 +124,7 @@ class DeterministicFallbackRouter:
         detection_signal = bool(DETECTION_COMPACT_WORDS.search(message or ""))
         identity_signal = bool(IDENTITY_WORDS.search(message or ""))
         security_signal = bool(SECURITY_ANALYSIS_WORDS.search(message or ""))
+        combined_signal = bool(COMBINED_ANALYSIS_WORDS.search(message or ""))
         entity_followup_signal = bool(
             entities.reference_detected
             or ENTITY_REFERENCE_WORDS.search(message or "")
@@ -125,18 +150,31 @@ class DeterministicFallbackRouter:
             intent, scope, direction, depth = "graph_relationships", "one_hop", "both", 1
             use_graph, requires_multiple, reason = True, True, "fallback_relationship"
             signal_group = "graph_relationship"
+        elif target and entity_count == 1 and combined_signal:
+            if TWO_HOP_WORDS.search(message or ""):
+                scope, depth = "two_hop", 2
+            elif FULL_DIRECT_WORDS.search(message or ""):
+                scope, depth = "full_neighbors", 1
+            else:
+                scope, depth = "node_summary", 0
+            intent, direction = "asset_investigation", _direction(message)
+            use_graph, use_detection, detection_detail = True, True, "summary"
+            reason = "fallback_comprehensive_combined_analysis"
+            signal_group = "combined_provider_request"
         elif target and entity_count == 1 and TWO_HOP_WORDS.search(message or ""):
             intent, scope, direction, depth = "graph_neighbors", "two_hop", _direction(message), 2
             use_graph, reason = True, "fallback_two_hop"
             signal_group = "graph_topology"
         elif target and entity_count == 1 and graph_signal and detection_signal:
-            intent, scope, direction, depth = "asset_investigation", "node_summary", "both", 0
+            scope = "full_neighbors" if FULL_DIRECT_WORDS.search(message or "") else "node_summary"
+            depth = 1 if scope == "full_neighbors" else 0
+            intent, direction = "asset_investigation", _direction(message)
             use_graph, use_detection, detection_detail = True, True, "summary"
             reason = "fallback_combined_graph_detection"
             signal_group = "combined_provider_request"
         elif target and entity_count == 1 and graph_signal:
             intent = "graph_neighbors"
-            scope = "full_neighbors" if FULL_WORDS.search(message or "") else "one_hop"
+            scope = "full_neighbors" if FULL_DIRECT_WORDS.search(message or "") or FULL_WORDS.search(message or "") else "one_hop"
             direction = _direction(message)
             depth = 1
             use_graph, reason = True, "fallback_graph_neighbors"
