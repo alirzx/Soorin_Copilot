@@ -9,7 +9,7 @@ from typing import Any
 import requests
 from urllib3.exceptions import ProtocolError
 
-from src.config.settings import Settings
+from src.config.llm_deployments import ArvanDeploymentConfig
 from src.core.context.models import approx_tokens
 from src.core.llm.errors import LLMError
 from src.core.llm.providers.base import LLMProviderResult
@@ -28,130 +28,206 @@ RETRYABLE_REQUEST_EXCEPTIONS = (
 PROVIDER_REQUEST_EXCEPTIONS = (requests.exceptions.RequestException, ProtocolError)
 
 
+def _usage_dict(value: Any) -> dict[str, Any]:
+    """Preserve reported usage fields without fabricating missing token counts."""
+    return dict(value) if isinstance(value, dict) else {}
+
+
 class ArvanProvider:
     provider_name = "arvan"
 
-    def __init__(self, settings: Settings) -> None:
-        self.settings = settings
+    def __init__(self, deployment: ArvanDeploymentConfig, *, enabled: bool = True) -> None:
+        self.deployment = deployment
+        self.enabled = enabled
         logger.info(
-            "event=arvan_provider_initialized provider=%s model=%s chat_path=%s",
+            "event=arvan_provider_initialized deployment=%s provider=%s model=%s host=%s enabled=%s ready=%s",
+            deployment.name,
             self.provider_name,
-            settings.arvan_model,
-            settings.arvan_chat_path,
+            deployment.model,
+            deployment.safe_host,
+            enabled,
+            self.health()["ready"],
         )
 
     @property
     def endpoint(self) -> str:
-        path = self.settings.arvan_chat_path
-        if not path.startswith("/"):
-            path = f"/{path}"
-        return f"{self.settings.arvan_base_url}{path}"
+        return self.deployment.endpoint
 
     def health(self) -> dict[str, object]:
         missing = []
-        if not self.settings.llm_enabled:
+        if not self.enabled:
             missing.append("llm_disabled")
-        if not self.settings.arvan_base_url:
-            missing.append("missing_base_url")
-        if not self.settings.arvan_api_key:
+        if not self.deployment.endpoint:
+            missing.append("missing_endpoint")
+        if not self.deployment.api_key:
             missing.append("missing_api_key")
 
         return {
-            "enabled": self.settings.llm_enabled,
+            "enabled": self.enabled,
             "ready": not missing,
+            "deployment": self.deployment.name,
             "provider": self.provider_name,
-            "model": self.settings.arvan_model,
-            "chat_path": self.settings.arvan_chat_path,
+            "model": self.deployment.model,
+            "host": self.deployment.safe_host,
             "missing": missing,
         }
+
+    def _log_complete(
+        self,
+        *,
+        request_id: str,
+        purpose: str,
+        status_code: int | str,
+        latency_ms: int,
+        finish_reason: Any = "",
+        usage: dict[str, Any] | None = None,
+        output_chars: int = 0,
+        reasoning_present: bool = False,
+        outcome: str,
+    ) -> None:
+        usage = usage or {}
+        logger.info(
+            "event=llm_request_complete request_id=%s purpose=%s deployment=%s provider=%s model=%s host=%s outcome=%s status_code=%s latency_ms=%s finish_reason=%s prompt_tokens=%s completion_tokens=%s total_tokens=%s output_chars=%s reasoning_present=%s",
+            request_id,
+            purpose,
+            self.deployment.name,
+            self.provider_name,
+            self.deployment.model,
+            self.deployment.safe_host,
+            outcome,
+            status_code,
+            latency_ms,
+            finish_reason or "",
+            usage.get("prompt_tokens", ""),
+            usage.get("completion_tokens", ""),
+            usage.get("total_tokens", ""),
+            output_chars,
+            reasoning_present,
+        )
 
     def chat(
         self,
         messages: list[dict[str, str]],
         *,
         request_id: str = "",
-        max_tokens: int | None = None,
-        temperature: float | None = None,
-        top_p: float | None = None,
-        timeout_seconds: int | None = None,
+        max_tokens: int,
+        temperature: float | None,
+        top_p: float | None,
+        timeout_seconds: int,
         purpose: str = "chat",
     ) -> LLMProviderResult:
         readiness = self.health()
         if not readiness["ready"]:
-            raise LLMError("Arvan provider is not configured.", reason="provider_not_ready")
+            raise LLMError(
+                "Selected Arvan deployment is not ready.",
+                reason="provider_not_ready",
+                details={"deployment": self.deployment.name},
+            )
 
-        payload = {
-            "model": self.settings.arvan_model,
+        payload: dict[str, Any] = {
+            "model": self.deployment.model,
             "messages": messages,
-            "max_tokens": max_tokens if max_tokens is not None else self.settings.arvan_max_tokens,
-            "temperature": temperature if temperature is not None else self.settings.arvan_temperature,
-            "top_p": top_p if top_p is not None else self.settings.arvan_top_p,
+            "max_tokens": max_tokens,
+            **self.deployment.request_options_dict(),
         }
+        if temperature is not None:
+            payload["temperature"] = temperature
+        if top_p is not None:
+            payload["top_p"] = top_p
         headers = {
-            "Authorization": f"{self.settings.arvan_auth_scheme} {self.settings.arvan_api_key}",
+            "Authorization": f"{self.deployment.auth_scheme} {self.deployment.api_key}",
             "Content-Type": "application/json",
         }
-        timeout = (
-            self.settings.llm_connect_timeout_seconds,
-            timeout_seconds if timeout_seconds is not None else self.settings.chat_timeout_seconds,
-        )
+        timeout = (self.deployment.connect_timeout_seconds, timeout_seconds)
 
         logger.info(
-            "event=provider_request_start request_id=%s provider=%s model=%s message_count=%s chat_path=%s purpose=%s connect_timeout_seconds=%s read_timeout_seconds=%s",
+            "event=provider_request_start request_id=%s purpose=%s deployment=%s provider=%s model=%s host=%s message_count=%s max_tokens=%s connect_timeout_seconds=%s read_timeout_seconds=%s temperature_included=%s top_p_included=%s",
             request_id,
-            self.provider_name,
-            self.settings.arvan_model,
-            len(messages),
-            self.settings.arvan_chat_path,
             purpose,
+            self.deployment.name,
+            self.provider_name,
+            self.deployment.model,
+            self.deployment.safe_host,
+            len(messages),
+            max_tokens,
             timeout[0],
             timeout[1],
+            "temperature" in payload,
+            "top_p" in payload,
         )
         started = time.perf_counter()
         try:
             response = requests.post(self.endpoint, json=payload, headers=headers, timeout=timeout)
         except PROVIDER_REQUEST_EXCEPTIONS as exc:
+            latency_ms = int((time.perf_counter() - started) * 1000)
             retryable = isinstance(exc, RETRYABLE_REQUEST_EXCEPTIONS)
             logger.warning(
-                "event=provider_request_exception request_id=%s provider=%s model=%s purpose=%s error_type=%s retryable=%s",
+                "event=provider_request_exception request_id=%s purpose=%s deployment=%s provider=%s model=%s host=%s error_type=%s retryable=%s latency_ms=%s",
                 request_id,
-                self.provider_name,
-                self.settings.arvan_model,
                 purpose,
+                self.deployment.name,
+                self.provider_name,
+                self.deployment.model,
+                self.deployment.safe_host,
                 type(exc).__name__,
                 retryable,
+                latency_ms,
+            )
+            self._log_complete(
+                request_id=request_id,
+                purpose=purpose,
+                status_code="",
+                latency_ms=latency_ms,
+                outcome="transport_error",
             )
             raise LLMError(
                 "Arvan request failed.",
                 reason="provider_transport_error",
-                details={"error_type": type(exc).__name__, "retryable": retryable},
+                details={
+                    "deployment": self.deployment.name,
+                    "error_type": type(exc).__name__,
+                    "retryable": retryable,
+                },
             ) from exc
 
         latency_ms = int((time.perf_counter() - started) * 1000)
         logger.info(
-            "event=provider_response request_id=%s provider=%s model=%s status_code=%s latency_ms=%s purpose=%s",
+            "event=provider_response request_id=%s purpose=%s deployment=%s provider=%s model=%s host=%s status_code=%s latency_ms=%s",
             request_id,
+            purpose,
+            self.deployment.name,
             self.provider_name,
-            self.settings.arvan_model,
+            self.deployment.model,
+            self.deployment.safe_host,
             response.status_code,
             latency_ms,
-            purpose,
         )
         if response.status_code >= 400:
+            retryable = response.status_code in RETRYABLE_HTTP_STATUS_CODES
             logger.warning(
-                "event=provider_http_error request_id=%s provider=%s model=%s status_code=%s latency_ms=%s retryable=%s",
+                "event=provider_http_error request_id=%s purpose=%s deployment=%s provider=%s model=%s host=%s status_code=%s latency_ms=%s retryable=%s",
                 request_id,
+                purpose,
+                self.deployment.name,
                 self.provider_name,
-                self.settings.arvan_model,
+                self.deployment.model,
+                self.deployment.safe_host,
                 response.status_code,
                 latency_ms,
-                response.status_code in RETRYABLE_HTTP_STATUS_CODES,
+                retryable,
             )
-            retryable = response.status_code in RETRYABLE_HTTP_STATUS_CODES
+            self._log_complete(
+                request_id=request_id,
+                purpose=purpose,
+                status_code=response.status_code,
+                latency_ms=latency_ms,
+                outcome="http_error",
+            )
             raise LLMError(
                 "Arvan provider returned an error.",
                 reason="provider_http_error",
                 details={
+                    "deployment": self.deployment.name,
                     "status_code": response.status_code,
                     "error_type": f"HTTP_{response.status_code}",
                     "retryable": retryable,
@@ -161,49 +237,66 @@ class ArvanProvider:
         try:
             data: dict[str, Any] = response.json()
         except ValueError as exc:
-            logger.exception(
-                "event=provider_invalid_json request_id=%s provider=%s model=%s status_code=%s latency_ms=%s",
+            logger.warning(
+                "event=provider_invalid_json request_id=%s purpose=%s deployment=%s provider=%s model=%s host=%s status_code=%s latency_ms=%s",
                 request_id,
+                purpose,
+                self.deployment.name,
                 self.provider_name,
-                self.settings.arvan_model,
+                self.deployment.model,
+                self.deployment.safe_host,
                 response.status_code,
                 latency_ms,
             )
+            self._log_complete(
+                request_id=request_id,
+                purpose=purpose,
+                status_code=response.status_code,
+                latency_ms=latency_ms,
+                outcome="invalid_json",
+            )
             raise LLMError("Arvan provider returned invalid JSON.", reason="provider_invalid_json") from exc
 
-        choice = (data.get("choices") or [{}])[0]
-        message = choice.get("message") or {}
+        choices = data.get("choices")
+        choice = choices[0] if isinstance(choices, list) and choices and isinstance(choices[0], dict) else {}
+        message = choice.get("message") if isinstance(choice.get("message"), dict) else {}
         text = str(message.get("content") or "")
         reasoning_present = bool(message.get("reasoning_content"))
+        finish_reason = choice.get("finish_reason")
+        usage = _usage_dict(data.get("usage"))
 
         if not text:
-            if purpose == "intent_router":
+            self._log_complete(
+                request_id=request_id,
+                purpose=purpose,
+                status_code=response.status_code,
+                latency_ms=latency_ms,
+                finish_reason=finish_reason,
+                usage=usage,
+                reasoning_present=reasoning_present,
+                outcome="empty_content",
+            )
+            if purpose in {"intent_router", "intent_router_repair"}:
                 return LLMProviderResult(
                     text="",
                     provider=self.provider_name,
-                    model=str(data.get("model") or self.settings.arvan_model),
-                    finish_reason=choice.get("finish_reason"),
-                    usage=data.get("usage") or {},
+                    model=self.deployment.model,
+                    deployment=self.deployment.name,
+                    finish_reason=finish_reason,
+                    usage=usage,
                     latency_ms=latency_ms,
                     status_code=response.status_code,
-                    endpoint=self.settings.arvan_chat_path,
+                    endpoint=self.deployment.safe_host,
                     reasoning_present=reasoning_present,
                     reasoning_exposed=False,
                     payload_format="chat_completions",
                 )
-            logger.warning(
-                "event=provider_empty_answer request_id=%s provider=%s model=%s latency_ms=%s",
-                request_id,
-                self.provider_name,
-                self.settings.arvan_model,
-                latency_ms,
+            raise LLMError(
+                "Arvan provider returned an empty answer.",
+                reason="provider_empty_answer",
+                details={"deployment": self.deployment.name},
             )
-            raise LLMError("Arvan provider returned an empty answer.", reason="provider_empty_answer")
 
-        usage = data.get("usage") or {}
-        prompt_tokens = usage.get("prompt_tokens")
-        completion_tokens = usage.get("completion_tokens")
-        total_tokens = usage.get("total_tokens")
         usage_keys = sorted(str(key) for key in usage.keys())
         numeric_usage_fields = sorted(
             str(key)
@@ -211,32 +304,43 @@ class ArvanProvider:
             if isinstance(value, (int, float)) and ("token" in str(key).lower() or "cache" in str(key).lower())
         )
         logger.info(
-            "event=provider_latency request_id=%s provider=%s model=%s latency_ms=%s purpose=%s assistant_chars=%s output_approx_tokens=%s provider_prompt_tokens=%s provider_completion_tokens=%s provider_total_tokens=%s usage_keys=%s numeric_usage_fields=%s assistant_preview=%r reasoning_present=%s",
+            "event=provider_usage request_id=%s purpose=%s deployment=%s provider=%s model=%s status_code=%s latency_ms=%s assistant_chars=%s output_approx_tokens=%s output_tokens=%s usage_keys=%s numeric_usage_fields=%s reasoning_present=%s",
             request_id,
-            self.provider_name,
-            str(data.get("model") or self.settings.arvan_model),
-            latency_ms,
             purpose,
+            self.deployment.name,
+            self.provider_name,
+            self.deployment.model,
+            response.status_code,
+            latency_ms,
             len(text),
             approx_tokens(text),
-            prompt_tokens if prompt_tokens is not None else "",
-            completion_tokens if completion_tokens is not None else "",
-            total_tokens if total_tokens is not None else "",
+            usage.get("output_tokens", ""),
             ",".join(usage_keys),
             ",".join(numeric_usage_fields),
-            text.strip().replace("\n", " ")[:120],
             reasoning_present,
+        )
+        self._log_complete(
+            request_id=request_id,
+            purpose=purpose,
+            status_code=response.status_code,
+            latency_ms=latency_ms,
+            finish_reason=finish_reason,
+            usage=usage,
+            output_chars=len(text),
+            reasoning_present=reasoning_present,
+            outcome="success",
         )
 
         return LLMProviderResult(
             text=text,
             provider=self.provider_name,
-            model=str(data.get("model") or self.settings.arvan_model),
-            finish_reason=choice.get("finish_reason"),
+            model=self.deployment.model,
+            deployment=self.deployment.name,
+            finish_reason=finish_reason,
             usage=usage,
             latency_ms=latency_ms,
             status_code=response.status_code,
-            endpoint=self.settings.arvan_chat_path,
+            endpoint=self.deployment.safe_host,
             reasoning_present=reasoning_present,
             reasoning_exposed=False,
             payload_format="chat_completions",

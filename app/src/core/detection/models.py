@@ -83,6 +83,10 @@ class DetectionClassification:
     vendor: str | None = None
     product: str | None = None
 
+    @property
+    def confidence_available(self) -> bool:
+        return self.confidence is not None
+
 
 @dataclass(frozen=True)
 class DetectionTagging:
@@ -91,6 +95,10 @@ class DetectionTagging:
     tag: str | None = None
     sub_tag: str | None = None
     confidence: float | None = None
+
+    @property
+    def confidence_available(self) -> bool:
+        return self.confidence is not None
 
 
 @dataclass(frozen=True)

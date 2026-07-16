@@ -140,7 +140,44 @@ class GraphRefreshService:
             self._thread.join(timeout=timeout_seconds)
         logger.info("event=graph_refresh_scheduler_stopped")
 
-    def refresh_once(self, *, force: bool = False) -> GraphRefreshResult:
+    def refresh_once(self, *, force: bool = False, reason: str | None = None) -> GraphRefreshResult:
+        metadata = get_graph_metadata()
+        snapshot_age_seconds = self._snapshot_age_seconds(metadata.get("active_graph_loaded_at"))
+        refresh_reason = "forced" if force else reason or ("no_active_snapshot" if get_cached_graph() is None else "manual_requested")
+        logger.info(
+            "event=graph_refresh_decision refresh_reason=%s snapshot_age_seconds=%s refresh_interval_seconds=%s active_snapshot_version=%s",
+            refresh_reason,
+            snapshot_age_seconds if snapshot_age_seconds is not None else "",
+            self.settings.graph_refresh_interval_seconds,
+            metadata.get("active_graph_version", ""),
+        )
+        active_graph = get_cached_graph()
+        scheduled_check = reason in {"startup", "interval_elapsed"}
+        if (
+            not force
+            and scheduled_check
+            and active_graph is not None
+            and snapshot_age_seconds is not None
+            and snapshot_age_seconds < self.settings.graph_refresh_interval_seconds
+        ):
+            logger.info(
+                "event=graph_refresh_reused refresh_reason=snapshot_fresh snapshot_age_seconds=%s refresh_interval_seconds=%s active_snapshot_version=%s",
+                snapshot_age_seconds,
+                self.settings.graph_refresh_interval_seconds,
+                metadata.get("active_graph_version", ""),
+            )
+            return GraphRefreshResult(
+                status="skipped",
+                activated=False,
+                nodes=active_graph.number_of_nodes(),
+                edges=active_graph.number_of_edges(),
+                raw_records=0,
+                processed_records=0,
+                snapshot_version=str(metadata.get("active_graph_version") or ""),
+                raw_snapshot_path=str(metadata.get("raw_snapshot_path") or ""),
+                processed_snapshot_path=str(metadata.get("processed_snapshot_path") or ""),
+                message="active_snapshot_fresh",
+            )
         if not self._lock.acquire(timeout=self.settings.graph_refresh_lock_timeout_seconds):
             logger.warning("event=graph_refresh_skipped_already_running")
             return GraphRefreshResult(
@@ -237,10 +274,11 @@ class GraphRefreshService:
             error_type = type(exc).__name__
             self._record_failure(error_type, str(exc)[:220])
             logger.warning(
-                "event=graph_refresh_failed snapshot_version=%s error_type=%s elapsed_ms=%s message=%s",
+                "event=graph_refresh_failed snapshot_version=%s error_type=%s elapsed_ms=%s active_snapshot_preserved=%s message=%s",
                 snapshot_version,
                 error_type,
                 elapsed_ms,
+                get_cached_graph() is not None,
                 str(exc)[:160],
             )
             return GraphRefreshResult(
@@ -272,9 +310,21 @@ class GraphRefreshService:
         if self.settings.graph_refresh_on_startup and self._stop_event.wait(initial_delay):
             return
         if self.settings.graph_refresh_on_startup and not self._stop_event.is_set():
-            self.refresh_once()
+            self.refresh_once(reason="startup")
         while not self._stop_event.wait(self.settings.graph_refresh_interval_seconds):
-            self.refresh_once()
+            self.refresh_once(reason="interval_elapsed")
+
+    @staticmethod
+    def _snapshot_age_seconds(loaded_at: object) -> int | None:
+        if not loaded_at:
+            return None
+        try:
+            loaded = datetime.fromisoformat(str(loaded_at).replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        if loaded.tzinfo is None:
+            loaded = loaded.replace(tzinfo=timezone.utc)
+        return max(0, int((datetime.now(timezone.utc) - loaded).total_seconds()))
 
     def _validate_graph(self, graph: nx.DiGraph, *, force: bool) -> None:
         if not isinstance(graph, nx.DiGraph):

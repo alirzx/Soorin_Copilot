@@ -6,6 +6,7 @@ import pickle
 import tempfile
 import unittest
 from dataclasses import replace
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -57,8 +58,10 @@ class FakeLLMClient:
 class FakeProductClient:
     def __init__(self, response: ProductTopologyResponse | Exception) -> None:
         self.response = response
+        self.calls = 0
 
     def fetch_topology_unique_ip_pairs(self) -> ProductTopologyResponse:
+        self.calls += 1
         if isinstance(self.response, Exception):
             raise self.response
         return self.response
@@ -83,7 +86,9 @@ def fake_result(
 def make_settings(**overrides):
     values = {
         "llm_provider": "fake",
-        "arvan_model": "fake",
+        "intent_router_deployment": "glm",
+        "chat_deployment": "glm",
+        "glm_model": "fake",
         "copilot_human_trace_enabled": False,
         "intent_router_enabled": True,
         "intent_router_min_confidence": 0.65,
@@ -127,6 +132,43 @@ class EntityAuthorityTests(unittest.TestCase):
             routing_state=SessionRoutingState(active_ip="192.168.30.115"),
         )
         self.assertEqual(result.primary_entity.source, "conversation")
+
+    def test_cidr_only_never_materializes_network_address_as_host(self) -> None:
+        for cidr in ("192.168.21.0/24", "10.0.0.0/8", "172.16.0.0/16", "2001:db8::/32"):
+            with self.subTest(cidr=cidr):
+                result = self.resolver.resolve(f"Identify peers in {cidr}.")
+                self.assertEqual(result.entities, [])
+                self.assertIsNone(result.primary_entity)
+                self.assertIn(cidr, result.subnet_constraints)
+                self.assertIn(cidr, result.unsupported_constraints)
+
+    def test_explicit_host_and_cidr_are_kept_separate(self) -> None:
+        result = self.resolver.resolve(
+            "For asset 192.168.0.55, identify bidirectional peers inside 192.168.21.7/24."
+        )
+        self.assertEqual([entity.value for entity in result.entities], ["192.168.0.55"])
+        self.assertEqual(result.subnet_constraints, ("192.168.21.0/24",))
+        self.assertNotIn("192.168.21.0", [entity.value for entity in result.entities])
+
+    def test_bounded_active_single_reference_phrases_resolve_consistently(self) -> None:
+        state = SessionRoutingState(active_ip="192.168.21.104")
+        phrases = [
+            "Show the connections of it.",
+            "Analyze evidence from it.",
+            "Use all of its evidence.",
+            "What do we know about it?",
+            "Assess behavior observed from it.",
+            "Show connections we have from it.",
+            "Analyze this host.",
+            "Continue with the same asset.",
+        ]
+        for phrase in phrases:
+            with self.subTest(phrase=phrase):
+                result = self.resolver.resolve(phrase, routing_state=state)
+                self.assertEqual(result.status, "resolved")
+                self.assertEqual(result.primary_entity.value, "192.168.21.104")
+                self.assertEqual(result.primary_entity.source, "conversation")
+                self.assertTrue(result.reference_detected)
 
     def test_possessive_single_entity_references_use_active_ip(self) -> None:
         state = SessionRoutingState(active_ip="192.168.21.1")
@@ -417,6 +459,75 @@ class RouterSchemaTests(unittest.TestCase):
         self.assertEqual(route.detection_detail, "summary")
         self.assertEqual(decision.route_normalization_reason, "combined_route_detection_detail_normalized")
 
+    def test_explicit_full_detection_depth_is_preserved_with_graph(self) -> None:
+        cases = [("full_neighbors", 1), ("two_hop", 2)]
+        for scope, depth in cases:
+            with self.subTest(scope=scope):
+                decision = validate_router_payload(
+                    self.payload(
+                        intent="asset_investigation",
+                        scope=scope,
+                        direction="both",
+                        depth=depth,
+                        requires_graph=True,
+                        requires_detection=True,
+                        detection_detail="compact_full",
+                    ),
+                    self.entities,
+                    min_confidence=0.65,
+                    message="Include every matched detection rule, all supporting signals, and all conflicts.",
+                )
+                route = normalize_intent_route(decision, self.entities)
+                self.assertTrue(route.use_graph)
+                self.assertTrue(route.use_detection)
+                self.assertEqual(route.scope, scope)
+                self.assertEqual(route.depth, depth)
+                self.assertEqual(route.detection_detail, "compact_full")
+
+    def test_anomaly_route_uses_current_graph_and_detection_evidence(self) -> None:
+        decision = validate_router_payload(
+            self.payload(
+                intent="graph_neighbors",
+                scope="one_hop",
+                direction="both",
+                depth=1,
+                requires_graph=True,
+                requires_detection=False,
+                detection_detail="summary",
+            ),
+            self.entities,
+            min_confidence=0.65,
+            message="Does this asset show unusual behavior?",
+        )
+        route = normalize_intent_route(decision, self.entities)
+        self.assertEqual(route.intent, "asset_investigation")
+        self.assertEqual(route.scope, "node_summary")
+        self.assertEqual(route.depth, 0)
+        self.assertTrue(route.use_graph)
+        self.assertTrue(route.use_detection)
+        self.assertEqual(route.detection_detail, "summary")
+
+    def test_deep_two_hop_anomaly_preserves_compact_full(self) -> None:
+        decision = validate_router_payload(
+            self.payload(
+                intent="asset_investigation",
+                scope="two_hop",
+                direction="both",
+                depth=2,
+                requires_graph=True,
+                requires_detection=True,
+                detection_detail="compact_full",
+            ),
+            self.entities,
+            min_confidence=0.65,
+            message="Perform a deep anomaly assessment using all detection rules, conflicts, and two-hop communication patterns.",
+        )
+        self.assertEqual(decision.scope, "two_hop")
+        self.assertEqual(decision.depth, 2)
+        self.assertTrue(decision.requires_graph)
+        self.assertTrue(decision.requires_detection)
+        self.assertEqual(decision.detection_detail, "compact_full")
+
     def test_general_knowledge_requests_no_providers(self) -> None:
         decision = validate_router_payload(
             self.payload(
@@ -482,6 +593,28 @@ class RouterSchemaTests(unittest.TestCase):
         self.assertTrue(decision.requires_detection)
         self.assertEqual(decision.detection_detail, "compact_full")
         self.assertEqual(route.decision_source, "glm")
+
+    def test_active_reference_normalizes_is_followup_true(self) -> None:
+        state = SessionRoutingState(active_ip="192.168.30.115")
+        entities = EntityResolver().resolve("Use all of its evidence.", routing_state=state)
+        decision = validate_router_payload(
+            self.payload(
+                intent="asset_investigation",
+                scope="node_summary",
+                direction="both",
+                depth=0,
+                requires_graph=True,
+                requires_detection=True,
+                entity_binding="active_single",
+                is_followup=False,
+            ),
+            entities,
+            min_confidence=0.65,
+            message="Use all of its evidence.",
+            routing_state=state,
+        )
+        self.assertTrue(decision.is_followup)
+        self.assertTrue(decision.route_normalized)
 
     def test_general_knowledge_binds_none(self) -> None:
         decision = validate_router_payload(
@@ -964,11 +1097,11 @@ class LLMPrimaryRouterTests(unittest.TestCase):
 
     def test_router_uses_router_specific_generation_settings_and_retry_budget(self) -> None:
         settings = make_settings(
-            intent_router_temperature=0.0,
-            intent_router_top_p=0.1,
-            intent_router_max_tokens=77,
-            intent_router_retry_max_tokens=155,
-            intent_router_timeout_seconds=13,
+            glm_router_temperature=0.0,
+            glm_router_top_p=0.1,
+            glm_router_max_tokens=77,
+            glm_router_retry_max_tokens=155,
+            glm_router_timeout_seconds=13,
         )
         llm = FakeLLMClient([
             fake_result("", finish_reason="length"),
@@ -984,6 +1117,8 @@ class LLMPrimaryRouterTests(unittest.TestCase):
         self.assertEqual(llm.calls[0]["timeout_seconds"], 13)
         self.assertEqual(llm.calls[1]["timeout_seconds"], 13)
         self.assertEqual(llm.calls[0]["transient_retries"], 0)
+        self.assertEqual(llm.calls[0]["purpose"], "intent_router")
+        self.assertEqual(llm.calls[1]["purpose"], "intent_router_repair")
         self.assertLess(len(llm.calls[1]["messages"][0]["content"]), len(router.system_prompt))
 
     def test_invalid_enum_and_missing_fields_use_one_content_repair(self) -> None:
@@ -1112,6 +1247,29 @@ class DeterministicFallbackPolicyTests(unittest.TestCase):
         self.assertEqual(route.intent, "asset_investigation")
         self.assertEqual(route.matched_signals, ["combined_provider_request"])
 
+    def test_referential_fallback_materializes_active_single_and_marks_followup(self) -> None:
+        state = SessionRoutingState(
+            active_ip="192.168.21.104",
+            last_provider="combined",
+            last_providers=("graph", "detection"),
+            previous_intent="asset_investigation",
+            previous_scope="node_summary",
+            previous_direction="both",
+            previous_depth=0,
+            previous_requires_detection=True,
+            previous_detection_detail="summary",
+        )
+        message = "What do we know about it?"
+        route = self.router.route(
+            message,
+            self.resolver.resolve(message, routing_state=state),
+            state,
+            fallback_reason="provider_error",
+        )
+        self.assertEqual(route.entity_binding, "active_single")
+        self.assertEqual(route.materialized_entities, ("192.168.21.104",))
+        self.assertTrue(route.followup_detected)
+
     def test_exact_prompt_a_fallback_uses_combined_node_summary(self) -> None:
         message = (
             "this is one of our asset 192.168.0.125 , i want you analyze this deeply and give me analytical "
@@ -1169,6 +1327,55 @@ class DeterministicFallbackPolicyTests(unittest.TestCase):
                 self.assertTrue(route.use_graph)
                 self.assertFalse(route.use_detection)
 
+    def test_topology_summary_uses_node_summary_not_heavy_retrieval(self) -> None:
+        message = "Summarize the topology around 192.168.21.104."
+        route = self.router.route(message, self.resolver.resolve(message), fallback_reason="provider_error")
+        self.assertEqual(route.scope, "node_summary")
+        self.assertEqual(route.depth, 0)
+        self.assertTrue(route.use_graph)
+
+    def test_comprehensive_report_needs_explicit_detection_depth_for_compact_full(self) -> None:
+        summary_message = "Give me a comprehensive report for 192.168.21.104."
+        full_message = (
+            "Give me a comprehensive report including every detection rule and all supporting signals "
+            "for 192.168.21.104."
+        )
+        summary_route = self.router.route(
+            summary_message,
+            self.resolver.resolve(summary_message),
+            fallback_reason="provider_error",
+        )
+        full_route = self.router.route(
+            full_message,
+            self.resolver.resolve(full_message),
+            fallback_reason="provider_error",
+        )
+        self.assertEqual(summary_route.detection_detail, "summary")
+        self.assertEqual(full_route.detection_detail, "compact_full")
+
+    def test_combined_full_detection_fallback_preserves_heavy_graph_scope(self) -> None:
+        cases = [
+            (
+                "Show all direct connections for 192.168.0.55 and include every matched detection rule, conflict, and supporting classification signal.",
+                "full_neighbors",
+                1,
+            ),
+            (
+                "Perform a two-hop investigation of 192.168.21.104 using all detection rules, supporting signals, conflicts, and complete profile evidence.",
+                "two_hop",
+                2,
+            ),
+        ]
+        for message, scope, depth in cases:
+            with self.subTest(scope=scope):
+                route = self.router.route(message, self.resolver.resolve(message), fallback_reason="provider_error")
+                self.assertEqual(route.intent, "asset_investigation")
+                self.assertEqual(route.scope, scope)
+                self.assertEqual(route.depth, depth)
+                self.assertTrue(route.use_graph)
+                self.assertTrue(route.use_detection)
+                self.assertEqual(route.detection_detail, "compact_full")
+
     def test_dependency_and_destination_phrases_set_direction(self) -> None:
         cases = [
             ("Which systems depend on 192.168.0.125?", "inbound"),
@@ -1196,7 +1403,8 @@ class DeterministicFallbackPolicyTests(unittest.TestCase):
 
         self.assertNotEqual(route.intent, "general_knowledge")
         self.assertTrue(route.use_graph)
-        self.assertFalse(route.use_detection)
+        self.assertTrue(route.use_detection)
+        self.assertEqual(route.detection_detail, "summary")
         self.assertIn(route.matched_signals[0], {"graph_topology", "security_or_anomaly"})
         self.assertIn("security_or_anomaly", route.matched_signals)
 
@@ -1928,6 +2136,44 @@ class GraphRefreshTests(unittest.TestCase):
         self.assertTrue(Path(self.settings.graph_pickle_path).exists())
         self.assertTrue(Path(self.settings.graph_stats_path).exists())
         self.assertEqual(service.status()["consecutive_failures"], 0)
+
+    def test_refresh_decision_logs_snapshot_age_interval_and_version(self) -> None:
+        service = GraphRefreshService(self.settings, FakeProductClient(self.topology_response()))  # type: ignore[arg-type]
+        with self.assertLogs("src.core.graph.refresh", level="INFO") as logs:
+            result = service.refresh_once(force=True)
+        self.assertEqual(result.status, "ok")
+        text = "\n".join(logs.output)
+        self.assertIn("refresh_reason=forced", text)
+        self.assertIn("snapshot_age_seconds=", text)
+        self.assertIn("refresh_interval_seconds=", text)
+        self.assertIn("active_snapshot_version=", text)
+
+    def test_configured_cache_intervals_are_at_least_ten_minutes(self) -> None:
+        settings = get_settings()
+        self.assertGreaterEqual(settings.detection_cache_ttl_seconds, 600)
+        self.assertGreaterEqual(settings.graph_refresh_interval_seconds, 600)
+
+    def test_scheduled_refresh_reuses_fresh_active_snapshot(self) -> None:
+        graph = nx.DiGraph()
+        graph.add_edge("192.168.0.1", "192.168.0.2")
+        replace_active_graph(graph, {"active_graph_version": "fresh"})
+        client = FakeProductClient(self.topology_response())
+        service = GraphRefreshService(self.settings, client)  # type: ignore[arg-type]
+        result = service.refresh_once(reason="startup")
+        self.assertEqual(result.status, "skipped")
+        self.assertEqual(result.message, "active_snapshot_fresh")
+        self.assertEqual(client.calls, 0)
+
+    def test_scheduled_refresh_runs_after_snapshot_interval(self) -> None:
+        graph = nx.DiGraph()
+        graph.add_edge("192.168.0.1", "192.168.0.2")
+        old = (datetime.now(timezone.utc) - timedelta(seconds=self.settings.graph_refresh_interval_seconds + 1)).isoformat()
+        replace_active_graph(graph, {"active_graph_version": "old", "active_graph_loaded_at": old})
+        client = FakeProductClient(self.topology_response())
+        service = GraphRefreshService(self.settings, client)  # type: ignore[arg-type]
+        result = service.refresh_once(reason="interval_elapsed")
+        self.assertEqual(result.status, "ok")
+        self.assertEqual(client.calls, 1)
 
     def test_failed_fetch_preserves_active_graph_and_records_failure(self) -> None:
         initial = nx.DiGraph()

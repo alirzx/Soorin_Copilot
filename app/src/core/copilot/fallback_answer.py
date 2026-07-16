@@ -40,7 +40,11 @@ def _detection_summary(detection: DetectionProviderResult) -> str:
     sub_tag = tagging.stored_sub_tag or tagging.sub_tag or "unknown"
     vendor = classification.vendor or "unknown"
     product = classification.product or "unknown"
-    confidence = classification.confidence if classification.confidence is not None else "unknown"
+    confidence = (
+        str(classification.confidence)
+        if classification.confidence is not None
+        else "unavailable (the product supplied no numeric confidence score)"
+    )
     limitation = evidence.limitations[0] if evidence.limitations else "Classification is limited to the supplied detection evidence."
     return (
         f"Detection evidence for {evidence.ip} reports tag/sub-tag {tag}/{sub_tag}, vendor/product {vendor}/{product}, "

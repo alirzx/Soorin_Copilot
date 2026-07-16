@@ -34,11 +34,13 @@ from src.core.product_client.errors import ProductApiError
 def make_settings(**overrides: Any):
     values = {
         "llm_provider": "fake",
-        "arvan_model": "fake",
+        "intent_router_deployment": "glm",
+        "chat_deployment": "glm",
+        "glm_model": "fake",
         "copilot_human_trace_enabled": False,
         "chat_store_history": False,
         "detection_cache_enabled": True,
-        "detection_cache_ttl_seconds": 300,
+        "detection_cache_ttl_seconds": 600,
         "detection_stale_on_error": True,
     }
     values.update(overrides)
@@ -271,6 +273,27 @@ class DetectionProviderCacheTests(unittest.TestCase):
         self.assertEqual(client.calls, 1)
         self.assertTrue(result.cache_hit)
 
+    def test_cached_compact_full_safely_supplies_summary(self) -> None:
+        client = FakeProductClient([self.raw()])
+        provider = DetectionContextProvider(make_settings(), client)  # type: ignore[arg-type]
+        provider.fetch("192.168.21.1", "compact_full", "req-full")
+        result = provider.fetch("192.168.21.1", "summary", "req-summary")
+        self.assertEqual(client.calls, 1)
+        self.assertTrue(result.cache_hit)
+        self.assertEqual(result.cached_detail, "compact_full")
+        self.assertEqual(result.detail, "summary")
+
+    def test_cached_summary_does_not_satisfy_compact_full(self) -> None:
+        client = FakeProductClient([self.raw(), self.raw()])
+        provider = DetectionContextProvider(make_settings(), client)  # type: ignore[arg-type]
+        provider.fetch("192.168.21.1", "summary", "req-summary")
+        with self.assertLogs("src.core.context.providers.detection", level="INFO") as logs:
+            result = provider.fetch("192.168.21.1", "compact_full", "req-full")
+        self.assertEqual(client.calls, 2)
+        self.assertFalse(result.cache_hit)
+        self.assertEqual(result.cache_miss_reason, "detail_mismatch")
+        self.assertIn("cache_miss_reason=detail_mismatch", "\n".join(logs.output))
+
     def test_expired_cache_refreshes(self) -> None:
         client = FakeProductClient([self.raw(), self.raw()])
         provider = DetectionContextProvider(make_settings(detection_cache_ttl_seconds=1), client)  # type: ignore[arg-type]
@@ -279,6 +302,7 @@ class DetectionProviderCacheTests(unittest.TestCase):
         result = provider.fetch("192.168.21.1", "summary", "req-2")
         self.assertEqual(client.calls, 2)
         self.assertFalse(result.stale)
+        self.assertEqual(result.cache_miss_reason, "expired")
 
     def test_stale_cache_used_on_fetch_failure(self) -> None:
         client = FakeProductClient([self.raw(), ProductApiError("temporary unavailable")])
@@ -351,6 +375,24 @@ class CopilotDetectionIntegrationTests(unittest.TestCase):
         self.assertIn("[SOORIN ASSET DETECTION EVIDENCE]", context_message)
         self.assertIn("[SOORIN GRAPH EVIDENCE]", context_message)
         self.assertIn("[SOORIN EVIDENCE ALIGNMENT]", context_message)
+        self.assertIn("confidence_available=true", context_message)
+
+    def test_combined_compact_full_reaches_both_providers_without_downgrade(self) -> None:
+        router_json = (
+            '{"intent":"asset_investigation","scope":"full_neighbors","direction":"both","depth":1,'
+            '"requires_graph":true,"requires_detection":true,"detection_detail":"compact_full",'
+            '"entity_binding":"explicit","requires_multiple_entities":false,"is_followup":false,'
+            '"classification_confidence":0.95,"reason":"full combined evidence"}'
+        )
+        service = self.service(router_json, graph_result(scope="full_neighbors"), detection_result(detail="compact_full"))
+        service.chat(
+            "Show all direct connections for 192.168.21.1 and include every matched detection rule and all supporting signals.",
+            request_id="combined-full",
+        )
+        self.assertEqual(service.graph_provider.calls, 1)  # type: ignore[attr-defined]
+        self.assertEqual(service.graph_provider.last_route.scope, "full_neighbors")  # type: ignore[attr-defined]
+        self.assertEqual(service.detection_provider.calls, 1)  # type: ignore[attr-defined]
+        self.assertEqual(service.detection_provider.last_detail, "compact_full")  # type: ignore[attr-defined]
 
     def test_graph_available_detection_unavailable_still_answers(self) -> None:
         service = self.service(self.asset_route(), graph_result(), detection_result("unavailable"))
@@ -423,7 +465,11 @@ class CopilotDetectionIntegrationTests(unittest.TestCase):
         self.assertIn("Detection evidence: status=not_found", context_message)
 
     def test_final_synthesis_uses_chat_timeout_and_unchanged_token_budget(self) -> None:
-        settings = make_settings(chat_timeout_seconds=287, chat_max_tokens=321, arvan_max_tokens=999)
+        settings = make_settings(
+            glm_chat_timeout_seconds=287,
+            glm_chat_max_tokens=321,
+            glm_max_tokens=999,
+        )
         llm = FakeLLMClient([fake_result(self.asset_route()), fake_result("grounded answer")])
         service = CopilotService(settings, llm, MemoryStore(max_messages=4))
         service.graph_provider = FakeGraphProvider(graph_result())  # type: ignore[assignment]
@@ -475,6 +521,9 @@ class CopilotDetectionIntegrationTests(unittest.TestCase):
         self.assertTrue(graph_provider.last_route.use_graph)
         self.assertTrue(graph_provider.last_route.use_detection)
         self.assertEqual(graph_provider.last_route.detection_detail, "summary")
+        state = state_store.get("prompt-b")
+        self.assertEqual(state.last_provider, "combined")
+        self.assertEqual(state.last_providers, ("graph", "detection"))
 
     @patch("src.core.llm.providers.arvan.requests.post")
     def test_graph_evidence_survives_router_502_and_two_final_502_responses(self, post) -> None:
@@ -482,8 +531,8 @@ class CopilotDetectionIntegrationTests(unittest.TestCase):
         settings = make_settings(
             llm_enabled=True,
             llm_provider="arvan",
-            arvan_base_url="https://example.invalid",
-            arvan_api_key="fake-key",
+            glm_base_url="https://example.invalid/v1",
+            glm_api_key="fake-key",
             llm_max_transient_retries=1,
             llm_retry_base_delay_seconds=0.0,
             llm_retry_max_delay_seconds=0.0,
@@ -572,7 +621,11 @@ class CopilotDetectionIntegrationTests(unittest.TestCase):
         self.assertNotIn("provider", response["answer"].lower())
 
     def test_final_response_trace_records_budget_finish_reason_and_truncation(self) -> None:
-        settings = make_settings(copilot_human_trace_enabled=True, chat_max_tokens=256, arvan_max_tokens=512)
+        settings = make_settings(
+            copilot_human_trace_enabled=True,
+            glm_chat_max_tokens=256,
+            glm_max_tokens=512,
+        )
         llm = FakeLLMClient([
             fake_result(self.asset_route()),
             fake_result("bounded answer", finish_reason="length", usage={"completion_tokens": 256, "output_tokens": 256}),
@@ -582,7 +635,7 @@ class CopilotDetectionIntegrationTests(unittest.TestCase):
         service.detection_provider = FakeDetectionProvider(detection_result())  # type: ignore[assignment]
 
         with self.assertLogs(level="INFO") as logs:
-            service.chat("Tell me about 192.168.21.1.", request_id="truncated-answer")
+            response = service.chat("Tell me about 192.168.21.1.", request_id="truncated-answer")
 
         text = "\n".join(logs.output)
         self.assertIn("requested_max_tokens=256", text)
@@ -591,6 +644,62 @@ class CopilotDetectionIntegrationTests(unittest.TestCase):
         self.assertIn("output_tokens=256", text)
         self.assertIn("answer_truncated=true", text)
         self.assertIn("fallback_answer_used=false", text)
+        self.assertIn("final_answer_truncated", response["_warnings"])
+
+    def test_api_propagates_final_answer_truncation_warning(self) -> None:
+        settings = make_settings(glm_chat_max_tokens=128, glm_max_tokens=256)
+        llm = FakeLLMClient([
+            fake_result(self.asset_route()),
+            fake_result("partial answer", finish_reason="length", usage={"completion_tokens": 128}),
+        ])
+        service = CopilotService(settings, llm, MemoryStore(max_messages=4))
+        service.graph_provider = FakeGraphProvider(graph_result())  # type: ignore[assignment]
+        service.detection_provider = FakeDetectionProvider(detection_result())  # type: ignore[assignment]
+        with self.assertLogs("src.api.routes", level="INFO") as logs:
+            with patch("src.api.routes.copilot_service", service):
+                response = api_chat(ChatRequest(session_id="truncated", message="Tell me about 192.168.21.1."))
+        self.assertEqual(response["status"], "ok")
+        self.assertIn("final_answer_truncated", response["warnings"])
+        self.assertIn("warning_count=1", "\n".join(logs.output))
+
+    def test_current_not_found_graph_status_is_authoritative_over_prior_assistant_claim(self) -> None:
+        router_json = (
+            '{"intent":"graph_neighbors","scope":"one_hop","direction":"both","depth":1,'
+            '"requires_graph":true,"requires_detection":false,"detection_detail":"summary",'
+            '"entity_binding":"explicit","requires_multiple_entities":false,"is_followup":false,'
+            '"classification_confidence":0.95,"reason":"current graph check"}'
+        )
+        llm = FakeLLMClient([fake_result(router_json), fake_result("Current graph evidence did not find this asset.")])
+        memory = MemoryStore(max_messages=6)
+        memory.append("grounding", "assistant", "The asset has five malicious peers.")
+        service = CopilotService(make_settings(chat_store_history=True), llm, memory)
+        service.graph_provider = FakeGraphProvider(graph_result("not_found"))  # type: ignore[assignment]
+        service.detection_provider = FakeDetectionProvider(detection_result("unavailable"))  # type: ignore[assignment]
+        response = service.chat("Show connections for 192.168.21.1.", "grounding", request_id="grounding")
+        dynamic_context = llm.calls[1]["messages"][1]["content"]
+        self.assertIn("Previous assistant messages are conversational context only", dynamic_context)
+        self.assertIn("Graph evidence: status=not_found", dynamic_context)
+        self.assertNotIn("five malicious peers", response["answer"])
+
+    def test_current_detection_context_is_authoritative_over_prior_classification(self) -> None:
+        llm = FakeLLMClient([
+            fake_result(self.asset_route(requires_graph=False, requires_detection=True)),
+            fake_result("Current product evidence classifies the asset as a workstation."),
+        ])
+        memory = MemoryStore(max_messages=6)
+        memory.append("detection-grounding", "assistant", "The asset is definitely a network router.")
+        service = CopilotService(make_settings(chat_store_history=True), llm, memory)
+        service.graph_provider = FakeGraphProvider(graph_result("unavailable"))  # type: ignore[assignment]
+        service.detection_provider = FakeDetectionProvider(detection_result())  # type: ignore[assignment]
+        response = service.chat(
+            "Identify 192.168.21.1 from current evidence.",
+            "detection-grounding",
+            request_id="detection-grounding",
+        )
+        dynamic_context = llm.calls[1]["messages"][1]["content"]
+        self.assertIn("Current structured graph/detection evidence", dynamic_context)
+        self.assertIn("Primary role: Domain Joined Workstation", dynamic_context)
+        self.assertNotIn("network router", response["answer"].lower())
 
     def test_missing_finish_reason_uses_requested_budget_for_truncation(self) -> None:
         self.assertTrue(_answer_truncated(None, 256, 256))
@@ -608,6 +717,28 @@ class CopilotDetectionIntegrationTests(unittest.TestCase):
         self.assertEqual(response["answer"], "grounded answer")
         self.assertEqual(service.graph_provider.calls, 0)  # type: ignore[attr-defined]
         self.assertEqual(service.detection_provider.calls, 0)  # type: ignore[attr-defined]
+
+    def test_cidr_only_uses_no_provider_and_does_not_replace_active_ip(self) -> None:
+        router_json = (
+            '{"intent":"unclear","scope":"none","direction":"none","depth":0,'
+            '"requires_graph":false,"requires_detection":false,"detection_detail":"summary",'
+            '"entity_binding":"none","requires_multiple_entities":false,"is_followup":false,'
+            '"classification_confidence":0.95,"reason":"unsupported subnet constraint"}'
+        )
+        llm = FakeLLMClient([fake_result(router_json), fake_result("Subnet filtering is not active for this request.")])
+        state_store = SessionRoutingStateStore()
+        state_store.set("cidr", SessionRoutingState(active_ip="192.168.0.55"))
+        service = CopilotService(make_settings(), llm, MemoryStore(max_messages=4), state_store)
+        service.graph_provider = FakeGraphProvider(graph_result())  # type: ignore[assignment]
+        service.detection_provider = FakeDetectionProvider(detection_result())  # type: ignore[assignment]
+        response = service.chat("Identify peers in 192.168.21.0/24.", "cidr", request_id="cidr-only")
+        self.assertEqual(service.graph_provider.calls, 0)  # type: ignore[attr-defined]
+        self.assertEqual(service.detection_provider.calls, 0)  # type: ignore[attr-defined]
+        self.assertEqual(state_store.get("cidr").active_ip, "192.168.0.55")
+        self.assertIn("Subnet filtering", response["answer"])
+        dynamic_context = llm.calls[1]["messages"][1]["content"]
+        self.assertIn("192.168.21.0/24", dynamic_context)
+        self.assertIn("not host assets", dynamic_context)
 
     def test_provider_failure_does_not_crash_request(self) -> None:
         service = self.service(self.asset_route(), graph_result(), RuntimeError("boom"))
@@ -662,6 +793,28 @@ class CopilotDetectionIntegrationTests(unittest.TestCase):
         self.assertEqual(service.detection_provider.calls, 1)  # type: ignore[attr-defined]
         self.assertEqual(state_store.get("s1").active_ip, "192.168.30.111")
         self.assertEqual(state_store.get("s1").last_provider, "detection")
+        self.assertEqual(state_store.get("s1").last_providers, ("detection",))
+
+    def test_active_reference_trace_reports_final_resolved_entity(self) -> None:
+        router_json = (
+            '{"intent":"asset_investigation","scope":"node_summary","direction":"both","depth":0,'
+            '"requires_graph":true,"requires_detection":true,"detection_detail":"summary",'
+            '"entity_binding":"active_single","requires_multiple_entities":false,"is_followup":true,'
+            '"classification_confidence":0.95,"reason":"active reference"}'
+        )
+        llm = FakeLLMClient([fake_result(router_json), fake_result("answer")])
+        state_store = SessionRoutingStateStore()
+        state_store.set("trace-active", SessionRoutingState(active_ip="192.168.30.111"))
+        service = CopilotService(make_settings(copilot_human_trace_enabled=True), llm, MemoryStore(max_messages=4), state_store)
+        service.graph_provider = FakeGraphProvider(graph_result(target_ip="192.168.30.111"))  # type: ignore[assignment]
+        service.detection_provider = FakeDetectionProvider(detection_result(target_ip="192.168.30.111"))  # type: ignore[assignment]
+        with self.assertLogs("src.core.copilot.trace", level="INFO") as logs:
+            service.chat("Use all of its evidence.", "trace-active", request_id="trace-active")
+        text = "\n".join(logs.output)
+        self.assertIn("initial_entity_status", text)
+        self.assertIn("final_entity_status", text)
+        self.assertIn("resolved", text)
+        self.assertIn("192.168.30.111", text)
 
     def test_active_pair_graph_followup_succeeds_without_pre_resolved_pair(self) -> None:
         router_json = (

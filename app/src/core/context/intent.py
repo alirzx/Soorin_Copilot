@@ -52,6 +52,12 @@ DETECTION_ONLY_DETAIL_WORDS = re.compile(
     r"why\s+(?:is|was)\s+.+\s+classif(?:ied|ication))\b",
     re.IGNORECASE,
 )
+DETECTION_DEPTH_WORDS = re.compile(
+    r"\b(?:all|every|complete|full|detailed|deep)\s+(?:matched\s+)?(?:detection\s+)?(?:rules?|signals?|conflicts?|classification\s+evidence|profile\s+evidence|detection\s+evidence)\b"
+    r"|\b(?:all|every)\s+(?:supporting\s+)?(?:classification\s+)?signals?\b"
+    r"|\b(?:every\s+matched\s+rule|deep\s+(?:detection|forensic)\s+(?:analysis|assessment|evidence))\b",
+    re.IGNORECASE,
+)
 
 
 def _valid_ipv4(value: str | None) -> str | None:
@@ -79,6 +85,8 @@ def _empty_resolution(entities: EntityResolution, *, binding: str = "none") -> E
         reference_type=entities.reference_type,
         reference_suppressed=entities.reference_suppressed,
         suppression_reason=entities.suppression_reason or binding,
+        subnet_constraints=entities.subnet_constraints,
+        unsupported_constraints=entities.unsupported_constraints,
     )
 
 
@@ -99,6 +107,8 @@ def _resolution_from_entities(
         reference_type=entities.reference_type,
         reference_suppressed=entities.reference_suppressed,
         suppression_reason=entities.suppression_reason,
+        subnet_constraints=entities.subnet_constraints,
+        unsupported_constraints=entities.unsupported_constraints,
     )
 
 
@@ -208,6 +218,11 @@ COMBINED_ANALYSIS_WORDS = re.compile(
     r"full\s+asset\s+assessment|identity\s+and\s+connections|classification\s+and\s+topology)\b",
     re.IGNORECASE,
 )
+SECURITY_ANALYSIS_WORDS = re.compile(
+    r"\b(?:anomal(?:y|ies|ous)|abnormal|unusual\s+behavio[u]?r|suspicious\s+behavio[u]?r|"
+    r"security\s+concern|unexpected\s+communication|possible\s+compromise)\b",
+    re.IGNORECASE,
+)
 
 ROUTER_SYSTEM_PROMPT_FALLBACK = (
     "You classify Soorin Copilot routing only. Return exactly one JSON object. "
@@ -295,6 +310,7 @@ def build_routing_context(
         "ui_entity_present": bool((ui_context or {}).get("selected_ip")),
         "ui_selected_entity_present": bool((ui_context or {}).get("selected_ip")),
         "previous_provider": routing_state.last_provider,
+        "previous_providers": list(routing_state.last_providers),
         "previous_intent": routing_state.previous_intent,
         "previous_scope": routing_state.previous_scope,
         "previous_direction": routing_state.previous_direction,
@@ -302,6 +318,8 @@ def build_routing_context(
         "previous_requires_detection": routing_state.previous_requires_detection,
         "previous_detection_detail": routing_state.previous_detection_detail or "",
         "explicit_topic_detachment": entities.reference_suppressed,
+        "subnet_constraints": list(entities.subnet_constraints),
+        "unsupported_constraints": list(entities.unsupported_constraints),
     }
 
 
@@ -376,7 +394,9 @@ def validate_router_payload(
     message_text = message or ""
     compact_detection_requested = bool(DETECTION_COMPACT_WORDS.search(message_text))
     detection_only_requested = bool(DETECTION_ONLY_DETAIL_WORDS.search(message_text))
+    explicit_detection_depth_requested = bool(DETECTION_DEPTH_WORDS.search(message_text))
     combined_analysis_requested = bool(COMBINED_ANALYSIS_WORDS.search(message_text))
+    security_analysis_requested = bool(SECURITY_ANALYSIS_WORDS.search(message_text))
     graph_word_present = bool(PURE_GRAPH_WORDS.search(message_text))
     identity_word_present = bool(IDENTITY_WORDS.search(message_text))
 
@@ -438,6 +458,20 @@ def validate_router_payload(
         ui_context=ui_context,
     )
     entity_count = len(materialized_entities.entities)
+    is_followup = bool(payload["is_followup"])
+    if entity_binding in {"active_single", "active_pair"} and entities.reference_detected and not is_followup:
+        is_followup = True
+        normalize("referential_binding_requires_followup")
+    if security_analysis_requested and entity_count == 1:
+        if intent != "asset_investigation" or not requires_graph or not requires_detection:
+            normalize("security_assessment_requires_current_evidence", prefer=True)
+        intent = "asset_investigation"
+        requires_graph = True
+        requires_detection = True
+        requires_multiple = False
+        if scope not in {"node_summary", "full_neighbors", "two_hop"}:
+            scope, direction, depth = "node_summary", "both", 0
+        detection_detail = "compact_full" if explicit_detection_depth_requested else "summary"
     if intent == "asset_investigation" and entity_count == 1:
         combined_route_requested = requires_graph and requires_detection
         requires_detection = True
@@ -465,7 +499,7 @@ def validate_router_payload(
                 direction = "both"
                 depth = 0
                 normalize("node_summary_requires_graph", prefer=True)
-            if detection_detail == "compact_full":
+            if detection_detail == "compact_full" and not explicit_detection_depth_requested:
                 detection_detail = "summary"
                 normalize("combined_route_detection_detail_normalized", prefer=True)
             requires_multiple = False
@@ -532,6 +566,8 @@ def validate_router_payload(
         detection_detail = "summary"
     if scope == "full_neighbors" and depth != 1:
         raise ValueError("schema_validation_failed:full_neighbors_depth")
+    if scope == "one_hop" and depth != 1:
+        raise ValueError("schema_validation_failed:one_hop_depth")
     if scope == "two_hop" and depth != 2:
         raise ValueError("schema_validation_failed:two_hop_depth")
     if scope == "path" and depth != 0:
@@ -585,7 +621,7 @@ def validate_router_payload(
         materialized_entities=tuple(entity.value for entity in materialized_entities.entities),
         requires_multiple_entities=requires_multiple,
         relationship_mode="compare" if scope == "multi_entity_comparison" else "direct" if intent == "graph_relationships" else "none",
-        is_followup=bool(payload["is_followup"]),
+        is_followup=is_followup,
         classification_confidence=confidence,
         reason=str(payload.get("reason") or "")[:220],
         decision_source="glm",
@@ -678,27 +714,32 @@ class GLMIntentRouter:
         request_id: str = "",
     ) -> IntentDecision:
         started = time.perf_counter()
+        router_deployment = self.settings.deployment_for_purpose("intent_router")
+        router_request = router_deployment.request_config("intent_router")
         messages = [
             {"role": "system", "content": self.system_prompt},
             {"role": "user", "content": json.dumps(routing_context, sort_keys=True)},
         ]
         logger.info(
-            "event=intent_router_start request_id=%s entity_status=%s entity_count=%s previous_scope=%s router_timeout_seconds=%s router_max_tokens=%s",
+            "event=intent_router_start request_id=%s deployment=%s provider=%s model=%s entity_status=%s entity_count=%s previous_scope=%s router_timeout_seconds=%s router_max_tokens=%s",
             request_id,
+            router_deployment.name,
+            router_deployment.provider_type,
+            router_deployment.model,
             routing_context.get("entity_status"),
             routing_context.get("entity_count"),
             routing_context.get("previous_scope") or "",
-            self.settings.intent_router_timeout_seconds,
-            self.settings.intent_router_max_tokens,
+            router_request.read_timeout_seconds,
+            router_request.max_tokens,
         )
         try:
             result = self.llm_client.chat(
                 messages,
                 request_id=request_id,
-                max_tokens=self.settings.intent_router_max_tokens,
-                temperature=self.settings.intent_router_temperature,
-                top_p=self.settings.intent_router_top_p,
-                timeout_seconds=self.settings.intent_router_timeout_seconds,
+                max_tokens=router_request.max_tokens,
+                temperature=router_request.temperature,
+                top_p=router_request.top_p,
+                timeout_seconds=router_request.read_timeout_seconds,
                 purpose="intent_router",
                 transient_retries=0,
             )
@@ -743,11 +784,16 @@ class GLMIntentRouter:
                 bool(content),
             )
 
+        repair_deployment = self.settings.deployment_for_purpose("intent_router_repair")
+        repair_request = repair_deployment.request_config("intent_router_repair")
         logger.info(
-            "event=intent_router_repair_started request_id=%s reason=%s router_max_tokens=%s",
+            "event=intent_router_repair_started request_id=%s deployment=%s provider=%s model=%s reason=%s router_max_tokens=%s",
             request_id,
+            repair_deployment.name,
+            repair_deployment.provider_type,
+            repair_deployment.model,
             last_error[:120],
-            self.settings.intent_router_retry_max_tokens,
+            repair_request.max_tokens,
         )
         repair_payload = {
             "invalid_output": content[:1200],
@@ -762,11 +808,11 @@ class GLMIntentRouter:
             repair_result = self.llm_client.chat(
                 repair_messages,
                 request_id=request_id,
-                max_tokens=self.settings.intent_router_retry_max_tokens,
-                temperature=self.settings.intent_router_temperature,
-                top_p=self.settings.intent_router_top_p,
-                timeout_seconds=self.settings.intent_router_timeout_seconds,
-                purpose="intent_router",
+                max_tokens=repair_request.max_tokens,
+                temperature=repair_request.temperature,
+                top_p=repair_request.top_p,
+                timeout_seconds=repair_request.read_timeout_seconds,
+                purpose="intent_router_repair",
                 transient_retries=0,
             )
         except LLMError as exc:

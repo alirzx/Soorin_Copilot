@@ -10,7 +10,7 @@ from uuid import uuid4
 
 from src.config.settings import Settings
 from src.core.context import ContextComposer, DeterministicFallbackRouter, EntityResolver, GLMIntentRouter, normalize_intent_route
-from src.core.context.intent import build_routing_context, resolution_from_materialized_decision
+from src.core.context.intent import SECURITY_ANALYSIS_WORDS, build_routing_context, resolution_from_materialized_decision
 from src.core.context.models import (
     CopilotContextPackage,
     DetectionProviderResult,
@@ -110,7 +110,7 @@ class CopilotService:
         *,
         ui_context: dict[str, Any] | None = None,
         request_id: str | None = None,
-    ) -> dict[str, str]:
+    ) -> dict[str, Any]:
         request_id = request_id or uuid4().hex[:12]
         session = (session_id or "").strip() or uuid4().hex
         user_text = message.strip()
@@ -134,6 +134,7 @@ class CopilotService:
             active_entities_before=", ".join(routing_state.active_entities),
             active_entity_count_before=len(routing_state.active_entities),
             last_provider_before=routing_state.last_provider or "",
+            last_providers_before=", ".join(routing_state.last_providers),
             previous_intent=routing_state.previous_intent or "",
             previous_scope=routing_state.previous_scope or "",
             previous_direction=routing_state.previous_direction or "",
@@ -162,6 +163,8 @@ class CopilotService:
             suppression_reason=entities.suppression_reason or "",
             explicit_candidates=entities.explicit_candidate_count,
             valid_entities=entities.valid_entity_count,
+            subnet_constraints=", ".join(entities.subnet_constraints),
+            unsupported_constraints=", ".join(entities.unsupported_constraints),
         )
         routing_context = build_routing_context(user_text, entities, routing_state, ui_context=ui_context)
         trace.put("ROUTER INPUT", **routing_context)
@@ -198,8 +201,22 @@ class CopilotService:
             route_entities = resolution_from_materialized_decision(intent_decision, entities)
             route = normalize_intent_route(intent_decision, route_entities)
 
+        if SECURITY_ANALYSIS_WORDS.search(user_text) and "security_or_anomaly" not in route.matched_signals:
+            route = type(route)(
+                **{
+                    **route.__dict__,
+                    "matched_signals": [*route.matched_signals, "security_or_anomaly"],
+                }
+            )
+
+        router_deployment = self.settings.deployment_for_purpose("intent_router")
         trace.put(
             "INTENT",
+            router_deployment=router_deployment.name,
+            router_provider=router_deployment.provider_type,
+            router_model=router_deployment.model,
+            router_repair_deployment=router_deployment.name if route.glm_router_retry_count else "",
+            router_repair_model=router_deployment.model if route.glm_router_retry_count else "",
             decision_source=route.decision_source,
             intent=route.intent,
             scope=route.scope,
@@ -235,6 +252,10 @@ class CopilotService:
             binding_normalization_reason=route.binding_normalization_reason or "",
             materialized_entity_count=route.materialized_entity_count,
             materialized_entities=", ".join(route.materialized_entities),
+            initial_entity_status=entities.status,
+            final_entity_status=route_entities.status,
+            entity_recovered=entities.status != "resolved" and route_entities.status == "resolved",
+            entity_recovery_source=route.binding_source if entities.status != "resolved" and route_entities.status == "resolved" else "",
         )
         trace.put(
             "ROUTING",
@@ -272,6 +293,7 @@ class CopilotService:
         detection_result: DetectionProviderResult | None = None
         provenance: list[ProviderProvenance] = []
         limitations: list[str] = []
+        response_warnings: list[str] = []
         if route.use_graph and (route.target_entity or route.target_entities):
             try:
                 graph_result = self.graph_provider.provide(route.target_entity, route=route, request_id=request_id)
@@ -294,7 +316,7 @@ class CopilotService:
             if graph_result:
                 limitations.extend(graph_result.limitations)
             if graph_result and graph_result.status == "unavailable":
-                trace.warnings += 1
+                response_warnings.append("graph_evidence_unavailable")
         if route.use_detection and route.target_entity:
             try:
                 detection_result = self.detection_provider.fetch(
@@ -323,7 +345,11 @@ class CopilotService:
                 provenance.append(detection_result.provenance)
             limitations.extend(detection_result.limitations)
             if detection_result.status in {"not_found", "unavailable"}:
-                trace.warnings += 1
+                response_warnings.append(
+                    "detection_evidence_not_found"
+                    if detection_result.status == "not_found"
+                    else "detection_evidence_unavailable"
+                )
         graph_context = graph_result.context if graph_result else {}
         graph_metadata = get_graph_metadata()
         refresh_status = get_refresh_status()
@@ -359,15 +385,24 @@ class CopilotService:
             product=detection_result.evidence.classification.product if detection_result and detection_result.evidence else "",
             role=detection_result.evidence.classification.primary_role if detection_result and detection_result.evidence else "",
             confidence=detection_result.evidence.classification.confidence if detection_result and detection_result.evidence else "",
+            confidence_available=bool(
+                detection_result
+                and detection_result.evidence
+                and detection_result.evidence.classification.confidence_available
+            ),
             matched_rule_count=len(detection_result.evidence.matched_rules) if detection_result and detection_result.evidence else 0,
             conflict_count=len(detection_result.evidence.conflicts) if detection_result and detection_result.evidence else 0,
             cache_enabled=self.settings.detection_cache_enabled,
             cache_hit=detection_result.cache_hit if detection_result else False,
             cache_age_seconds=detection_result.cache_age_seconds if detection_result and detection_result.cache_age_seconds is not None else "",
+            cache_miss_reason=detection_result.cache_miss_reason if detection_result else "",
+            cached_detail=detection_result.cached_detail if detection_result and detection_result.cached_detail else "",
             stale=detection_result.stale if detection_result else False,
             provider_latency_ms=detection_result.latency_ms if detection_result else 0,
             context_chars=len(detection_result.rendered_context) if detection_result else 0,
             context_tokens_approx=approx_tokens(detection_result.rendered_context) if detection_result else 0,
+            context_truncated=detection_result.context_truncated if detection_result else False,
+            context_truncation_reason=detection_result.context_truncation_reason if detection_result else "",
             source=detection_result.evidence.source if detection_result and detection_result.evidence else "",
             fetched_at=detection_result.evidence.fetched_at.isoformat() if detection_result and detection_result.evidence else "",
             error_type=detection_result.error_type if detection_result else "",
@@ -491,15 +526,18 @@ class CopilotService:
             messages.append({"role": "system", "content": dynamic_context})
         messages.extend([*history, {"role": "user", "content": user_text}])
 
+        chat_deployment = self.settings.deployment_for_purpose("chat")
+        chat_request = chat_deployment.request_config("chat")
         system_chars = len(self.system_prompt)
         dynamic_context_chars = len(dynamic_context)
         conversation_chars = sum(len(item.get("content", "")) for item in history) + len(user_text)
         total_chars = sum(len(item.get("content", "")) for item in messages)
         logger.info(
-            "event=model_input_prepared request_id=%s provider=%s model=%s message_count=%s roles=%s system_chars=%s system_approx_tokens=%s graph_dynamic_approx_tokens=%s detection_dynamic_approx_tokens=%s fusion_dynamic_approx_tokens=%s dynamic_context_chars=%s dynamic_context_approx_tokens=%s conversation_chars=%s conversation_approx_tokens=%s total_input_chars=%s total_input_approx_tokens=%s",
+            "event=model_input_prepared request_id=%s deployment=%s provider=%s model=%s message_count=%s roles=%s system_chars=%s system_approx_tokens=%s graph_dynamic_approx_tokens=%s detection_dynamic_approx_tokens=%s fusion_dynamic_approx_tokens=%s dynamic_context_chars=%s dynamic_context_approx_tokens=%s conversation_chars=%s conversation_approx_tokens=%s total_input_chars=%s total_input_approx_tokens=%s",
             request_id,
-            self.settings.llm_provider,
-            self.settings.arvan_model,
+            chat_deployment.name,
+            chat_deployment.provider_type,
+            chat_deployment.model,
             len(messages),
             ",".join(item["role"] for item in messages),
             system_chars,
@@ -516,8 +554,9 @@ class CopilotService:
         )
         trace.put(
             "MODEL INPUT",
-            provider=self.settings.llm_provider,
-            model=self.settings.arvan_model,
+            deployment=chat_deployment.name,
+            provider=chat_deployment.provider_type,
+            model=chat_deployment.model,
             messages=len(messages),
             roles=", ".join(item["role"] for item in messages),
             system_tokens_approx=approx_tokens(self.system_prompt),
@@ -536,7 +575,7 @@ class CopilotService:
             len(messages),
             _preview(user_text),
         )
-        requested_max_tokens = min(self.settings.chat_max_tokens, self.settings.arvan_max_tokens)
+        requested_max_tokens = chat_request.max_tokens
         final_synthesis_status = "ok"
         fallback_answer_used = False
         try:
@@ -544,7 +583,9 @@ class CopilotService:
                 messages,
                 request_id=request_id,
                 max_tokens=requested_max_tokens,
-                timeout_seconds=self.settings.chat_timeout_seconds,
+                temperature=chat_request.temperature,
+                top_p=chat_request.top_p,
+                timeout_seconds=chat_request.read_timeout_seconds,
                 purpose="chat",
             )
         except LLMError as exc:
@@ -585,11 +626,12 @@ class CopilotService:
                 text=fallback_answer,
                 provider="deterministic",
                 model="evidence-fallback",
+                deployment="deterministic",
                 finish_reason=None,
             )
             final_synthesis_status = "failed"
             fallback_answer_used = True
-            trace.warnings += 1
+            response_warnings.append("final_synthesis_fallback_used")
             logger.warning(
                 "event=final_synthesis_failed request_id=%s reason=%s requested_max_tokens=%s fallback_answer_used=true",
                 request_id,
@@ -610,6 +652,10 @@ class CopilotService:
         completion_tokens = usage.get("completion_tokens", "")
         output_tokens = usage.get("output_tokens", "")
         answer_truncated = _answer_truncated(result.finish_reason, completion_tokens, requested_max_tokens)
+        if answer_truncated:
+            response_warnings.append("final_answer_truncated")
+        response_warnings = list(dict.fromkeys(response_warnings))
+        trace.warnings = len(response_warnings)
         logger.info(
             "event=final_synthesis_result request_id=%s requested_max_tokens=%s finish_reason=%s completion_tokens=%s output_tokens=%s answer_truncated=%s final_synthesis_status=%s fallback_answer_used=%s",
             request_id,
@@ -623,6 +669,9 @@ class CopilotService:
         )
         trace.put(
             "MODEL RESPONSE",
+            deployment=result.deployment,
+            provider=result.provider,
+            model=result.model,
             provider_status=result.status_code or "",
             provider_latency_ms=result.latency_ms,
             prompt_tokens=usage.get("prompt_tokens", ""),
@@ -681,13 +730,22 @@ class CopilotService:
         graph_available = bool(graph_result and graph_result.status == "available")
         detection_available = bool(detection_result and detection_result.status == "available")
         evidence_execution_succeeded = graph_execution_succeeded or detection_execution_succeeded
+        used_providers = tuple(
+            provider
+            for provider, succeeded in (
+                ("graph", graph_execution_succeeded and route.use_graph),
+                ("detection", detection_execution_succeeded and route.use_detection),
+            )
+            if succeeded
+        )
         updated_last_provider = (
-            "graph"
-            if graph_execution_succeeded and route.use_graph
-            else "detection"
-            if detection_execution_succeeded and route.use_detection
+            "combined"
+            if len(used_providers) == 2
+            else used_providers[0]
+            if used_providers
             else routing_state.last_provider
         )
+        updated_last_providers = used_providers or routing_state.last_providers
         updated_previous_intent = route.intent if evidence_execution_succeeded else routing_state.previous_intent
         updated_previous_scope = route.scope if evidence_execution_succeeded else routing_state.previous_scope
         updated_previous_direction = route.direction if evidence_execution_succeeded else routing_state.previous_direction
@@ -705,6 +763,7 @@ class CopilotService:
             previous_entity_count=len(route_entities.entities) if can_update_entity_state else routing_state.previous_entity_count,
             previous_entity_mode=route_entities.entity_mode if can_update_entity_state else routing_state.previous_entity_mode,
             last_provider=updated_last_provider,
+            last_providers=updated_last_providers,
             previous_intent=updated_previous_intent,
             previous_scope=updated_previous_scope,
             previous_direction=updated_previous_direction,
@@ -715,7 +774,7 @@ class CopilotService:
         self.routing_state_store.set(session, new_routing_state)
         if new_routing_state != routing_state:
             logger.info(
-                "event=session_routing_state_updated request_id=%s session_id=%s previous_active_ip=%s active_ip=%s previous_active_entities=%s active_entities=%s previous_last_provider=%s last_provider=%s previous_intent=%s previous_scope=%s previous_direction=%s previous_depth=%s update_reason=%s",
+                "event=session_routing_state_updated request_id=%s session_id=%s previous_active_ip=%s active_ip=%s previous_active_entities=%s active_entities=%s previous_last_provider=%s last_provider=%s last_providers=%s previous_intent=%s previous_scope=%s previous_direction=%s previous_depth=%s update_reason=%s",
                 request_id,
                 session,
                 routing_state.active_ip or "",
@@ -724,6 +783,7 @@ class CopilotService:
                 ",".join(new_routing_state.active_entities),
                 routing_state.last_provider or "",
                 new_routing_state.last_provider or "",
+                ",".join(new_routing_state.last_providers),
                 new_routing_state.previous_intent or "",
                 new_routing_state.previous_scope or "",
                 new_routing_state.previous_direction or "",
@@ -745,6 +805,7 @@ class CopilotService:
             active_entities_after=", ".join(new_routing_state.active_entities),
             active_entity_count_after=len(new_routing_state.active_entities),
             last_provider_after=new_routing_state.last_provider or "",
+            last_providers_after=", ".join(new_routing_state.last_providers),
             previous_intent_after=new_routing_state.previous_intent or "",
             previous_scope_after=new_routing_state.previous_scope or "",
             previous_direction_after=new_routing_state.previous_direction or "",
@@ -824,4 +885,5 @@ class CopilotService:
             "answer": result.text,
             "provider": result.provider,
             "model": result.model,
+            "_warnings": response_warnings,
         }

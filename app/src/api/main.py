@@ -24,13 +24,19 @@ def create_app() -> FastAPI:
     @app.on_event("startup")
     def on_startup() -> None:
         settings = get_settings()
+        settings.validate_selected_llm_deployments()
+        router_deployment = settings.deployment_for_purpose("intent_router")
+        chat_deployment = settings.deployment_for_purpose("chat")
         logger.info("==================== API STARTUP ====================")
         logger.info(
-            "event=application_startup host=%s port=%s provider=%s model=%s",
+            "event=application_startup host=%s port=%s provider=%s router_deployment=%s router_model=%s chat_deployment=%s chat_model=%s",
             settings.api_host,
             settings.api_port,
             settings.llm_provider,
-            settings.arvan_model,
+            router_deployment.name,
+            router_deployment.model,
+            chat_deployment.name,
+            chat_deployment.model,
         )
         refresh_service = get_api_graph_refresh_service()
         set_graph_refresh_service(refresh_service)

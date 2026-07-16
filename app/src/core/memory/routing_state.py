@@ -13,6 +13,7 @@ class SessionRoutingState:
     previous_entity_count: int = 0
     previous_entity_mode: str | None = None
     last_provider: str | None = None
+    last_providers: tuple[str, ...] = ()
     previous_intent: str | None = None
     previous_scope: str | None = None
     previous_direction: str | None = None

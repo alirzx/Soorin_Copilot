@@ -70,8 +70,9 @@ def health() -> dict[str, str]:
 def llm_health() -> dict[str, Any]:
     result = llm_client.health()
     logger.info(
-        "event=http_llm_health ready=%s provider=%s model=%s",
+        "event=http_llm_health ready=%s deployment=%s provider=%s model=%s",
         result.get("ready"),
+        result.get("deployment"),
         result.get("provider"),
         result.get("model"),
     )
@@ -129,9 +130,10 @@ def chat(request: ChatRequest) -> dict[str, Any]:
                 }
             ],
         )
+    warnings = list(result.pop("_warnings", []))
     latency_ms = int((time.perf_counter() - started) * 1000)
     logger.info(
-        "event=http_chat_response request_id=%s session_id=%s status=ok provider=%s model=%s answer_chars=%s answer_approx_tokens=%s latency_ms=%s warning_count=0 error_count=0",
+        "event=http_chat_response request_id=%s session_id=%s status=ok provider=%s model=%s answer_chars=%s answer_approx_tokens=%s latency_ms=%s warning_count=%s error_count=0",
         request_id,
         result.get("session_id", ""),
         result.get("provider", ""),
@@ -139,10 +141,11 @@ def chat(request: ChatRequest) -> dict[str, Any]:
         len(result.get("answer", "")),
         approx_tokens(result.get("answer", "")),
         latency_ms,
+        len(warnings),
     )
     logger.info(
         "event=copilot_request_end request_id=%s status=ok latency_ms=%s",
         request_id,
         latency_ms,
     )
-    return envelope("ok", result)
+    return envelope("ok", result, warnings=warnings)

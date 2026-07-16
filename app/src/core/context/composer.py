@@ -81,7 +81,21 @@ class ContextComposer:
 
     @staticmethod
     def _compose_provider_statuses(package: CopilotContextPackage) -> str:
-        lines = ["[SOORIN PROVIDER STATUS]", "Treat unavailable or missing evidence as a limitation, not as evidence about the asset."]
+        lines = [
+            "[SOORIN EVIDENCE AUTHORITY]",
+            "Current structured graph/detection evidence and current provider statuses are authoritative for this turn.",
+            "Previous assistant messages are conversational context only. Never treat their asset claims, peer lists, classifications, counts, or conclusions as verified evidence.",
+            "If current evidence is not_found, skipped, or unavailable, do not reconstruct evidence from earlier assistant text.",
+            "Treat unavailable or missing evidence as a limitation, not as evidence about the asset.",
+        ]
+        if package.entities and package.entities.unsupported_constraints:
+            constraints = ", ".join(package.entities.unsupported_constraints)
+            lines.extend(
+                [
+                    f"Unsupported routing constraints: {constraints}",
+                    "CIDR/subnet filtering is not active in the Copilot graph provider. These values are constraints, not host assets, and were not queried as graph nodes.",
+                ]
+            )
         graph = package.graph
         if graph:
             source = graph.provenance.source if graph.provenance else "observed_communication_graph"
@@ -96,13 +110,27 @@ class ContextComposer:
             source = detection.provenance.source if detection.provenance else "product_asset_detection"
             found = detection.evidence.found if detection.evidence else False if detection.status == "not_found" else "unknown"
             lines.append(f"Detection evidence: status={detection.status}; asset_found={str(found).lower()}; source={source}")
+            if detection.evidence:
+                confidence = detection.evidence.classification.confidence
+                if confidence is None:
+                    lines.append(
+                        "Detection confidence: confidence=null; confidence_available=false. Treat any product label as tentative and do not invent a numeric score."
+                    )
+                elif confidence >= 0.8:
+                    lines.append(
+                        f"Detection confidence: confidence={confidence}; confidence_available=true. A strong classification inference is supported by the supplied score, subject to evidence limitations."
+                    )
+                else:
+                    lines.append(
+                        f"Detection confidence: confidence={confidence}; confidence_available=true. Report the supplied score without overstating classification certainty."
+                    )
             limitation = next(iter(detection.limitations), "")
             if limitation:
                 lines.append(f"Detection limitation: {limitation}")
             elif detection.status == "unavailable":
                 lines.append("Detection limitation: Detection evidence was unavailable for this request.")
 
-        return "\n".join(lines) if graph or detection else ""
+        return "\n".join(lines)
 
     def _compose_graph(self, package: CopilotContextPackage, *, request_id: str = "") -> str:
         graph = package.graph
@@ -115,6 +143,11 @@ class ContextComposer:
 
         context = graph.context or {}
         nodes, edges, truncation_reasons = self._select_context_records(context)
+        provider_context_truncated = bool(context.get("context_truncated", False))
+        if provider_context_truncated and not truncation_reasons:
+            truncation_reasons.append(
+                str(context.get("context_truncation_reason") or "provider_context_limit")
+            )
         context_truncated = bool(truncation_reasons)
         truncation_reason = truncation_reasons[0] if truncation_reasons else None
         retrieved_nodes = list(context.get("nodes") or [])
@@ -233,8 +266,13 @@ class ContextComposer:
                 lines.append(f"Included node IDs: {_list_node_ids(nodes, limit=self.settings.graph_context_max_enumerated_nodes)}")
                 lines.append(f"Included edges: {_list_edges(edges, limit=self.settings.graph_context_max_enumerated_edges)}")
             if context.get("formal_anomaly_evidence_available") is False:
-                lines.append("Formal anomaly evidence: unavailable; no dedicated anomaly provider was used.")
-                lines.append("Available analysis: bounded structural interpretation of the supplied graph evidence only.")
+                lines.append("Formal anomaly evidence: unavailable; no dedicated anomaly score was supplied.")
+                lines.append(
+                    "For anomaly questions, still assess the supplied evidence: inbound/outbound balance, peer breadth, bidirectional pattern, graph reach, classification consistency, confidence availability, rules, conflicts, missing evidence, and truncation."
+                )
+                lines.append(
+                    "Offer plausible benign explanations and anomaly hypotheses, then state what evidence would confirm or reject them. This is an evidence-based assessment, not a formal anomaly score."
+                )
             if context.get("path_exists") is not None:
                 lines.append(f"Path exists: {bool(context.get('path_exists'))}; hop_count={context.get('hop_count')}")
             if context.get("retrieval_truncated"):

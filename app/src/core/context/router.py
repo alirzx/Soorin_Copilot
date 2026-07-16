@@ -20,8 +20,9 @@ GRAPH_WORDS = re.compile(
 )
 FULL_WORDS = re.compile(r"\b(?:all|every|full|complete|entire)\b", re.IGNORECASE)
 FULL_DIRECT_WORDS = re.compile(
-    r"\b(?:all(?:\s+of)?\s+(?:its\s+)?(?:direct\s+)?connections?|every\s+direct\s+neighbor|"
-    r"all\s+first[-\s]hop\s+peers?|complete\s+(?:direct\s+)?neighbor\s+list)\b",
+    r"\b(?:all(?:\s+of)?\s+(?:its\s+)?(?:direct\s+)?connections?|every\s+direct\s+(?:connection|neighbor)|"
+    r"all\s+direct\s+neighbors?|all\s+first[-\s]hop\s+peers?|every\s+first[-\s]hop\s+peer|"
+    r"complete\s+(?:direct\s+|first[-\s]hop\s+)?(?:neighbor|peer)\s+list|all\s+inbound\s+and\s+outbound\s+peers?)\b",
     re.IGNORECASE,
 )
 INBOUND_WORDS = re.compile(
@@ -38,7 +39,8 @@ DIRECT_RELATIONSHIP_WORDS = re.compile(r"\b(?:directly\s+connected|direct\s+conn
 COMPARISON_WORDS = re.compile(r"\b(?:compare|comparison|both\s+assets|both\s+ips|positions?|shared\s+peers?|common\s+peers?|broader\s+outbound|relationship)\b", re.IGNORECASE)
 TWO_HOP_WORDS = re.compile(
     r"\b(?:two[-\s]hops?|2\s+hops?|neighbors?\s+of\s+neighbors?|second[-\s]degree(?:\s+connections?|\s+impact)?|"
-    r"surrounding\s+network|expand\s+the\s+network|wider\s+local\s+impact|connections?\s+through\s+direct\s+neighbors?)\b",
+    r"indirect\s+connections?|direct\s+and\s+indirect(?:\s+two[-\s]hop)?\s+connections?|surrounding\s+network|"
+    r"expand\s+the\s+network|wider\s+local\s+impact|connections?\s+through\s+(?:its\s+|direct\s+)?neighbors?)\b",
     re.IGNORECASE,
 )
 ASSET_WORDS = re.compile(r"\b(?:tell|show|explain|investigate|analy[sz]e|what\s+about|how\s+about|what\s+.*know|all\s+you\s+know)\b", re.IGNORECASE)
@@ -51,15 +53,27 @@ DETECTION_COMPACT_WORDS = re.compile(
     r"\b(?:classified|classification|detect(?:ion|ed)?|evidence|rules?|matched\s+rules?|conflicts?|full\s+details?|all\s+available\s+detection|why\s+was)\b",
     re.IGNORECASE,
 )
+DETECTION_DEPTH_WORDS = re.compile(
+    r"\b(?:all|every|complete|full|detailed|deep)\s+(?:matched\s+)?(?:detection\s+)?(?:rules?|signals?|conflicts?|classification\s+evidence|profile\s+evidence|detection\s+evidence)\b"
+    r"|\b(?:all|every)\s+(?:supporting\s+)?(?:classification\s+)?signals?\b"
+    r"|\bdeep\s+(?:detection|forensic)\s+(?:analysis|assessment|evidence)\b",
+    re.IGNORECASE,
+)
 IDENTITY_WORDS = re.compile(r"\b(?:what\s+is|tell\s+me\s+about|summary|asset|device|role|identity|behaviou?r|agree)\b", re.IGNORECASE)
+TOPOLOGY_SUMMARY_WORDS = re.compile(
+    r"\b(?:summari[sz]e|summary|overview|high[-\s]level)\b.{0,40}\b(?:graph|topology|connections?)\b"
+    r"|\b(?:graph|topology)\b.{0,40}\b(?:summary|overview)\b",
+    re.IGNORECASE,
+)
 SECURITY_ANALYSIS_WORDS = re.compile(
     r"\b(?:anomal(?:y|ies|ous)|suspicious|unusual|abnormal|security|risk|threat|compromise[ds]?)\b",
     re.IGNORECASE,
 )
 COMBINED_ANALYSIS_WORDS = re.compile(
-    r"\b(?:analy[sz]e\s+(?:this\s+)?asset\s+deeply|all\s+(?:available\s+)?evidence|"
-    r"complete\s+(?:the\s+)?analysis|comprehensive\s+(?:analytical\s+)?report|"
-    r"full\s+asset\s+assessment|identity\s+and\s+connections|classification\s+and\s+topology)\b",
+    r"\b(?:analy[sz]e\s+(?:this\s+)?asset\s+deeply|deep\s+analysis|all\s+(?:available\s+)?evidence|"
+    r"complete\s+(?:the\s+)?(?:analysis|evidence)|full\s+evidence|comprehensive\s+(?:analytical\s+)?report|"
+    r"complete\s+report|complete\s+asset\s+assessment|full\s+asset\s+assessment|"
+    r"identity\s+and\s+(?:connections|communication\s+evidence)|classification\s+and\s+(?:topology|communication\s+evidence)|profile\s+and\s+topology)\b",
     re.IGNORECASE,
 )
 OPERATIONAL_INTENTS = {
@@ -99,6 +113,9 @@ class DeterministicFallbackRouter:
         entity_count = len(entities.entities)
         target = entities.entities[0] if entities.entities else entities.primary_entity
         last_provider = routing_state.last_provider if routing_state else None
+        last_providers = set(routing_state.last_providers if routing_state else ())
+        if last_provider:
+            last_providers.add(last_provider)
         previous_intent = routing_state.previous_intent if routing_state else None
         previous_scope = routing_state.previous_scope if routing_state else None
         previous_route_used = False
@@ -125,6 +142,7 @@ class DeterministicFallbackRouter:
         identity_signal = bool(IDENTITY_WORDS.search(message or ""))
         security_signal = bool(SECURITY_ANALYSIS_WORDS.search(message or ""))
         combined_signal = bool(COMBINED_ANALYSIS_WORDS.search(message or ""))
+        explicit_detection_depth = bool(DETECTION_DEPTH_WORDS.search(message or ""))
         entity_followup_signal = bool(
             entities.reference_detected
             or ENTITY_REFERENCE_WORDS.search(message or "")
@@ -158,25 +176,37 @@ class DeterministicFallbackRouter:
             else:
                 scope, depth = "node_summary", 0
             intent, direction = "asset_investigation", _direction(message)
-            use_graph, use_detection, detection_detail = True, True, "summary"
+            use_graph, use_detection = True, True
+            detection_detail = "compact_full" if explicit_detection_depth else "summary"
             reason = "fallback_comprehensive_combined_analysis"
             signal_group = "combined_provider_request"
         elif target and entity_count == 1 and TWO_HOP_WORDS.search(message or ""):
             intent, scope, direction, depth = "graph_neighbors", "two_hop", _direction(message), 2
             use_graph, reason = True, "fallback_two_hop"
+            if detection_signal or security_signal:
+                intent = "asset_investigation"
+                use_detection = True
+                detection_detail = "compact_full" if explicit_detection_depth else "summary"
             signal_group = "graph_topology"
         elif target and entity_count == 1 and graph_signal and detection_signal:
             scope = "full_neighbors" if FULL_DIRECT_WORDS.search(message or "") else "node_summary"
             depth = 1 if scope == "full_neighbors" else 0
             intent, direction = "asset_investigation", _direction(message)
-            use_graph, use_detection, detection_detail = True, True, "summary"
+            use_graph, use_detection = True, True
+            detection_detail = "compact_full" if explicit_detection_depth else "summary"
             reason = "fallback_combined_graph_detection"
             signal_group = "combined_provider_request"
-        elif target and entity_count == 1 and graph_signal:
+        elif target and entity_count == 1 and graph_signal and not security_signal:
             intent = "graph_neighbors"
-            scope = "full_neighbors" if FULL_DIRECT_WORDS.search(message or "") or FULL_WORDS.search(message or "") else "one_hop"
+            scope = (
+                "node_summary"
+                if TOPOLOGY_SUMMARY_WORDS.search(message or "")
+                else "full_neighbors"
+                if FULL_DIRECT_WORDS.search(message or "") or FULL_WORDS.search(message or "")
+                else "one_hop"
+            )
             direction = _direction(message)
-            depth = 1
+            depth = 0 if scope == "node_summary" else 1
             use_graph, reason = True, "fallback_graph_neighbors"
             signal_group = "graph_topology"
         elif target and entity_count == 1 and detection_signal:
@@ -189,9 +219,11 @@ class DeterministicFallbackRouter:
             signal_group = "asset_identity"
         elif target and entity_count == 1 and security_signal:
             intent, scope, direction, depth = "asset_investigation", "node_summary", "both", 0
-            use_graph, reason = True, "fallback_security_graph_baseline"
+            use_graph, use_detection = True, True
+            detection_detail = "compact_full" if explicit_detection_depth else "summary"
+            reason = "fallback_security_combined_baseline"
             signal_group = "security_or_anomaly"
-        elif target and entity_followup_signal and previous_intent in OPERATIONAL_INTENTS and last_provider in {"graph", "detection"}:
+        elif target and entity_followup_signal and previous_intent in OPERATIONAL_INTENTS and last_providers.intersection({"graph", "detection"}):
             previous_route_used = True
             if entity_count == 2 and previous_intent in {"graph_relationships", "graph_path"}:
                 intent = previous_intent  # type: ignore[assignment]
@@ -208,7 +240,7 @@ class DeterministicFallbackRouter:
                     if routing_state and routing_state.previous_direction in {"inbound", "outbound", "both"}
                     else "both",
                 )  # type: ignore[arg-type]
-                use_graph = bool(last_provider == "graph" or scope != "none")
+                use_graph = bool("graph" in last_providers or scope != "none")
                 use_detection = bool(
                     intent == "asset_investigation"
                     and routing_state
@@ -242,7 +274,7 @@ class DeterministicFallbackRouter:
             ],
             graph_intent_detected=use_graph and intent.startswith("graph_"),
             asset_investigation_detected=intent == "asset_investigation",
-            followup_detected=intent == "graph_followup",
+            followup_detected=bool(entity_followup_signal and target and target.source == "conversation") or previous_route_used,
             intent=intent,
             scope=scope,
             direction=direction,

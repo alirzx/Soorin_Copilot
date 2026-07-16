@@ -24,6 +24,7 @@ logger = logging.getLogger(__name__)
 class _CacheEntry:
     evidence: AssetDetectionEvidence
     stored_at: float
+    detail: DetectionDetail
 
 
 def _safe_error(exc: Exception) -> str:
@@ -65,16 +66,19 @@ class DetectionContextProvider:
         )
 
         cached = self._get_cache_entry(normalized_ip)
-        if cached and self._is_fresh(cached):
+        cache_miss_reason = self._cache_miss_reason(cached, detail)
+        if cached and cache_miss_reason is None:
             age = self._cache_age(cached)
             rendered = self._render(cached.evidence, detail)
             status = "not_found" if cached.evidence.found is False else "available"
             latency_ms = int((time.perf_counter() - started) * 1000)
             logger.info(
-                "event=detection_cache_hit request_id=%s ip=%s age_seconds=%s stale=false",
+                "event=detection_cache_hit request_id=%s ip=%s cache_age_seconds=%s cached_detail=%s requested_detail=%s stale=false",
                 request_id,
                 normalized_ip,
                 age,
+                cached.detail,
+                detail,
             )
             return self._result(
                 status=status,
@@ -84,16 +88,26 @@ class DetectionContextProvider:
                 rendered_context=rendered,
                 cache_hit=True,
                 cache_age_seconds=age,
+                cached_detail=cached.detail,
                 stale=False,
                 latency_ms=latency_ms,
             )
+
+        logger.info(
+            "event=detection_cache_miss request_id=%s ip=%s cache_miss_reason=%s cached_detail=%s requested_detail=%s",
+            request_id,
+            normalized_ip,
+            cache_miss_reason,
+            cached.detail if cached else "",
+            detail,
+        )
 
         try:
             raw = self.product_client.get_asset_detection(normalized_ip, request_id=request_id)
             evidence = adapt_asset_detection(raw, fetched_at=datetime.now(timezone.utc))
         except ProductApiError as exc:
             latency_ms = int((time.perf_counter() - started) * 1000)
-            if cached and self.settings.detection_stale_on_error:
+            if cached and self.settings.detection_stale_on_error and self._detail_satisfies(cached.detail, detail):
                 age = self._cache_age(cached)
                 rendered = self._render(cached.evidence, detail)
                 logger.warning(
@@ -110,6 +124,8 @@ class DetectionContextProvider:
                     rendered_context=rendered,
                     cache_hit=True,
                     cache_age_seconds=age,
+                    cache_miss_reason=cache_miss_reason,
+                    cached_detail=cached.detail,
                     stale=True,
                     latency_ms=latency_ms,
                     error_type=type(exc).__name__,
@@ -125,7 +141,7 @@ class DetectionContextProvider:
 
         if self.settings.detection_cache_enabled:
             with self._lock:
-                self._cache[normalized_ip] = _CacheEntry(evidence=evidence, stored_at=time.time())
+                self._cache[normalized_ip] = _CacheEntry(evidence=evidence, stored_at=time.time(), detail=detail)
 
         rendered = self._render(evidence, detail)
         status = "not_found" if evidence.found is False else "available"
@@ -159,6 +175,8 @@ class DetectionContextProvider:
             limitations=evidence.limitations,
             cache_hit=False,
             cache_age_seconds=0,
+            cache_miss_reason=cache_miss_reason,
+            cached_detail=cached.detail if cached else None,
             stale=False,
             latency_ms=latency_ms,
         )
@@ -171,6 +189,21 @@ class DetectionContextProvider:
 
     def _is_fresh(self, entry: _CacheEntry) -> bool:
         return self._cache_age(entry) <= max(0, self.settings.detection_cache_ttl_seconds)
+
+    @staticmethod
+    def _detail_satisfies(cached_detail: DetectionDetail, requested_detail: DetectionDetail) -> bool:
+        return cached_detail == "compact_full" or requested_detail == "summary"
+
+    def _cache_miss_reason(self, entry: _CacheEntry | None, requested_detail: DetectionDetail) -> str | None:
+        if not self.settings.detection_cache_enabled:
+            return "disabled"
+        if entry is None:
+            return "not_found"
+        if not self._is_fresh(entry):
+            return "expired"
+        if not self._detail_satisfies(entry.detail, requested_detail):
+            return "detail_mismatch"
+        return None
 
     @staticmethod
     def _cache_age(entry: _CacheEntry) -> int:
@@ -211,6 +244,8 @@ class DetectionContextProvider:
         limitations: list[str] | None = None,
         cache_hit: bool = False,
         cache_age_seconds: int | None = None,
+        cache_miss_reason: str | None = None,
+        cached_detail: DetectionDetail | None = None,
         stale: bool = False,
         latency_ms: int = 0,
         error_type: str | None = None,
@@ -227,6 +262,10 @@ class DetectionContextProvider:
             limitations=list(limitations or (evidence.limitations if evidence else [])),
             cache_hit=cache_hit,
             cache_age_seconds=cache_age_seconds,
+            cache_miss_reason=cache_miss_reason,
+            cached_detail=cached_detail,
+            context_truncated=rendered_context.endswith("...[truncated]"),
+            context_truncation_reason=("detection_context_character_limit" if rendered_context.endswith("...[truncated]") else None),
             stale=stale,
             latency_ms=latency_ms,
             error_type=error_type,

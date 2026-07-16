@@ -60,6 +60,8 @@ class EntityResolution:
     reference_type: str | None = None
     reference_suppressed: bool = False
     suppression_reason: str | None = None
+    subnet_constraints: tuple[str, ...] = ()
+    unsupported_constraints: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -180,6 +182,10 @@ class DetectionProviderResult:
     limitations: list[str] = field(default_factory=list)
     cache_hit: bool = False
     cache_age_seconds: int | None = None
+    cache_miss_reason: str | None = None
+    cached_detail: DetectionDetail | None = None
+    context_truncated: bool = False
+    context_truncation_reason: str | None = None
     stale: bool = False
     latency_ms: int = 0
     error_type: str | None = None

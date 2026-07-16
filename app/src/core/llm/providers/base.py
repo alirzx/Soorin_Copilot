@@ -19,6 +19,7 @@ class LLMProviderResult:
     reasoning_present: bool = False
     reasoning_exposed: bool = False
     payload_format: str = "text"
+    deployment: str = ""
 
     def to_public_dict(self) -> Dict[str, Any]:
         """Return safe metadata without raw responses or reasoning content."""
@@ -26,6 +27,7 @@ class LLMProviderResult:
             "text": self.text,
             "provider": self.provider,
             "model": self.model,
+            "deployment": self.deployment,
             "finish_reason": self.finish_reason,
             "usage": dict(self.usage or {}),
             "latency_ms": self.latency_ms,

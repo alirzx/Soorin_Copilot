@@ -8,6 +8,12 @@ from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 
+from src.config.llm_deployments import (
+    ArvanDeploymentConfig,
+    LLMDeploymentName,
+    VALID_LLM_DEPLOYMENTS,
+)
+
 
 APP_DIR = Path(__file__).resolve().parents[2]
 ENV_PATH = APP_DIR / ".env"
@@ -51,6 +57,19 @@ def _float(name: str, default: float) -> float:
     return float(value)
 
 
+def _optional_float(name: str) -> float | None:
+    value = os.getenv(name)
+    if value is None or value.strip() == "":
+        return None
+    return float(value)
+
+
+def _deployment_name(name: str, default: LLMDeploymentName = "glm") -> LLMDeploymentName:
+    value = (os.getenv(name) or default).strip().lower()
+    if value not in VALID_LLM_DEPLOYMENTS:
+        valid = ", ".join(VALID_LLM_DEPLOYMENTS)
+        raise ValueError(f"Invalid LLM deployment alias for {name}. Valid aliases: {valid}")
+    return value  # type: ignore[return-value]
 @dataclass(frozen=True)
 class Settings:
     api_host: str
@@ -62,20 +81,47 @@ class Settings:
     streamlit_server_port: int
     llm_enabled: bool
     llm_provider: str
-    arvan_base_url: str
-    arvan_model: str
-    arvan_api_key: str
-    arvan_auth_scheme: str
-    arvan_chat_path: str
-    llm_connect_timeout_seconds: int
-    chat_timeout_seconds: int
-    arvan_max_tokens: int
-    arvan_temperature: float
-    arvan_top_p: float
+    intent_router_deployment: LLMDeploymentName
+    chat_deployment: LLMDeploymentName
+    glm_base_url: str
+    glm_chat_path: str
+    glm_model: str
+    glm_api_key: str
+    glm_auth_scheme: str
+    glm_connect_timeout_seconds: int
+    glm_router_timeout_seconds: int
+    glm_chat_timeout_seconds: int
+    glm_max_tokens: int
+    glm_router_max_tokens: int
+    glm_router_retry_max_tokens: int
+    glm_chat_max_tokens: int
+    glm_router_temperature: float | None
+    glm_router_top_p: float | None
+    glm_chat_temperature: float | None
+    glm_chat_top_p: float | None
+    glm_supports_temperature: bool
+    glm_supports_top_p: bool
+    gpt55_base_url: str
+    gpt55_chat_path: str
+    gpt55_model: str
+    gpt55_api_key: str
+    gpt55_auth_scheme: str
+    gpt55_connect_timeout_seconds: int
+    gpt55_router_timeout_seconds: int
+    gpt55_chat_timeout_seconds: int
+    gpt55_max_tokens: int
+    gpt55_router_max_tokens: int
+    gpt55_router_retry_max_tokens: int
+    gpt55_chat_max_tokens: int
+    gpt55_router_temperature: float | None
+    gpt55_router_top_p: float | None
+    gpt55_chat_temperature: float | None
+    gpt55_chat_top_p: float | None
+    gpt55_supports_temperature: bool
+    gpt55_supports_top_p: bool
     llm_max_transient_retries: int
     llm_retry_base_delay_seconds: float
     llm_retry_max_delay_seconds: float
-    chat_max_tokens: int
     llm_context_window_tokens: int
     llm_reserved_output_tokens: int
     llm_context_safety_margin_tokens: int
@@ -130,13 +176,8 @@ class Settings:
     graph_comparison_max_shared_peers: int
     intent_router_enabled: bool
     intent_router_system_prompt_path: str
-    intent_router_timeout_seconds: int
     intent_router_min_confidence: float
     intent_router_retry_enabled: bool
-    intent_router_temperature: float
-    intent_router_top_p: float
-    intent_router_max_tokens: int
-    intent_router_retry_max_tokens: int
     graph_auto_refresh_enabled: bool
     graph_refresh_interval_seconds: int
     graph_refresh_on_startup: bool
@@ -152,6 +193,71 @@ class Settings:
     graph_refresh_max_edge_drop_ratio: float
     copilot_human_trace_enabled: bool
 
+    def deployment(self, name: LLMDeploymentName) -> ArvanDeploymentConfig:
+        """Build either deployment through the same typed configuration contract."""
+        if name == "glm":
+            return ArvanDeploymentConfig(
+                name="glm",
+                base_url=self.glm_base_url,
+                chat_path=self.glm_chat_path,
+                model=self.glm_model,
+                api_key=self.glm_api_key,
+                auth_scheme=self.glm_auth_scheme,
+                connect_timeout_seconds=self.glm_connect_timeout_seconds,
+                maximum_completion_tokens=self.glm_max_tokens,
+                router_read_timeout_seconds=self.glm_router_timeout_seconds,
+                router_max_tokens=self.glm_router_max_tokens,
+                router_repair_max_tokens=self.glm_router_retry_max_tokens,
+                chat_read_timeout_seconds=self.glm_chat_timeout_seconds,
+                chat_max_tokens=self.glm_chat_max_tokens,
+                router_temperature=self.glm_router_temperature,
+                router_top_p=self.glm_router_top_p,
+                chat_temperature=self.glm_chat_temperature,
+                chat_top_p=self.glm_chat_top_p,
+                supports_temperature=self.glm_supports_temperature,
+                supports_top_p=self.glm_supports_top_p,
+            )
+        if name == "gpt55":
+            return ArvanDeploymentConfig(
+                name="gpt55",
+                base_url=self.gpt55_base_url,
+                chat_path=self.gpt55_chat_path,
+                model=self.gpt55_model,
+                api_key=self.gpt55_api_key,
+                auth_scheme=self.gpt55_auth_scheme,
+                connect_timeout_seconds=self.gpt55_connect_timeout_seconds,
+                maximum_completion_tokens=self.gpt55_max_tokens,
+                router_read_timeout_seconds=self.gpt55_router_timeout_seconds,
+                router_max_tokens=self.gpt55_router_max_tokens,
+                router_repair_max_tokens=self.gpt55_router_retry_max_tokens,
+                chat_read_timeout_seconds=self.gpt55_chat_timeout_seconds,
+                chat_max_tokens=self.gpt55_chat_max_tokens,
+                router_temperature=self.gpt55_router_temperature,
+                router_top_p=self.gpt55_router_top_p,
+                chat_temperature=self.gpt55_chat_temperature,
+                chat_top_p=self.gpt55_chat_top_p,
+                supports_temperature=self.gpt55_supports_temperature,
+                supports_top_p=self.gpt55_supports_top_p,
+            )
+        valid = ", ".join(VALID_LLM_DEPLOYMENTS)
+        raise ValueError(f"Invalid LLM deployment alias. Valid aliases: {valid}")
+
+    def deployment_for_purpose(self, purpose: str) -> ArvanDeploymentConfig:
+        alias = self.chat_deployment if purpose == "chat" else self.intent_router_deployment
+        return self.deployment(alias)
+
+    def validate_selected_llm_deployments(self) -> None:
+        """Fail startup safely when an enabled selected deployment has no endpoint."""
+        if not self.llm_enabled or self.llm_provider != "arvan":
+            return
+        selected = dict.fromkeys((self.intent_router_deployment, self.chat_deployment))
+        missing = [alias for alias in selected if not self.deployment(alias).base_url]
+        if missing:
+            raise ValueError(
+                "Selected LLM deployment base URL is not configured for: "
+                + ", ".join(missing)
+            )
+
 
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:
@@ -166,20 +272,68 @@ def get_settings() -> Settings:
         streamlit_server_port=_int("STREAMLIT_SERVER_PORT", 8503),
         llm_enabled=_bool("SOORIN_LLM_ENABLED", True),
         llm_provider=os.getenv("SOORIN_LLM_PROVIDER", "arvan").strip().lower(),
-        arvan_base_url=os.getenv("SOORIN_ARVAN_BASE_URL", "").strip().rstrip("/"),
-        arvan_model=os.getenv("SOORIN_ARVAN_MODEL", "GLM-5.2").strip(),
-        arvan_api_key=os.getenv("SOORIN_ARVAN_API_KEY", "").strip(),
-        arvan_auth_scheme=os.getenv("SOORIN_ARVAN_AUTH_SCHEME", "apikey").strip(),
-        arvan_chat_path=os.getenv("SOORIN_ARVAN_CHAT_PATH", "/chat/completions").strip(),
-        llm_connect_timeout_seconds=_int("SOORIN_LLM_CONNECT_TIMEOUT_SECONDS", 8),
-        chat_timeout_seconds=_int("SOORIN_CHAT_TIMEOUT_SECONDS", 300),
-        arvan_max_tokens=_int("SOORIN_ARVAN_MAX_TOKENS", 12288),
-        arvan_temperature=_float("SOORIN_ARVAN_TEMPERATURE", 0.2),
-        arvan_top_p=_float("SOORIN_ARVAN_TOP_P", 0.9),
+        intent_router_deployment=_deployment_name("SOORIN_INTENT_ROUTER_DEPLOYMENT"),
+        chat_deployment=_deployment_name("SOORIN_CHAT_DEPLOYMENT"),
+        glm_base_url=os.getenv("SOORIN_LLM_GLM_BASE_URL", "").strip().rstrip("/"),
+        glm_chat_path=os.getenv("SOORIN_LLM_GLM_CHAT_PATH", "/chat/completions").strip(),
+        glm_model=os.getenv("SOORIN_LLM_GLM_MODEL", "GLM-5.2").strip(),
+        glm_api_key=os.getenv("SOORIN_LLM_GLM_API_KEY", "").strip(),
+        glm_auth_scheme=os.getenv("SOORIN_LLM_GLM_AUTH_SCHEME", "apikey").strip(),
+        glm_connect_timeout_seconds=_int("SOORIN_LLM_GLM_CONNECT_TIMEOUT_SECONDS", 8),
+        glm_router_timeout_seconds=_int("SOORIN_LLM_GLM_ROUTER_TIMEOUT_SECONDS", 15),
+        glm_chat_timeout_seconds=_int("SOORIN_LLM_GLM_CHAT_TIMEOUT_SECONDS", 300),
+        glm_max_tokens=_int("SOORIN_LLM_GLM_MAX_TOKENS", 12288),
+        glm_router_max_tokens=_int("SOORIN_LLM_GLM_ROUTER_MAX_TOKENS", 384),
+        glm_router_retry_max_tokens=_int("SOORIN_LLM_GLM_ROUTER_RETRY_MAX_TOKENS", 640),
+        glm_chat_max_tokens=_int("SOORIN_LLM_GLM_CHAT_MAX_TOKENS", 4096),
+        glm_router_temperature=_optional_float("SOORIN_LLM_GLM_ROUTER_TEMPERATURE"),
+        glm_router_top_p=_optional_float("SOORIN_LLM_GLM_ROUTER_TOP_P"),
+        glm_chat_temperature=_optional_float("SOORIN_LLM_GLM_CHAT_TEMPERATURE"),
+        glm_chat_top_p=_optional_float("SOORIN_LLM_GLM_CHAT_TOP_P"),
+        glm_supports_temperature=_bool("SOORIN_LLM_GLM_SUPPORTS_TEMPERATURE", True),
+        glm_supports_top_p=_bool("SOORIN_LLM_GLM_SUPPORTS_TOP_P", True),
+        gpt55_base_url=os.getenv("SOORIN_LLM_GPT55_BASE_URL", "").strip().rstrip("/"),
+        gpt55_chat_path=os.getenv("SOORIN_LLM_GPT55_CHAT_PATH", "/chat/completions").strip(),
+        gpt55_model=os.getenv("SOORIN_LLM_GPT55_MODEL", "GPT-5.5").strip(),
+        gpt55_api_key=os.getenv("SOORIN_LLM_GPT55_API_KEY", "").strip(),
+        gpt55_auth_scheme=os.getenv("SOORIN_LLM_GPT55_AUTH_SCHEME", "apikey").strip(),
+        gpt55_connect_timeout_seconds=_int(
+            "SOORIN_LLM_GPT55_CONNECT_TIMEOUT_SECONDS",
+            8,
+        ),
+        gpt55_router_timeout_seconds=_int(
+            "SOORIN_LLM_GPT55_ROUTER_TIMEOUT_SECONDS",
+            30,
+        ),
+        gpt55_chat_timeout_seconds=_int(
+            "SOORIN_LLM_GPT55_CHAT_TIMEOUT_SECONDS",
+            360,
+        ),
+        gpt55_max_tokens=_int(
+            "SOORIN_LLM_GPT55_MAX_TOKENS",
+            12288,
+        ),
+        gpt55_router_max_tokens=_int(
+            "SOORIN_LLM_GPT55_ROUTER_MAX_TOKENS",
+            924,
+        ),
+        gpt55_router_retry_max_tokens=_int(
+            "SOORIN_LLM_GPT55_ROUTER_RETRY_MAX_TOKENS",
+            1284,
+        ),
+        gpt55_chat_max_tokens=_int(
+            "SOORIN_LLM_GPT55_CHAT_MAX_TOKENS",
+            12288,
+        ),
+        gpt55_router_temperature=_optional_float("SOORIN_LLM_GPT55_ROUTER_TEMPERATURE"),
+        gpt55_router_top_p=_optional_float("SOORIN_LLM_GPT55_ROUTER_TOP_P"),
+        gpt55_chat_temperature=_optional_float("SOORIN_LLM_GPT55_CHAT_TEMPERATURE"),
+        gpt55_chat_top_p=_optional_float("SOORIN_LLM_GPT55_CHAT_TOP_P"),
+        gpt55_supports_temperature=_bool("SOORIN_LLM_GPT55_SUPPORTS_TEMPERATURE", False),
+        gpt55_supports_top_p=_bool("SOORIN_LLM_GPT55_SUPPORTS_TOP_P", False),
         llm_max_transient_retries=_int("SOORIN_LLM_MAX_TRANSIENT_RETRIES", 1),
         llm_retry_base_delay_seconds=_float("SOORIN_LLM_RETRY_BASE_DELAY_SECONDS", 0.25),
         llm_retry_max_delay_seconds=_float("SOORIN_LLM_RETRY_MAX_DELAY_SECONDS", 1.0),
-        chat_max_tokens=_int("SOORIN_CHAT_MAX_TOKENS", 4096),
         llm_context_window_tokens=_int("SOORIN_LLM_CONTEXT_WINDOW_TOKENS", 32768),
         llm_reserved_output_tokens=_int("SOORIN_LLM_RESERVED_OUTPUT_TOKENS", 12288),
         llm_context_safety_margin_tokens=_int("SOORIN_LLM_CONTEXT_SAFETY_MARGIN_TOKENS", 2048),
@@ -213,7 +367,7 @@ def get_settings() -> Settings:
         product_max_retries=_int("SOORIN_PRODUCT_MAX_RETRIES", 5),
         product_retry_backoff_seconds=_float("SOORIN_PRODUCT_RETRY_BACKOFF_SECONDS", 3.0),
         detection_cache_enabled=_bool("SOORIN_DETECTION_CACHE_ENABLED", True),
-        detection_cache_ttl_seconds=_int("SOORIN_DETECTION_CACHE_TTL_SECONDS", 300),
+        detection_cache_ttl_seconds=max(600, _int("SOORIN_DETECTION_CACHE_TTL_SECONDS", 600)),
         detection_stale_on_error=_bool("SOORIN_DETECTION_STALE_ON_ERROR", True),
         graph_raw_path=os.getenv("SOORIN_GRAPH_RAW_PATH", "data/raw/topology_raw.json").strip(),
         graph_pickle_path=os.getenv("SOORIN_GRAPH_PICKLE_PATH", "data/processed/topology_graph.pkl").strip(),
@@ -240,15 +394,10 @@ def get_settings() -> Settings:
             "SOORIN_INTENT_ROUTER_SYSTEM_PROMPT_PATH",
             "app/prompts/intent_router_system_prompt.md",
         ).strip(),
-        intent_router_timeout_seconds=_int("SOORIN_INTENT_ROUTER_TIMEOUT_SECONDS", 15),
         intent_router_min_confidence=_float("SOORIN_INTENT_ROUTER_MIN_CONFIDENCE", 0.65),
         intent_router_retry_enabled=_bool("SOORIN_INTENT_ROUTER_RETRY_ENABLED", True),
-        intent_router_temperature=_float("SOORIN_INTENT_ROUTER_TEMPERATURE", 0.0),
-        intent_router_top_p=_float("SOORIN_INTENT_ROUTER_TOP_P", 0.1),
-        intent_router_max_tokens=_int("SOORIN_INTENT_ROUTER_MAX_TOKENS", 384),
-        intent_router_retry_max_tokens=_int("SOORIN_INTENT_ROUTER_RETRY_MAX_TOKENS", 640),
         graph_auto_refresh_enabled=_bool("SOORIN_GRAPH_AUTO_REFRESH_ENABLED", True),
-        graph_refresh_interval_seconds=_int("SOORIN_GRAPH_REFRESH_INTERVAL_SECONDS", 900),
+        graph_refresh_interval_seconds=max(600, _int("SOORIN_GRAPH_REFRESH_INTERVAL_SECONDS", 900)),
         graph_refresh_on_startup=_bool("SOORIN_GRAPH_REFRESH_ON_STARTUP", True),
         graph_refresh_startup_delay_seconds=_int("SOORIN_GRAPH_REFRESH_STARTUP_DELAY_SECONDS", 5),
         graph_refresh_jitter_seconds=_int("SOORIN_GRAPH_REFRESH_JITTER_SECONDS", 30),
@@ -263,9 +412,11 @@ def get_settings() -> Settings:
         copilot_human_trace_enabled=_bool("SOORIN_COPILOT_HUMAN_TRACE_ENABLED", True),
     )
     logger.info(
-        "event=settings_loaded env_file_path=%s env_file_loaded=%s product_base_url_configured=%s product_token_present=%s product_hwid_present=%s product_username_present=%s product_password_present=%s product_captcha_bypass_present=%s",
+        "event=settings_loaded env_file_path=%s env_file_loaded=%s router_deployment=%s chat_deployment=%s product_base_url_configured=%s product_token_present=%s product_hwid_present=%s product_username_present=%s product_password_present=%s product_captcha_bypass_present=%s",
         ENV_PATH,
         env_file_loaded,
+        settings.intent_router_deployment,
+        settings.chat_deployment,
         bool(settings.product_api_base_url),
         bool(settings.product_api_token),
         bool(settings.product_hwid),

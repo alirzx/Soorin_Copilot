@@ -325,6 +325,19 @@ class AssetDetectionNormalizationTests(unittest.TestCase):
         self.assertLess(len(short), 2200)
         self.assertLess(len(full), 5200)
 
+    def test_missing_confidence_is_explicitly_typed_and_rendered(self) -> None:
+        payload = sample_payload()
+        payload["detection"]["confidence"] = None
+        payload["tagging"]["confidence"] = None
+        evidence = adapt_asset_detection(
+            RawAssetDetectionResponse.model_validate(payload),
+            fetched_at=datetime(2026, 7, 12, tzinfo=timezone.utc),
+        )
+        self.assertIsNone(evidence.classification.confidence)
+        self.assertIn("Confidence: null", summary(evidence))
+        self.assertIn("Confidence available: false", summary(evidence))
+        self.assertIn("confidence=null, confidence_available=false", compact_full(evidence))
+
     def test_null_and_missing_sections_are_separate(self) -> None:
         raw = RawAssetDetectionResponse.model_validate(
             {
