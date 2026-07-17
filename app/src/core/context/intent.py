@@ -12,7 +12,6 @@ from typing import Any
 
 from src.config.settings import Settings
 from src.core.context.models import (
-    DetectionDetail,
     EntityBinding,
     EntityResolution,
     GraphDirection,
@@ -25,6 +24,7 @@ from src.core.context.models import (
 from src.core.llm.client import LLMClient
 from src.core.llm.errors import LLMError
 from src.core.memory.routing_state import SessionRoutingState
+from src.core.context.router import is_exhaustive_connection_request
 
 
 logger = logging.getLogger(__name__)
@@ -40,22 +40,15 @@ ALLOWED_INTENTS: set[str] = {
 }
 ALLOWED_SCOPES: set[str] = {"none", "node_summary", "one_hop", "full_neighbors", "two_hop", "path", "multi_entity_comparison"}
 ALLOWED_DIRECTIONS: set[str] = {"none", "inbound", "outbound", "both"}
-ALLOWED_DETECTION_DETAILS: set[str] = {"summary", "compact_full"}
 ALLOWED_ENTITY_BINDINGS: set[str] = {"explicit", "ui", "active_single", "active_pair", "none"}
-DETECTION_COMPACT_WORDS = re.compile(
+DETECTION_EVIDENCE_WORDS = re.compile(
     r"\b(?:classified|classification|detect(?:ion|ed)?|evidence|rules?|matched\s+rules?|conflicts?|full\s+details?|all\s+available\s+detection|why\s+was)\b",
     re.IGNORECASE,
 )
-DETECTION_ONLY_DETAIL_WORDS = re.compile(
-    r"\b(?:all\s+matched\s+rules?|all\s+classification\s+evidence|show\s+(?:all\s+)?conflicts?|"
-    r"confidence\s+and\s+supporting\s+signals?|complete\s+detection\s+evidence|"
-    r"why\s+(?:is|was)\s+.+\s+classif(?:ied|ication))\b",
-    re.IGNORECASE,
-)
-DETECTION_DEPTH_WORDS = re.compile(
-    r"\b(?:all|every|complete|full|detailed|deep)\s+(?:matched\s+)?(?:detection\s+)?(?:rules?|signals?|conflicts?|classification\s+evidence|profile\s+evidence|detection\s+evidence)\b"
-    r"|\b(?:all|every)\s+(?:supporting\s+)?(?:classification\s+)?signals?\b"
-    r"|\b(?:every\s+matched\s+rule|deep\s+(?:detection|forensic)\s+(?:analysis|assessment|evidence))\b",
+ASSET_PROFILE_WORDS = re.compile(
+    r"\b(?:asset\s+profile|profile|inventory|owner|assigned\s+user|hostname|operating\s+system|os|asset\s+type|"
+    r"device\s+type|risk(?:\s+(?:score|level|trend))?|alerts?|services?|authentication|kerberos|ldap|ntlm|smb|"
+    r"domain\s+join(?:ed)?|mac(?:\s+(?:address|vendor))?|open\s+ports?|kdc|identity)\b",
     re.IGNORECASE,
 )
 
@@ -229,11 +222,12 @@ ROUTER_SYSTEM_PROMPT_FALLBACK = (
     "Do not answer the user. Use only supplied deterministic entities. "
     "Choose entity_binding from explicit, ui, active_single, active_pair, none. "
     "Allowed scopes include none, node_summary, one_hop, full_neighbors, two_hop, path, "
-    "and multi_entity_comparison. Never request depth greater than 2."
+    "and multi_entity_comparison. Select graph, detection, and asset_profile independently. "
+    "Detection always means complete JSON. Never request depth greater than 2."
 )
 ROUTER_REPAIR_SYSTEM_PROMPT = (
     "Repair one Soorin routing object. Return JSON only. Required keys: intent, scope, direction, depth, "
-    "requires_graph, requires_detection, detection_detail, entity_binding, requires_multiple_entities, "
+    "requires_graph, requires_detection, requires_asset_profile, entity_binding, requires_multiple_entities, "
     "is_followup, classification_confidence, reason. Allowed intents: general_knowledge, asset_investigation, "
     "graph_neighbors, graph_relationships, graph_path, graph_followup, unclear. Allowed scopes: none, "
     "node_summary, one_hop, full_neighbors, two_hop, path, multi_entity_comparison. Allowed directions: none, "
@@ -316,7 +310,7 @@ def build_routing_context(
         "previous_direction": routing_state.previous_direction,
         "previous_depth": routing_state.previous_depth,
         "previous_requires_detection": routing_state.previous_requires_detection,
-        "previous_detection_detail": routing_state.previous_detection_detail or "",
+        "previous_requires_asset_profile": routing_state.previous_requires_asset_profile,
         "explicit_topic_detachment": entities.reference_suppressed,
         "subnet_constraints": list(entities.subnet_constraints),
         "unsupported_constraints": list(entities.unsupported_constraints),
@@ -338,18 +332,21 @@ def validate_router_payload(
         "direction",
         "depth",
         "requires_graph",
+        "requires_detection",
+        "requires_asset_profile",
         "requires_multiple_entities",
         "is_followup",
         "classification_confidence",
         "reason",
     }
+    if unexpected := sorted(set(payload).difference(required | {"entity_binding"})):
+        raise ValueError(f"schema_validation_failed:unexpected={','.join(unexpected)}")
     if missing := sorted(required.difference(payload)):
         raise ValueError(f"schema_validation_failed:missing={','.join(missing)}")
 
     intent = str(payload["intent"])
     scope = str(payload["scope"])
     direction = str(payload["direction"])
-    entity_count = len(entities.entities)
     route_normalized = False
     route_normalization_reason = None
 
@@ -382,23 +379,14 @@ def validate_router_payload(
     if depth < 0 or depth > 2:
         raise ValueError("schema_validation_failed:depth_range")
 
-    requires_graph = bool(payload["requires_graph"])
-    requires_multiple = bool(payload["requires_multiple_entities"])
-    raw_detection_detail = str(payload.get("detection_detail") or "summary")
-    detection_detail: DetectionDetail = "summary"
-    if raw_detection_detail in ALLOWED_DETECTION_DETAILS:
-        detection_detail = raw_detection_detail  # type: ignore[assignment]
-    else:
-        normalize("invalid_detection_detail_defaulted")
-    requires_detection = bool(payload.get("requires_detection", False))
-    message_text = message or ""
-    compact_detection_requested = bool(DETECTION_COMPACT_WORDS.search(message_text))
-    detection_only_requested = bool(DETECTION_ONLY_DETAIL_WORDS.search(message_text))
-    explicit_detection_depth_requested = bool(DETECTION_DEPTH_WORDS.search(message_text))
-    combined_analysis_requested = bool(COMBINED_ANALYSIS_WORDS.search(message_text))
-    security_analysis_requested = bool(SECURITY_ANALYSIS_WORDS.search(message_text))
-    graph_word_present = bool(PURE_GRAPH_WORDS.search(message_text))
-    identity_word_present = bool(IDENTITY_WORDS.search(message_text))
+    for name in ("requires_graph", "requires_detection", "requires_asset_profile", "requires_multiple_entities", "is_followup"):
+        if not isinstance(payload[name], bool):
+            raise ValueError(f"schema_validation_failed:{name}")
+    requires_graph = payload["requires_graph"]
+    requires_detection = payload["requires_detection"]
+    requires_asset_profile = payload["requires_asset_profile"]
+    requires_multiple = payload["requires_multiple_entities"]
+    exhaustive_connections = is_exhaustive_connection_request(message)
 
     requested_entity_binding = str(payload.get("entity_binding") or "")
     binding_normalized = False
@@ -437,20 +425,6 @@ def validate_router_payload(
         entity_binding = "none"
         binding_normalized = True
         binding_normalization_reason = "general_requires_no_entity_binding"
-    if ui_ip and not explicit_entity_count and not entities.reference_suppressed and intent in {"general_knowledge", "unclear"}:
-        intent = "asset_investigation"
-        scope = "node_summary"
-        direction = "both"
-        depth = 0
-        requires_graph = True
-        requires_detection = True
-        detection_detail = "summary"
-        requires_multiple = False
-        entity_binding = "ui"
-        binding_normalized = True
-        binding_normalization_reason = "ui_entity_takes_authority"
-        normalize("ui_subject_requires_asset_route", prefer=True)
-
     materialized_entities, binding_source = materialize_entity_binding(
         entity_binding,
         entities,
@@ -458,76 +432,60 @@ def validate_router_payload(
         ui_context=ui_context,
     )
     entity_count = len(materialized_entities.entities)
-    is_followup = bool(payload["is_followup"])
+    is_followup = payload["is_followup"]
     if entity_binding in {"active_single", "active_pair"} and entities.reference_detected and not is_followup:
         is_followup = True
         normalize("referential_binding_requires_followup")
-    if security_analysis_requested and entity_count == 1:
-        if intent != "asset_investigation" or not requires_graph or not requires_detection:
-            normalize("security_assessment_requires_current_evidence", prefer=True)
-        intent = "asset_investigation"
-        requires_graph = True
-        requires_detection = True
+    if entity_count > 2:
+        raise ValueError("entity_requirement_failed:too_many_entities")
+    if (
+        intent not in {"general_knowledge", "unclear"}
+        and any((requires_graph, requires_detection, requires_asset_profile))
+        and entity_count == 0
+    ):
+        raise ValueError("entity_requirement_failed")
+    if entity_count == 2 and any((requires_graph, requires_detection, requires_asset_profile)) and not requires_multiple:
+        requires_multiple = True
+        normalize("multi_entity_provider_route_requires_pair", prefer=True)
+    if entity_count == 1 and requires_multiple:
         requires_multiple = False
-        if scope not in {"node_summary", "full_neighbors", "two_hop"}:
-            scope, direction, depth = "node_summary", "both", 0
-        detection_detail = "compact_full" if explicit_detection_depth_requested else "summary"
-    if intent == "asset_investigation" and entity_count == 1:
-        combined_route_requested = requires_graph and requires_detection
-        requires_detection = True
-        if (
-            detection_only_requested
-            and not combined_route_requested
-            and not combined_analysis_requested
-            and not graph_word_present
-        ):
-            if scope != "none" or direction != "none" or depth != 0 or requires_graph or detection_detail != "compact_full":
-                normalize("detection_compact_full_requested", prefer=True)
-            scope = "none"
-            direction = "none"
-            depth = 0
-            requires_graph = False
-            detection_detail = "compact_full"
-            requires_multiple = False
-        elif requires_graph:
-            if scope == "none":
-                scope = "node_summary"
-                direction = "both"
-                depth = 0
-                normalize("node_summary_requires_graph", prefer=True)
-            elif scope == "node_summary" and (direction != "both" or depth != 0):
-                direction = "both"
-                depth = 0
-                normalize("node_summary_requires_graph", prefer=True)
-            if detection_detail == "compact_full" and not explicit_detection_depth_requested:
-                detection_detail = "summary"
-                normalize("combined_route_detection_detail_normalized", prefer=True)
-            requires_multiple = False
-        elif compact_detection_requested and not combined_analysis_requested:
-            if scope != "none" or direction != "none" or depth != 0 or requires_graph or detection_detail != "compact_full":
-                normalize("detection_compact_full_requested", prefer=True)
-            scope = "none"
-            direction = "none"
-            depth = 0
-            requires_graph = False
-            detection_detail = "compact_full"
-            requires_multiple = False
+        normalize("single_entity_route_clears_pair_requirement")
+
+    if intent in {"general_knowledge", "unclear"}:
+        if scope != "none":
+            raise ValueError("schema_validation_failed:general_scope")
+        if any((requires_graph, requires_detection, requires_asset_profile)):
+            normalize("general_skips_product_context")
+        requires_graph = requires_detection = requires_asset_profile = False
+        scope, direction, depth, requires_multiple = "none", "none", 0, False
+    elif intent == "asset_investigation" and entity_count in {1, 2} and not any((requires_graph, requires_detection, requires_asset_profile)):
+        requires_asset_profile = True
+        normalize("asset_investigation_requires_evidence")
+
+    if scope in {"node_summary", "one_hop", "full_neighbors", "two_hop", "path", "multi_entity_comparison"} and not requires_graph:
+        requires_graph = True
+        normalize("graph_scope_requires_graph")
+    if requires_graph and scope == "none":
+        if entity_count == 2:
+            intent, scope, direction, depth, requires_multiple = "graph_relationships", "multi_entity_comparison", "both", 1, True
+            normalize("multi_entity_graph_requires_comparison_scope", prefer=True)
         else:
-            if (
-                scope != "node_summary"
-                or direction != "both"
-                or depth != 0
-                or not requires_graph
-                or requires_multiple
-                or not requires_detection
-            ):
-                normalize("node_summary_requires_graph", prefer=True)
-            scope = "node_summary"
-            direction = "both"
-            depth = 0
-            requires_graph = True
-            detection_detail = "summary"
-            requires_multiple = False
+            scope, direction, depth = "node_summary", "both", 0
+            normalize("node_summary_requires_graph", prefer=True)
+    if not requires_graph and scope != "none":
+        scope, direction, depth = "none", "none", 0
+        normalize("provider_only_route_clears_graph_scope")
+    if exhaustive_connections and entity_count == 1:
+        intent, scope, direction, depth = "graph_neighbors", "full_neighbors", "both", 1
+        requires_graph, requires_multiple = True, False
+        normalize("exhaustive_connections_require_full_neighbors", prefer=True)
+    elif exhaustive_connections and entity_count == 2:
+        intent, scope, direction, depth = "graph_relationships", "multi_entity_comparison", "both", 1
+        requires_graph, requires_multiple = True, True
+        normalize("exhaustive_pair_requires_complete_comparison", prefer=True)
+    if scope == "node_summary" and (direction != "both" or depth != 0):
+        direction, depth = "both", 0
+        normalize("node_summary_requires_graph", prefer=True)
     if intent == "graph_neighbors" and (requires_multiple or entity_count == 2):
         intent = "graph_relationships"
         scope = "multi_entity_comparison"
@@ -536,34 +494,6 @@ def validate_router_payload(
         requires_graph = True
         requires_multiple = True
         normalize("multi_entity_neighbors_to_relationship")
-    if intent in {"graph_neighbors", "graph_path", "graph_relationships"} and entity_count == 1:
-        if detection_only_requested and not graph_word_present:
-            requires_detection = True
-            detection_detail = "compact_full"
-            if not identity_word_present:
-                scope = "none"
-                direction = "none"
-                depth = 0
-                requires_graph = False
-                intent = "asset_investigation"
-                normalize("detection_compact_full_requested", prefer=True)
-        elif graph_word_present and not identity_word_present:
-            if requires_detection:
-                normalize("pure_graph_skips_detection")
-            requires_detection = False
-            detection_detail = "summary"
-    if entity_count != 1 or materialized_entities.entity_mode == "multiple":
-        if requires_detection:
-            normalize("detection_requires_single_entity")
-        requires_detection = False
-        detection_detail = "summary"
-    if intent in {"general_knowledge", "unclear"}:
-        if requires_detection:
-            normalize("general_skips_detection")
-        requires_detection = False
-        detection_detail = "summary"
-    if not requires_detection:
-        detection_detail = "summary"
     if scope == "full_neighbors" and depth != 1:
         raise ValueError("schema_validation_failed:full_neighbors_depth")
     if scope == "one_hop" and depth != 1:
@@ -588,7 +518,7 @@ def validate_router_payload(
         raise ValueError("schema_validation_failed:neighbors_multi_entity")
     if intent == "graph_neighbors" and entity_count != 1:
         raise ValueError("entity_requirement_failed")
-    if intent == "asset_investigation" and entity_count != 1:
+    if intent == "asset_investigation" and entity_count not in {1, 2}:
         raise ValueError("entity_requirement_failed")
     if intent == "graph_relationships" and entity_count != 2:
         raise ValueError("entity_requirement_failed")
@@ -598,11 +528,8 @@ def validate_router_payload(
         raise ValueError("schema_validation_failed:relationship_scope")
     if requires_multiple and entity_count != 2:
         raise ValueError("entity_requirement_failed")
-    if requires_graph and not materialized_entities.entities:
+    if any((requires_graph, requires_detection, requires_asset_profile)) and not materialized_entities.entities:
         raise ValueError("entity_requirement_failed")
-    if entity_count > 2 and requires_graph:
-        raise ValueError("entity_requirement_failed:too_many_entities")
-
     return IntentDecision(
         intent=intent,  # type: ignore[arg-type]
         scope=scope,  # type: ignore[arg-type]
@@ -610,7 +537,7 @@ def validate_router_payload(
         depth=depth,
         requires_graph=requires_graph,
         requires_detection=requires_detection,
-        detection_detail=detection_detail,
+        requires_asset_profile=requires_asset_profile,
         entity_binding=entity_binding,
         requested_entity_binding=requested_entity_binding,
         binding_source=binding_source,
@@ -624,7 +551,8 @@ def validate_router_payload(
         is_followup=is_followup,
         classification_confidence=confidence,
         reason=str(payload.get("reason") or "")[:220],
-        decision_source="glm",
+        decision_source="semantic_router",
+        exhaustive_connections_requested=exhaustive_connections,
         router_called=True,
         content_present=True,
         route_normalized=route_normalized,
@@ -632,7 +560,7 @@ def validate_router_payload(
     )
 
 
-class GLMIntentRouter:
+class SemanticIntentRouter:
     """Call the answer provider once to classify routing, never to select entities."""
 
     def __init__(self, settings: Settings, llm_client: LLMClient) -> None:
@@ -721,10 +649,11 @@ class GLMIntentRouter:
             {"role": "user", "content": json.dumps(routing_context, sort_keys=True)},
         ]
         logger.info(
-            "event=intent_router_start request_id=%s deployment=%s provider=%s model=%s entity_status=%s entity_count=%s previous_scope=%s router_timeout_seconds=%s router_max_tokens=%s",
+            "event=intent_router_start request_id=%s router_deployment=%s router_provider=%s router_model=%s router_engine=%s entity_status=%s entity_count=%s previous_scope=%s router_timeout_seconds=%s router_max_tokens=%s",
             request_id,
             router_deployment.name,
             router_deployment.provider_type,
+            router_deployment.model,
             router_deployment.model,
             routing_context.get("entity_status"),
             routing_context.get("entity_count"),
@@ -787,10 +716,11 @@ class GLMIntentRouter:
         repair_deployment = self.settings.deployment_for_purpose("intent_router_repair")
         repair_request = repair_deployment.request_config("intent_router_repair")
         logger.info(
-            "event=intent_router_repair_started request_id=%s deployment=%s provider=%s model=%s reason=%s router_max_tokens=%s",
+            "event=intent_router_repair_started request_id=%s router_repair_deployment=%s router_repair_provider=%s router_repair_model=%s router_repair_engine=%s reason=%s router_max_tokens=%s",
             request_id,
             repair_deployment.name,
             repair_deployment.provider_type,
+            repair_deployment.model,
             repair_deployment.model,
             last_error[:120],
             repair_request.max_tokens,
@@ -865,7 +795,7 @@ class GLMIntentRouter:
             repair_completion_tokens,
         )
         return self._complete(
-            decision,
+            IntentDecision(**{**decision.__dict__, "decision_source": "semantic_router_repair"}),
             started,
             1,
             repair_finish_reason,
@@ -941,15 +871,16 @@ class GLMIntentRouter:
             }
         )
         logger.info(
-            "event=intent_router_complete request_id=%s decision_source=glm intent=%s scope=%s direction=%s depth=%s requires_graph=%s requires_detection=%s detection_detail=%s entity_binding=%s binding_source=%s binding_available=%s binding_normalized=%s binding_normalization_reason=%s materialized_entity_count=%s route_normalized=%s route_normalization_reason=%s confidence=%s retry_count=%s latency_ms=%s finish_reason=%s content_present=%s completion_tokens=%s",
+            "event=intent_router_complete request_id=%s decision_source=%s intent=%s scope=%s direction=%s depth=%s requires_graph=%s requires_detection=%s requires_asset_profile=%s entity_binding=%s binding_source=%s binding_available=%s binding_normalized=%s binding_normalization_reason=%s materialized_entity_count=%s route_normalized=%s route_normalization_reason=%s confidence=%s retry_count=%s latency_ms=%s finish_reason=%s content_present=%s completion_tokens=%s",
             request_id,
+            decision.decision_source,
             decision.intent,
             decision.scope,
             decision.direction,
             decision.depth,
             decision.requires_graph,
             decision.requires_detection,
-            decision.detection_detail,
+            decision.requires_asset_profile,
             decision.entity_binding,
             decision.binding_source,
             decision.binding_available,
@@ -994,7 +925,7 @@ class GLMIntentRouter:
             requires_graph=False,
             classification_confidence=0.0,
             reason="Router failed; deterministic fallback required.",
-            decision_source="fallback",
+            decision_source="deterministic_fallback",
             router_called=True,
             latency_ms=latency_ms,
             retry_count=retry_count,

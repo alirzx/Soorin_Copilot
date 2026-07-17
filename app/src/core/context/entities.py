@@ -39,6 +39,11 @@ REFERENTIAL_ENTITY_PATTERNS: dict[str, re.Pattern[str]] = {
         r"\b(?:go\s+deeper|continue|continue\s+with\s+(?:this|the\s+same\s+asset)|now\s+show|analy[sz]e\s+further|expand\s+the\s+analysis)\b",
         re.IGNORECASE,
     ),
+    "exhaustive_connection_followup": re.compile(
+        r"\b(?:now\s+)?(?:show|list|give|enumerate)\b.{0,40}\b(?:all|every|full|complete)\b.{0,40}"
+        r"\b(?:connections?|neighbors?|neighborhoods?|peers?|inbound|outbound|bidirectional)\b",
+        re.IGNORECASE,
+    ),
     "bounded_it_reference": re.compile(
         r"\b(?:of|from|for|about)\s+it\b|\b(?:evidence|connections?|behavio[u]?r|information|data)\s+(?:we\s+have\s+)?(?:for|from|about)\s+it\b",
         re.IGNORECASE,
@@ -52,7 +57,12 @@ REFERENTIAL_ENTITY_PATTERNS: dict[str, re.Pattern[str]] = {
         re.IGNORECASE,
     ),
     "its_asset_attribute": re.compile(
-        r"\bits\s+(?:data|details?|info|information|behavior|behaviour|role|profile|summary)\b",
+        r"\bits\s+(?:data|details?|info|information|behavior|behaviour|role|profile|summary|owner|hostname|os|"
+        r"operating\s+system|risk(?:\s+(?:score|level|trend))?|alerts?|services?|identity|kerberos|ldap|ntlm|smb|mac)\b",
+        re.IGNORECASE,
+    ),
+    "owner_or_profile_reference": re.compile(
+        r"\b(?:who\s+owns\s+it|who\s+uses\s+it|is\s+it\s+domain\s+joined|what\s+about\s+its\s+(?:profile|identity|risk|authentication))\b",
         re.IGNORECASE,
     ),
     "it_graph_attribute": re.compile(
@@ -83,7 +93,8 @@ PAIR_REFERENCE_PATTERNS: dict[str, re.Pattern[str]] = {
         re.IGNORECASE,
     ),
     "those_assets": re.compile(r"\bthose\s+(?:assets|ips|hosts|nodes)\b", re.IGNORECASE),
-    "their_relationship": re.compile(r"\btheir\s+(?:relationship|connection|connections|path|neighbors|peers|topology|positions?)\b", re.IGNORECASE),
+    "their_relationship": re.compile(r"\btheir\s+(?:(?:complete|full|direct)\s+)?(?:relationships?|connections?|path|neighbors?|neighborhoods?|peers?|topology|positions?)\b", re.IGNORECASE),
+    "their_profiles": re.compile(r"\b(?:their\s+(?:profiles?|identities|classifications?|risks?)|both\s+profiles?)\b", re.IGNORECASE),
     "shared_peers": re.compile(r"\b(?:shared|common)\s+(?:peers|neighbors|connections|subnets)\b", re.IGNORECASE),
     "which_one": re.compile(r"\bwhich\s+one\b", re.IGNORECASE),
 }

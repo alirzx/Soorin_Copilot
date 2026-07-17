@@ -11,7 +11,7 @@ from urllib3.exceptions import ProtocolError
 
 from src.config.settings import get_settings
 from src.core.context.entities import EntityResolver
-from src.core.context.intent import GLMIntentRouter
+from src.core.context.intent import SemanticIntentRouter as GLMIntentRouter
 from src.core.llm.client import LLMClient
 from src.core.llm.errors import LLMError
 from src.core.memory.routing_state import SessionRoutingState

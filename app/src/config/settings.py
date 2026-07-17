@@ -140,6 +140,7 @@ class Settings:
     product_api_base_url: str
     product_topology_path: str
     product_asset_detection_path: str
+    product_asset_profile_path: str
     product_login_path: str
     product_api_token: str
     product_username: str
@@ -258,6 +259,11 @@ class Settings:
                 + ", ".join(missing)
             )
 
+    def validate_product_paths(self) -> None:
+        """Validate asset path templates without exposing configured URLs."""
+        if self.product_asset_profile_path.count("{ip}") != 1 or ".." in self.product_asset_profile_path:
+            raise ValueError("SOORIN_PRODUCT_ASSET_PROFILE_PATH must contain exactly one safe {ip} placeholder.")
+
 
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:
@@ -355,6 +361,7 @@ def get_settings() -> Settings:
         product_api_base_url=os.getenv("SOORIN_PRODUCT_API_BASE_URL", "").strip().rstrip("/"),
         product_topology_path=os.getenv("SOORIN_PRODUCT_TOPOLOGY_PATH", "/zeek/connections/unique-ip-pairs").strip(),
         product_asset_detection_path=os.getenv("SOORIN_PRODUCT_ASSET_DETECTION_PATH", "/asset-detection/test/{ip}").strip(),
+        product_asset_profile_path=os.getenv("SOORIN_PRODUCT_ASSET_PROFILE_PATH", "/profile/{ip}").strip(),
         product_login_path=os.getenv("SOORIN_PRODUCT_LOGIN_PATH", "/auth/login").strip(),
         product_api_token=os.getenv("SOORIN_PRODUCT_API_TOKEN", "").strip(),
         product_username=os.getenv("SOORIN_PRODUCT_USERNAME", "").strip(),
@@ -411,6 +418,7 @@ def get_settings() -> Settings:
         graph_refresh_max_edge_drop_ratio=_float("SOORIN_GRAPH_REFRESH_MAX_EDGE_DROP_RATIO", 0.90),
         copilot_human_trace_enabled=_bool("SOORIN_COPILOT_HUMAN_TRACE_ENABLED", True),
     )
+    settings.validate_product_paths()
     logger.info(
         "event=settings_loaded env_file_path=%s env_file_loaded=%s router_deployment=%s chat_deployment=%s product_base_url_configured=%s product_token_present=%s product_hwid_present=%s product_username_present=%s product_password_present=%s product_captcha_bypass_present=%s",
         ENV_PATH,

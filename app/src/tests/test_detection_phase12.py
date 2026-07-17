@@ -1,54 +1,62 @@
-"""Focused tests for asset-detection product client and normalization."""
+"""Focused tests for lossless product asset endpoints and shared authentication."""
 
 from __future__ import annotations
 
 import unittest
-import time
 from dataclasses import replace
-from datetime import datetime, timezone
 from typing import Any
+from unittest.mock import patch
 
 import requests
 
 from src.config.settings import get_settings
-from src.core.detection import adapt_asset_detection, compact_full, summary
-from src.core.detection.models import RawAssetDetectionResponse
-from src.core.product_client import ProductApiClient, ProductAuthManager
-from src.core.product_client.errors import ProductApiError, ProductApiHTTPError
+from src.core.product_client import ProductApiClient
+from src.core.product_client.errors import ProductApiConfigError, ProductApiError, ProductApiHTTPError
 
 
 class FakeResponse:
-    def __init__(self, status_code: int, payload: Any) -> None:
+    def __init__(self, status_code: int, payload: Any = None, *, json_error: Exception | None = None) -> None:
         self.status_code = status_code
         self._payload = payload
+        self._json_error = json_error
 
     def json(self) -> Any:
+        if self._json_error:
+            raise self._json_error
         return self._payload
 
 
 class FakeSession:
     def __init__(
         self,
-        responses: list[FakeResponse | Exception],
+        get_responses: list[FakeResponse | Exception],
         *,
         post_responses: list[FakeResponse | Exception] | None = None,
     ) -> None:
-        self.responses = list(responses)
+        self.get_responses = list(get_responses)
         self.post_responses = list(post_responses or [])
-        self.calls: list[dict[str, Any]] = []
+        self.get_calls: list[dict[str, Any]] = []
         self.post_calls: list[dict[str, Any]] = []
 
     def mount(self, *_args: Any, **_kwargs: Any) -> None:
         return None
 
     def get(self, url: str, *, headers: dict[str, str], timeout: tuple[int, int]) -> FakeResponse:
-        self.calls.append({"url": url, "headers": headers, "timeout": timeout})
-        response = self.responses.pop(0)
+        # This deliberately has no json/data/body parameter: the endpoint is GET-only.
+        self.get_calls.append({"url": url, "headers": headers, "timeout": timeout})
+        response = self.get_responses.pop(0)
         if isinstance(response, Exception):
             raise response
         return response
 
-    def post(self, url: str, *, headers: dict[str, str], json: dict[str, Any], timeout: tuple[int, int]) -> FakeResponse:
+    def post(
+        self,
+        url: str,
+        *,
+        headers: dict[str, str],
+        json: dict[str, Any],
+        timeout: tuple[int, int],
+    ) -> FakeResponse:
         self.post_calls.append({"url": url, "headers": headers, "json": json, "timeout": timeout})
         response = self.post_responses.pop(0)
         if isinstance(response, Exception):
@@ -58,300 +66,182 @@ class FakeSession:
 
 def make_settings(**overrides: Any):
     values = {
-        "product_api_base_url": "http://product.local",
+        "product_api_base_url": "http://product.invalid",
         "product_asset_detection_path": "/asset-detection/test/{ip}",
+        "product_asset_profile_path": "/profile/{ip}",
         "product_login_path": "/auth/login",
-        "product_api_token": "Bearer secret-token",
-        "product_username": "admin",
-        "product_password": "secret-password",
-        "product_captcha_bypass": "captcha-secret",
+        "product_api_token": "Bearer bootstrap-token",
+        "product_username": "test-user",
+        "product_password": "test-password",
+        "product_captcha_bypass": "test-captcha",
         "product_token_refresh_seconds": 600,
-        "product_hwid": "secret-hwid",
+        "product_hwid": "test-hwid",
         "product_connect_timeout_seconds": 7,
         "product_read_timeout_seconds": 11,
         "product_max_retries": 1,
         "product_retry_backoff_seconds": 0.0,
     }
     values.update(overrides)
-    return replace(
-        get_settings(),
-        **values,
-    )
+    return replace(get_settings(), **values)
 
 
-def sample_payload() -> dict[str, Any]:
+def detection_payload() -> dict[str, Any]:
     return {
-        "ip": "192.168.21.1",
+        "ip": "192.0.2.10",
         "assetFound": True,
-        "storedTag": "Endpoint",
-        "storedSubTag": "Workstation",
-        "detection": {
-            "primaryRole": "Domain Joined Workstation",
-            "confidence": 0.91,
-            "topRoles": [{"role": "Domain Joined Workstation"}, {"role": "Windows Host"}],
-            "vendor": "Microsoft",
-            "product": "Windows 10",
-        },
-        "tagging": {
-            "tag": "Endpoint",
-            "subTag": "Windows",
-            "confidence": 0.88,
-            "inferredDeviceType": "Network Device",
-        },
+        "nullable": None,
+        "falseValue": False,
+        "emptyList": [],
+        "emptyObject": {},
         "matchedRules": [
-            {
-                "id": "r1",
-                "code": "windows_identity",
-                "name": "Windows identity",
-                "confidence": 0.9,
-                "evidence": ["os_is_windows=true", "os_is_windows=true", "kerberos_server=false"],
-            }
+            {"id": index, "evidence": [f"signal-{index}", None, False]}
+            for index in range(25)
         ],
-        "signals": {
-            "extended": {
-                "os_is_linux": False,
-                "os_is_windows": True,
-                "is_domain_controller": False,
-                "kerberos_server": False,
-                "serves_smb_sessions": False,
-                "tls_server_sessions": 0,
-                "dns_query_count": 0,
-                "outbound_ratio_pct": 99.5,
-                "dhcp_is_printer": False,
-                "printer_product": "Printer",
-                "external_peer_count": 0,
-            },
-            "normalized": {
-                "outbound_ratio_pct": 100,
-                "primary_role": "Domain Joined Workstation",
-                "vendor": "Microsoft",
-                "product": "",
-                "nullable_hint": None,
-            },
-        },
-        "futureBackendField": {"kept": True},
+        "conflicts": [{"code": f"conflict-{index}"} for index in range(12)],
+        "unknownFutureField": {"nested": [{"original_key": "original-value"}]},
     }
 
 
-class ProductAssetDetectionClientTests(unittest.TestCase):
-    def client(self, session: FakeSession) -> ProductApiClient:
-        client = ProductApiClient(make_settings())
-        client.session = session  # type: ignore[assignment]
-        return client
+def profile_payload() -> dict[str, Any]:
+    return {
+        "id": "asset-test-1",
+        "ip_address": "192.0.2.10",
+        "risk_score": 42,
+        "identity": {
+            "snmp": None,
+            "kerberos": {"domain_joined": True, "servers": ["192.0.2.20"]},
+            "ldap": {"success": False, "users": []},
+            "ntlm": {"observed": True, "details": {}},
+            "smb": {"ports": [445], "sessions": []},
+            "network": {"mac": "00:00:5e:00:53:01", "open_ports": [80, 443]},
+            "detection": {"role": "fake-server", "confidence": None},
+        },
+        "future_profile_field": {"preserve": [None, False, {}, []]},
+    }
 
-    def test_successful_request_construction_and_headers_are_not_logged(self) -> None:
-        session = FakeSession([FakeResponse(200, sample_payload())])
+
+class ProductAssetEndpointTests(unittest.TestCase):
+    def client(self, session: FakeSession, **settings_overrides: Any) -> ProductApiClient:
+        with patch("src.core.product_client.client.requests.Session", return_value=session):
+            return ProductApiClient(make_settings(**settings_overrides))
+
+    def test_profile_uses_safe_get_path_shared_bearer_and_hwid_without_body(self) -> None:
+        session = FakeSession([FakeResponse(200, profile_payload())])
+        result = self.client(session).get_asset_profile(" 192.0.2.10 ", request_id="req-profile")
+
+        self.assertEqual(result.target_ip, "192.0.2.10")
+        self.assertEqual(result.endpoint_path, "/profile/192.0.2.10")
+        self.assertEqual(session.get_calls[0]["url"], "http://product.invalid/profile/192.0.2.10")
+        self.assertEqual(session.get_calls[0]["headers"]["Authorization"], "Bearer bootstrap-token")
+        self.assertEqual(session.get_calls[0]["headers"]["x-hwid"], "test-hwid")
+        self.assertEqual(session.get_calls[0]["timeout"], (7, 11))
+
+    def test_detection_and_profile_preserve_complete_raw_payloads(self) -> None:
+        detection = detection_payload()
+        profile = profile_payload()
+        session = FakeSession([FakeResponse(200, detection), FakeResponse(200, profile)])
         client = self.client(session)
-        with self.assertLogs("src.core.product_client.client", level="INFO") as logs:
-            response = client.get_asset_detection("192.168.21.1", request_id="req-1")
 
-        self.assertEqual(response.ip, "192.168.21.1")
-        self.assertEqual(session.calls[0]["url"], "http://product.local/asset-detection/test/192.168.21.1")
-        self.assertEqual(session.calls[0]["headers"]["Authorization"], "Bearer secret-token")
-        self.assertEqual(session.calls[0]["headers"]["x-hwid"], "secret-hwid")
-        self.assertEqual(session.calls[0]["timeout"], (7, 11))
-        log_text = "\n".join(logs.output)
-        self.assertIn("endpoint_path=/asset-detection/test/192.168.21.1", log_text)
-        self.assertNotIn("secret-token", log_text)
-        self.assertNotIn("secret-hwid", log_text)
-        self.assertNotIn("Authorization", log_text)
+        detection_result = client.get_asset_detection("192.0.2.10")
+        profile_result = client.get_asset_profile("192.0.2.10")
 
-    def test_login_request_uses_expected_headers_and_body_without_logging_secrets(self) -> None:
-        session = FakeSession([], post_responses=[FakeResponse(200, {"accessToken": "login-token"})])
-        manager = ProductAuthManager(make_settings(product_api_token=""), session)  # type: ignore[arg-type]
-        with self.assertLogs("src.core.product_client.auth", level="INFO") as logs:
-            token = manager.get_token(request_id="auth-1")
-        self.assertEqual(token, "login-token")
-        self.assertEqual(session.post_calls[0]["url"], "http://product.local/auth/login")
-        self.assertEqual(session.post_calls[0]["headers"]["x-hwid"], "secret-hwid")
-        self.assertEqual(session.post_calls[0]["headers"]["x-captcha-bypass"], "captcha-secret")
-        self.assertEqual(session.post_calls[0]["json"], {"username": "admin", "password": "secret-password"})
-        log_text = "\n".join(logs.output)
-        self.assertIn("product_auth_login_started", log_text)
-        self.assertIn("product_auth_login_succeeded", log_text)
-        self.assertNotIn("login-token", log_text)
-        self.assertNotIn("secret-password", log_text)
-        self.assertNotIn("secret-hwid", log_text)
-        self.assertNotIn("captcha-secret", log_text)
+        self.assertEqual(detection_result.raw_payload, detection)
+        self.assertEqual(profile_result.raw_payload, profile)
+        self.assertIsNone(detection_result.raw_payload["nullable"])
+        self.assertFalse(detection_result.raw_payload["falseValue"])
+        self.assertEqual(detection_result.raw_payload["emptyList"], [])
+        self.assertEqual(detection_result.raw_payload["emptyObject"], {})
+        self.assertEqual(len(detection_result.raw_payload["matchedRules"]), 25)
+        self.assertEqual(len(detection_result.raw_payload["conflicts"]), 12)
+        self.assertIsNone(profile_result.raw_payload["identity"]["snmp"])
+        self.assertIn("future_profile_field", profile_result.raw_payload)
+        self.assertEqual(session.get_calls[0]["headers"]["Authorization"], "Bearer bootstrap-token")
+        self.assertEqual(session.get_calls[1]["headers"]["Authorization"], "Bearer bootstrap-token")
+        self.assertEqual(session.post_calls, [])
 
-    def test_token_reuse_before_expiry_and_refresh_after_configured_age(self) -> None:
-        session = FakeSession(
-            [],
-            post_responses=[
-                FakeResponse(200, {"accessToken": "token-1"}),
-                FakeResponse(200, {"accessToken": "token-2"}),
-            ],
-        )
-        manager = ProductAuthManager(make_settings(product_api_token="", product_token_refresh_seconds=1), session)  # type: ignore[arg-type]
-        self.assertEqual(manager.get_token(request_id="auth-2"), "token-1")
-        self.assertEqual(manager.get_token(request_id="auth-3"), "token-1")
-        manager._token_created_at = time.time() - 5
-        self.assertEqual(manager.get_token(request_id="auth-4"), "token-2")
-        self.assertEqual(len(session.post_calls), 2)
-
-    def test_401_invalidates_token_logins_once_and_retries_original_request(self) -> None:
-        session = FakeSession(
-            [FakeResponse(401, {"error": "expired"}), FakeResponse(200, sample_payload())],
-            post_responses=[
-                FakeResponse(200, {"accessToken": "token-1"}),
-                FakeResponse(200, {"accessToken": "token-2"}),
-            ],
-        )
-        client = ProductApiClient(make_settings(product_api_token=""))
-        client.session = session  # type: ignore[assignment]
-        client.auth_manager = ProductAuthManager(make_settings(product_api_token=""), session)  # type: ignore[assignment]
-        response = client.get_asset_detection("192.168.21.1", request_id="auth-5")
-        self.assertEqual(response.ip, "192.168.21.1")
-        self.assertEqual(len(session.calls), 2)
-        self.assertEqual(len(session.post_calls), 2)
-        self.assertEqual(client.last_auth_retry_count, 1)
-
-    def test_second_401_raises_typed_unauthorized_error(self) -> None:
-        session = FakeSession(
-            [FakeResponse(401, {"error": "expired"}), FakeResponse(401, {"error": "expired"})],
-            post_responses=[
-                FakeResponse(200, {"accessToken": "token-1"}),
-                FakeResponse(200, {"accessToken": "token-2"}),
-            ],
-        )
-        client = ProductApiClient(make_settings(product_api_token=""))
-        client.session = session  # type: ignore[assignment]
-        client.auth_manager = ProductAuthManager(make_settings(product_api_token=""), session)  # type: ignore[assignment]
-        with self.assertRaises(ProductApiHTTPError) as caught:
-            client.get_asset_detection("192.168.21.1", request_id="auth-6")
-        self.assertEqual(caught.exception.status_code, 401)
-        self.assertEqual(len(session.calls), 2)
-        self.assertEqual(len(session.post_calls), 2)
-
-    def test_graph_and_detection_clients_can_share_one_token_manager(self) -> None:
-        auth_session = FakeSession([], post_responses=[FakeResponse(200, {"accessToken": "shared-token"})])
-        manager = ProductAuthManager(make_settings(product_api_token=""), auth_session)  # type: ignore[arg-type]
-        graph_session = FakeSession([FakeResponse(200, [{"src_ip": "192.168.1.1", "dst_ip": "192.168.1.2"}])])
-        detection_session = FakeSession([FakeResponse(200, sample_payload())])
-        graph_client = ProductApiClient(make_settings(product_api_token=""), manager)
-        detection_client = ProductApiClient(make_settings(product_api_token=""), manager)
-        graph_client.session = graph_session  # type: ignore[assignment]
-        detection_client.session = detection_session  # type: ignore[assignment]
-        graph_client.fetch_topology_unique_ip_pairs()
-        detection_client.get_asset_detection("192.168.21.1")
-        self.assertEqual(len(auth_session.post_calls), 1)
-        self.assertEqual(graph_session.calls[0]["headers"]["Authorization"], "Bearer shared-token")
-        self.assertEqual(detection_session.calls[0]["headers"]["Authorization"], "Bearer shared-token")
-
-    def test_invalid_ip_is_rejected_before_http_call(self) -> None:
-        session = FakeSession([FakeResponse(200, sample_payload())])
+    def test_invalid_ip_and_unsafe_template_are_rejected_before_request(self) -> None:
+        session = FakeSession([])
         client = self.client(session)
         with self.assertRaises(ProductApiError):
-            client.get_asset_detection("999.999.999.999")
-        self.assertEqual(session.calls, [])
+            client.get_asset_profile("../../admin")
+        self.assertEqual(session.get_calls, [])
 
-    def test_detection_404_returns_typed_not_found_payload(self) -> None:
-        session = FakeSession([FakeResponse(404, {"error": "missing"})])
-        client = self.client(session)
+        unsafe = self.client(session, product_asset_profile_path="/profile/{ip}/../secrets")
+        with self.assertRaises(ProductApiConfigError):
+            unsafe.get_asset_profile("192.0.2.10")
+        self.assertEqual(session.get_calls, [])
 
-        response = client.get_asset_detection("192.168.21.1", request_id="missing-asset")
-
-        self.assertEqual(response.ip, "192.168.21.1")
-        self.assertFalse(response.asset_found)
-        self.assertEqual(len(session.calls), 1)
-
-    def test_unrelated_404_retains_typed_http_error(self) -> None:
-        session = FakeSession([FakeResponse(404, {"error": "missing"})])
-        client = self.client(session)
-        with self.assertRaises(ProductApiHTTPError) as caught:
-            client.get_json("/unknown-endpoint")
-        self.assertEqual(caught.exception.status_code, 404)
-        self.assertEqual(len(session.calls), 1)
-
-    def test_retryable_server_and_network_errors_raise_typed_errors(self) -> None:
-        server = self.client(FakeSession([FakeResponse(500, {"error": "server"})]))
-        with self.assertRaises(ProductApiHTTPError) as server_error:
-            server.get_asset_detection("192.168.21.1")
-        self.assertEqual(server_error.exception.status_code, 500)
-
-        network = self.client(FakeSession([requests.ConnectionError("network down")]))
-        with self.assertRaises(ProductApiError):
-            network.get_asset_detection("192.168.21.1")
-
-
-class AssetDetectionNormalizationTests(unittest.TestCase):
-    def evidence(self):
-        raw = RawAssetDetectionResponse.model_validate(sample_payload())
-        return adapt_asset_detection(raw, fetched_at=datetime(2026, 7, 12, tzinfo=timezone.utc))
-
-    def test_raw_schema_accepts_real_shape_and_future_additions(self) -> None:
-        raw = RawAssetDetectionResponse.model_validate(sample_payload())
-        self.assertTrue(raw.asset_found)
-        self.assertEqual(raw.stored_tag, "Endpoint")
-        self.assertEqual(raw.stored_sub_tag, "Workstation")
-        self.assertEqual(len(raw.matched_rules), 1)
-        self.assertIsNotNone(raw.signals)
-        self.assertEqual(raw.model_extra["futureBackendField"], {"kept": True})
-
-    def test_preserves_false_zero_null_empty_and_missing_distinctions(self) -> None:
-        evidence = self.evidence()
-        self.assertIs(evidence.signals.extended["os_is_linux"], False)
-        self.assertIs(evidence.signals.extended["is_domain_controller"], False)
-        self.assertEqual(evidence.signals.extended["tls_server_sessions"], 0)
-        self.assertEqual(evidence.signals.extended["dns_query_count"], 0)
-        self.assertIsNone(evidence.signals.normalized["nullable_hint"])
-        self.assertEqual(evidence.signals.normalized["product"], "")
-        self.assertNotIn("missing_protocol_section", evidence.signals.normalized)
-
-    def test_duplicate_evidence_removed_and_precise_metric_preferred(self) -> None:
-        evidence = self.evidence()
-        self.assertEqual(evidence.matched_rules[0].evidence.count("os_is_windows=true"), 1)
-        self.assertEqual(evidence.signals.metrics["outbound_ratio_pct"], 99.5)
-        self.assertEqual(evidence.signals.normalized["outbound_ratio_pct"], 100)
-
-    def test_conflicts_are_structured(self) -> None:
-        evidence = self.evidence()
-        codes = {conflict.code for conflict in evidence.conflicts}
-        self.assertIn("role_device_type_conflict", codes)
-        self.assertIn("printer_hint_conflict", codes)
-        self.assertIn("rounded_metric_mismatch", codes)
-        for conflict in evidence.conflicts:
-            self.assertTrue(conflict.severity)
-            self.assertTrue(conflict.explanation)
-
-    def test_summary_and_compact_full_are_bounded_and_include_negatives(self) -> None:
-        evidence = self.evidence()
-        short = summary(evidence)
-        full = compact_full(evidence)
-        self.assertIn("Asset found: True", short)
-        self.assertIn("Primary role: Domain Joined Workstation", short)
-        self.assertIn("kerberos_server=false", full)
-        self.assertIn("tls_server_sessions=0", full)
-        self.assertLess(len(short), 2200)
-        self.assertLess(len(full), 5200)
-
-    def test_missing_confidence_is_explicitly_typed_and_rendered(self) -> None:
-        payload = sample_payload()
-        payload["detection"]["confidence"] = None
-        payload["tagging"]["confidence"] = None
-        evidence = adapt_asset_detection(
-            RawAssetDetectionResponse.model_validate(payload),
-            fetched_at=datetime(2026, 7, 12, tzinfo=timezone.utc),
+    def test_profile_404_is_typed_not_found_without_fake_payload(self) -> None:
+        result = self.client(FakeSession([FakeResponse(404, {"message": "not found"})])).get_asset_profile(
+            "192.0.2.10"
         )
-        self.assertIsNone(evidence.classification.confidence)
-        self.assertIn("Confidence: null", summary(evidence))
-        self.assertIn("Confidence available: false", summary(evidence))
-        self.assertIn("confidence=null, confidence_available=false", compact_full(evidence))
+        self.assertFalse(result.found)
+        self.assertIsNone(result.raw_payload)
+        self.assertEqual(result.status_code, 404)
 
-    def test_null_and_missing_sections_are_separate(self) -> None:
-        raw = RawAssetDetectionResponse.model_validate(
-            {
-                "ip": "192.168.21.1",
-                "assetFound": False,
-                "detection": None,
-                "signals": {"extended": None},
-            }
+    def test_401_reuses_shared_login_and_retries_once(self) -> None:
+        session = FakeSession(
+            [FakeResponse(401, {}), FakeResponse(200, profile_payload())],
+            post_responses=[FakeResponse(200, {"accessToken": "refreshed-token"})],
         )
-        evidence = adapt_asset_detection(raw, fetched_at=datetime(2026, 7, 12, tzinfo=timezone.utc))
-        self.assertIn("detection", evidence.signals.null_sections)
-        self.assertIn("signals.extended", evidence.signals.null_sections)
-        self.assertIn("tagging", evidence.signals.missing_sections)
-        self.assertIn("signals.normalized", evidence.signals.missing_sections)
+        result = self.client(session).get_asset_profile("192.0.2.10", request_id="req-refresh")
+
+        self.assertEqual(result.status_code, 200)
+        self.assertEqual(len(session.get_calls), 2)
+        self.assertEqual(len(session.post_calls), 1)
+        self.assertEqual(session.post_calls[0]["url"], "http://product.invalid/auth/login")
+        self.assertEqual(session.post_calls[0]["headers"]["x-hwid"], "test-hwid")
+        self.assertEqual(session.post_calls[0]["headers"]["x-captcha-bypass"], "test-captcha")
+        self.assertEqual(
+            session.post_calls[0]["json"],
+            {"username": "test-user", "password": "test-password"},
+        )
+        self.assertEqual(session.get_calls[1]["headers"]["Authorization"], "Bearer refreshed-token")
+        self.assertEqual(session.get_calls[1]["headers"]["x-hwid"], "test-hwid")
+
+    def test_second_401_and_other_http_failures_remain_typed(self) -> None:
+        session = FakeSession(
+            [FakeResponse(401, {}), FakeResponse(401, {})],
+            post_responses=[FakeResponse(200, {"accessToken": "refreshed-token"})],
+        )
+        with self.assertRaises(ProductApiHTTPError) as unauthorized:
+            self.client(session).get_asset_profile("192.0.2.10")
+        self.assertEqual(unauthorized.exception.status_code, 401)
+        self.assertEqual(len(session.get_calls), 2)
+        self.assertEqual(len(session.post_calls), 1)
+
+        for status_code in (403, 429, 500):
+            with self.subTest(status_code=status_code):
+                with self.assertRaises(ProductApiHTTPError) as error:
+                    self.client(FakeSession([FakeResponse(status_code, {})])).get_asset_profile("192.0.2.10")
+                self.assertEqual(error.exception.status_code, status_code)
+
+    def test_timeout_malformed_json_and_unexpected_json_type_fail_safely(self) -> None:
+        with self.assertRaisesRegex(ProductApiError, "request failed"):
+            self.client(FakeSession([requests.Timeout("private timeout details")])).get_asset_profile("192.0.2.10")
+
+        with self.assertRaisesRegex(ProductApiError, "not valid JSON"):
+            self.client(FakeSession([FakeResponse(200, json_error=ValueError("bad JSON"))])).get_asset_profile(
+                "192.0.2.10"
+            )
+
+        with self.assertRaisesRegex(ProductApiError, "JSON object or array"):
+            self.client(FakeSession([FakeResponse(200, "not-an-object")])).get_asset_profile("192.0.2.10")
+
+        with self.assertRaisesRegex(ProductApiError, "JSON object or array"):
+            self.client(FakeSession([FakeResponse(200, None)])).get_asset_profile("192.0.2.10")
+
+    def test_operational_logs_do_not_contain_payload_or_credentials(self) -> None:
+        payload = profile_payload()
+        payload["private_marker"] = "DO-NOT-LOG-PROFILE-CONTENT"
+        session = FakeSession([FakeResponse(200, payload)])
+        with self.assertLogs("src.core.product_client", level="INFO") as captured:
+            self.client(session).get_asset_profile("192.0.2.10", request_id="req-safe-log")
+
+        logs = "\n".join(captured.output)
+        self.assertIn("event=product_asset_endpoint_validated", logs)
+        for secret in ("DO-NOT-LOG-PROFILE-CONTENT", "bootstrap-token", "test-password", "test-hwid"):
+            self.assertNotIn(secret, logs)
 
 
 if __name__ == "__main__":

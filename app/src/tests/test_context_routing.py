@@ -17,7 +17,7 @@ from src.config.settings import get_settings
 from src.core.context.composer import ContextComposer
 from src.core.context.entities import EntityResolver
 from src.core.context.intent import (
-    GLMIntentRouter,
+    SemanticIntentRouter as GLMIntentRouter,
     ROUTER_SYSTEM_PROMPT_FALLBACK,
     _extract_first_json_object,
     _json_from_text,
@@ -271,7 +271,7 @@ class RouterSchemaTests(unittest.TestCase):
             "depth": 1,
             "requires_graph": True,
             "requires_detection": False,
-            "detection_detail": "summary",
+            "requires_asset_profile": False,
             "entity_binding": "explicit",
             "requires_multiple_entities": False,
             "is_followup": False,
@@ -351,11 +351,10 @@ class RouterSchemaTests(unittest.TestCase):
         self.assertTrue(decision.route_normalized)
         self.assertEqual(decision.route_normalization_reason, "node_summary_requires_graph")
         self.assertTrue(route.use_graph)
-        self.assertTrue(route.use_detection)
-        self.assertEqual(route.detection_detail, "summary")
-        self.assertEqual(route.decision_source, "glm")
+        self.assertFalse(route.use_detection)
+        self.assertEqual(route.decision_source, "semantic_router")
 
-    def test_default_asset_investigation_requests_graph_and_detection_summary(self) -> None:
+    def test_asset_investigation_honors_selected_providers(self) -> None:
         decision = validate_router_payload(
             self.payload(intent="asset_investigation", scope="node_summary", direction="both", depth=0),
             self.entities,
@@ -364,12 +363,12 @@ class RouterSchemaTests(unittest.TestCase):
         )
         route = normalize_intent_route(decision, self.entities)
         self.assertTrue(route.use_graph)
-        self.assertTrue(route.use_detection)
-        self.assertEqual(route.detection_detail, "summary")
+        self.assertFalse(route.use_detection)
+        self.assertFalse(route.use_asset_profile)
 
-    def test_classification_explanation_requests_detection_compact_full_only(self) -> None:
+    def test_classification_explanation_can_request_detection_only(self) -> None:
         decision = validate_router_payload(
-            self.payload(intent="asset_investigation", scope="node_summary", direction="both", depth=0),
+            self.payload(intent="asset_investigation", scope="none", direction="none", depth=0, requires_graph=False, requires_detection=True),
             self.entities,
             min_confidence=0.65,
             message="Why is 192.168.30.115 classified as a Windows workstation?",
@@ -377,10 +376,9 @@ class RouterSchemaTests(unittest.TestCase):
         route = normalize_intent_route(decision, self.entities)
         self.assertFalse(route.use_graph)
         self.assertTrue(route.use_detection)
-        self.assertEqual(route.detection_detail, "compact_full")
         self.assertEqual(route.scope, "none")
 
-    def test_pure_graph_request_skips_detection(self) -> None:
+    def test_graph_route_preserves_explicit_provider_selection(self) -> None:
         decision = validate_router_payload(
             self.payload(intent="graph_neighbors", scope="one_hop", direction="outbound", depth=1, requires_detection=True),
             self.entities,
@@ -389,7 +387,7 @@ class RouterSchemaTests(unittest.TestCase):
         )
         route = normalize_intent_route(decision, self.entities)
         self.assertTrue(route.use_graph)
-        self.assertFalse(route.use_detection)
+        self.assertTrue(route.use_detection)
 
     def test_combined_role_topology_requests_both(self) -> None:
         decision = validate_router_payload(
@@ -399,7 +397,7 @@ class RouterSchemaTests(unittest.TestCase):
                 direction="both",
                 depth=0,
                 requires_graph=True,
-                requires_detection=False,
+                requires_detection=True,
             ),
             self.entities,
             min_confidence=0.65,
@@ -408,7 +406,6 @@ class RouterSchemaTests(unittest.TestCase):
         route = normalize_intent_route(decision, self.entities)
         self.assertTrue(route.use_graph)
         self.assertTrue(route.use_detection)
-        self.assertEqual(route.detection_detail, "summary")
 
     def test_combined_asset_scopes_preserve_graph_and_detection(self) -> None:
         cases = [("node_summary", 0), ("full_neighbors", 1), ("two_hop", 2)]
@@ -422,7 +419,7 @@ class RouterSchemaTests(unittest.TestCase):
                         depth=depth,
                         requires_graph=True,
                         requires_detection=True,
-                        detection_detail="summary",
+                        requires_asset_profile=True,
                     ),
                     self.entities,
                     min_confidence=0.65,
@@ -434,32 +431,17 @@ class RouterSchemaTests(unittest.TestCase):
                 self.assertEqual(route.direction, "both")
                 self.assertTrue(route.use_graph)
                 self.assertTrue(route.use_detection)
-                self.assertEqual(route.detection_detail, "summary")
+                self.assertTrue(route.use_asset_profile)
 
-    def test_combined_compact_full_normalizes_detail_without_removing_graph(self) -> None:
-        decision = validate_router_payload(
-            self.payload(
-                intent="asset_investigation",
-                scope="full_neighbors",
-                direction="both",
-                depth=1,
-                requires_graph=True,
-                requires_detection=True,
-                detection_detail="compact_full",
-            ),
-            self.entities,
-            min_confidence=0.65,
-            message="Show conflicts for this combined assessment.",
-        )
-        route = normalize_intent_route(decision, self.entities)
-        self.assertEqual(route.scope, "full_neighbors")
-        self.assertEqual(route.depth, 1)
-        self.assertTrue(route.use_graph)
-        self.assertTrue(route.use_detection)
-        self.assertEqual(route.detection_detail, "summary")
-        self.assertEqual(decision.route_normalization_reason, "combined_route_detection_detail_normalized")
+    def test_obsolete_detection_mode_field_is_rejected(self) -> None:
+        with self.assertRaisesRegex(ValueError, "unexpected"):
+            validate_router_payload(
+                {**self.payload(requires_detection=True), "detection_detail": "summary"},
+                self.entities,
+                min_confidence=0.65,
+            )
 
-    def test_explicit_full_detection_depth_is_preserved_with_graph(self) -> None:
+    def test_detection_selection_is_preserved_with_graph(self) -> None:
         cases = [("full_neighbors", 1), ("two_hop", 2)]
         for scope, depth in cases:
             with self.subTest(scope=scope):
@@ -471,7 +453,6 @@ class RouterSchemaTests(unittest.TestCase):
                         depth=depth,
                         requires_graph=True,
                         requires_detection=True,
-                        detection_detail="compact_full",
                     ),
                     self.entities,
                     min_confidence=0.65,
@@ -482,7 +463,6 @@ class RouterSchemaTests(unittest.TestCase):
                 self.assertTrue(route.use_detection)
                 self.assertEqual(route.scope, scope)
                 self.assertEqual(route.depth, depth)
-                self.assertEqual(route.detection_detail, "compact_full")
 
     def test_anomaly_route_uses_current_graph_and_detection_evidence(self) -> None:
         decision = validate_router_payload(
@@ -493,21 +473,19 @@ class RouterSchemaTests(unittest.TestCase):
                 depth=1,
                 requires_graph=True,
                 requires_detection=False,
-                detection_detail="summary",
             ),
             self.entities,
             min_confidence=0.65,
             message="Does this asset show unusual behavior?",
         )
         route = normalize_intent_route(decision, self.entities)
-        self.assertEqual(route.intent, "asset_investigation")
-        self.assertEqual(route.scope, "node_summary")
-        self.assertEqual(route.depth, 0)
+        self.assertEqual(route.intent, "graph_neighbors")
+        self.assertEqual(route.scope, "one_hop")
+        self.assertEqual(route.depth, 1)
         self.assertTrue(route.use_graph)
-        self.assertTrue(route.use_detection)
-        self.assertEqual(route.detection_detail, "summary")
+        self.assertFalse(route.use_detection)
 
-    def test_deep_two_hop_anomaly_preserves_compact_full(self) -> None:
+    def test_deep_two_hop_route_preserves_all_selected_providers(self) -> None:
         decision = validate_router_payload(
             self.payload(
                 intent="asset_investigation",
@@ -516,7 +494,7 @@ class RouterSchemaTests(unittest.TestCase):
                 depth=2,
                 requires_graph=True,
                 requires_detection=True,
-                detection_detail="compact_full",
+                requires_asset_profile=True,
             ),
             self.entities,
             min_confidence=0.65,
@@ -526,7 +504,7 @@ class RouterSchemaTests(unittest.TestCase):
         self.assertEqual(decision.depth, 2)
         self.assertTrue(decision.requires_graph)
         self.assertTrue(decision.requires_detection)
-        self.assertEqual(decision.detection_detail, "compact_full")
+        self.assertTrue(decision.requires_asset_profile)
 
     def test_general_knowledge_requests_no_providers(self) -> None:
         decision = validate_router_payload(
@@ -546,7 +524,7 @@ class RouterSchemaTests(unittest.TestCase):
         self.assertFalse(route.use_graph)
         self.assertFalse(route.use_detection)
 
-    def test_multiple_entities_skip_detection(self) -> None:
+    def test_multiple_entities_can_use_detection(self) -> None:
         decision = validate_router_payload(
             self.payload(
                 intent="graph_path",
@@ -555,7 +533,6 @@ class RouterSchemaTests(unittest.TestCase):
                 depth=0,
                 requires_graph=True,
                 requires_detection=True,
-                detection_detail="compact_full",
                 requires_multiple_entities=True,
             ),
             self.two_entities,
@@ -564,8 +541,7 @@ class RouterSchemaTests(unittest.TestCase):
         )
         route = normalize_intent_route(decision, self.two_entities)
         self.assertTrue(route.use_graph)
-        self.assertFalse(route.use_detection)
-        self.assertEqual(route.detection_detail, "summary")
+        self.assertTrue(route.use_detection)
 
     def test_active_single_binding_allows_detection_followup_without_pre_resolved_entity(self) -> None:
         no_entities = EntityResolver().resolve("Show me more detection evidence.")
@@ -578,7 +554,6 @@ class RouterSchemaTests(unittest.TestCase):
                 depth=0,
                 requires_graph=False,
                 requires_detection=True,
-                detection_detail="compact_full",
                 entity_binding="active_single",
                 is_followup=True,
             ),
@@ -591,8 +566,7 @@ class RouterSchemaTests(unittest.TestCase):
         self.assertEqual(decision.entity_binding, "active_single")
         self.assertEqual(decision.materialized_entities, ("192.168.30.111",))
         self.assertTrue(decision.requires_detection)
-        self.assertEqual(decision.detection_detail, "compact_full")
-        self.assertEqual(route.decision_source, "glm")
+        self.assertEqual(route.decision_source, "semantic_router")
 
     def test_active_reference_normalizes_is_followup_true(self) -> None:
         state = SessionRoutingState(active_ip="192.168.30.115")
@@ -672,7 +646,6 @@ class RouterSchemaTests(unittest.TestCase):
                 depth=0,
                 requires_graph=False,
                 requires_detection=True,
-                detection_detail="compact_full",
                 entity_binding="active_single",
             ),
             explicit,
@@ -731,13 +704,12 @@ class RouterSchemaTests(unittest.TestCase):
             ui_context={"selected_ip": "192.168.30.113"},
             routing_state=SessionRoutingState(active_ip="192.168.30.111"),
         )
-        self.assertEqual(decision.intent, "asset_investigation")
+        self.assertEqual(decision.intent, "general_knowledge")
         self.assertEqual(decision.entity_binding, "ui")
         self.assertEqual(decision.materialized_entities, ("192.168.30.113",))
         self.assertEqual(decision.binding_normalization_reason, "ui_entity_takes_authority")
-        self.assertEqual(decision.route_normalization_reason, "ui_subject_requires_asset_route")
-        self.assertTrue(decision.requires_graph)
-        self.assertTrue(decision.requires_detection)
+        self.assertFalse(decision.requires_graph)
+        self.assertFalse(decision.requires_detection)
 
     def test_explicit_ip_overrides_ui_and_active_state(self) -> None:
         explicit = EntityResolver().resolve(
@@ -753,7 +725,6 @@ class RouterSchemaTests(unittest.TestCase):
                 depth=0,
                 requires_graph=False,
                 requires_detection=True,
-                detection_detail="compact_full",
                 entity_binding="ui",
             ),
             explicit,
@@ -930,7 +901,6 @@ class RouterSchemaTests(unittest.TestCase):
                     depth=0,
                     requires_graph=False,
                     requires_detection=True,
-                    detection_detail="compact_full",
                     entity_binding="active_single",
                 ),
                 EntityResolver().resolve("Show detection evidence."),
@@ -947,18 +917,15 @@ class RouterSchemaTests(unittest.TestCase):
                 min_confidence=0.65,
             )
 
-    def test_invalid_detection_detail_normalizes_safely(self) -> None:
-        decision = validate_router_payload(
-            self.payload(detection_detail="verbose"),
-            self.entities,
-            min_confidence=0.65,
-            message="Show all connections of 192.168.30.115.",
-        )
-        route = normalize_intent_route(decision, self.entities)
-        self.assertEqual(route.detection_detail, "summary")
-        self.assertTrue(route.route_normalized)
+    def test_unknown_router_fields_are_rejected(self) -> None:
+        with self.assertRaisesRegex(ValueError, "unexpected"):
+            validate_router_payload(
+                {**self.payload(), "legacy_mode": "verbose"},
+                self.entities,
+                min_confidence=0.65,
+            )
 
-    def test_followup_show_more_evidence_uses_active_ip_and_compact_full(self) -> None:
+    def test_followup_show_more_evidence_uses_active_ip(self) -> None:
         entities = EntityResolver().resolve(
             "show more evidence",
             routing_state=SessionRoutingState(active_ip="192.168.30.115"),
@@ -972,7 +939,6 @@ class RouterSchemaTests(unittest.TestCase):
                 depth=0,
                 requires_graph=False,
                 requires_detection=True,
-                detection_detail="compact_full",
                 entity_binding="active_single",
                 is_followup=True,
             ),
@@ -985,7 +951,6 @@ class RouterSchemaTests(unittest.TestCase):
         self.assertEqual(decision.binding_source, "conversation")
         self.assertEqual(decision.materialized_entities, ("192.168.30.115",))
         self.assertTrue(decision.requires_detection)
-        self.assertEqual(decision.detection_detail, "compact_full")
 
     def test_three_entities_are_rejected_for_graph_routes(self) -> None:
         three = EntityResolver().resolve("Compare 192.168.1.1 192.168.1.2 192.168.1.3")
@@ -1057,11 +1022,11 @@ class LLMPrimaryRouterTests(unittest.TestCase):
     def test_valid_glm_decision_normalizes_without_fallback(self) -> None:
         router = GLMIntentRouter(
             self.settings,
-            FakeLLMClient([fake_result('{"intent":"asset_investigation","scope":"node_summary","direction":"both","depth":0,"requires_graph":true,"requires_detection":true,"detection_detail":"summary","requires_multiple_entities":false,"is_followup":false,"classification_confidence":0.92,"reason":"asset question"}')]),  # type: ignore[arg-type]
+            FakeLLMClient([fake_result('{"intent":"asset_investigation","scope":"node_summary","direction":"both","depth":0,"requires_graph":true,"requires_detection":true,"requires_asset_profile":true,"requires_multiple_entities":false,"is_followup":false,"classification_confidence":0.92,"reason":"asset question"}')]),  # type: ignore[arg-type]
         )
         decision = router.classify("Tell me about 192.168.30.115", self.entities, SessionRoutingState())
         route = normalize_intent_route(decision, self.entities)
-        self.assertEqual(route.decision_source, "glm")
+        self.assertEqual(route.decision_source, "semantic_router")
         self.assertFalse(route.fallback_used)
         self.assertEqual(route.scope, "node_summary")
         self.assertTrue(route.use_detection)
@@ -1077,7 +1042,7 @@ class LLMPrimaryRouterTests(unittest.TestCase):
             self.settings,
             FakeLLMClient([
                 fake_result("", finish_reason="length"),
-                fake_result('{"intent":"asset_investigation","scope":"node_summary","direction":"both","depth":0,"requires_graph":true,"requires_multiple_entities":false,"is_followup":false,"classification_confidence":0.9,"reason":"ok"}'),
+                fake_result('{"intent":"asset_investigation","scope":"node_summary","direction":"both","depth":0,"requires_graph":true,"requires_detection":false,"requires_asset_profile":false,"requires_multiple_entities":false,"is_followup":false,"classification_confidence":0.9,"reason":"ok"}'),
             ]),  # type: ignore[arg-type]
         )
         decision = router.classify("192.168.30.115", self.entities, SessionRoutingState())
@@ -1091,7 +1056,7 @@ class LLMPrimaryRouterTests(unittest.TestCase):
         self.assertEqual(len(llm.calls), 1)
         low = GLMIntentRouter(
             make_settings(intent_router_retry_enabled=False),
-            FakeLLMClient([fake_result('{"intent":"asset_investigation","scope":"node_summary","direction":"both","depth":0,"requires_graph":true,"requires_multiple_entities":false,"is_followup":false,"classification_confidence":0.2,"reason":"low"}')]),  # type: ignore[arg-type]
+            FakeLLMClient([fake_result('{"intent":"asset_investigation","scope":"node_summary","direction":"both","depth":0,"requires_graph":true,"requires_detection":false,"requires_asset_profile":false,"requires_multiple_entities":false,"is_followup":false,"classification_confidence":0.2,"reason":"low"}')]),  # type: ignore[arg-type]
         )
         self.assertTrue(low.classify("x", self.entities, SessionRoutingState()).fallback_used)
 
@@ -1105,7 +1070,7 @@ class LLMPrimaryRouterTests(unittest.TestCase):
         )
         llm = FakeLLMClient([
             fake_result("", finish_reason="length"),
-            fake_result('{"intent":"asset_investigation","scope":"node_summary","direction":"both","depth":0,"requires_graph":true,"requires_multiple_entities":false,"is_followup":false,"classification_confidence":0.9,"reason":"ok"}'),
+            fake_result('{"intent":"asset_investigation","scope":"node_summary","direction":"both","depth":0,"requires_graph":true,"requires_detection":false,"requires_asset_profile":false,"requires_multiple_entities":false,"is_followup":false,"classification_confidence":0.9,"reason":"ok"}'),
         ])
         router = GLMIntentRouter(settings, llm)  # type: ignore[arg-type]
         decision = router.classify("192.168.30.115", self.entities, SessionRoutingState())
@@ -1124,7 +1089,7 @@ class LLMPrimaryRouterTests(unittest.TestCase):
     def test_invalid_enum_and_missing_fields_use_one_content_repair(self) -> None:
         valid = (
             '{"intent":"asset_investigation","scope":"node_summary","direction":"both","depth":0,'
-            '"requires_graph":true,"requires_multiple_entities":false,"is_followup":false,'
+            '"requires_graph":true,"requires_detection":false,"requires_asset_profile":false,"requires_multiple_entities":false,"is_followup":false,'
             '"classification_confidence":0.9,"reason":"repaired"}'
         )
         invalid_outputs = [
@@ -1151,7 +1116,7 @@ class LLMPrimaryRouterTests(unittest.TestCase):
     def test_router_logs_actual_completion_tokens(self) -> None:
         valid = (
             '{"intent":"asset_investigation","scope":"node_summary","direction":"both","depth":0,'
-            '"requires_graph":true,"requires_multiple_entities":false,"is_followup":false,'
+            '"requires_graph":true,"requires_detection":false,"requires_asset_profile":false,"requires_multiple_entities":false,"is_followup":false,'
             '"classification_confidence":0.9,"reason":"ok"}'
         )
         router = GLMIntentRouter(
@@ -1170,7 +1135,7 @@ class LLMPrimaryRouterTests(unittest.TestCase):
         entities = EntityResolver().resolve(prompt)
         payload = (
             '{"intent":"asset_investigation","scope":"node_summary","direction":"both","depth":0,'
-            '"requires_graph":true,"requires_detection":true,"detection_detail":"summary",'
+            '"requires_graph":true,"requires_detection":true,"requires_asset_profile":true,'
             '"entity_binding":"explicit","requires_multiple_entities":false,"is_followup":false,'
             '"classification_confidence":0.97,"reason":"combined analysis"}'
         )
@@ -1178,11 +1143,11 @@ class LLMPrimaryRouterTests(unittest.TestCase):
 
         decision = router.classify(prompt, entities, SessionRoutingState())
 
-        self.assertEqual(decision.decision_source, "glm")
+        self.assertEqual(decision.decision_source, "semantic_router")
         self.assertEqual(decision.scope, "node_summary")
         self.assertTrue(decision.requires_graph)
         self.assertTrue(decision.requires_detection)
-        self.assertEqual(decision.detection_detail, "summary")
+        self.assertTrue(decision.requires_asset_profile)
         self.assertEqual(decision.entity_binding, "explicit")
 
     def test_exact_prompt_b_repair_preserves_combined_full_neighbors(self) -> None:
@@ -1198,12 +1163,12 @@ class LLMPrimaryRouterTests(unittest.TestCase):
             previous_direction="none",
             previous_depth=0,
             previous_requires_detection=True,
-            previous_detection_detail="compact_full",
+            previous_requires_asset_profile=True,
         )
         entities = EntityResolver().resolve(prompt, routing_state=state)
         repaired = (
             '{"intent":"asset_investigation","scope":"full_neighbors","direction":"both","depth":1,'
-            '"requires_graph":true,"requires_detection":true,"detection_detail":"summary",'
+            '"requires_graph":true,"requires_detection":true,"requires_asset_profile":true,'
             '"entity_binding":"active_single","requires_multiple_entities":false,"is_followup":true,'
             '"classification_confidence":0.97,"reason":"combined follow-up"}'
         )
@@ -1212,13 +1177,13 @@ class LLMPrimaryRouterTests(unittest.TestCase):
 
         decision = router.classify(prompt, entities, state)
 
-        self.assertEqual(decision.decision_source, "glm")
+        self.assertEqual(decision.decision_source, "semantic_router_repair")
         self.assertEqual(decision.retry_count, 1)
         self.assertEqual(decision.scope, "full_neighbors")
         self.assertEqual(decision.depth, 1)
         self.assertTrue(decision.requires_graph)
         self.assertTrue(decision.requires_detection)
-        self.assertEqual(decision.detection_detail, "summary")
+        self.assertTrue(decision.requires_asset_profile)
         self.assertEqual(decision.entity_binding, "active_single")
 
     def test_router_prompt_loads_from_file_and_missing_file_falls_back(self) -> None:
@@ -1230,7 +1195,7 @@ class LLMPrimaryRouterTests(unittest.TestCase):
             FakeLLMClient([fake_result("{}")]),  # type: ignore[arg-type]
         )
         self.assertEqual(missing.system_prompt, ROUTER_SYSTEM_PROMPT_FALLBACK)
-        self.assertLess(len(ROUTER_SYSTEM_PROMPT_FALLBACK), 400)
+        self.assertLess(len(ROUTER_SYSTEM_PROMPT_FALLBACK), 600)
 
 
 class DeterministicFallbackPolicyTests(unittest.TestCase):
@@ -1245,7 +1210,7 @@ class DeterministicFallbackPolicyTests(unittest.TestCase):
         self.assertTrue(route.use_graph)
         self.assertTrue(route.use_detection)
         self.assertEqual(route.intent, "asset_investigation")
-        self.assertEqual(route.matched_signals, ["combined_provider_request"])
+        self.assertIn(route.matched_signals[0], {"graph_topology", "asset_evidence"})
 
     def test_referential_fallback_materializes_active_single_and_marks_followup(self) -> None:
         state = SessionRoutingState(
@@ -1257,7 +1222,7 @@ class DeterministicFallbackPolicyTests(unittest.TestCase):
             previous_direction="both",
             previous_depth=0,
             previous_requires_detection=True,
-            previous_detection_detail="summary",
+            previous_requires_asset_profile=False,
         )
         message = "What do we know about it?"
         route = self.router.route(
@@ -1281,7 +1246,7 @@ class DeterministicFallbackPolicyTests(unittest.TestCase):
         self.assertEqual(route.depth, 0)
         self.assertTrue(route.use_graph)
         self.assertTrue(route.use_detection)
-        self.assertEqual(route.detection_detail, "summary")
+        self.assertTrue(route.use_asset_profile)
         self.assertEqual(route.entity_binding, "explicit")
 
     def test_exact_prompt_b_fallback_uses_combined_full_neighbors(self) -> None:
@@ -1297,7 +1262,7 @@ class DeterministicFallbackPolicyTests(unittest.TestCase):
             previous_direction="none",
             previous_depth=0,
             previous_requires_detection=True,
-            previous_detection_detail="compact_full",
+            previous_requires_asset_profile=True,
         )
         route = self.router.route(
             message,
@@ -1310,7 +1275,7 @@ class DeterministicFallbackPolicyTests(unittest.TestCase):
         self.assertEqual(route.depth, 1)
         self.assertTrue(route.use_graph)
         self.assertTrue(route.use_detection)
-        self.assertEqual(route.detection_detail, "summary")
+        self.assertTrue(route.use_asset_profile)
         self.assertEqual(route.entity_binding, "active_single")
 
     def test_explicit_graph_detail_phrases_map_to_full_and_two_hop(self) -> None:
@@ -1334,7 +1299,7 @@ class DeterministicFallbackPolicyTests(unittest.TestCase):
         self.assertEqual(route.depth, 0)
         self.assertTrue(route.use_graph)
 
-    def test_comprehensive_report_needs_explicit_detection_depth_for_compact_full(self) -> None:
+    def test_comprehensive_report_always_uses_complete_provider_payloads(self) -> None:
         summary_message = "Give me a comprehensive report for 192.168.21.104."
         full_message = (
             "Give me a comprehensive report including every detection rule and all supporting signals "
@@ -1350,8 +1315,10 @@ class DeterministicFallbackPolicyTests(unittest.TestCase):
             self.resolver.resolve(full_message),
             fallback_reason="provider_error",
         )
-        self.assertEqual(summary_route.detection_detail, "summary")
-        self.assertEqual(full_route.detection_detail, "compact_full")
+        self.assertTrue(summary_route.use_detection)
+        self.assertTrue(full_route.use_detection)
+        self.assertTrue(summary_route.use_asset_profile)
+        self.assertTrue(full_route.use_asset_profile)
 
     def test_combined_full_detection_fallback_preserves_heavy_graph_scope(self) -> None:
         cases = [
@@ -1359,14 +1326,16 @@ class DeterministicFallbackPolicyTests(unittest.TestCase):
                 "Show all direct connections for 192.168.0.55 and include every matched detection rule, conflict, and supporting classification signal.",
                 "full_neighbors",
                 1,
+                False,
             ),
             (
                 "Perform a two-hop investigation of 192.168.21.104 using all detection rules, supporting signals, conflicts, and complete profile evidence.",
                 "two_hop",
                 2,
+                True,
             ),
         ]
-        for message, scope, depth in cases:
+        for message, scope, depth, requires_profile in cases:
             with self.subTest(scope=scope):
                 route = self.router.route(message, self.resolver.resolve(message), fallback_reason="provider_error")
                 self.assertEqual(route.intent, "asset_investigation")
@@ -1374,7 +1343,7 @@ class DeterministicFallbackPolicyTests(unittest.TestCase):
                 self.assertEqual(route.depth, depth)
                 self.assertTrue(route.use_graph)
                 self.assertTrue(route.use_detection)
-                self.assertEqual(route.detection_detail, "compact_full")
+                self.assertEqual(route.use_asset_profile, requires_profile)
 
     def test_dependency_and_destination_phrases_set_direction(self) -> None:
         cases = [
@@ -1404,8 +1373,8 @@ class DeterministicFallbackPolicyTests(unittest.TestCase):
         self.assertNotEqual(route.intent, "general_knowledge")
         self.assertTrue(route.use_graph)
         self.assertTrue(route.use_detection)
-        self.assertEqual(route.detection_detail, "summary")
-        self.assertIn(route.matched_signals[0], {"graph_topology", "security_or_anomaly"})
+        self.assertTrue(route.use_asset_profile)
+        self.assertIn(route.matched_signals[0], {"graph_topology", "security_or_anomaly", "all_product_and_graph_evidence"})
         self.assertIn("security_or_anomaly", route.matched_signals)
 
     def test_graph_only_inbound_request_uses_graph(self) -> None:
@@ -1572,6 +1541,78 @@ class CopilotHelpContentTests(unittest.TestCase):
         self.assertIsNone(build_copilot_ui_context(None))
 
 
+class ExhaustiveConnectionRoutingTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.resolver = EntityResolver()
+        self.fallback = DeterministicFallbackRouter()
+
+    def test_explicit_and_active_single_exhaustive_wording_uses_full_neighbors(self) -> None:
+        cases = (
+            "Show all connections for 192.168.0.125",
+            "List every inbound, outbound, and bidirectional peer for 192.168.0.125",
+            "Show the complete neighborhood of 192.168.0.125",
+        )
+        for message in cases:
+            with self.subTest(message=message):
+                route = self.fallback.route(message, self.resolver.resolve(message), fallback_reason="test")
+                self.assertEqual((route.scope, route.depth), ("full_neighbors", 1))
+                self.assertTrue(route.use_graph)
+                self.assertTrue(route.exhaustive_connections_requested)
+
+        state = SessionRoutingState(active_ip="192.168.0.125")
+        for message in ("Show all of its connections.", "Now list every peer.", "Based on all of its connections, analyze it."):
+            with self.subTest(message=message):
+                route = self.fallback.route(message, self.resolver.resolve(message, routing_state=state), state, fallback_reason="test")
+                self.assertEqual(route.scope, "full_neighbors")
+                self.assertEqual(route.binding_source, "conversation")
+
+    def test_summary_wording_does_not_expand_to_full_neighbors(self) -> None:
+        for message in (
+            "Summarize the connections of 192.168.0.125",
+            "Analyze the network behavior of 192.168.0.125",
+            "Give me a graph overview for 192.168.0.125",
+        ):
+            with self.subTest(message=message):
+                route = self.fallback.route(message, self.resolver.resolve(message), fallback_reason="test")
+                self.assertNotEqual(route.scope, "full_neighbors")
+                self.assertFalse(route.exhaustive_connections_requested)
+
+    def test_active_pair_complete_neighborhood_followup_keeps_both_entities(self) -> None:
+        state = SessionRoutingState(active_entities=("192.168.0.125", "192.168.0.126"))
+        message = "Compare their complete neighborhoods."
+        route = self.fallback.route(message, self.resolver.resolve(message, routing_state=state), state, fallback_reason="test")
+        self.assertEqual(route.scope, "multi_entity_comparison")
+        self.assertEqual(route.materialized_entities, state.active_entities)
+        self.assertTrue(route.requires_multiple_entities)
+        self.assertTrue(route.exhaustive_connections_requested)
+
+    def test_semantic_payload_is_normalized_to_exhaustive_single_and_pair_scopes(self) -> None:
+        base = {
+            "intent": "asset_investigation",
+            "scope": "node_summary",
+            "direction": "both",
+            "depth": 0,
+            "requires_graph": True,
+            "requires_detection": False,
+            "requires_asset_profile": False,
+            "requires_multiple_entities": False,
+            "is_followup": False,
+            "classification_confidence": 0.95,
+            "reason": "fixture",
+        }
+        single = self.resolver.resolve("Show all connections for 192.168.0.125")
+        decision = validate_router_payload(base, single, min_confidence=0.65, message="Show all connections for 192.168.0.125")
+        self.assertEqual((decision.intent, decision.scope, decision.depth), ("graph_neighbors", "full_neighbors", 1))
+        self.assertEqual(decision.route_normalization_reason, "exhaustive_connections_require_full_neighbors")
+        self.assertEqual(decision.decision_source, "semantic_router")
+
+        pair_message = "Compare the complete neighborhoods of 192.168.0.125 and 192.168.0.126"
+        pair = self.resolver.resolve(pair_message)
+        pair_decision = validate_router_payload(base, pair, min_confidence=0.65, message=pair_message)
+        self.assertEqual((pair_decision.intent, pair_decision.scope), ("graph_relationships", "multi_entity_comparison"))
+        self.assertTrue(pair_decision.requires_multiple_entities)
+
+
 class GraphRetrievalTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp_dir = tempfile.TemporaryDirectory()
@@ -1646,7 +1687,7 @@ class GraphRetrievalTests(unittest.TestCase):
         self.assertEqual(result.context["inbound_context_included"], 0)
         self.assertEqual(result.context["outbound_context_included"], 0)
         self.assertEqual(result.context["bidirectional_context_included"], 0)
-        self.assertIn("model_context_included=0", text)
+        self.assertIn('"serialized_nodes":1', text)
 
     def test_single_node_zero_edge_context_preserves_counter_invariants(self) -> None:
         context = {
@@ -1684,7 +1725,7 @@ class GraphRetrievalTests(unittest.TestCase):
 
         self.assertFalse(result.context["formal_anomaly_evidence_available"])
         self.assertTrue(result.context["graph_structural_analysis_available"])
-        self.assertIn("Formal anomaly evidence: unavailable", text)
+        self.assertIn("No dedicated anomaly provider evidence is available", text)
 
     def test_subnet_formatter_returns_canonical_cidr(self) -> None:
         self.assertEqual(get_subnet("192.168.0.149"), "192.168.0.0/24")
@@ -1779,7 +1820,8 @@ class GraphRetrievalTests(unittest.TestCase):
         self.assertEqual(result.context["inbound_retrieved"], 33)
         self.assertEqual(result.context["inbound_context_included"], 33)
         self.assertFalse(result.context["context_truncated"])
-        self.assertIn("All 33 requested inbound peers were retrieved and explicitly included.", text)
+        self.assertIn('"complete_for_user_request":true', text)
+        self.assertIn('"returned":33', text)
 
     def test_directional_context_counts_use_actual_included_directions(self) -> None:
         graph = nx.DiGraph()
@@ -1849,8 +1891,8 @@ class GraphRetrievalTests(unittest.TestCase):
         self.assertLess(result.context["outbound_context_included"], result.context["outbound_retrieved"])
         self.assertFalse(result.context["retrieval_truncated"])
         self.assertTrue(result.context["context_truncated"])
-        self.assertIn("graph_retrieved=120", text)
-        self.assertIn("model_context_included=", text)
+        self.assertIn('"returned":120', text)
+        self.assertIn('"serialized_context_truncated":true', text)
 
     def test_two_hop_edge_only_truncation_reports_edge_limit(self) -> None:
         graph = nx.DiGraph()
@@ -2225,10 +2267,117 @@ class GraphRefreshTests(unittest.TestCase):
         self.assertEqual(result.status, "skipped")
 
 
+class GraphCompletenessContractTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.target = "192.168.0.125"
+        self.entity = ResolvedEntity(type="ip", value=self.target, source="message")
+
+    def graph_with_inbound(self, count: int) -> nx.DiGraph:
+        graph = nx.DiGraph()
+        for index in range(count):
+            graph.add_edge(f"10.0.0.{index + 1}", self.target)
+        replace_active_graph(graph, {"active_graph_source": "test"})
+        return graph
+
+    def test_node_summary_keeps_20_node_cap_but_satisfies_summary_scope(self) -> None:
+        self.graph_with_inbound(30)
+        context = retrieve_graph_context(
+            GraphRetrievalSpec(scope="node_summary", direction="both", depth=0, entities=[self.entity]),
+            make_settings(graph_one_hop_max_nodes=500),
+        )
+        self.assertEqual(context["requested_scope"], "node_summary")
+        self.assertLessEqual(context["returned_node_count"], 20)
+        self.assertFalse(context["retrieval_complete"])
+        self.assertTrue(context["retrieval_truncated"])
+        self.assertEqual(context["retrieval_truncation_reason"], "node_limit:20")
+        self.assertTrue(context["requested_scope_complete"])
+        self.assertTrue(context["complete_for_user_request"])
+
+    def test_full_neighbors_uses_hard_max_and_reports_incomplete_request(self) -> None:
+        self.graph_with_inbound(30)
+        context = retrieve_graph_context(
+            GraphRetrievalSpec(scope="full_neighbors", direction="both", depth=1, entities=[self.entity], exhaustive_connections_requested=True),
+            make_settings(graph_full_neighbors_hard_max=10),
+        )
+        self.assertLessEqual(context["returned_node_count"], 10)
+        self.assertFalse(context["retrieval_complete"])
+        self.assertFalse(context["requested_scope_complete"])
+        self.assertFalse(context["complete_for_user_request"])
+
+    def test_full_neighbors_within_hard_max_is_complete_for_user(self) -> None:
+        self.graph_with_inbound(5)
+        context = retrieve_graph_context(
+            GraphRetrievalSpec(scope="full_neighbors", direction="both", depth=1, entities=[self.entity], exhaustive_connections_requested=True),
+            make_settings(graph_full_neighbors_hard_max=20),
+        )
+        self.assertTrue(context["retrieval_complete"])
+        self.assertTrue(context["requested_scope_complete"])
+        self.assertTrue(context["complete_for_user_request"])
+
+    def test_complete_retrieval_and_serialization_are_independent(self) -> None:
+        self.graph_with_inbound(12)
+        settings = make_settings(
+            graph_full_neighbors_hard_max=50,
+            graph_full_enumeration_max_peers=2,
+            graph_context_max_enumerated_nodes=4,
+            graph_context_max_enumerated_edges=4,
+        )
+        result = GraphContextProvider(settings).provide(
+            self.entity,
+            route=replace(
+                GraphRetrievalTests.route(self, "full_neighbors", "inbound", 1, [self.entity]),
+                exhaustive_connections_requested=True,
+            ),
+        )
+        text = ContextComposer(settings).compose(CopilotContextPackage(entities=EntityResolver().resolve(self.target), graph=result))
+        self.assertTrue(result.context["retrieval_complete"])
+        self.assertTrue(result.context["serialized_context_truncated"])
+        self.assertFalse(result.context["serialized_context_complete_for_retrieved_subset"])
+        self.assertFalse(result.context["complete_for_user_request"])
+        self.assertIn('"complete_for_user_request":false', text)
+        self.assertIn("Do not say all connections", text)
+
+    def test_node_summary_totals_do_not_invent_peer_identities(self) -> None:
+        self.graph_with_inbound(5)
+        settings = make_settings()
+        result = GraphContextProvider(settings).provide(
+            self.entity,
+            route=GraphRetrievalTests.route(self, "node_summary", "both", 0, [self.entity]),
+        )
+        text = ContextComposer(settings).compose(CopilotContextPackage(entities=EntityResolver().resolve(self.target), graph=result))
+        self.assertIn('"inbound":{"peers":[],"returned":5,"total":5}', text)
+        self.assertEqual(result.context["context_node_count"], 1)
+        self.assertEqual(result.context["context_edge_count"], 0)
+
+    def test_pair_graph_context_is_separated_by_entity(self) -> None:
+        other = ResolvedEntity(type="ip", value="192.168.0.126", source="message")
+        graph = nx.DiGraph()
+        graph.add_edge("10.0.0.1", self.target)
+        graph.add_edge(other.value, "10.0.0.1")
+        replace_active_graph(graph, {"active_graph_source": "test"})
+        settings = make_settings()
+        result = GraphContextProvider(settings).provide(
+            None,
+            route=GraphRetrievalTests.route(
+                self,
+                "multi_entity_comparison",
+                "both",
+                1,
+                [self.entity, other],
+                intent="graph_relationships",
+                relationship_mode="compare",
+            ),
+        )
+        text = ContextComposer(settings).compose(CopilotContextPackage(entities=EntityResolver().resolve(f"{self.target} {other.value}"), graph=result))
+        self.assertIn(f'"entities":{{"{self.target}"', text)
+        self.assertIn(f'"{other.value}":', text)
+        self.assertIn('"comparison":{', text)
+
+
 class ServiceAndTraceTests(unittest.TestCase):
     def test_state_updates_previous_route_and_general_question_preserves_active_entity(self) -> None:
         settings = make_settings()
-        router_json = '{"intent":"asset_investigation","scope":"node_summary","direction":"both","depth":0,"requires_graph":true,"requires_multiple_entities":false,"is_followup":false,"classification_confidence":0.9,"reason":"asset"}'
+        router_json = '{"intent":"asset_investigation","scope":"node_summary","direction":"both","depth":0,"requires_graph":true,"requires_detection":false,"requires_asset_profile":false,"requires_multiple_entities":false,"is_followup":false,"classification_confidence":0.9,"reason":"asset"}'
         llm = FakeLLMClient([fake_result(router_json), fake_result("answer")])
         state_store = SessionRoutingStateStore()
         service = CopilotService(settings, llm, MemoryStore(10), state_store)
@@ -2246,9 +2395,9 @@ class ServiceAndTraceTests(unittest.TestCase):
 
     def test_single_asset_summary_and_possessive_followups_use_graph_and_state(self) -> None:
         settings = make_settings()
-        asset_json = '{"intent":"asset_investigation","scope":"node_summary","direction":"both","depth":0,"requires_graph":true,"requires_multiple_entities":false,"is_followup":false,"classification_confidence":0.9,"reason":"asset"}'
-        malformed_asset_json = '{"intent":"asset_investigation","scope":"node_summary","direction":"none","depth":1,"requires_graph":false,"requires_multiple_entities":false,"is_followup":true,"classification_confidence":0.9,"reason":"asset followup"}'
-        connections_json = '{"intent":"graph_neighbors","scope":"one_hop","direction":"both","depth":1,"requires_graph":true,"requires_multiple_entities":false,"is_followup":true,"classification_confidence":0.9,"reason":"connections"}'
+        asset_json = '{"intent":"asset_investigation","scope":"node_summary","direction":"both","depth":0,"requires_graph":true,"requires_detection":false,"requires_asset_profile":false,"requires_multiple_entities":false,"is_followup":false,"classification_confidence":0.9,"reason":"asset"}'
+        malformed_asset_json = '{"intent":"asset_investigation","scope":"node_summary","direction":"none","depth":1,"requires_graph":false,"requires_detection":false,"requires_asset_profile":false,"requires_multiple_entities":false,"is_followup":true,"classification_confidence":0.9,"reason":"asset followup"}'
+        connections_json = '{"intent":"graph_neighbors","scope":"one_hop","direction":"both","depth":1,"requires_graph":true,"requires_detection":false,"requires_asset_profile":false,"requires_multiple_entities":false,"is_followup":true,"classification_confidence":0.9,"reason":"connections"}'
         llm = FakeLLMClient([
             fake_result(asset_json),
             fake_result("asset answer"),
@@ -2293,7 +2442,7 @@ class ServiceAndTraceTests(unittest.TestCase):
         self.assertEqual(captured_routes[0].intent, "asset_investigation")
         self.assertEqual(captured_routes[0].scope, "node_summary")
         self.assertTrue(captured_routes[0].use_graph)
-        self.assertEqual(captured_routes[0].decision_source, "glm")
+        self.assertEqual(captured_routes[0].decision_source, "semantic_router")
         self.assertFalse(captured_routes[0].fallback_used)
         self.assertEqual(captured_entities[0].source, "message")
 
@@ -2304,7 +2453,7 @@ class ServiceAndTraceTests(unittest.TestCase):
         self.assertTrue(captured_routes[1].use_graph)
         self.assertTrue(captured_routes[1].route_normalized)
         self.assertEqual(captured_routes[1].route_normalization_reason, "node_summary_requires_graph")
-        self.assertEqual(captured_routes[1].decision_source, "glm")
+        self.assertEqual(captured_routes[1].decision_source, "semantic_router")
         self.assertEqual(captured_entities[1].source, "conversation")
 
         self.assertEqual(captured_routes[2].intent, "graph_neighbors")
@@ -2324,8 +2473,8 @@ class ServiceAndTraceTests(unittest.TestCase):
 
     def test_two_entity_state_is_preserved_for_followup_path(self) -> None:
         settings = make_settings()
-        relationship_json = '{"intent":"graph_relationships","scope":"one_hop","direction":"both","depth":1,"requires_graph":true,"requires_multiple_entities":true,"is_followup":false,"classification_confidence":0.9,"reason":"direct"}'
-        path_json = '{"intent":"graph_path","scope":"path","direction":"both","depth":0,"requires_graph":true,"requires_multiple_entities":true,"is_followup":true,"classification_confidence":0.9,"reason":"path"}'
+        relationship_json = '{"intent":"graph_relationships","scope":"one_hop","direction":"both","depth":1,"requires_graph":true,"requires_detection":false,"requires_asset_profile":false,"requires_multiple_entities":true,"is_followup":false,"classification_confidence":0.9,"reason":"direct"}'
+        path_json = '{"intent":"graph_path","scope":"path","direction":"both","depth":0,"requires_graph":true,"requires_detection":false,"requires_asset_profile":false,"requires_multiple_entities":true,"is_followup":true,"classification_confidence":0.9,"reason":"path"}'
         llm = FakeLLMClient([fake_result(relationship_json), fake_result("answer one"), fake_result(path_json), fake_result("answer two")])
         state_store = SessionRoutingStateStore()
         service = CopilotService(settings, llm, MemoryStore(20), state_store)
@@ -2356,7 +2505,7 @@ class ServiceAndTraceTests(unittest.TestCase):
 
     def test_single_entity_replaces_pair_state(self) -> None:
         settings = make_settings()
-        router_json = '{"intent":"asset_investigation","scope":"node_summary","direction":"both","depth":0,"requires_graph":true,"requires_multiple_entities":false,"is_followup":false,"classification_confidence":0.9,"reason":"asset"}'
+        router_json = '{"intent":"asset_investigation","scope":"node_summary","direction":"both","depth":0,"requires_graph":true,"requires_detection":false,"requires_asset_profile":false,"requires_multiple_entities":false,"is_followup":false,"classification_confidence":0.9,"reason":"asset"}'
         llm = FakeLLMClient([fake_result(router_json), fake_result("answer")])
         state_store = SessionRoutingStateStore()
         state_store.set("s", SessionRoutingState(active_entities=("192.168.30.100", "192.168.30.101")))
@@ -2374,8 +2523,8 @@ class ServiceAndTraceTests(unittest.TestCase):
 
     def test_general_and_unclear_turns_preserve_active_pair_state(self) -> None:
         settings = make_settings()
-        general_json = '{"intent":"general_knowledge","scope":"none","direction":"none","depth":0,"requires_graph":false,"requires_multiple_entities":false,"is_followup":false,"classification_confidence":0.9,"reason":"general"}'
-        unclear_json = '{"intent":"unclear","scope":"none","direction":"none","depth":0,"requires_graph":false,"requires_multiple_entities":false,"is_followup":false,"classification_confidence":0.9,"reason":"unclear"}'
+        general_json = '{"intent":"general_knowledge","scope":"none","direction":"none","depth":0,"requires_graph":false,"requires_detection":false,"requires_asset_profile":false,"requires_multiple_entities":false,"is_followup":false,"classification_confidence":0.9,"reason":"general"}'
+        unclear_json = '{"intent":"unclear","scope":"none","direction":"none","depth":0,"requires_graph":false,"requires_detection":false,"requires_asset_profile":false,"requires_multiple_entities":false,"is_followup":false,"classification_confidence":0.9,"reason":"unclear"}'
         llm = FakeLLMClient([fake_result(general_json), fake_result("general answer"), fake_result(unclear_json), fake_result("unclear answer")])
         state_store = SessionRoutingStateStore()
         pair = ("192.168.30.100", "192.168.30.101")
@@ -2396,8 +2545,8 @@ class ServiceAndTraceTests(unittest.TestCase):
 
     def test_general_and_unclear_turns_preserve_active_single_state_and_previous_route(self) -> None:
         settings = make_settings()
-        general_json = '{"intent":"general_knowledge","scope":"none","direction":"none","depth":0,"requires_graph":false,"requires_multiple_entities":false,"is_followup":false,"classification_confidence":0.9,"reason":"general"}'
-        unclear_json = '{"intent":"unclear","scope":"none","direction":"none","depth":0,"requires_graph":false,"requires_multiple_entities":false,"is_followup":false,"classification_confidence":0.9,"reason":"unclear"}'
+        general_json = '{"intent":"general_knowledge","scope":"none","direction":"none","depth":0,"requires_graph":false,"requires_detection":false,"requires_asset_profile":false,"requires_multiple_entities":false,"is_followup":false,"classification_confidence":0.9,"reason":"general"}'
+        unclear_json = '{"intent":"unclear","scope":"none","direction":"none","depth":0,"requires_graph":false,"requires_detection":false,"requires_asset_profile":false,"requires_multiple_entities":false,"is_followup":false,"classification_confidence":0.9,"reason":"unclear"}'
         llm = FakeLLMClient([fake_result(general_json), fake_result("general answer"), fake_result(unclear_json), fake_result("unclear answer")])
         state_store = SessionRoutingStateStore()
         state_store.set(
@@ -2431,7 +2580,7 @@ class ServiceAndTraceTests(unittest.TestCase):
 
     def test_explicit_new_ip_replaces_previous_active_single_ip(self) -> None:
         settings = make_settings()
-        router_json = '{"intent":"asset_investigation","scope":"node_summary","direction":"both","depth":0,"requires_graph":true,"requires_multiple_entities":false,"is_followup":false,"classification_confidence":0.9,"reason":"asset"}'
+        router_json = '{"intent":"asset_investigation","scope":"node_summary","direction":"both","depth":0,"requires_graph":true,"requires_detection":false,"requires_asset_profile":false,"requires_multiple_entities":false,"is_followup":false,"classification_confidence":0.9,"reason":"asset"}'
         llm = FakeLLMClient([fake_result(router_json), fake_result("answer")])
         state_store = SessionRoutingStateStore()
         state_store.set("single", SessionRoutingState(active_ip="192.168.21.1"))
@@ -2450,7 +2599,7 @@ class ServiceAndTraceTests(unittest.TestCase):
 
     def test_explicit_broad_comparison_executes_comparison_route_and_stores_pair(self) -> None:
         settings = make_settings()
-        comparison_json = '{"intent":"graph_relationships","scope":"multi_entity_comparison","direction":"both","depth":1,"requires_graph":true,"requires_multiple_entities":true,"is_followup":false,"classification_confidence":0.9,"reason":"compare"}'
+        comparison_json = '{"intent":"graph_relationships","scope":"multi_entity_comparison","direction":"both","depth":1,"requires_graph":true,"requires_detection":false,"requires_asset_profile":false,"requires_multiple_entities":true,"is_followup":false,"classification_confidence":0.9,"reason":"compare"}'
         llm = FakeLLMClient([fake_result(comparison_json), fake_result("comparison answer")])
         state_store = SessionRoutingStateStore()
         service = CopilotService(settings, llm, MemoryStore(20), state_store)
@@ -2501,7 +2650,7 @@ class ServiceAndTraceTests(unittest.TestCase):
             conversation_recent_raw_messages=2,
             conversation_summary_max_tokens=80,
         )
-        router_json = '{"intent":"general_knowledge","scope":"none","direction":"none","depth":0,"requires_graph":false,"requires_multiple_entities":false,"is_followup":false,"classification_confidence":0.9,"reason":"general"}'
+        router_json = '{"intent":"general_knowledge","scope":"none","direction":"none","depth":0,"requires_graph":false,"requires_detection":false,"requires_asset_profile":false,"requires_multiple_entities":false,"is_followup":false,"classification_confidence":0.9,"reason":"general"}'
         long_old_answer = "OLD_ASSISTANT_REPORT " * 80
         memory = MemoryStore(50)
         memory.append("m", "user", "older question")
@@ -2522,7 +2671,7 @@ class ServiceAndTraceTests(unittest.TestCase):
             conversation_recent_raw_messages=2,
             conversation_summary_max_tokens=80,
         )
-        comparison_json = '{"intent":"graph_relationships","scope":"multi_entity_comparison","direction":"both","depth":1,"requires_graph":true,"requires_multiple_entities":true,"is_followup":true,"classification_confidence":0.9,"reason":"compare"}'
+        comparison_json = '{"intent":"graph_relationships","scope":"multi_entity_comparison","direction":"both","depth":1,"requires_graph":true,"requires_detection":false,"requires_asset_profile":false,"requires_multiple_entities":true,"is_followup":true,"classification_confidence":0.9,"reason":"compare"}'
         long_old_answer = "OLD_PAIR_ASSISTANT_REPORT " * 80
         memory = MemoryStore(50)
         memory.append("pair", "user", "older pair question")

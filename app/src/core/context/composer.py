@@ -1,9 +1,9 @@
-"""Compose bounded model-facing context from typed provider results."""
+"""Compose bounded, deterministic model-facing provider context."""
 
 from __future__ import annotations
 
+import json
 import logging
-from collections import Counter
 from typing import Any
 
 from src.config.settings import Settings, get_settings
@@ -12,439 +12,354 @@ from src.core.context.models import CopilotContextPackage, approx_tokens
 
 logger = logging.getLogger(__name__)
 
+PROVIDER_SEMANTICS = {
+    "asset_profile": {
+        "description": "Product inventory, identity, risk, service, alert, authentication, and current asset-state evidence.",
+        "limitation": "Nested detection-related fields may share lineage with Asset Detection; repeated fields are not automatically independent corroboration.",
+    },
+    "asset_detection": {
+        "description": "Product-generated classifier output, rules, signals, metrics, confidence, conflicts, and supporting evidence.",
+        "limitation": "Classification evidence is not automatically authoritative inventory truth.",
+    },
+    "graph": {
+        "description": "Observed communication topology.",
+        "limitation": "Does not by itself prove protocol purpose, trust, service dependency, successful authentication, compromise, routing capability, or attack paths; coverage may be partial.",
+    },
+}
 
-def _list_values(values: list[str], limit: int = 10) -> str:
-    if not values:
-        return "none"
-    shown = values[:limit]
-    suffix = f" (+{len(values) - limit} more)" if len(values) > limit else ""
-    return ", ".join(shown) + suffix
+VALUE_SEMANTICS = (
+    "Missing, null, false, zero, empty string, empty array, empty object, provider unavailable, and not observed are distinct. "
+    "A current zero does not prove the condition never existed historically."
+)
 
-
-def _list_node_ids(nodes: list[dict[str, object]], limit: int = 15) -> str:
-    values = [str(node.get("id", "")) for node in nodes if node.get("id")]
-    return _list_values(values, limit=limit)
-
-
-def _list_edges(edges: list[dict[str, object]], limit: int = 15) -> str:
-    values = [f"{edge.get('source')} -> {edge.get('target')}" for edge in edges]
-    return _list_values(values, limit=limit)
+GRAPH_GROUNDING_RULES = [
+    "Disclose partial graph evidence.",
+    "Distinguish aggregate totals from returned peer identities; never invent missing peers.",
+    "Do not say all connections, every peer, or complete neighborhood unless complete_for_user_request is true.",
+    "When truncated, use returned subset, retrieved peers, or summary evidence.",
+    "Zero returned peers does not imply zero total peers.",
+    "Topology does not prove protocol purpose, trust, dependency, authentication, compromise, routing capability, or attack paths.",
+]
 
 
 class ContextComposer:
-    """Turn structured context into a bounded instruction/evidence message."""
+    """Turn typed provider results into bounded model evidence without lossy product transforms."""
 
     def __init__(self, settings: Settings | None = None) -> None:
         self.settings = settings or get_settings()
-        self.last_parts: dict[str, str] = {"status": "", "graph": "", "detection": "", "fusion": ""}
-
-    def compose(self, package: CopilotContextPackage, *, request_id: str = "") -> str:
-        detection = package.detection
-        detection_text = (
-            detection.rendered_context
-            if detection and detection.status in {"available", "not_found"} and detection.rendered_context
-            else ""
-        )
-        status_text = self._compose_provider_statuses(package)
-        graph_text = self._compose_graph(package, request_id=request_id)
-        fusion_text = self._compose_alignment(package)
-        self.last_parts = {
-            "status": status_text,
-            "graph": graph_text,
-            "detection": detection_text,
-            "fusion": fusion_text,
+        self.last_parts: dict[str, str] = {
+            "status": "",
+            "asset_profile": "",
+            "detection": "",
+            "graph": "",
+            "fusion": "",
         }
-        parts = [part for part in [status_text, detection_text, graph_text, fusion_text] if part]
+        self.last_inclusion: dict[str, tuple[bool, str | None]] = {}
+
+    def compose(self, package: CopilotContextPackage, *, request_id: str = "", base_input_tokens: int = 0) -> str:
+        profile_sections = self._compose_json_sections(package.asset_profiles, "ASSET_PROFILE_JSON")
+        detection_sections = self._compose_json_sections(package.detections, "ASSET_DETECTION_JSON")
+        graph_candidate = self._compose_graph(package, request_id=request_id)
+        max_dynamic_tokens = max(
+            0,
+            self.settings.llm_context_window_tokens
+            - self.settings.llm_reserved_output_tokens
+            - self.settings.llm_context_safety_margin_tokens
+            - base_input_tokens,
+        )
+
+        self.last_inclusion = {}
+        provisional = self._compose_provider_manifest(package, graph_included=bool(graph_candidate))
+        used_tokens = approx_tokens(provisional)
+        included_profiles: list[str] = []
+        included_detections: list[str] = []
+        for provider_name, ip, section in [*profile_sections, *detection_sections]:
+            key = f"{provider_name}:{ip}"
+            section_tokens = approx_tokens(section)
+            if used_tokens + section_tokens <= max_dynamic_tokens:
+                used_tokens += section_tokens
+                self.last_inclusion[key] = (True, None)
+                (included_profiles if provider_name == "asset_profile" else included_detections).append(section)
+            else:
+                self.last_inclusion[key] = (False, "global_context_limit")
+                logger.warning(
+                    "event=product_context_not_included request_id=%s provider=%s target_ip=%s raw_json_approx_tokens=%s reason=global_context_limit raw_payload_preserved=true",
+                    request_id,
+                    provider_name,
+                    ip,
+                    section_tokens,
+                )
+
+        graph_text = graph_candidate
+        graph_included = False
+        if graph_text:
+            graph_tokens = approx_tokens(graph_text)
+            if used_tokens + graph_tokens <= max_dynamic_tokens:
+                graph_included = True
+                used_tokens += graph_tokens
+            else:
+                logger.warning(
+                    "event=graph_context_not_included request_id=%s context_approx_tokens=%s reason=global_context_limit",
+                    request_id,
+                    graph_tokens,
+                )
+                graph_text = ""
+        self.last_inclusion["graph"] = (graph_included, None if graph_included else "global_context_limit")
+
+        manifest = self._compose_provider_manifest(package, graph_included=graph_included)
+        profile_text = "\n\n".join(included_profiles)
+        detection_text = "\n\n".join(included_detections)
+        parts = [part for part in (manifest, profile_text, detection_text, graph_text) if part]
         text = "\n\n".join(parts)
+        self.last_parts = {
+            "status": manifest,
+            "asset_profile": profile_text,
+            "detection": detection_text,
+            "graph": graph_text,
+            "fusion": "",
+        }
         logger.info(
-            "event=context_composed request_id=%s providers=%s status_chars=%s graph_chars=%s detection_chars=%s fusion_chars=%s total_dynamic_chars=%s total_dynamic_approx_tokens=%s",
+            "event=context_composed request_id=%s providers=%s manifest_chars=%s asset_profile_chars=%s detection_chars=%s graph_chars=%s total_dynamic_chars=%s total_dynamic_approx_tokens=%s max_dynamic_tokens=%s",
             request_id,
-            ",".join(
-                name
-                for name, part in [
-                    ("status", status_text),
-                    ("graph", graph_text),
-                    ("detection", detection_text),
-                    ("fusion", fusion_text),
-                ]
-                if part
-            )
-            or "none",
-            len(status_text),
-            len(graph_text),
+            ",".join(name for name, value in (("manifest", manifest), ("asset_profile", profile_text), ("detection", detection_text), ("graph", graph_text)) if value),
+            len(manifest),
+            len(profile_text),
             len(detection_text),
-            len(fusion_text),
+            len(graph_text),
             len(text),
             approx_tokens(text),
+            max_dynamic_tokens,
         )
         return text
 
     @staticmethod
-    def _compose_provider_statuses(package: CopilotContextPackage) -> str:
-        lines = [
-            "[SOORIN EVIDENCE AUTHORITY]",
-            "Current structured graph/detection evidence and current provider statuses are authoritative for this turn.",
-            "Previous assistant messages are conversational context only. Never treat their asset claims, peer lists, classifications, counts, or conclusions as verified evidence.",
-            "If current evidence is not_found, skipped, or unavailable, do not reconstruct evidence from earlier assistant text.",
-            "Treat unavailable or missing evidence as a limitation, not as evidence about the asset.",
-        ]
-        if package.entities and package.entities.unsupported_constraints:
-            constraints = ", ".join(package.entities.unsupported_constraints)
-            lines.extend(
-                [
-                    f"Unsupported routing constraints: {constraints}",
-                    "CIDR/subnet filtering is not active in the Copilot graph provider. These values are constraints, not host assets, and were not queried as graph nodes.",
-                ]
+    def _compose_json_sections(results: list[Any], tag: str) -> list[tuple[str, str, str]]:
+        sections: list[tuple[str, str, str]] = []
+        provider_name = "asset_profile" if tag == "ASSET_PROFILE_JSON" else "detection"
+        for result in results:
+            if result.status not in {"available", "not_found"} or not result.serialized_json:
+                continue
+            sections.append(
+                (
+                    provider_name,
+                    result.ip,
+                    "\n".join((f'[{tag} ip="{result.ip}"]', result.serialized_json, f'[/{tag}]')),
+                )
             )
-        graph = package.graph
-        if graph:
-            source = graph.provenance.source if graph.provenance else "observed_communication_graph"
-            lines.append(f"Graph evidence: status={graph.status}; source={source}")
-            if graph.limitations:
-                lines.append(f"Graph limitation: {graph.limitations[0]}")
-            elif graph.status == "unavailable":
-                lines.append("Graph limitation: Graph evidence was unavailable for this request.")
+        return sections
 
-        detection = package.detection
-        if detection:
-            source = detection.provenance.source if detection.provenance else "product_asset_detection"
-            found = detection.evidence.found if detection.evidence else False if detection.status == "not_found" else "unknown"
-            lines.append(f"Detection evidence: status={detection.status}; asset_found={str(found).lower()}; source={source}")
-            if detection.evidence:
-                confidence = detection.evidence.classification.confidence
-                if confidence is None:
-                    lines.append(
-                        "Detection confidence: confidence=null; confidence_available=false. Treat any product label as tentative and do not invent a numeric score."
-                    )
-                elif confidence >= 0.8:
-                    lines.append(
-                        f"Detection confidence: confidence={confidence}; confidence_available=true. A strong classification inference is supported by the supplied score, subject to evidence limitations."
-                    )
-                else:
-                    lines.append(
-                        f"Detection confidence: confidence={confidence}; confidence_available=true. Report the supplied score without overstating classification certainty."
-                    )
-            limitation = next(iter(detection.limitations), "")
-            if limitation:
-                lines.append(f"Detection limitation: {limitation}")
-            elif detection.status == "unavailable":
-                lines.append("Detection limitation: Detection evidence was unavailable for this request.")
+    @staticmethod
+    def _combined_status(results: list[Any]) -> str:
+        if not results:
+            return "skipped"
+        statuses = {item.status for item in results}
+        return next(iter(statuses)) if len(statuses) == 1 else "partial"
 
-        return "\n".join(lines)
+    def _product_coverage(self, results: list[Any], provider_name: str) -> dict[str, Any]:
+        entities: dict[str, Any] = {}
+        for item in results:
+            included = self.last_inclusion.get(f"{provider_name}:{item.ip}", (False, None))[0]
+            entities[item.ip] = {
+                "status": item.status,
+                "payload_included": included,
+                "payload_complete": bool(item.full_payload_fetched),
+                "stale": bool(item.stale),
+            }
+        return {
+            "status": self._combined_status(results),
+            "payload_included": bool(entities) and all(value["payload_included"] for value in entities.values()),
+            "payload_complete": bool(entities) and all(value["payload_complete"] for value in entities.values()),
+            "stale": any(value["stale"] for value in entities.values()),
+            "entities": entities,
+        }
+
+    def _compose_provider_manifest(self, package: CopilotContextPackage, *, graph_included: bool) -> str:
+        requested: list[str] = []
+        coverage: dict[str, Any] = {}
+        if package.asset_profiles:
+            requested.append("asset_profile")
+            coverage["asset_profile"] = self._product_coverage(package.asset_profiles, "asset_profile")
+        if package.detections:
+            requested.append("asset_detection")
+            coverage["asset_detection"] = self._product_coverage(package.detections, "detection")
+        if package.graph:
+            requested.append("graph")
+            context = package.graph.context or {}
+            coverage["graph"] = {
+                "status": package.graph.status,
+                "payload_included": graph_included,
+                "requested_scope": context.get("requested_scope", context.get("scope", "none")),
+                "candidate_node_count": context.get("candidate_node_count", 0),
+                "returned_node_count": context.get("retrieved_node_count", context.get("returned_node_count", 0)),
+                "candidate_edge_count": context.get("candidate_edge_count", 0),
+                "returned_edge_count": context.get("retrieved_edge_count", context.get("returned_edge_count", 0)),
+                "retrieval_complete": context.get("retrieval_complete", False),
+                "retrieval_truncated": context.get("retrieval_truncated", False),
+                "retrieval_truncation_reason": context.get("retrieval_truncation_reason"),
+                "serialized_context_complete_for_retrieved_subset": context.get("serialized_context_complete_for_retrieved_subset", False),
+                "serialized_context_truncated": context.get("serialized_context_truncated", False),
+                "serialized_context_truncation_reason": context.get("serialized_context_truncation_reason"),
+                "requested_scope_complete": context.get("requested_scope_complete", False),
+                "complete_for_user_request": bool(graph_included and context.get("complete_for_user_request", False)),
+            }
+        target_entities = [entity.value for entity in package.entities.entities]
+        if not target_entities and package.graph:
+            target_entities = [str(item) for item in package.graph.context.get("target_ips", []) if item]
+            if not target_entities and package.graph.context.get("target_ip"):
+                target_entities = [str(package.graph.context["target_ip"])]
+        manifest = {
+            "evidence_authority": "Current provider payloads and coverage are authoritative for this turn; previous assistant claims are conversation only.",
+            "provider_coverage": coverage,
+            "provider_semantics": {name: PROVIDER_SEMANTICS[name] for name in requested},
+            "requested_providers": requested,
+            "target_entities": target_entities,
+            "value_semantics": VALUE_SEMANTICS,
+        }
+        return "[SOORIN_PROVIDER_MANIFEST]\n" + json.dumps(manifest, ensure_ascii=False, separators=(",", ":"), sort_keys=True) + "\n[/SOORIN_PROVIDER_MANIFEST]"
 
     def _compose_graph(self, package: CopilotContextPackage, *, request_id: str = "") -> str:
         graph = package.graph
         if not graph or graph.status not in {"available", "not_found"}:
-            logger.info(
-                "event=context_composer_complete request_id=%s section_count=0 context_chars=0 context_approx_tokens=0",
-                request_id,
-            )
             return ""
-
         context = graph.context or {}
-        nodes, edges, truncation_reasons = self._select_context_records(context)
-        provider_context_truncated = bool(context.get("context_truncated", False))
-        if provider_context_truncated and not truncation_reasons:
-            truncation_reasons.append(
-                str(context.get("context_truncation_reason") or "provider_context_limit")
-            )
-        context_truncated = bool(truncation_reasons)
-        truncation_reason = truncation_reasons[0] if truncation_reasons else None
-        retrieved_nodes = list(context.get("nodes") or [])
-        retrieved_edges = list(context.get("edges") or context.get("path_edges") or [])
-        retrieved_node_count = int(context.get("retrieved_node_count", len(retrieved_nodes)) or 0)
-        retrieved_edge_count = int(context.get("retrieved_edge_count", len(retrieved_edges)) or 0)
-        context["candidate_node_count"] = max(
-            int(context.get("candidate_node_count", retrieved_node_count) or 0),
-            retrieved_node_count,
+        nodes, edges, reasons = self._select_context_records(context)
+        serialized_truncated = bool(reasons)
+        serialized_reason = reasons[0] if reasons else None
+        target_ip = str(context.get("target_ip") or "")
+        direction_counts = self._included_direction_counts(nodes, target_ip)
+        context.update(
+            {
+                "included_node_count": len(nodes),
+                "included_edge_count": len(edges),
+                "context_node_count": len(nodes),
+                "context_edge_count": len(edges),
+                "inbound_context_included": direction_counts["inbound"],
+                "outbound_context_included": direction_counts["outbound"],
+                "bidirectional_context_included": direction_counts["bidirectional"],
+                "serialized_context_complete_for_retrieved_subset": not serialized_truncated,
+                "serialized_context_truncated": serialized_truncated,
+                "serialized_context_truncation_reason": serialized_reason,
+                "context_truncated": serialized_truncated,
+                "context_truncation_reasons": reasons,
+                "context_truncation_reason": serialized_reason,
+                "context_mode": "aggregate_only" if context.get("scope") == "node_summary" else "enumerated",
+                "aggregate_only_context": context.get("scope") == "node_summary",
+                "complete_for_user_request": bool(context.get("requested_scope_complete", False) and not serialized_truncated),
+            }
         )
-        context["candidate_edge_count"] = max(
-            int(context.get("candidate_edge_count", retrieved_edge_count) or 0),
-            retrieved_edge_count,
-        )
-        context["retrieved_node_count"] = retrieved_node_count
-        context["retrieved_edge_count"] = retrieved_edge_count
-        context["included_node_count"] = len(nodes)
-        context["included_edge_count"] = len(edges)
-        context["context_node_count"] = len(nodes)
-        context["context_edge_count"] = len(edges)
-        context["context_truncated"] = context_truncated
-        context["context_truncation_reasons"] = truncation_reasons
-        context["context_truncation_reason"] = truncation_reason
-        context["context_mode"] = "aggregate_only" if context.get("scope") == "node_summary" else "enumerated"
-        context["aggregate_only_context"] = context.get("scope") == "node_summary"
-        direction_counts = self._included_direction_counts(nodes, context.get("target_ip", ""))
-        context["inbound_context_included"] = direction_counts["inbound"]
-        context["outbound_context_included"] = direction_counts["outbound"]
-        context["bidirectional_context_included"] = direction_counts["bidirectional"]
-
-        peer_subnets = Counter(str(node.get("subnet") or "other") for node in nodes if node.get("hop") != 0)
-        subnet_summary = ", ".join(f"{subnet}{count}" for subnet, count in peer_subnets.most_common(12)) or "none"
-        scope = str(context.get("scope", "node_summary"))
-        direction = str(context.get("direction", "both"))
-        relationship_mode = str(context.get("relationship_mode", "none"))
-        target_ips = [str(item) for item in (context.get("target_ips") or []) if item]
-
-        lines = [
-            "[SOORIN GRAPH EVIDENCE]",
-            "Active UI-selected investigation entity." if graph.target_entity and graph.target_entity.source == "ui" else "Active investigation entity.",
-            "Use this section as bounded product evidence. Do not infer beyond it.",
-            "Use this evidence only when relevant to the current question.",
-            "Describe graph structure as observed communication relationships.",
-            "Distinguish observed graph evidence from structural interpretation and unknown evidence.",
-            f"Evidence source: {graph.provenance.source if graph.provenance else 'observed_communication_graph'}",
-            f"Target IPs: {_list_values(target_ips, limit=2)}"
-            if target_ips
-            else f"Target IP: {context.get('target_ip') or (graph.target_entity.value if graph.target_entity else '')}",
-            f"Node found: {bool(context.get('node_found'))}",
-            f"Scope: {context.get('scope', 'node_summary')}, direction={context.get('direction', 'both')}, depth={context.get('depth', 0)}",
-        ]
-
-        if graph.status == "available":
-            if relationship_mode == "direct":
-                lines.extend(
-                    [
-                        f"Relationship source: {context.get('source', '')}; present={context.get('source_present', False)}",
-                        f"Relationship target: {context.get('target', '')}; present={context.get('target_present', False)}",
-                        f"Forward edge source_to_target: {context.get('forward_edge', False)}",
-                        f"Reverse edge target_to_source: {context.get('reverse_edge', False)}",
-                        f"Direct relationship: {context.get('relationship_status', context.get('relationship', 'unknown'))}; bidirectional={context.get('bidirectional', False)}",
-                    ]
-                )
-            if relationship_mode == "compare":
-                entity_a = dict(context.get("entity_a") or {})
-                entity_b = dict(context.get("entity_b") or {})
-                direct = dict(context.get("direct_relationship") or {})
-                degree_comparison = dict(context.get("degree_comparison") or {})
-                subnet_comparison = dict(context.get("subnet_comparison") or {})
-                lines.extend(
-                    [
-                        f"Comparison entities: {_list_values([str(item) for item in context.get('entities', [])], limit=2)}",
-                        f"Entity A summary: ip={entity_a.get('ip', '')}, present={entity_a.get('present', False)}, inbound_total={entity_a.get('inbound_total', 0)}, outbound_total={entity_a.get('outbound_total', 0)}, bidirectional_total={entity_a.get('bidirectional_total', 0)}",
-                        f"Entity B summary: ip={entity_b.get('ip', '')}, present={entity_b.get('present', False)}, inbound_total={entity_b.get('inbound_total', 0)}, outbound_total={entity_b.get('outbound_total', 0)}, bidirectional_total={entity_b.get('bidirectional_total', 0)}",
-                        f"Direct relationship A->B={direct.get('a_to_b', False)}, B->A={direct.get('b_to_a', False)}, relationship={direct.get('relationship_status', direct.get('relationship', 'unknown'))}",
-                        f"Degree comparison: entity_a_total_peers={degree_comparison.get('entity_a_total_peer_count', 0)}, entity_b_total_peers={degree_comparison.get('entity_b_total_peer_count', 0)}, broader_outbound={degree_comparison.get('broader_outbound_entity', 'unknown')}, broader_inbound={degree_comparison.get('broader_inbound_entity', 'unknown')}",
-                        f"Subnet comparison: shared={_list_values([str(item) for item in subnet_comparison.get('shared_subnets', [])], limit=8)}, entity_a_unique={_list_values([str(item) for item in subnet_comparison.get('entity_a_unique_subnets', [])], limit=8)}, entity_b_unique={_list_values([str(item) for item in subnet_comparison.get('entity_b_unique_subnets', [])], limit=8)}",
-                        f"Shared peers: total={context.get('shared_peer_total', 0)}, retrieved={context.get('shared_peers_retrieved_count', 0)}, values={_list_values([str(item) for item in context.get('shared_peers_retrieved', [])], limit=self.settings.graph_comparison_max_shared_peers)}",
-                        f"Unique peer totals: entity_a={context.get('entity_a_unique_peer_total', 0)}, entity_b={context.get('entity_b_unique_peer_total', 0)}",
-                    ]
-                )
-            lines.extend(
-                [
-                    f"Inbound peers: observed_total={context.get('inbound_total', 0)}, graph_retrieved={context.get('inbound_retrieved', context.get('inbound_returned', 0))}, model_context_included={context.get('inbound_context_included', 0)}",
-                    f"Outbound peers: observed_total={context.get('outbound_total', 0)}, graph_retrieved={context.get('outbound_retrieved', context.get('outbound_returned', 0))}, model_context_included={context.get('outbound_context_included', 0)}",
-                    f"Bidirectional peers: observed_total={context.get('bidirectional_total', 0)}, graph_retrieved={context.get('bidirectional_retrieved', context.get('bidirectional_returned', 0))}, model_context_included={context.get('bidirectional_context_included', 0)}",
-                    f"Nodes: candidate={context.get('candidate_node_count', 0)}, graph_retrieved={context.get('retrieved_node_count', context.get('returned_node_count', 0))}, model_context_included={context.get('context_node_count', 0)}",
-                    f"Edges: candidate={context.get('candidate_edge_count', 0)}, graph_retrieved={context.get('retrieved_edge_count', context.get('returned_edge_count', 0))}, model_context_included={context.get('context_edge_count', 0)}",
-                    f"Context mode: {context.get('context_mode', 'enumerated')}",
-                    f"Peer subnet distribution in this prompt: {subnet_summary}",
-                    f"Outbound subnets reached: {_list_values(list(context.get('subnets_reached') or []), limit=12)}",
-                ]
-            )
-            if scope == "node_summary":
-                lines.append("Neighbor lists are intentionally not enumerated for node_summary.")
-            elif scope == "two_hop":
-                hop_counts = Counter(int(node.get("hop", 0)) for node in nodes)
-                lines.append(
-                    f"Hop summary in this prompt: hop0={hop_counts.get(0, 0)}, hop1={hop_counts.get(1, 0)}, hop2={hop_counts.get(2, 0)}"
-                )
-                lines.append(f"Representative node IDs: {_list_node_ids(nodes, limit=30)}")
-                lines.append(f"Representative edges: {_list_edges(edges, limit=30)}")
-            elif scope == "path":
-                lines.append(f"Path nodes: {_list_values(list(context.get('path_nodes') or []), limit=40)}")
-                lines.append(f"Path edges: {_list_edges(edges, limit=40)}")
-            else:
-                matching_peers = self._matching_peer_count(context, direction)
-                included_peers = direction_counts.get(direction, direction_counts["union"])
-                if scope == "full_neighbors" and matching_peers <= self.settings.graph_full_enumeration_max_peers and not context_truncated:
-                    lines.append(f"All {matching_peers} requested {direction} peers were retrieved and explicitly included.")
-                elif scope == "full_neighbors":
-                    lines.append(
-                        f"{matching_peers} requested {direction} peers were retrieved; {included_peers} are explicitly included in this prompt."
-                    )
-                    lines.append("The full machine-readable graph retrieval result exists outside the model context.")
-                lines.append(f"Included node IDs: {_list_node_ids(nodes, limit=self.settings.graph_context_max_enumerated_nodes)}")
-                lines.append(f"Included edges: {_list_edges(edges, limit=self.settings.graph_context_max_enumerated_edges)}")
-            if context.get("formal_anomaly_evidence_available") is False:
-                lines.append("Formal anomaly evidence: unavailable; no dedicated anomaly score was supplied.")
-                lines.append(
-                    "For anomaly questions, still assess the supplied evidence: inbound/outbound balance, peer breadth, bidirectional pattern, graph reach, classification consistency, confidence availability, rules, conflicts, missing evidence, and truncation."
-                )
-                lines.append(
-                    "Offer plausible benign explanations and anomaly hypotheses, then state what evidence would confirm or reject them. This is an evidence-based assessment, not a formal anomaly score."
-                )
-            if context.get("path_exists") is not None:
-                lines.append(f"Path exists: {bool(context.get('path_exists'))}; hop_count={context.get('hop_count')}")
-            if context.get("retrieval_truncated"):
-                lines.append(f"Graph retrieval truncation: true; reason={context.get('retrieval_truncation_reason') or 'unknown'}")
-            else:
-                lines.append("Graph retrieval truncation: false.")
-            if context.get("context_truncated"):
-                lines.append(f"Model-context truncation: true; reason={context.get('context_truncation_reason') or 'graph_context_token_budget'}")
-            else:
-                lines.append("Model-context truncation: false.")
-        else:
-            lines.append("No node for this IP exists in the currently loaded observed communication graph.")
-
-        limitations = list(context.get("limitations") or graph.limitations or [])
-        if limitations:
-            lines.append("Limitations:")
-            lines.extend(f"- {item}" for item in limitations[:5])
-        lines.extend(
-            [
-                "Grounding rules:",
-                "- Mention graph evidence only when useful for the user's question.",
-                "- If the evidence is missing or insufficient, say what is missing.",
-                "- Do not claim live logs, live assets, routing proof, or raw topology access.",
-                "- Inbound-only can be called inbound-only or sink-like in this graph, not server/client/asset role proof.",
-                "- Do not describe edges as successful sessions or established connections unless supplied.",
-                "- Do not infer ports, protocols, bytes, traffic volume, processes, maliciousness, or physical topology.",
-                "- Prefer 'high-degree' or 'highly connected' over 'highly active' unless temporal traffic evidence is supplied.",
-            ]
-        )
-
-        text = "\n".join(lines)
+        inbound_peers = sorted(str(node["id"]) for node in nodes if node.get("id") != target_ip and node.get("inbound"))
+        outbound_peers = sorted(str(node["id"]) for node in nodes if node.get("id") != target_ip and node.get("outbound"))
+        bidirectional_peers = sorted(set(inbound_peers).intersection(outbound_peers))
+        coverage = {
+            "retrieval_complete": context.get("retrieval_complete", False),
+            "retrieval_truncated": context.get("retrieval_truncated", False),
+            "retrieval_truncation_reason": context.get("retrieval_truncation_reason"),
+            "serialized_context_complete_for_retrieved_subset": not serialized_truncated,
+            "serialized_context_truncated": serialized_truncated,
+            "serialized_context_truncation_reason": serialized_reason,
+            "requested_scope_complete": context.get("requested_scope_complete", False),
+            "complete_for_user_request": context["complete_for_user_request"],
+        }
+        payload: dict[str, Any] = {
+            "status": graph.status,
+            "target_ip": target_ip,
+            "target_ips": context.get("target_ips", [target_ip] if target_ip else []),
+            "requested_scope": context.get("requested_scope", context.get("scope", "none")),
+            "direction": context.get("direction", "none"),
+            "depth": context.get("depth", 0),
+            "coverage": coverage,
+            "counts": {
+                "candidate_nodes": context.get("candidate_node_count", 0),
+                "returned_nodes": context.get("retrieved_node_count", context.get("returned_node_count", 0)),
+                "serialized_nodes": len(nodes),
+                "candidate_edges": context.get("candidate_edge_count", 0),
+                "returned_edges": context.get("retrieved_edge_count", context.get("returned_edge_count", 0)),
+                "serialized_edges": len(edges),
+            },
+            "relationships": {
+                "inbound": {"total": context.get("inbound_total", 0), "returned": context.get("inbound_retrieved", context.get("inbound_returned", 0)), "peers": inbound_peers},
+                "outbound": {"total": context.get("outbound_total", 0), "returned": context.get("outbound_retrieved", context.get("outbound_returned", 0)), "peers": outbound_peers},
+                "bidirectional": {"total": context.get("bidirectional_total", 0), "returned": context.get("bidirectional_retrieved", context.get("bidirectional_returned", 0)), "peers": bidirectional_peers},
+            },
+            "nodes": nodes,
+            "edges": edges,
+            "limitations": list(context.get("limitations") or graph.limitations or []),
+            "grounding_rules": GRAPH_GROUNDING_RULES,
+        }
+        if context.get("relationship_mode") == "direct":
+            payload["direct_relationship"] = {
+                "source": context.get("source"),
+                "target": context.get("target"),
+                "source_present": context.get("source_present", False),
+                "target_present": context.get("target_present", False),
+                "source_to_target": context.get("forward_edge", False),
+                "target_to_source": context.get("reverse_edge", False),
+                "relationship_status": context.get("relationship_status", context.get("relationship", "unknown")),
+            }
+        if context.get("relationship_mode") == "compare":
+            entity_a = dict(context.get("entity_a") or {})
+            entity_b = dict(context.get("entity_b") or {})
+            payload["entities"] = {
+                str(entity_a.get("ip", "entity_a")): {key: value for key, value in entity_a.items() if key != "peers_retrieved"},
+                str(entity_b.get("ip", "entity_b")): {key: value for key, value in entity_b.items() if key != "peers_retrieved"},
+            }
+            payload["comparison"] = {
+                "shared_peer_total": context.get("shared_peer_total", 0),
+                "shared_peers_returned": context.get("shared_peers_retrieved", []),
+                "entity_a_unique_peer_total": context.get("entity_a_unique_peer_total", 0),
+                "entity_b_unique_peer_total": context.get("entity_b_unique_peer_total", 0),
+                "relationship": context.get("direct_relationship", {}),
+                "degree": context.get("degree_comparison", {}),
+                "subnets": context.get("subnet_comparison", {}),
+            }
+        if "path_exists" in context:
+            payload["path"] = {
+                "exists": context.get("path_exists"),
+                "hop_count": context.get("hop_count"),
+                "nodes": context.get("path_nodes", []),
+            }
+        text = "[SOORIN_GRAPH_CONTEXT_JSON]\n" + json.dumps(payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True) + "\n[/SOORIN_GRAPH_CONTEXT_JSON]"
         logger.info(
-            "event=context_composer_complete request_id=%s section_count=1 context_chars=%s context_approx_tokens=%s graph_status=%s limitation_count=%s retrieval_nodes=%s context_nodes=%s retrieval_edges=%s context_edges=%s context_truncated=%s",
+            "event=context_composer_graph_complete request_id=%s graph_status=%s requested_scope=%s retrieval_complete=%s serialized_context_complete_for_retrieved_subset=%s requested_scope_complete=%s complete_for_user_request=%s returned_nodes=%s serialized_nodes=%s returned_edges=%s serialized_edges=%s context_chars=%s",
             request_id,
-            len(text),
-            approx_tokens(text),
             graph.status,
-            len(limitations),
-            context.get("retrieved_node_count", context.get("returned_node_count", 0)),
-            context.get("context_node_count", 0),
-            context.get("retrieved_edge_count", context.get("returned_edge_count", 0)),
-            context.get("context_edge_count", 0),
-            context.get("context_truncated", False),
+            payload["requested_scope"],
+            coverage["retrieval_complete"],
+            coverage["serialized_context_complete_for_retrieved_subset"],
+            coverage["requested_scope_complete"],
+            coverage["complete_for_user_request"],
+            payload["counts"]["returned_nodes"],
+            len(nodes),
+            payload["counts"]["returned_edges"],
+            len(edges),
+            len(text),
         )
         return text
 
-    @staticmethod
-    def _compose_alignment(package: CopilotContextPackage) -> str:
-        graph = package.graph
-        detection = package.detection
-        if not graph or not detection or graph.status != "available" or detection.status != "available" or not detection.evidence:
-            return ""
-
-        context = graph.context or {}
-        evidence = detection.evidence
-        role_text = " ".join(
-            str(item or "")
-            for item in [
-                evidence.classification.primary_role,
-                evidence.classification.inferred_device_type,
-                evidence.tagging.stored_tag,
-                evidence.tagging.stored_sub_tag,
-                evidence.tagging.tag,
-                evidence.tagging.sub_tag,
-            ]
-        ).lower()
-        inbound_total = int(context.get("inbound_total", 0) or 0)
-        outbound_total = int(context.get("outbound_total", 0) or 0)
-        agreement: list[str] = []
-        conflicts: list[str] = []
-        unknowns: list[str] = []
-
-        if "workstation" in role_text and outbound_total > inbound_total:
-            agreement.append("Detected workstation role and outbound-heavy graph behavior may align.")
-        if "workstation" in role_text and inbound_total > max(1, outbound_total * 2):
-            conflicts.append("Detected workstation role may conflict with heavy server-like inbound exposure.")
-        if "network" in role_text and not any(
-            key in evidence.signals.metrics
-            for key in ["snmp", "snmp_seen", "network_os", "network_device_evidence"]
-        ):
-            conflicts.append("Detected network-device wording has weak or missing SNMP/network-OS evidence.")
-        if not agreement:
-            unknowns.append("No deterministic agreement signal was found; this is not negative proof.")
-        if not conflicts:
-            unknowns.append("No deterministic conflict signal was found in the bounded evidence.")
-
-        lines = [
-            "[SOORIN EVIDENCE ALIGNMENT]",
-            "agreement:",
-            *[f"- {item}" for item in agreement],
-            "conflicts:",
-            *[f"- {item}" for item in conflicts],
-            "unknowns:",
-            *[f"- {item}" for item in unknowns],
-        ]
-        return "\n".join(lines)
-
-    def _select_context_records(
-        self,
-        context: dict[str, Any],
-    ) -> tuple[list[dict[str, object]], list[dict[str, object]], list[str]]:
+    def _select_context_records(self, context: dict[str, Any]) -> tuple[list[dict[str, object]], list[dict[str, object]], list[str]]:
         nodes = list(context.get("nodes") or [])
         edges = list(context.get("edges") or context.get("path_edges") or [])
         scope = str(context.get("scope", "node_summary"))
-        direction = str(context.get("direction", "both"))
-        peer_count = self._matching_peer_count(context, direction)
         target_ip = str(context.get("target_ip") or "")
-
         if scope == "node_summary":
-            selected_nodes = [node for node in nodes if str(node.get("id") or "") == target_ip][:1]
-            return selected_nodes, [], []
-
+            return [node for node in nodes if str(node.get("id") or "") == target_ip][:1], [], []
         node_limit = self.settings.graph_context_max_enumerated_nodes
         edge_limit = self.settings.graph_context_max_enumerated_edges
-        if scope == "full_neighbors" and peer_count <= self.settings.graph_full_enumeration_max_peers:
-            node_limit = max(node_limit, len(nodes))
-            edge_limit = max(edge_limit, len(edges))
+        if scope == "full_neighbors" and self._matching_peer_count(context, str(context.get("direction", "both"))) <= self.settings.graph_full_enumeration_max_peers:
+            node_limit, edge_limit = max(node_limit, len(nodes)), max(edge_limit, len(edges))
         if scope == "path":
-            node_limit = max(node_limit, len(nodes))
-            edge_limit = max(edge_limit, len(edges))
-        ordered_nodes = nodes
-        if target_ip:
-            ordered_nodes = [
-                *[node for node in nodes if str(node.get("id") or "") == target_ip],
-                *[node for node in nodes if str(node.get("id") or "") != target_ip],
-            ]
-        selected_nodes = ordered_nodes[:node_limit]
-        selected_node_ids = {str(node.get("id")) for node in selected_nodes if node.get("id")}
-        eligible_edges = [
-            edge for edge in edges
-            if selected_node_ids
-            and str(edge.get("source")) in selected_node_ids
-            and str(edge.get("target")) in selected_node_ids
-        ]
+            node_limit, edge_limit = max(node_limit, len(nodes)), max(edge_limit, len(edges))
+        ordered = [*[node for node in nodes if str(node.get("id") or "") == target_ip], *[node for node in nodes if str(node.get("id") or "") != target_ip]]
+        selected_nodes = ordered[:node_limit]
+        selected_ids = {str(node.get("id")) for node in selected_nodes if node.get("id")}
+        eligible_edges = [edge for edge in edges if str(edge.get("source")) in selected_ids and str(edge.get("target")) in selected_ids]
         selected_edges = eligible_edges[:edge_limit]
-        truncation_reasons: list[str] = []
+        reasons: list[str] = []
         if len(selected_nodes) < len(nodes):
-            truncation_reasons.append("graph_context_node_limit")
+            reasons.append("graph_context_node_limit")
         if len(selected_edges) < len(eligible_edges):
-            truncation_reasons.append("graph_context_edge_limit")
-
-        def probe_tokens() -> int:
-            text_probe = "\n".join([
-                _list_node_ids(selected_nodes, limit=len(selected_nodes) or 1),
-                _list_edges(selected_edges, limit=len(selected_edges) or 1),
-            ])
-            return approx_tokens(text_probe)
-
-        context_token_budget = max(256, min(self.settings.graph_max_context_tokens, self._available_graph_context_tokens()))
-        token_records_removed = False
-        while selected_edges and probe_tokens() > context_token_budget:
-            selected_edges.pop()
-            token_records_removed = True
-        while len(selected_nodes) > 1 and probe_tokens() > context_token_budget:
-            selected_nodes.pop()
-            selected_node_ids = {str(node.get("id")) for node in selected_nodes if node.get("id")}
-            selected_edges = [
-                edge
-                for edge in selected_edges
-                if str(edge.get("source")) in selected_node_ids and str(edge.get("target")) in selected_node_ids
-            ]
-            token_records_removed = True
-        if token_records_removed:
-            truncation_reasons.append("graph_context_token_budget")
-        return selected_nodes, selected_edges, truncation_reasons
-
-    def _available_graph_context_tokens(self) -> int:
-        return (
-            self.settings.llm_context_window_tokens
-            - self.settings.llm_reserved_output_tokens
-            - self.settings.llm_context_safety_margin_tokens
-        )
+            reasons.append("graph_context_edge_limit")
+        return selected_nodes, selected_edges, reasons
 
     @staticmethod
     def _matching_peer_count(context: dict[str, Any], direction: str) -> int:
@@ -452,30 +367,11 @@ class ContextComposer:
             return int(context.get("inbound_retrieved", context.get("inbound_returned", 0)) or 0)
         if direction == "outbound":
             return int(context.get("outbound_retrieved", context.get("outbound_returned", 0)) or 0)
-        return max(
-            int(context.get("inbound_retrieved", context.get("inbound_returned", 0)) or 0),
-            int(context.get("outbound_retrieved", context.get("outbound_returned", 0)) or 0),
-            int(context.get("bidirectional_retrieved", context.get("bidirectional_returned", 0)) or 0),
-        )
+        return len({str(node.get("id")) for node in context.get("nodes", []) if node.get("hop") != 0 and node.get("id")})
 
     @staticmethod
     def _included_direction_counts(nodes: list[dict[str, object]], target_ip: object) -> dict[str, int]:
         target = str(target_ip or "")
-        inbound = {
-            str(node.get("id"))
-            for node in nodes
-            if node.get("id") and str(node.get("id")) != target and bool(node.get("inbound"))
-        }
-        outbound = {
-            str(node.get("id"))
-            for node in nodes
-            if node.get("id") and str(node.get("id")) != target and bool(node.get("outbound"))
-        }
-        bidirectional = inbound.intersection(outbound)
-        return {
-            "inbound": len(inbound),
-            "outbound": len(outbound),
-            "bidirectional": len(bidirectional),
-            "both": len(inbound.union(outbound)),
-            "union": len(inbound.union(outbound)),
-        }
+        inbound = {str(node.get("id")) for node in nodes if node.get("id") and str(node.get("id")) != target and bool(node.get("inbound"))}
+        outbound = {str(node.get("id")) for node in nodes if node.get("id") and str(node.get("id")) != target and bool(node.get("outbound"))}
+        return {"inbound": len(inbound), "outbound": len(outbound), "bidirectional": len(inbound & outbound)}

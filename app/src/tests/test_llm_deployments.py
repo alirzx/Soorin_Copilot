@@ -14,7 +14,7 @@ import src.config.settings as settings_module
 from src.config.llm_deployments import normalize_chat_endpoint
 from src.config.settings import Settings, get_settings
 from src.core.context.entities import EntityResolver
-from src.core.context.intent import GLMIntentRouter
+from src.core.context.intent import SemanticIntentRouter as GLMIntentRouter
 from src.core.llm.client import LLMClient
 from src.core.llm.errors import LLMError
 from src.core.memory.routing_state import SessionRoutingState
@@ -313,6 +313,8 @@ class DeploymentRequestTests(unittest.TestCase):
                 "direction": "both",
                 "depth": 0,
                 "requires_graph": True,
+                "requires_detection": False,
+                "requires_asset_profile": False,
                 "requires_multiple_entities": False,
                 "is_followup": False,
                 "classification_confidence": 0.9,
@@ -329,6 +331,7 @@ class DeploymentRequestTests(unittest.TestCase):
         )
 
         self.assertFalse(decision.fallback_used)
+        self.assertEqual(decision.decision_source, "semantic_router_repair")
         self.assertEqual([call.args[0] for call in post.call_args_list], [GPT_ENDPOINT, GPT_ENDPOINT])
         self.assertEqual(post.call_args_list[0].kwargs["json"]["max_tokens"], 77)
         self.assertEqual(post.call_args_list[1].kwargs["json"]["max_tokens"], 155)
@@ -399,6 +402,40 @@ class DeploymentRequestTests(unittest.TestCase):
         self.assertNotIn(secret_path, logs)
         self.assertNotIn(secret_key, logs)
         self.assertNotIn("Authorization", logs)
+
+
+    @patch("src.core.llm.providers.arvan.requests.post")
+    def test_semantic_router_telemetry_uses_selected_gpt_and_glm_model_identity(self, post) -> None:
+        valid = json.dumps(
+            {
+                "intent": "asset_investigation",
+                "scope": "node_summary",
+                "direction": "both",
+                "depth": 0,
+                "requires_graph": True,
+                "requires_detection": False,
+                "requires_asset_profile": False,
+                "requires_multiple_entities": False,
+                "is_followup": False,
+                "classification_confidence": 0.9,
+                "reason": "fixture",
+            }
+        )
+        for deployment, expected_model in (("gpt55", "GPT-5.5"), ("glm", "GLM-5.2")):
+            with self.subTest(deployment=deployment):
+                post.reset_mock()
+                post.return_value = response(valid)
+                settings = isolated_settings(SOORIN_INTENT_ROUTER_DEPLOYMENT=deployment)
+                router = GLMIntentRouter(settings, LLMClient(settings))
+                entities = EntityResolver().resolve("Tell me about 192.0.2.10")
+                with self.assertLogs("src.core.context.intent", level="INFO") as logs:
+                    decision = router.classify("Tell me about 192.0.2.10", entities, SessionRoutingState())
+                rendered = "\n".join(logs.output)
+                self.assertEqual(decision.decision_source, "semantic_router")
+                self.assertIn(f"router_deployment={deployment}", rendered)
+                self.assertIn(f"router_model={expected_model}", rendered)
+                self.assertIn(f"router_engine={expected_model}", rendered)
+                self.assertIn("decision_source=semantic_router", rendered)
 
 
 class UsageAndErrorCompatibilityTests(unittest.TestCase):

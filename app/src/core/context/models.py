@@ -5,12 +5,9 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
-from src.core.detection.models import AssetDetectionEvidence
-
-
 EntitySource = Literal["message", "ui", "conversation"]
 EntityType = Literal["ip"]
-ProviderStatus = Literal["available", "not_found", "unavailable", "skipped"]
+ProviderStatus = Literal["available", "not_found", "unavailable", "context_too_large", "skipped"]
 ResolutionStatus = Literal["resolved", "none", "ambiguous", "invalid"]
 EntityMode = Literal["none", "single", "multiple", "ambiguous", "invalid"]
 IntentName = Literal[
@@ -22,11 +19,10 @@ IntentName = Literal[
     "graph_followup",
     "unclear",
 ]
-IntentDecisionSource = Literal["deterministic", "glm", "fallback", "disabled"]
+IntentDecisionSource = Literal["semantic_router", "semantic_router_repair", "deterministic_fallback", "disabled"]
 GraphScope = Literal["none", "node_summary", "one_hop", "full_neighbors", "two_hop", "path", "multi_entity_comparison"]
 GraphDirection = Literal["none", "inbound", "outbound", "both"]
 RelationshipMode = Literal["none", "direct", "compare"]
-DetectionDetail = Literal["summary", "compact_full"]
 EntityBinding = Literal["explicit", "ui", "active_single", "active_pair", "none"]
 
 
@@ -72,7 +68,7 @@ class IntentDecision:
     depth: int
     requires_graph: bool
     requires_detection: bool = False
-    detection_detail: DetectionDetail = "summary"
+    requires_asset_profile: bool = False
     entity_binding: EntityBinding = "none"
     requested_entity_binding: str = "none"
     binding_source: str = ""
@@ -86,7 +82,8 @@ class IntentDecision:
     is_followup: bool = False
     classification_confidence: float = 0.0
     reason: str = ""
-    decision_source: IntentDecisionSource = "deterministic"
+    decision_source: IntentDecisionSource = "deterministic_fallback"
+    exhaustive_connections_requested: bool = False
     router_called: bool = False
     latency_ms: int = 0
     retry_count: int = 0
@@ -107,6 +104,10 @@ class IntentDecision:
         return self.requires_detection
 
     @property
+    def use_asset_profile(self) -> bool:
+        return self.requires_asset_profile
+
+    @property
     def confidence(self) -> float:
         return self.classification_confidence
 
@@ -116,7 +117,7 @@ class RouteDecision:
     use_graph: bool
     reason: str
     use_detection: bool = False
-    detection_detail: DetectionDetail = "summary"
+    use_asset_profile: bool = False
     entity_binding: EntityBinding = "none"
     requested_entity_binding: str = "none"
     resolved_entity_binding: EntityBinding = "none"
@@ -139,13 +140,14 @@ class RouteDecision:
     requires_multiple_entities: bool = False
     relationship_mode: RelationshipMode = "none"
     intent_confidence: float = 0.0
-    decision_source: IntentDecisionSource = "deterministic"
-    glm_router_called: bool = False
-    glm_router_latency_ms: int = 0
-    glm_router_retry_count: int = 0
-    glm_router_finish_reason: str | None = None
-    glm_router_content_present: bool = False
-    glm_router_error: str | None = None
+    decision_source: IntentDecisionSource = "deterministic_fallback"
+    exhaustive_connections_requested: bool = False
+    semantic_router_called: bool = False
+    semantic_router_latency_ms: int = 0
+    semantic_router_retry_count: int = 0
+    semantic_router_finish_reason: str | None = None
+    semantic_router_content_present: bool = False
+    semantic_router_error: str | None = None
     fallback_used: bool = False
     fallback_reason: str | None = None
     route_normalized: bool = False
@@ -174,18 +176,56 @@ class GraphProviderResult:
 class DetectionProviderResult:
     provider: Literal["detection"]
     status: ProviderStatus
-    detail: DetectionDetail
     ip: str = ""
-    evidence: AssetDetectionEvidence | None = None
-    rendered_context: str = ""
+    raw_payload: dict[str, Any] | list[Any] | None = None
+    serialized_json: str = ""
     provenance: ProviderProvenance | None = None
     limitations: list[str] = field(default_factory=list)
     cache_hit: bool = False
     cache_age_seconds: int | None = None
     cache_miss_reason: str | None = None
-    cached_detail: DetectionDetail | None = None
     context_truncated: bool = False
     context_truncation_reason: str | None = None
+    raw_json_bytes: int = 0
+    raw_json_chars: int = 0
+    raw_json_approx_tokens: int = 0
+    raw_top_level_key_count: int = 0
+    raw_payload_present: bool = False
+    full_payload_fetched: bool = False
+    full_payload_included: bool = False
+    asset_found: bool | None = None
+    http_status: int | None = None
+    fetched_at: str | None = None
+    stale: bool = False
+    latency_ms: int = 0
+    error_type: str | None = None
+    safe_error: str | None = None
+
+
+@dataclass(frozen=True)
+class AssetProfileProviderResult:
+    provider: Literal["asset_profile"]
+    status: ProviderStatus
+    ip: str = ""
+    raw_payload: dict[str, Any] | list[Any] | None = None
+    serialized_json: str = ""
+    provenance: ProviderProvenance | None = None
+    limitations: list[str] = field(default_factory=list)
+    cache_hit: bool = False
+    cache_age_seconds: int | None = None
+    cache_miss_reason: str | None = None
+    context_truncated: bool = False
+    context_truncation_reason: str | None = None
+    raw_json_bytes: int = 0
+    raw_json_chars: int = 0
+    raw_json_approx_tokens: int = 0
+    raw_top_level_key_count: int = 0
+    raw_payload_present: bool = False
+    full_payload_fetched: bool = False
+    full_payload_included: bool = False
+    asset_found: bool | None = None
+    http_status: int | None = None
+    fetched_at: str | None = None
     stale: bool = False
     latency_ms: int = 0
     error_type: str | None = None
@@ -196,7 +236,8 @@ class DetectionProviderResult:
 class CopilotContextPackage:
     entities: EntityResolution
     graph: GraphProviderResult | None = None
-    detection: DetectionProviderResult | None = None
+    detections: list[DetectionProviderResult] = field(default_factory=list)
+    asset_profiles: list[AssetProfileProviderResult] = field(default_factory=list)
     provenance: list[ProviderProvenance] = field(default_factory=list)
     limitations: list[str] = field(default_factory=list)
 
@@ -204,5 +245,14 @@ class CopilotContextPackage:
     def has_model_context(self) -> bool:
         return bool(
             (self.graph and self.graph.status in {"available", "not_found"})
-            or (self.detection and self.detection.status in {"available", "not_found"})
+            or any(item.status in {"available", "not_found"} for item in self.detections)
+            or any(item.status in {"available", "not_found"} for item in self.asset_profiles)
         )
+
+    @property
+    def detection(self) -> DetectionProviderResult | None:
+        return self.detections[0] if self.detections else None
+
+    @property
+    def asset_profile(self) -> AssetProfileProviderResult | None:
+        return self.asset_profiles[0] if self.asset_profiles else None

@@ -9,9 +9,10 @@ from typing import Any
 from uuid import uuid4
 
 from src.config.settings import Settings
-from src.core.context import ContextComposer, DeterministicFallbackRouter, EntityResolver, GLMIntentRouter, normalize_intent_route
+from src.core.context import ContextComposer, DeterministicFallbackRouter, EntityResolver, SemanticIntentRouter, normalize_intent_route
 from src.core.context.intent import SECURITY_ANALYSIS_WORDS, build_routing_context, resolution_from_materialized_decision
 from src.core.context.models import (
+    AssetProfileProviderResult,
     CopilotContextPackage,
     DetectionProviderResult,
     GraphProviderResult,
@@ -19,7 +20,7 @@ from src.core.context.models import (
     approx_tokens,
     compact_preview,
 )
-from src.core.context.providers import DetectionContextProvider, GraphContextProvider
+from src.core.context.providers import AssetProfileContextProvider, DetectionContextProvider, GraphContextProvider
 from src.core.llm.client import LLMClient
 from src.core.llm.errors import LLMError
 from src.core.llm.providers.base import LLMProviderResult
@@ -29,6 +30,7 @@ from src.core.copilot.trace import CopilotRequestTrace, render_human_copilot_tra
 from src.core.copilot.fallback_answer import build_evidence_fallback_answer
 from src.core.graph.loader import get_graph_metadata
 from src.core.graph.refresh import get_refresh_status
+from src.core.product_client import ProductApiClient
 
 
 logger = logging.getLogger(__name__)
@@ -68,9 +70,11 @@ class CopilotService:
         self.system_prompt = self._load_system_prompt()
         self.entity_resolver = EntityResolver()
         self.fallback_router = DeterministicFallbackRouter()
-        self.intent_router = GLMIntentRouter(settings, llm_client)
+        self.intent_router = SemanticIntentRouter(settings, llm_client)
         self.graph_provider = GraphContextProvider(settings)
-        self.detection_provider = DetectionContextProvider(settings)
+        product_client = ProductApiClient(settings)
+        self.detection_provider = DetectionContextProvider(settings, product_client)
+        self.asset_profile_provider = AssetProfileContextProvider(settings, product_client)
         self.context_composer = ContextComposer(settings)
 
     def _load_system_prompt(self) -> str:
@@ -102,6 +106,72 @@ class CopilotService:
             len(prompt),
         )
         return prompt
+
+    @staticmethod
+    def _trace_product_results(
+        trace: CopilotRequestTrace,
+        section: str,
+        results: list[Any],
+        cache_enabled: bool,
+    ) -> None:
+        """Record transport and size telemetry without copying product content."""
+        trace.put(
+            section,
+            status=", ".join(f"{item.ip}:{item.status}" for item in results) or "skipped",
+            target_ip=", ".join(item.ip for item in results),
+            result_count=len(results),
+            asset_found=", ".join(str(item.asset_found) for item in results),
+            http_status=", ".join(str(item.http_status or "") for item in results),
+            cache_enabled=cache_enabled,
+            cache_hit=", ".join(str(item.cache_hit).lower() for item in results),
+            cache_age_seconds=", ".join(str(item.cache_age_seconds if item.cache_age_seconds is not None else "") for item in results),
+            stale=", ".join(str(item.stale).lower() for item in results),
+            provider_latency_ms=sum(item.latency_ms for item in results),
+            raw_json_bytes=sum(item.raw_json_bytes for item in results),
+            raw_json_chars=sum(item.raw_json_chars for item in results),
+            raw_json_approx_tokens=sum(item.raw_json_approx_tokens for item in results),
+            raw_top_level_key_count=sum(item.raw_top_level_key_count for item in results),
+            raw_payload_present=all(item.raw_payload_present for item in results) if results else False,
+            full_payload_fetched=all(item.full_payload_fetched for item in results) if results else False,
+            full_payload_included=False,
+            context_chars=0,
+            context_approx_tokens=0,
+            context_truncated=False,
+            context_truncation_reason="",
+            source=", ".join(item.provenance.source for item in results if item.provenance),
+            fetched_at=", ".join(item.fetched_at or "" for item in results),
+            error_type=", ".join(item.error_type or "" for item in results),
+            safe_error=", ".join(item.safe_error or "" for item in results),
+        )
+
+    @staticmethod
+    def _combined_status(results: list[Any]) -> str:
+        if not results:
+            return "skipped"
+        statuses = {item.status for item in results}
+        if len(statuses) == 1:
+            return next(iter(statuses))
+        return "partial"
+
+    def _update_product_inclusion_trace(
+        self,
+        trace: CopilotRequestTrace,
+        section: str,
+        provider_name: str,
+        results: list[Any],
+        context_text: str,
+    ) -> None:
+        fetched = [item for item in results if item.status in {"available", "not_found"} and item.raw_payload_present]
+        inclusion = [self.context_composer.last_inclusion.get(f"{provider_name}:{item.ip}", (False, None)) for item in fetched]
+        reasons = [reason for included, reason in inclusion if not included and reason]
+        trace.put(
+            section,
+            full_payload_included=bool(fetched) and all(included for included, _ in inclusion),
+            context_chars=len(context_text),
+            context_approx_tokens=approx_tokens(context_text),
+            context_truncated=bool(reasons),
+            context_truncation_reason=", ".join(dict.fromkeys(reasons)),
+        )
 
     def chat(
         self,
@@ -140,7 +210,7 @@ class CopilotService:
             previous_direction=routing_state.previous_direction or "",
             previous_depth=routing_state.previous_depth if routing_state.previous_depth is not None else "",
             previous_requires_detection=routing_state.previous_requires_detection,
-            previous_detection_detail=routing_state.previous_detection_detail or "",
+            previous_requires_asset_profile=routing_state.previous_requires_asset_profile,
         )
         logger.info(
             "event=session_routing_state_loaded request_id=%s session_id=%s active_ip=%s last_provider=%s",
@@ -187,12 +257,12 @@ class CopilotService:
             route = type(route)(
                 **{
                     **route.__dict__,
-                    "glm_router_called": intent_decision.router_called,
-                    "glm_router_latency_ms": intent_decision.latency_ms,
-                    "glm_router_retry_count": intent_decision.retry_count,
-                    "glm_router_finish_reason": intent_decision.finish_reason,
-                    "glm_router_content_present": intent_decision.content_present,
-                    "glm_router_error": intent_decision.error_reason,
+                    "semantic_router_called": intent_decision.router_called,
+                    "semantic_router_latency_ms": intent_decision.latency_ms,
+                    "semantic_router_retry_count": intent_decision.retry_count,
+                    "semantic_router_finish_reason": intent_decision.finish_reason,
+                    "semantic_router_content_present": intent_decision.content_present,
+                    "semantic_router_error": intent_decision.error_reason,
                     "fallback_used": True,
                     "fallback_reason": intent_decision.fallback_reason or intent_decision.error_reason,
                 }
@@ -210,13 +280,17 @@ class CopilotService:
             )
 
         router_deployment = self.settings.deployment_for_purpose("intent_router")
+        router_repair_deployment = self.settings.deployment_for_purpose("intent_router_repair")
         trace.put(
             "INTENT",
             router_deployment=router_deployment.name,
             router_provider=router_deployment.provider_type,
             router_model=router_deployment.model,
-            router_repair_deployment=router_deployment.name if route.glm_router_retry_count else "",
-            router_repair_model=router_deployment.model if route.glm_router_retry_count else "",
+            router_engine=router_deployment.model,
+            router_repair_deployment=router_repair_deployment.name if route.semantic_router_retry_count else "",
+            router_repair_provider=router_repair_deployment.provider_type if route.semantic_router_retry_count else "",
+            router_repair_model=router_repair_deployment.model if route.semantic_router_retry_count else "",
+            router_repair_engine=router_repair_deployment.model if route.semantic_router_retry_count else "",
             decision_source=route.decision_source,
             intent=route.intent,
             scope=route.scope,
@@ -224,18 +298,19 @@ class CopilotService:
             depth=route.depth,
             requires_graph=route.use_graph,
             requires_detection=route.use_detection,
-            detection_detail=route.detection_detail,
+            requires_asset_profile=route.use_asset_profile,
             entity_binding=route.entity_binding,
             requires_multiple_entities=route.requires_multiple_entities,
             is_followup=route.followup_detected,
             classification_confidence=route.intent_confidence,
             reason=route.reason,
-            glm_router_called=route.glm_router_called,
-            glm_router_latency_ms=route.glm_router_latency_ms,
-            glm_router_retry_count=route.glm_router_retry_count,
-            glm_router_finish_reason=route.glm_router_finish_reason or "",
-            glm_router_content_present=route.glm_router_content_present,
-            glm_router_error=route.glm_router_error or "",
+            semantic_router_called=route.semantic_router_called,
+            semantic_router_latency_ms=route.semantic_router_latency_ms,
+            semantic_router_retry_count=route.semantic_router_retry_count,
+            semantic_router_finish_reason=route.semantic_router_finish_reason or "",
+            semantic_router_content_present=route.semantic_router_content_present,
+            semantic_router_error=route.semantic_router_error or "",
+            exhaustive_connections_requested=route.exhaustive_connections_requested,
             fallback_used=route.fallback_used,
             fallback_reason=route.fallback_reason or "",
             route_normalized=route.route_normalized,
@@ -261,11 +336,13 @@ class CopilotService:
             "ROUTING",
             use_graph=route.use_graph,
             use_detection=route.use_detection,
+            use_asset_profile=route.use_asset_profile,
             selected_providers=", ".join(
                 provider
                 for provider, enabled in [
                     ("graph", route.use_graph),
                     ("detection", route.use_detection),
+                    ("asset_profile", route.use_asset_profile),
                 ]
                 if enabled
             )
@@ -290,7 +367,8 @@ class CopilotService:
         )
 
         graph_result = None
-        detection_result: DetectionProviderResult | None = None
+        detection_results: list[DetectionProviderResult] = []
+        asset_profile_results: list[AssetProfileProviderResult] = []
         provenance: list[ProviderProvenance] = []
         limitations: list[str] = []
         response_warnings: list[str] = []
@@ -317,39 +395,61 @@ class CopilotService:
                 limitations.extend(graph_result.limitations)
             if graph_result and graph_result.status == "unavailable":
                 response_warnings.append("graph_evidence_unavailable")
-        if route.use_detection and route.target_entity:
-            try:
-                detection_result = self.detection_provider.fetch(
-                    route.target_entity.value,
-                    route.detection_detail,
-                    request_id,
-                    session_id=session,
-                )
-            except Exception as exc:
-                logger.warning(
-                    "event=detection_provider_failed request_id=%s status=unavailable error_type=%s stale_fallback=false latency_ms=0",
-                    request_id,
-                    type(exc).__name__,
-                )
-                detection_result = DetectionProviderResult(
-                    provider="detection",
-                    status="unavailable",
-                    detail=route.detection_detail,
-                    ip=route.target_entity.value,
-                    latency_ms=0,
-                    error_type=type(exc).__name__,
-                    safe_error="Detection provider failed.",
-                    limitations=["Detection evidence was unavailable for this request."],
-                )
-            if detection_result.provenance:
-                provenance.append(detection_result.provenance)
-            limitations.extend(detection_result.limitations)
-            if detection_result.status in {"not_found", "unavailable"}:
-                response_warnings.append(
-                    "detection_evidence_not_found"
-                    if detection_result.status == "not_found"
-                    else "detection_evidence_unavailable"
-                )
+        product_targets = route.target_entities[:2]
+        if route.use_detection:
+            for target_entity in product_targets:
+                try:
+                    result = self.detection_provider.fetch(target_entity.value, request_id, session_id=session)
+                except Exception as exc:
+                    logger.warning(
+                        "event=detection_provider_failed request_id=%s target_ip=%s status=unavailable error_type=%s stale_fallback=false latency_ms=0",
+                        request_id,
+                        target_entity.value,
+                        type(exc).__name__,
+                    )
+                    result = DetectionProviderResult(
+                        provider="detection",
+                        status="unavailable",
+                        ip=target_entity.value,
+                        error_type=type(exc).__name__,
+                        safe_error="Detection provider failed.",
+                        limitations=["Detection evidence was unavailable for this request."],
+                    )
+                detection_results.append(result)
+                if result.provenance:
+                    provenance.append(result.provenance)
+                limitations.extend(result.limitations)
+                if result.status in {"not_found", "unavailable"}:
+                    response_warnings.append(
+                        "detection_evidence_not_found" if result.status == "not_found" else "detection_evidence_unavailable"
+                    )
+        if route.use_asset_profile:
+            for target_entity in product_targets:
+                try:
+                    result = self.asset_profile_provider.fetch(target_entity.value, request_id, session_id=session)
+                except Exception as exc:
+                    logger.warning(
+                        "event=asset_profile_provider_failed request_id=%s target_ip=%s status=unavailable error_type=%s stale_fallback=false latency_ms=0",
+                        request_id,
+                        target_entity.value,
+                        type(exc).__name__,
+                    )
+                    result = AssetProfileProviderResult(
+                        provider="asset_profile",
+                        status="unavailable",
+                        ip=target_entity.value,
+                        error_type=type(exc).__name__,
+                        safe_error="Asset Profile provider failed.",
+                        limitations=["Asset Profile evidence was unavailable for this request."],
+                    )
+                asset_profile_results.append(result)
+                if result.provenance:
+                    provenance.append(result.provenance)
+                limitations.extend(result.limitations)
+                if result.status in {"not_found", "unavailable"}:
+                    response_warnings.append(
+                        "asset_profile_not_found" if result.status == "not_found" else "asset_profile_unavailable"
+                    )
         graph_context = graph_result.context if graph_result else {}
         graph_metadata = get_graph_metadata()
         refresh_status = get_refresh_status()
@@ -365,50 +465,8 @@ class CopilotService:
                 if graph_result and graph_result.target_entity
                 else graph_context.get("target_ip", "") if isinstance(graph_context, dict) else ""
             )
-        trace.put(
-            "ASSET DETECTION",
-            status=detection_result.status if detection_result else "skipped",
-            target_ip=detection_result.ip if detection_result else "",
-            detail=detection_result.detail if detection_result else route.detection_detail,
-            asset_found=detection_result.evidence.found if detection_result and detection_result.evidence else "",
-            tag=(
-                detection_result.evidence.tagging.stored_tag or detection_result.evidence.tagging.tag or ""
-                if detection_result and detection_result.evidence
-                else ""
-            ),
-            sub_tag=(
-                detection_result.evidence.tagging.stored_sub_tag or detection_result.evidence.tagging.sub_tag or ""
-                if detection_result and detection_result.evidence
-                else ""
-            ),
-            vendor=detection_result.evidence.classification.vendor if detection_result and detection_result.evidence else "",
-            product=detection_result.evidence.classification.product if detection_result and detection_result.evidence else "",
-            role=detection_result.evidence.classification.primary_role if detection_result and detection_result.evidence else "",
-            confidence=detection_result.evidence.classification.confidence if detection_result and detection_result.evidence else "",
-            confidence_available=bool(
-                detection_result
-                and detection_result.evidence
-                and detection_result.evidence.classification.confidence_available
-            ),
-            matched_rule_count=len(detection_result.evidence.matched_rules) if detection_result and detection_result.evidence else 0,
-            conflict_count=len(detection_result.evidence.conflicts) if detection_result and detection_result.evidence else 0,
-            cache_enabled=self.settings.detection_cache_enabled,
-            cache_hit=detection_result.cache_hit if detection_result else False,
-            cache_age_seconds=detection_result.cache_age_seconds if detection_result and detection_result.cache_age_seconds is not None else "",
-            cache_miss_reason=detection_result.cache_miss_reason if detection_result else "",
-            cached_detail=detection_result.cached_detail if detection_result and detection_result.cached_detail else "",
-            stale=detection_result.stale if detection_result else False,
-            provider_latency_ms=detection_result.latency_ms if detection_result else 0,
-            context_chars=len(detection_result.rendered_context) if detection_result else 0,
-            context_tokens_approx=approx_tokens(detection_result.rendered_context) if detection_result else 0,
-            context_truncated=detection_result.context_truncated if detection_result else False,
-            context_truncation_reason=detection_result.context_truncation_reason if detection_result else "",
-            source=detection_result.evidence.source if detection_result and detection_result.evidence else "",
-            fetched_at=detection_result.evidence.fetched_at.isoformat() if detection_result and detection_result.evidence else "",
-            error_type=detection_result.error_type if detection_result else "",
-            safe_error=detection_result.safe_error if detection_result else "",
-            limitation=detection_result.limitations[0] if detection_result and detection_result.limitations else "",
-        )
+        self._trace_product_results(trace, "ASSET DETECTION", detection_results, self.settings.detection_cache_enabled)
+        self._trace_product_results(trace, "ASSET PROFILE", asset_profile_results, self.settings.detection_cache_enabled)
         trace.put(
             "GRAPH RETRIEVAL",
             status=graph_result.status if graph_result else "skipped",
@@ -428,6 +486,7 @@ class CopilotService:
             candidate_edge_count=graph_context.get("candidate_edge_count", "") if isinstance(graph_context, dict) else "",
             retrieval_edge_count=graph_context.get("retrieved_edge_count", graph_context.get("returned_edge_count", "")) if isinstance(graph_context, dict) else "",
             retrieval_truncated=graph_context.get("retrieval_truncated", graph_context.get("truncated", False)) if isinstance(graph_context, dict) else False,
+            retrieval_complete=graph_context.get("retrieval_complete", False) if isinstance(graph_context, dict) else False,
             retrieval_truncation_reasons=graph_context.get("retrieval_truncation_reasons", []) if isinstance(graph_context, dict) else [],
             retrieval_truncation_reason=(graph_context.get("retrieval_truncation_reason") or graph_context.get("truncation_reason") or "") if isinstance(graph_context, dict) else "",
             graph_snapshot_version=graph_metadata.get("active_graph_version", ""),
@@ -443,51 +502,86 @@ class CopilotService:
             comparison_shared_peer_total=graph_context.get("shared_peer_total", "") if isinstance(graph_context, dict) else "",
             comparison_entity_a_unique_peer_total=graph_context.get("entity_a_unique_peer_total", "") if isinstance(graph_context, dict) else "",
             comparison_entity_b_unique_peer_total=graph_context.get("entity_b_unique_peer_total", "") if isinstance(graph_context, dict) else "",
+            requested_scope_complete=graph_context.get("requested_scope_complete", False) if isinstance(graph_context, dict) else False,
+            complete_for_user_request=graph_context.get("complete_for_user_request", False) if isinstance(graph_context, dict) else False,
         )
 
         context_package = CopilotContextPackage(
             entities=route_entities,
             graph=graph_result,
-            detection=detection_result,
+            detections=detection_results,
+            asset_profiles=asset_profile_results,
             provenance=provenance,
             limitations=limitations,
         )
         provider_statuses = {
             "graph": graph_result.status if graph_result else "skipped",
-            "detection": detection_result.status if detection_result else "skipped",
+            "detection": self._combined_status(detection_results),
+            "asset_profile": self._combined_status(asset_profile_results),
         }
         logger.info(
-            "event=provider_statuses request_id=%s graph=%s detection=%s",
+            "event=provider_statuses request_id=%s graph=%s detection=%s asset_profile=%s",
             request_id,
             provider_statuses["graph"],
             provider_statuses["detection"],
+            provider_statuses["asset_profile"],
         )
         requested_statuses = [
             provider_statuses[name]
-            for name, requested in (("graph", route.use_graph), ("detection", route.use_detection))
+            for name, requested in (("graph", route.use_graph), ("detection", route.use_detection), ("asset_profile", route.use_asset_profile))
             if requested
         ]
-        if "available" in requested_statuses and any(status != "available" for status in requested_statuses):
+        if "partial" in requested_statuses or ("available" in requested_statuses and any(status != "available" for status in requested_statuses)):
             logger.info(
-                "event=partial_provider_result request_id=%s graph=%s detection=%s synthesis_continues=true",
+                "event=partial_provider_result request_id=%s graph=%s detection=%s asset_profile=%s synthesis_continues=true",
                 request_id,
                 provider_statuses["graph"],
                 provider_statuses["detection"],
+                provider_statuses["asset_profile"],
             )
         logger.info(
-            "event=context_package_created request_id=%s entity_status=%s entity_count=%s graph_status=%s detection_status=%s provenance_count=%s limitation_count=%s",
+            "event=context_package_created request_id=%s entity_status=%s entity_count=%s graph_status=%s detection_status=%s asset_profile_status=%s provenance_count=%s limitation_count=%s",
             request_id,
             route_entities.status,
             len(route_entities.entities),
             graph_result.status if graph_result else "skipped",
-            detection_result.status if detection_result else "skipped",
+            provider_statuses["detection"],
+            provider_statuses["asset_profile"],
             len(provenance),
             len(limitations),
         )
-        dynamic_context = self.context_composer.compose(context_package, request_id=request_id)
+        conversation_snapshot = (
+            self.memory_store.prepare_for_model(session, self.settings, routing_state, request_id=request_id)
+            if self.settings.chat_store_history
+            else None
+        )
+        history = conversation_snapshot.messages if conversation_snapshot else []
+        base_input_tokens = approx_tokens(self.system_prompt) + approx_tokens(user_text) + sum(
+            approx_tokens(item.get("content", "")) for item in history
+        )
+        dynamic_context = self.context_composer.compose(
+            context_package,
+            request_id=request_id,
+            base_input_tokens=base_input_tokens,
+        )
+        profile_dynamic_context = self.context_composer.last_parts.get("asset_profile", "")
         graph_dynamic_context = self.context_composer.last_parts.get("graph", "")
         detection_dynamic_context = self.context_composer.last_parts.get("detection", "")
         fusion_dynamic_context = self.context_composer.last_parts.get("fusion", "")
+        self._update_product_inclusion_trace(trace, "ASSET PROFILE", "asset_profile", asset_profile_results, profile_dynamic_context)
+        self._update_product_inclusion_trace(trace, "ASSET DETECTION", "detection", detection_results, detection_dynamic_context)
+        if any(
+            not self.context_composer.last_inclusion.get(f"detection:{item.ip}", (False, None))[0]
+            for item in detection_results
+            if item.status in {"available", "not_found"} and item.raw_payload_present
+        ):
+            response_warnings.append("detection_context_too_large")
+        if any(
+            not self.context_composer.last_inclusion.get(f"asset_profile:{item.ip}", (False, None))[0]
+            for item in asset_profile_results
+            if item.status in {"available", "not_found"} and item.raw_payload_present
+        ):
+            response_warnings.append("asset_profile_context_too_large")
         trace.put(
             "GRAPH RETRIEVAL",
             inbound_context_included=graph_context.get("inbound_context_included", "") if isinstance(graph_context, dict) else "",
@@ -497,16 +591,15 @@ class CopilotService:
             context_edge_count=graph_context.get("context_edge_count", "") if isinstance(graph_context, dict) else "",
             context_truncated=graph_context.get("context_truncated", False) if isinstance(graph_context, dict) else False,
             context_truncation_reason=graph_context.get("context_truncation_reason", "") if isinstance(graph_context, dict) else "",
+            serialized_context_complete_for_retrieved_subset=graph_context.get("serialized_context_complete_for_retrieved_subset", False) if isinstance(graph_context, dict) else False,
+            serialized_context_truncated=graph_context.get("serialized_context_truncated", False) if isinstance(graph_context, dict) else False,
+            serialized_context_truncation_reason=graph_context.get("serialized_context_truncation_reason", "") if isinstance(graph_context, dict) else "",
+            requested_scope_complete=graph_context.get("requested_scope_complete", False) if isinstance(graph_context, dict) else False,
+            complete_for_user_request=graph_context.get("complete_for_user_request", False) if isinstance(graph_context, dict) else False,
             context_chars=len(graph_dynamic_context),
             context_tokens_approx=approx_tokens(graph_dynamic_context),
         )
 
-        conversation_snapshot = (
-            self.memory_store.prepare_for_model(session, self.settings, routing_state, request_id=request_id)
-            if self.settings.chat_store_history
-            else None
-        )
-        history = conversation_snapshot.messages if conversation_snapshot else []
         trace.put(
             "MEMORY",
             conversation_raw_message_count=conversation_snapshot.raw_message_count if conversation_snapshot else 0,
@@ -533,7 +626,7 @@ class CopilotService:
         conversation_chars = sum(len(item.get("content", "")) for item in history) + len(user_text)
         total_chars = sum(len(item.get("content", "")) for item in messages)
         logger.info(
-            "event=model_input_prepared request_id=%s deployment=%s provider=%s model=%s message_count=%s roles=%s system_chars=%s system_approx_tokens=%s graph_dynamic_approx_tokens=%s detection_dynamic_approx_tokens=%s fusion_dynamic_approx_tokens=%s dynamic_context_chars=%s dynamic_context_approx_tokens=%s conversation_chars=%s conversation_approx_tokens=%s total_input_chars=%s total_input_approx_tokens=%s",
+            "event=model_input_prepared request_id=%s deployment=%s provider=%s model=%s message_count=%s roles=%s system_chars=%s system_approx_tokens=%s asset_profile_dynamic_approx_tokens=%s detection_dynamic_approx_tokens=%s graph_dynamic_approx_tokens=%s fusion_dynamic_approx_tokens=%s dynamic_context_chars=%s dynamic_context_approx_tokens=%s conversation_chars=%s conversation_approx_tokens=%s total_input_chars=%s total_input_approx_tokens=%s",
             request_id,
             chat_deployment.name,
             chat_deployment.provider_type,
@@ -542,8 +635,9 @@ class CopilotService:
             ",".join(item["role"] for item in messages),
             system_chars,
             approx_tokens(self.system_prompt),
-            approx_tokens(graph_dynamic_context),
+            approx_tokens(profile_dynamic_context),
             approx_tokens(detection_dynamic_context),
+            approx_tokens(graph_dynamic_context),
             approx_tokens(fusion_dynamic_context),
             dynamic_context_chars,
             approx_tokens(dynamic_context),
@@ -560,6 +654,7 @@ class CopilotService:
             messages=len(messages),
             roles=", ".join(item["role"] for item in messages),
             system_tokens_approx=approx_tokens(self.system_prompt),
+            asset_profile_dynamic_tokens_approx=approx_tokens(profile_dynamic_context),
             graph_dynamic_tokens_approx=approx_tokens(graph_dynamic_context),
             detection_dynamic_tokens_approx=approx_tokens(detection_dynamic_context),
             fusion_dynamic_tokens_approx=approx_tokens(fusion_dynamic_context),
@@ -589,7 +684,7 @@ class CopilotService:
                 purpose="chat",
             )
         except LLMError as exc:
-            fallback_answer = build_evidence_fallback_answer(graph_result, detection_result)
+            fallback_answer = build_evidence_fallback_answer(graph_result, detection_results, asset_profile_results)
             if not fallback_answer:
                 trace.status = "error"
                 trace.errors = 1
@@ -726,21 +821,24 @@ class CopilotService:
                 update_reason = "entity_pair_resolved"
 
         graph_execution_succeeded = bool(graph_result and graph_result.status in {"available", "not_found"})
-        detection_execution_succeeded = bool(detection_result and detection_result.status in {"available", "not_found"})
+        detection_execution_succeeded = bool(detection_results) and all(item.status in {"available", "not_found"} for item in detection_results)
+        asset_profile_execution_succeeded = bool(asset_profile_results) and all(item.status in {"available", "not_found"} for item in asset_profile_results)
         graph_available = bool(graph_result and graph_result.status == "available")
-        detection_available = bool(detection_result and detection_result.status == "available")
-        evidence_execution_succeeded = graph_execution_succeeded or detection_execution_succeeded
+        detection_available = any(item.status == "available" for item in detection_results)
+        asset_profile_available = any(item.status == "available" for item in asset_profile_results)
+        evidence_execution_succeeded = graph_execution_succeeded or detection_execution_succeeded or asset_profile_execution_succeeded
         used_providers = tuple(
             provider
             for provider, succeeded in (
                 ("graph", graph_execution_succeeded and route.use_graph),
                 ("detection", detection_execution_succeeded and route.use_detection),
+                ("asset_profile", asset_profile_execution_succeeded and route.use_asset_profile),
             )
             if succeeded
         )
         updated_last_provider = (
             "combined"
-            if len(used_providers) == 2
+            if len(used_providers) > 1
             else used_providers[0]
             if used_providers
             else routing_state.last_provider
@@ -753,8 +851,8 @@ class CopilotService:
         updated_previous_requires_detection = (
             route.use_detection if evidence_execution_succeeded else routing_state.previous_requires_detection
         )
-        updated_previous_detection_detail = (
-            route.detection_detail if evidence_execution_succeeded else routing_state.previous_detection_detail
+        updated_previous_requires_asset_profile = (
+            route.use_asset_profile if evidence_execution_succeeded else routing_state.previous_requires_asset_profile
         )
         new_routing_state = SessionRoutingState(
             active_ip=updated_active_ip,
@@ -769,7 +867,7 @@ class CopilotService:
             previous_direction=updated_previous_direction,
             previous_depth=updated_previous_depth,
             previous_requires_detection=updated_previous_requires_detection,
-            previous_detection_detail=updated_previous_detection_detail,
+            previous_requires_asset_profile=updated_previous_requires_asset_profile,
         )
         self.routing_state_store.set(session, new_routing_state)
         if new_routing_state != routing_state:
@@ -811,7 +909,7 @@ class CopilotService:
             previous_direction_after=new_routing_state.previous_direction or "",
             previous_depth_after=new_routing_state.previous_depth if new_routing_state.previous_depth is not None else "",
             previous_requires_detection_after=new_routing_state.previous_requires_detection,
-            previous_detection_detail_after=new_routing_state.previous_detection_detail or "",
+            previous_requires_asset_profile_after=new_routing_state.previous_requires_asset_profile,
             update_reason=update_reason,
         )
         if self.settings.chat_store_history:
@@ -843,7 +941,7 @@ class CopilotService:
             errors=trace.errors,
             providers_requested=", ".join(
                 provider
-                for provider, enabled in [("graph", route.use_graph), ("detection", route.use_detection)]
+                for provider, enabled in [("graph", route.use_graph), ("detection", route.use_detection), ("asset_profile", route.use_asset_profile)]
                 if enabled
             )
             or "none",
@@ -852,6 +950,7 @@ class CopilotService:
                 for provider, available in [
                     ("graph", graph_available),
                     ("detection", detection_available),
+                    ("asset_profile", asset_profile_available),
                 ]
                 if available
             )
@@ -860,7 +959,8 @@ class CopilotService:
                 provider
                 for provider, not_found in [
                     ("graph", bool(route.use_graph and graph_result and graph_result.status == "not_found")),
-                    ("detection", bool(route.use_detection and detection_result and detection_result.status == "not_found")),
+                    ("detection", bool(route.use_detection and any(item.status == "not_found" for item in detection_results))),
+                    ("asset_profile", bool(route.use_asset_profile and any(item.status == "not_found" for item in asset_profile_results))),
                 ]
                 if not_found
             )
@@ -869,7 +969,8 @@ class CopilotService:
                 provider
                 for provider, unavailable in [
                     ("graph", bool(route.use_graph and graph_result and graph_result.status == "unavailable")),
-                    ("detection", bool(route.use_detection and detection_result and detection_result.status == "unavailable")),
+                    ("detection", bool(route.use_detection and any(item.status == "unavailable" for item in detection_results))),
+                    ("asset_profile", bool(route.use_asset_profile and any(item.status == "unavailable" for item in asset_profile_results))),
                 ]
                 if unavailable
             )

@@ -13,10 +13,9 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 from src.config.settings import Settings
-from src.core.detection.models import RawAssetDetectionResponse
 from src.core.product_client.auth import ProductAuthManager
 from src.core.product_client.errors import ProductApiConfigError, ProductApiError, ProductApiHTTPError
-from src.core.product_client.schemas import ProductTopologyResponse
+from src.core.product_client.schemas import ProductAssetResponse, ProductTopologyResponse
 
 
 logger = logging.getLogger(__name__)
@@ -97,7 +96,12 @@ class ProductApiClient:
                     timeout=(self.connect_timeout, self.read_timeout),
                 )
             except requests.RequestException as exc:
-                logger.exception("event=product_request_exception request_id=%s endpoint_path=%s", request_id, endpoint_path)
+                logger.warning(
+                    "event=product_request_exception request_id=%s endpoint_path=%s error_type=%s",
+                    request_id,
+                    endpoint_path,
+                    type(exc).__name__,
+                )
                 raise ProductApiError("Product API request failed.") from exc
 
             if response.status_code != 401 or attempt == 1:
@@ -154,54 +158,92 @@ class ProductApiClient:
             elapsed_seconds=elapsed,
         )
 
-    def get_asset_detection(self, ip: str, *, request_id: str = "") -> RawAssetDetectionResponse:
-        """Fetch and validate raw asset-detection evidence for one IP address."""
+    def _asset_endpoint_path(self, template: str, ip: str, *, endpoint_name: str, request_id: str) -> tuple[str, str]:
+        """Validate one IPv4 target before substituting it into a configured path."""
         try:
             normalized_ip = str(ipaddress.ip_address(str(ip).strip()))
         except ValueError as exc:
-            logger.info("event=product_asset_detection_invalid_ip request_id=%s", request_id)
-            raise ProductApiError("Invalid IP address for asset detection.") from exc
-
+            logger.info("event=product_asset_endpoint_invalid_ip request_id=%s endpoint_name=%s", request_id, endpoint_name)
+            raise ProductApiError(f"Invalid IP address for {endpoint_name}.") from exc
+        if template.count("{ip}") != 1 or ".." in template:
+            raise ProductApiConfigError(f"Configured {endpoint_name} path must contain exactly one safe {{ip}} placeholder.")
         safe_ip = quote(normalized_ip, safe="")
-        endpoint_path = self.settings.product_asset_detection_path.format(ip=safe_ip)
+        return normalized_ip, template.format(ip=safe_ip)
+
+    def _get_asset_json(
+        self,
+        ip: str,
+        template: str,
+        *,
+        endpoint_name: str,
+        request_id: str = "",
+    ) -> ProductAssetResponse:
+        normalized_ip, endpoint_path = self._asset_endpoint_path(
+            template,
+            ip,
+            endpoint_name=endpoint_name,
+            request_id=request_id,
+        )
+
         try:
             payload, status_code, elapsed = self.get_json(endpoint_path, request_id=request_id)
         except ProductApiHTTPError as exc:
             if exc.status_code != 404:
                 raise
             logger.info(
-                "event=detection_not_found request_id=%s endpoint_path=%s ip=%s status_code=404",
+                "event=product_asset_endpoint_not_found request_id=%s endpoint_name=%s endpoint_path=%s ip=%s status_code=404",
                 request_id,
+                endpoint_name,
                 endpoint_path,
                 normalized_ip,
             )
-            return RawAssetDetectionResponse(ip=normalized_ip, assetFound=False)
-        try:
-            response = RawAssetDetectionResponse.model_validate(payload)
-        except ValueError as exc:
-            logger.info(
-                "event=product_asset_detection_validation_failed request_id=%s endpoint_path=%s status_code=%s elapsed_ms=%s",
-                request_id,
-                endpoint_path,
-                status_code,
-                int(elapsed * 1000),
+            return ProductAssetResponse(
+                target_ip=normalized_ip,
+                raw_payload=None,
+                endpoint_path=endpoint_path,
+                status_code=404,
+                elapsed_seconds=0.0,
+                found=False,
             )
-            raise ProductApiError("Product asset-detection response failed validation.") from exc
-
-        signal_sections = []
-        if response.signals:
-            if response.signals.extended is not None:
-                signal_sections.append("extended")
-            if response.signals.normalized is not None:
-                signal_sections.append("normalized")
+        if not isinstance(payload, (dict, list)):
+            raise ProductApiError(f"Product {endpoint_name} response must be a JSON object or array.")
+        found = payload.get("assetFound") if isinstance(payload, dict) else True
+        if not isinstance(found, bool):
+            found = True
         logger.info(
-            "event=product_asset_detection_validated request_id=%s endpoint_path=%s status_code=%s elapsed_ms=%s asset_found=%s matched_rules=%s signal_sections=%s",
+            "event=product_asset_endpoint_validated request_id=%s endpoint_name=%s endpoint_path=%s status_code=%s elapsed_ms=%s asset_found=%s top_level_type=%s top_level_key_count=%s",
             request_id,
+            endpoint_name,
             endpoint_path,
             status_code,
             int(elapsed * 1000),
-            response.asset_found,
-            len(response.matched_rules),
-            ",".join(signal_sections),
+            found,
+            type(payload).__name__,
+            len(payload),
         )
-        return response
+        return ProductAssetResponse(
+            target_ip=normalized_ip,
+            raw_payload=payload,
+            endpoint_path=endpoint_path,
+            status_code=status_code,
+            elapsed_seconds=elapsed,
+            found=found,
+        )
+
+    def get_asset_detection(self, ip: str, *, request_id: str = "") -> ProductAssetResponse:
+        """Fetch one complete asset-detection JSON payload without reshaping it."""
+        return self._get_asset_json(
+            ip,
+            self.settings.product_asset_detection_path,
+            endpoint_name="asset_detection",
+            request_id=request_id,
+        )
+
+    def get_asset_profile(self, ip: str, *, request_id: str = "") -> ProductAssetResponse:
+        """Fetch one complete Asset Profile JSON payload through shared authentication."""
+        return self._get_asset_json(
+            ip,
+            self.settings.product_asset_profile_path,
+            endpoint_name="asset_profile",
+            request_id=request_id,
+        )

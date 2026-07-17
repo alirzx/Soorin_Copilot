@@ -52,6 +52,7 @@ def render_human_copilot_trace(trace: CopilotRequestTrace) -> None:
         "ENTITY BINDING",
         "INTENT",
         "ROUTING",
+        "ASSET PROFILE",
         "ASSET DETECTION",
         "GRAPH RETRIEVAL",
         "MODEL INPUT",

@@ -1,4 +1,4 @@
-"""Small validated product API schemas used by graph ingestion."""
+"""Validated response envelopes for Soorin product API endpoints."""
 
 from __future__ import annotations
 
@@ -95,3 +95,15 @@ class ProductTopologyResponse:
             status_code=status_code,
             elapsed_seconds=elapsed_seconds,
         )
+
+
+@dataclass(frozen=True)
+class ProductAssetResponse:
+    """Lossless product JSON plus transport metadata for one asset endpoint."""
+
+    target_ip: str
+    raw_payload: dict[str, Any] | list[Any] | None
+    endpoint_path: str
+    status_code: int
+    elapsed_seconds: float
+    found: bool | None

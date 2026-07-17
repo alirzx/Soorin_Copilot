@@ -19,7 +19,7 @@ class SessionRoutingState:
     previous_direction: str | None = None
     previous_depth: int | None = None
     previous_requires_detection: bool = False
-    previous_detection_detail: str | None = None
+    previous_requires_asset_profile: bool = False
 
 
 class SessionRoutingStateStore:

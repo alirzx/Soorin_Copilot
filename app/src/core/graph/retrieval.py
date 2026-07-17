@@ -28,6 +28,32 @@ class GraphRetrievalSpec:
     entities: list[ResolvedEntity]
     intent: IntentName = "graph_neighbors"
     relationship_mode: RelationshipMode = "none"
+    exhaustive_connections_requested: bool = False
+
+
+def _apply_completeness_contract(
+    result: dict[str, object],
+    spec: GraphRetrievalSpec,
+) -> dict[str, object]:
+    """Attach one canonical contract for retrieval, serialization, and user scope."""
+    retrieval_truncated = bool(result.get("retrieval_truncated", result.get("truncated", False)))
+    retrieval_complete = not retrieval_truncated
+    requested_scope_complete = retrieval_complete or spec.scope == "node_summary"
+    result.update(
+        {
+            "requested_scope": spec.scope,
+            "retrieval_complete": retrieval_complete,
+            "retrieval_truncated": retrieval_truncated,
+            "retrieval_truncation_reason": result.get("retrieval_truncation_reason") or result.get("truncation_reason"),
+            "serialized_context_complete_for_retrieved_subset": True,
+            "serialized_context_truncated": False,
+            "serialized_context_truncation_reason": None,
+            "requested_scope_complete": requested_scope_complete,
+            "complete_for_user_request": requested_scope_complete,
+            "exhaustive_connections_requested": spec.exhaustive_connections_requested,
+        }
+    )
+    return result
 
 
 def _empty_result(spec: GraphRetrievalSpec, target_ip: str, *, node_found: bool) -> dict[str, object]:
@@ -122,18 +148,20 @@ def retrieve_graph_context(spec: GraphRetrievalSpec, settings: Settings) -> dict
     graph = get_graph()
     if spec.intent == "graph_relationships" and len(spec.entities) == 2:
         if spec.scope == "multi_entity_comparison" or spec.relationship_mode == "compare":
-            return _comparison_context(graph, spec, settings)
-        return _relationship_context(graph, spec)
-    if spec.scope == "path":
-        return _path_context(graph, spec, settings)
-
-    target_ip = spec.entities[0].value if spec.entities else ""
-    if not target_ip or target_ip not in graph:
-        return _empty_result(spec, target_ip, node_found=False)
-
-    if spec.scope == "two_hop":
-        return _two_hop_context(graph, spec, settings)
-    return _neighbor_context(graph, spec, settings)
+            result = _comparison_context(graph, spec, settings)
+        else:
+            result = _relationship_context(graph, spec)
+    elif spec.scope == "path":
+        result = _path_context(graph, spec, settings)
+    else:
+        target_ip = spec.entities[0].value if spec.entities else ""
+        if not target_ip or target_ip not in graph:
+            result = _empty_result(spec, target_ip, node_found=False)
+        elif spec.scope == "two_hop":
+            result = _two_hop_context(graph, spec, settings)
+        else:
+            result = _neighbor_context(graph, spec, settings)
+    return _apply_completeness_contract(result, spec)
 
 
 def _neighbor_context(graph: nx.DiGraph, spec: GraphRetrievalSpec, settings: Settings) -> dict[str, object]:
@@ -142,7 +170,7 @@ def _neighbor_context(graph: nx.DiGraph, spec: GraphRetrievalSpec, settings: Set
     outbound_all = sorted(graph.successors(target))
     bidirectional_all = sorted(set(inbound_all).intersection(outbound_all))
     inbound, outbound, bidirectional = _neighbors(graph, target, spec.direction)
-    all_candidate_nodes = sorted(set([target, *inbound, *outbound]))
+    all_candidate_nodes = [target, *sorted(set([*inbound, *outbound]).difference({target}))]
     candidate_edges = [_edge_dict(src, target, graph) for src in inbound] + [_edge_dict(target, dst, graph) for dst in outbound]
 
     if spec.scope == "node_summary":
