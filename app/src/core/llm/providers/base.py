@@ -3,7 +3,36 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Literal, Optional
+
+
+LLMStreamEventType = Literal[
+    "reasoning_delta",
+    "answer_delta",
+    "usage",
+    "done",
+    "error",
+]
+
+
+@dataclass(frozen=True)
+class LLMStreamEvent:
+    """Provider-neutral incremental event with no raw provider payload."""
+
+    type: LLMStreamEventType
+    text: str = ""
+    data: Dict[str, Any] = field(default_factory=dict)
+    message: str = ""
+
+    def to_public_dict(self) -> Dict[str, Any]:
+        event: Dict[str, Any] = {"type": self.type}
+        if self.text:
+            event["text"] = self.text
+        if self.data:
+            event["data"] = dict(self.data)
+        if self.message:
+            event["message"] = self.message
+        return event
 
 
 @dataclass

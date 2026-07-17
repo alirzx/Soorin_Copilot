@@ -2,19 +2,23 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import time
+from collections.abc import Iterator
 from typing import Any
 from uuid import uuid4
 
 from fastapi import APIRouter
 from pydantic import BaseModel, Field, field_validator
+from starlette.responses import StreamingResponse
 
 from src.config.settings import get_settings
 from src.core.copilot.service import CopilotService
 from src.core.context.models import approx_tokens, compact_preview
 from src.core.llm.client import LLMClient
 from src.core.llm.errors import LLMError
+from src.core.llm.providers.base import LLMStreamEvent
 from src.core.memory.routing_state import SessionRoutingStateStore
 from src.core.memory.store import MemoryStore
 
@@ -58,6 +62,12 @@ def envelope(
         "warnings": warnings or [],
         "errors": errors or [],
     }
+
+
+def encode_sse_event(event: LLMStreamEvent) -> str:
+    """Serialize one normalized event without exposing provider payloads."""
+    data = json.dumps(event.to_public_dict(), ensure_ascii=False, separators=(",", ":"))
+    return f"event: {event.type}\ndata: {data}\n\n"
 
 
 @router.get("/health")
@@ -149,3 +159,50 @@ def chat(request: ChatRequest) -> dict[str, Any]:
         latency_ms,
     )
     return envelope("ok", result, warnings=warnings)
+
+
+@router.post("/chat/stream")
+def chat_stream(request: ChatRequest) -> StreamingResponse:
+    """Stream only final-model events while preserving the existing chat route."""
+    request_id = uuid4().hex[:12]
+    session_for_log = (request.session_id or "").strip()
+    started = time.perf_counter()
+    logger.info(
+        "event=http_chat_stream_request request_id=%s session_id=%s message_chars=%s approx_tokens=%s ui_context_present=%s selected_ip_present=%s",
+        request_id,
+        session_for_log,
+        len(request.message),
+        approx_tokens(request.message),
+        bool(request.ui_context),
+        bool(request.ui_context and request.ui_context.selected_ip),
+    )
+
+    def events() -> Iterator[str]:
+        status = "error"
+        try:
+            for event in copilot_service.chat_stream(
+                request.message,
+                request.session_id,
+                ui_context=request.ui_context.model_dump() if request.ui_context else None,
+                request_id=request_id,
+            ):
+                if event.type == "done":
+                    status = "ok"
+                yield encode_sse_event(event)
+        finally:
+            logger.info(
+                "event=http_chat_stream_response request_id=%s session_id=%s status=%s latency_ms=%s",
+                request_id,
+                session_for_log,
+                status,
+                int((time.perf_counter() - started) * 1000),
+            )
+
+    return StreamingResponse(
+        events(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )

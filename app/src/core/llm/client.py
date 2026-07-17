@@ -5,12 +5,13 @@ from __future__ import annotations
 import logging
 import random
 import time
+from collections.abc import Iterator
 
 from src.config.llm_deployments import ArvanDeploymentConfig, LLMRequestConfig
 from src.config.settings import Settings
 from src.core.llm.errors import LLMDisabledError, LLMError
 from src.core.llm.providers.arvan import ArvanProvider
-from src.core.llm.providers.base import LLMProviderResult
+from src.core.llm.providers.base import LLMProviderResult, LLMStreamEvent
 
 
 logger = logging.getLogger(__name__)
@@ -190,6 +191,59 @@ class LLMClient:
             return result
 
         raise LLMError("LLM provider retry loop ended unexpectedly.", reason="provider_retry_state_error")
+
+    def stream_chat(
+        self,
+        messages: list[dict[str, str]],
+        *,
+        request_id: str = "",
+        max_tokens: int | None = None,
+        temperature: float | None = None,
+        top_p: float | None = None,
+        timeout_seconds: int | None = None,
+        purpose: str = "chat",
+    ) -> Iterator[LLMStreamEvent]:
+        """Stream only the final chat deployment; routing remains non-streaming."""
+        if purpose != "chat":
+            raise LLMError(
+                "Streaming is supported only for final chat synthesis.",
+                reason="provider_stream_purpose_not_supported",
+            )
+        if not self.settings.llm_enabled:
+            raise LLMDisabledError("LLM is disabled.", reason="llm_disabled")
+
+        deployment = self.deployment_for_purpose(purpose)
+        provider = self.providers.get(deployment.name)
+        if provider is None or not callable(getattr(provider, "stream_chat", None)):
+            raise LLMError(
+                "Selected LLM provider does not support streaming.",
+                reason="provider_stream_not_supported",
+            )
+
+        defaults = deployment.request_config(purpose)
+        resolved_max_tokens = defaults.max_tokens
+        if max_tokens is not None:
+            resolved_max_tokens = min(
+                max(1, int(max_tokens)),
+                max(1, deployment.maximum_completion_tokens),
+            )
+        resolved_temperature = defaults.temperature if temperature is None else temperature
+        if not deployment.supports_temperature:
+            resolved_temperature = None
+        resolved_top_p = defaults.top_p if top_p is None else top_p
+        if not deployment.supports_top_p:
+            resolved_top_p = None
+        resolved_timeout = defaults.read_timeout_seconds if timeout_seconds is None else max(1, int(timeout_seconds))
+
+        yield from provider.stream_chat(
+            messages,
+            request_id=request_id,
+            max_tokens=resolved_max_tokens,
+            temperature=resolved_temperature,
+            top_p=resolved_top_p,
+            timeout_seconds=resolved_timeout,
+            purpose=purpose,
+        )
 
     def health(self) -> dict[str, object]:
         if not self.providers:

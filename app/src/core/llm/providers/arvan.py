@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import time
+from collections.abc import Iterator
 from typing import Any
 
 import requests
@@ -12,7 +14,7 @@ from urllib3.exceptions import ProtocolError
 from src.config.llm_deployments import ArvanDeploymentConfig
 from src.core.context.models import approx_tokens
 from src.core.llm.errors import LLMError
-from src.core.llm.providers.base import LLMProviderResult
+from src.core.llm.providers.base import LLMProviderResult, LLMStreamEvent
 
 
 logger = logging.getLogger(__name__)
@@ -345,3 +347,197 @@ class ArvanProvider:
             reasoning_exposed=False,
             payload_format="chat_completions",
         )
+
+    def stream_chat(
+        self,
+        messages: list[dict[str, str]],
+        *,
+        request_id: str = "",
+        max_tokens: int,
+        temperature: float | None,
+        top_p: float | None,
+        timeout_seconds: int,
+        purpose: str = "chat",
+    ) -> Iterator[LLMStreamEvent]:
+        """Normalize OpenAI-compatible SSE chunks without retaining raw payloads."""
+        if purpose != "chat":
+            raise LLMError(
+                "Streaming is supported only for final chat synthesis.",
+                reason="provider_stream_purpose_not_supported",
+            )
+        readiness = self.health()
+        if not readiness["ready"]:
+            raise LLMError(
+                "Selected Arvan deployment is not ready.",
+                reason="provider_not_ready",
+                details={"deployment": self.deployment.name},
+            )
+
+        payload: dict[str, Any] = {
+            "model": self.deployment.model,
+            "messages": messages,
+            "max_tokens": max_tokens,
+            **self.deployment.request_options_dict(),
+            "stream": True,
+        }
+        if temperature is not None:
+            payload["temperature"] = temperature
+        if top_p is not None:
+            payload["top_p"] = top_p
+        headers = {
+            "Authorization": f"{self.deployment.auth_scheme} {self.deployment.api_key}",
+            "Content-Type": "application/json",
+        }
+        timeout = (self.deployment.connect_timeout_seconds, timeout_seconds)
+        logger.info(
+            "event=provider_stream_request_start request_id=%s purpose=%s deployment=%s provider=%s model=%s host=%s message_count=%s max_tokens=%s",
+            request_id,
+            purpose,
+            self.deployment.name,
+            self.provider_name,
+            self.deployment.model,
+            self.deployment.safe_host,
+            len(messages),
+            max_tokens,
+        )
+
+        started = time.perf_counter()
+        response: requests.Response | None = None
+        chunk_count = 0
+        reasoning_chunk_count = 0
+        answer_chunk_count = 0
+        finish_reason: Any = None
+        usage: dict[str, Any] = {}
+        try:
+            response = requests.post(
+                self.endpoint,
+                json=payload,
+                headers=headers,
+                timeout=timeout,
+                stream=True,
+            )
+            header_latency_ms = int((time.perf_counter() - started) * 1000)
+            logger.info(
+                "event=provider_stream_response request_id=%s purpose=%s deployment=%s provider=%s model=%s host=%s status_code=%s header_latency_ms=%s",
+                request_id,
+                purpose,
+                self.deployment.name,
+                self.provider_name,
+                self.deployment.model,
+                self.deployment.safe_host,
+                response.status_code,
+                header_latency_ms,
+            )
+            if response.status_code >= 400:
+                retryable = response.status_code in RETRYABLE_HTTP_STATUS_CODES
+                raise LLMError(
+                    "Arvan provider returned a streaming error.",
+                    reason="provider_stream_http_error",
+                    details={
+                        "deployment": self.deployment.name,
+                        "status_code": response.status_code,
+                        "error_type": f"HTTP_{response.status_code}",
+                        "retryable": retryable,
+                    },
+                )
+
+            stream_done = False
+            for raw_line in response.iter_lines(chunk_size=1, decode_unicode=True):
+                line = raw_line.decode("utf-8", errors="replace") if isinstance(raw_line, bytes) else str(raw_line or "")
+                line = line.strip()
+                if not line or line.startswith(":"):
+                    continue
+                if line.startswith("data:"):
+                    line = line[5:].strip()
+                if not line:
+                    continue
+                if line == "[DONE]":
+                    stream_done = True
+                    break
+                try:
+                    data = json.loads(line)
+                except (TypeError, ValueError) as exc:
+                    raise LLMError(
+                        "Arvan provider returned an invalid streaming event.",
+                        reason="provider_stream_invalid_json",
+                        details={"error_type": type(exc).__name__},
+                    ) from exc
+                if not isinstance(data, dict):
+                    continue
+                if isinstance(data.get("error"), dict):
+                    raise LLMError(
+                        "Arvan provider returned a streaming error.",
+                        reason="provider_stream_error",
+                    )
+
+                reported_usage = _usage_dict(data.get("usage"))
+                if reported_usage:
+                    usage = reported_usage
+                    chunk_count += 1
+                    yield LLMStreamEvent("usage", data=usage)
+
+                choices = data.get("choices")
+                choice = choices[0] if isinstance(choices, list) and choices and isinstance(choices[0], dict) else {}
+                delta = choice.get("delta") if isinstance(choice.get("delta"), dict) else {}
+                reasoning_delta = delta.get("reasoning_content")
+                if isinstance(reasoning_delta, str) and reasoning_delta:
+                    chunk_count += 1
+                    reasoning_chunk_count += 1
+                    yield LLMStreamEvent("reasoning_delta", text=reasoning_delta)
+                answer_delta = delta.get("content")
+                if isinstance(answer_delta, str) and answer_delta:
+                    chunk_count += 1
+                    answer_chunk_count += 1
+                    yield LLMStreamEvent("answer_delta", text=answer_delta)
+                if choice.get("finish_reason") is not None:
+                    finish_reason = choice.get("finish_reason")
+
+            latency_ms = int((time.perf_counter() - started) * 1000)
+            yield LLMStreamEvent(
+                "done",
+                data={
+                    "provider": self.provider_name,
+                    "model": self.deployment.model,
+                    "deployment": self.deployment.name,
+                    "finish_reason": finish_reason,
+                    "usage": usage,
+                    "latency_ms": latency_ms,
+                    "status_code": response.status_code,
+                    "stream_terminated": stream_done,
+                },
+            )
+            logger.info(
+                "event=provider_stream_complete request_id=%s purpose=%s deployment=%s provider=%s model=%s status_code=%s latency_ms=%s chunk_count=%s reasoning_chunk_count=%s answer_chunk_count=%s finish_reason=%s",
+                request_id,
+                purpose,
+                self.deployment.name,
+                self.provider_name,
+                self.deployment.model,
+                response.status_code,
+                latency_ms,
+                chunk_count,
+                reasoning_chunk_count,
+                answer_chunk_count,
+                finish_reason or "",
+            )
+        except PROVIDER_REQUEST_EXCEPTIONS as exc:
+            latency_ms = int((time.perf_counter() - started) * 1000)
+            logger.warning(
+                "event=provider_stream_exception request_id=%s purpose=%s deployment=%s provider=%s model=%s host=%s error_type=%s latency_ms=%s",
+                request_id,
+                purpose,
+                self.deployment.name,
+                self.provider_name,
+                self.deployment.model,
+                self.deployment.safe_host,
+                type(exc).__name__,
+                latency_ms,
+            )
+            raise LLMError(
+                "Arvan streaming request failed.",
+                reason="provider_stream_transport_error",
+                details={"error_type": type(exc).__name__},
+            ) from exc
+        finally:
+            if response is not None:
+                response.close()

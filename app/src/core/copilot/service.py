@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import logging
 import time
+from collections.abc import Callable, Iterator
 from pathlib import Path
+from queue import SimpleQueue
+from threading import Thread
 from typing import Any
 from uuid import uuid4
 
@@ -23,7 +26,7 @@ from src.core.context.models import (
 from src.core.context.providers import AssetProfileContextProvider, DetectionContextProvider, GraphContextProvider
 from src.core.llm.client import LLMClient
 from src.core.llm.errors import LLMError
-from src.core.llm.providers.base import LLMProviderResult
+from src.core.llm.providers.base import LLMProviderResult, LLMStreamEvent
 from src.core.memory.routing_state import SessionRoutingState, SessionRoutingStateStore
 from src.core.memory.store import MemoryStore
 from src.core.copilot.trace import CopilotRequestTrace, render_human_copilot_trace
@@ -173,6 +176,162 @@ class CopilotService:
             context_truncation_reason=", ".join(dict.fromkeys(reasons)),
         )
 
+    def _stream_final_model(
+        self,
+        messages: list[dict[str, str]],
+        *,
+        request_id: str,
+        max_tokens: int,
+        temperature: float | None,
+        top_p: float | None,
+        timeout_seconds: int,
+        sink: Callable[[LLMStreamEvent], None],
+        metrics: dict[str, Any],
+    ) -> LLMProviderResult:
+        """Collect one final-model stream while forwarding safe incremental events."""
+        deployment = self.settings.deployment_for_purpose("chat")
+        started = time.perf_counter()
+        answer_parts: list[str] = []
+        usage: dict[str, Any] = {}
+        finish_reason: str | None = None
+        done_data: dict[str, Any] = {}
+
+        try:
+            stream_chat = getattr(self.llm_client, "stream_chat", None)
+            if not callable(stream_chat):
+                raise LLMError(
+                    "Selected LLM client does not support streaming.",
+                    reason="provider_stream_not_supported",
+                )
+            for event in stream_chat(
+                messages,
+                request_id=request_id,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                timeout_seconds=timeout_seconds,
+                purpose="chat",
+            ):
+                metrics["stream_chunk_count"] += 1
+                if event.type == "reasoning_delta" and event.text:
+                    metrics["streaming_used"] = True
+                    metrics["reasoning_chunk_count"] += 1
+                    if metrics["first_reasoning_chunk_latency_ms"] is None:
+                        metrics["first_reasoning_chunk_latency_ms"] = int(
+                            (time.perf_counter() - started) * 1000
+                        )
+                    if self.settings.llm_expose_reasoning:
+                        sink(event)
+                elif event.type == "answer_delta" and event.text:
+                    metrics["streaming_used"] = True
+                    metrics["answer_chunk_count"] += 1
+                    if metrics["first_answer_chunk_latency_ms"] is None:
+                        metrics["first_answer_chunk_latency_ms"] = int(
+                            (time.perf_counter() - started) * 1000
+                        )
+                    answer_parts.append(event.text)
+                    sink(event)
+                elif event.type == "usage":
+                    usage = dict(event.data)
+                    sink(event)
+                elif event.type == "done":
+                    done_data = dict(event.data)
+                    finish_reason = done_data.get("finish_reason")
+                    usage = dict(done_data.get("usage") or usage)
+                elif event.type == "error":
+                    raise LLMError(
+                        "The main-model stream failed.",
+                        reason="provider_stream_error",
+                    )
+        except LLMError as exc:
+            metrics["stream_error_type"] = str(exc.details.get("error_type") or exc.reason)
+            if answer_parts:
+                logger.warning(
+                    "event=main_model_stream_interrupted request_id=%s deployment=%s provider=%s model=%s answer_chunks=%s error_type=%s fallback=false",
+                    request_id,
+                    deployment.name,
+                    deployment.provider_type,
+                    deployment.model,
+                    len(answer_parts),
+                    metrics["stream_error_type"],
+                )
+                raise LLMError(
+                    "The Copilot response stream was interrupted.",
+                    reason="provider_stream_interrupted",
+                    details={
+                        "partial_output": True,
+                        "error_type": metrics["stream_error_type"],
+                    },
+                ) from exc
+            logger.warning(
+                "event=main_model_stream_fallback request_id=%s deployment=%s provider=%s model=%s error_type=%s fallback=non_stream",
+                request_id,
+                deployment.name,
+                deployment.provider_type,
+                deployment.model,
+                metrics["stream_error_type"],
+            )
+            result = self.llm_client.chat(
+                messages,
+                request_id=request_id,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                timeout_seconds=timeout_seconds,
+                purpose="chat",
+            )
+            sink(LLMStreamEvent("answer_delta", text=result.text))
+            return result
+
+        if not answer_parts:
+            metrics["stream_error_type"] = "provider_stream_empty_answer"
+            logger.warning(
+                "event=main_model_stream_fallback request_id=%s deployment=%s provider=%s model=%s error_type=%s fallback=non_stream",
+                request_id,
+                deployment.name,
+                deployment.provider_type,
+                deployment.model,
+                metrics["stream_error_type"],
+            )
+            result = self.llm_client.chat(
+                messages,
+                request_id=request_id,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                timeout_seconds=timeout_seconds,
+                purpose="chat",
+            )
+            sink(LLMStreamEvent("answer_delta", text=result.text))
+            return result
+
+        stream_terminated = bool(done_data.get("stream_terminated"))
+        if not stream_terminated and not finish_reason:
+            metrics["stream_error_type"] = "provider_stream_incomplete"
+            raise LLMError(
+                "The Copilot response stream ended before completion.",
+                reason="provider_stream_interrupted",
+                details={"partial_output": True, "error_type": metrics["stream_error_type"]},
+            )
+
+        metrics["stream_completed"] = True
+        return LLMProviderResult(
+            text="".join(answer_parts),
+            provider=str(done_data.get("provider") or deployment.provider_type),
+            model=str(done_data.get("model") or deployment.model),
+            deployment=str(done_data.get("deployment") or deployment.name),
+            finish_reason=finish_reason,
+            usage=usage,
+            latency_ms=int(done_data.get("latency_ms") or ((time.perf_counter() - started) * 1000)),
+            status_code=done_data.get("status_code"),
+            endpoint=deployment.safe_host,
+            reasoning_present=metrics["reasoning_chunk_count"] > 0,
+            reasoning_exposed=bool(
+                metrics["reasoning_chunk_count"] and self.settings.llm_expose_reasoning
+            ),
+            payload_format="chat_completions_stream",
+        )
+
     def chat(
         self,
         message: str,
@@ -180,6 +339,91 @@ class CopilotService:
         *,
         ui_context: dict[str, Any] | None = None,
         request_id: str | None = None,
+    ) -> dict[str, Any]:
+        return self._chat(
+            message,
+            session_id,
+            ui_context=ui_context,
+            request_id=request_id,
+        )
+
+    def chat_stream(
+        self,
+        message: str,
+        session_id: str | None = None,
+        *,
+        ui_context: dict[str, Any] | None = None,
+        request_id: str | None = None,
+    ) -> Iterator[LLMStreamEvent]:
+        """Run the existing orchestration once and expose final-model events."""
+        event_queue: SimpleQueue[LLMStreamEvent | None] = SimpleQueue()
+
+        def run() -> None:
+            try:
+                result = self._chat(
+                    message,
+                    session_id,
+                    ui_context=ui_context,
+                    request_id=request_id,
+                    stream_sink=event_queue.put,
+                )
+                warnings = list(result.pop("_warnings", []))
+                event_queue.put(
+                    LLMStreamEvent(
+                        "done",
+                        data={
+                            "session_id": result.get("session_id", ""),
+                            "provider": result.get("provider", ""),
+                            "model": result.get("model", ""),
+                            "warnings": warnings,
+                        },
+                    )
+                )
+            except LLMError as exc:
+                logger.warning(
+                    "event=copilot_stream_error request_id=%s reason=%s error_type=%s",
+                    request_id or "",
+                    exc.reason,
+                    str(exc.details.get("error_type") or exc.reason),
+                )
+                event_queue.put(
+                    LLMStreamEvent(
+                        "error",
+                        message="The Copilot could not complete the streamed response.",
+                        data={"reason": exc.reason},
+                    )
+                )
+            except Exception as exc:
+                logger.exception(
+                    "event=copilot_stream_exception request_id=%s error_type=%s",
+                    request_id or "",
+                    type(exc).__name__,
+                )
+                event_queue.put(
+                    LLMStreamEvent(
+                        "error",
+                        message="The Copilot could not complete the streamed response.",
+                        data={"reason": "stream_internal_error"},
+                    )
+                )
+            finally:
+                event_queue.put(None)
+
+        Thread(target=run, name="copilot-final-stream", daemon=True).start()
+        while True:
+            event = event_queue.get()
+            if event is None:
+                break
+            yield event
+
+    def _chat(
+        self,
+        message: str,
+        session_id: str | None = None,
+        *,
+        ui_context: dict[str, Any] | None = None,
+        request_id: str | None = None,
+        stream_sink: Callable[[LLMStreamEvent], None] | None = None,
     ) -> dict[str, Any]:
         request_id = request_id or uuid4().hex[:12]
         session = (session_id or "").strip() or uuid4().hex
@@ -195,6 +439,7 @@ class CopilotService:
             "REQUEST",
             ui_context_present=bool(ui_context),
             ui_selected_ip=ui_selected_ip,
+            streaming_requested=stream_sink is not None,
         )
 
         routing_state = self.routing_state_store.get(session)
@@ -673,18 +918,46 @@ class CopilotService:
         requested_max_tokens = chat_request.max_tokens
         final_synthesis_status = "ok"
         fallback_answer_used = False
+        stream_metrics: dict[str, Any] = {
+            "streaming_requested": stream_sink is not None,
+            "streaming_used": False,
+            "first_reasoning_chunk_latency_ms": None,
+            "first_answer_chunk_latency_ms": None,
+            "stream_chunk_count": 0,
+            "reasoning_chunk_count": 0,
+            "answer_chunk_count": 0,
+            "stream_completed": False,
+            "stream_error_type": "",
+        }
         try:
-            result = self.llm_client.chat(
-                messages,
-                request_id=request_id,
-                max_tokens=requested_max_tokens,
-                temperature=chat_request.temperature,
-                top_p=chat_request.top_p,
-                timeout_seconds=chat_request.read_timeout_seconds,
-                purpose="chat",
-            )
+            if stream_sink is not None:
+                result = self._stream_final_model(
+                    messages,
+                    request_id=request_id,
+                    max_tokens=requested_max_tokens,
+                    temperature=chat_request.temperature,
+                    top_p=chat_request.top_p,
+                    timeout_seconds=chat_request.read_timeout_seconds,
+                    sink=stream_sink,
+                    metrics=stream_metrics,
+                )
+            else:
+                result = self.llm_client.chat(
+                    messages,
+                    request_id=request_id,
+                    max_tokens=requested_max_tokens,
+                    temperature=chat_request.temperature,
+                    top_p=chat_request.top_p,
+                    timeout_seconds=chat_request.read_timeout_seconds,
+                    purpose="chat",
+                )
         except LLMError as exc:
-            fallback_answer = build_evidence_fallback_answer(graph_result, detection_results, asset_profile_results)
+            partial_stream = bool(exc.details.get("partial_output"))
+            fallback_answer = "" if partial_stream else build_evidence_fallback_answer(
+                graph_result,
+                detection_results,
+                asset_profile_results,
+            )
             if not fallback_answer:
                 trace.status = "error"
                 trace.errors = 1
@@ -727,6 +1000,8 @@ class CopilotService:
             final_synthesis_status = "failed"
             fallback_answer_used = True
             response_warnings.append("final_synthesis_fallback_used")
+            if stream_sink is not None:
+                stream_sink(LLMStreamEvent("answer_delta", text=fallback_answer))
             logger.warning(
                 "event=final_synthesis_failed request_id=%s reason=%s requested_max_tokens=%s fallback_answer_used=true",
                 request_id,
@@ -762,6 +1037,23 @@ class CopilotService:
             final_synthesis_status,
             str(fallback_answer_used).lower(),
         )
+        logger.info(
+            "event=main_model_stream_metrics request_id=%s streaming_requested=%s streaming_used=%s first_reasoning_chunk_latency_ms=%s first_answer_chunk_latency_ms=%s stream_chunk_count=%s reasoning_chunk_count=%s answer_chunk_count=%s stream_completed=%s stream_error_type=%s",
+            request_id,
+            str(stream_metrics["streaming_requested"]).lower(),
+            str(stream_metrics["streaming_used"]).lower(),
+            stream_metrics["first_reasoning_chunk_latency_ms"]
+            if stream_metrics["first_reasoning_chunk_latency_ms"] is not None
+            else "",
+            stream_metrics["first_answer_chunk_latency_ms"]
+            if stream_metrics["first_answer_chunk_latency_ms"] is not None
+            else "",
+            stream_metrics["stream_chunk_count"],
+            stream_metrics["reasoning_chunk_count"],
+            stream_metrics["answer_chunk_count"],
+            str(stream_metrics["stream_completed"]).lower(),
+            stream_metrics["stream_error_type"],
+        )
         trace.put(
             "MODEL RESPONSE",
             deployment=result.deployment,
@@ -780,6 +1072,7 @@ class CopilotService:
             fallback_answer_used=fallback_answer_used,
             answer_chars=len(result.text),
             answer_tokens_approx=approx_tokens(result.text),
+            **stream_metrics,
         )
 
         if self.settings.chat_store_history:
