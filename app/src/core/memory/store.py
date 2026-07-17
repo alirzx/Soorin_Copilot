@@ -45,6 +45,34 @@ class MemoryStore:
         history.append({"role": role, "content": content})
         self._history[session_id] = history[-self.max_messages :]
 
+    @staticmethod
+    def fit_messages_to_budget(
+        messages: list[dict[str, str]],
+        max_tokens: int,
+        *,
+        prefer_current_evidence: bool = False,
+    ) -> list[dict[str, str]]:
+        """Return a non-mutating bounded history, dropping old assistant claims first."""
+        selected = [dict(message) for message in messages]
+        budget = max(0, int(max_tokens))
+
+        def token_count() -> int:
+            return sum(approx_tokens(item.get("content", "")) for item in selected)
+
+        if token_count() <= budget:
+            return selected
+        role_priority = ("assistant", "system", "user") if prefer_current_evidence else ("system", "user", "assistant")
+        for role in role_priority:
+            index = 0
+            while token_count() > budget and index < len(selected):
+                if selected[index].get("role") == role:
+                    selected.pop(index)
+                else:
+                    index += 1
+        while selected and token_count() > budget:
+            selected.pop(0)
+        return selected
+
     def prepare_for_model(
         self,
         session_id: str,

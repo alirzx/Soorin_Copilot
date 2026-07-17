@@ -41,6 +41,9 @@ GRAPH_GROUNDING_RULES = [
     "Topology does not prove protocol purpose, trust, dependency, authentication, compromise, routing capability, or attack paths.",
 ]
 
+COMPACT_PRODUCT_TARGET_TOKENS = 384
+MIN_EXHAUSTIVE_GRAPH_TOKENS = 512
+
 
 class ContextComposer:
     """Turn typed provider results into bounded model evidence without lossy product transforms."""
@@ -55,11 +58,13 @@ class ContextComposer:
             "fusion": "",
         }
         self.last_inclusion: dict[str, tuple[bool, str | None]] = {}
+        self.last_representation: dict[str, str] = {}
+        self.required_context_missing = False
+        self.last_budget: dict[str, int] = {}
 
     def compose(self, package: CopilotContextPackage, *, request_id: str = "", base_input_tokens: int = 0) -> str:
         profile_sections = self._compose_json_sections(package.asset_profiles, "ASSET_PROFILE_JSON")
         detection_sections = self._compose_json_sections(package.detections, "ASSET_DETECTION_JSON")
-        graph_candidate = self._compose_graph(package, request_id=request_id)
         max_dynamic_tokens = max(
             0,
             self.settings.llm_context_window_tokens
@@ -67,8 +72,24 @@ class ContextComposer:
             - self.settings.llm_context_safety_margin_tokens
             - base_input_tokens,
         )
+        self.required_context_missing = False
+        self.last_budget = {
+            "base_input_tokens": base_input_tokens,
+            "max_dynamic_tokens": max_dynamic_tokens,
+        }
+        if self._is_exhaustive_graph_request(package):
+            return self._compose_exhaustive_graph_context(
+                package,
+                profile_sections,
+                detection_sections,
+                max_dynamic_tokens=max_dynamic_tokens,
+                request_id=request_id,
+            )
+
+        graph_candidate = self._compose_graph(package, request_id=request_id)
 
         self.last_inclusion = {}
+        self.last_representation = {}
         provisional = self._compose_provider_manifest(package, graph_included=bool(graph_candidate))
         used_tokens = approx_tokens(provisional)
         included_profiles: list[str] = []
@@ -79,9 +100,11 @@ class ContextComposer:
             if used_tokens + section_tokens <= max_dynamic_tokens:
                 used_tokens += section_tokens
                 self.last_inclusion[key] = (True, None)
+                self.last_representation[key] = "full"
                 (included_profiles if provider_name == "asset_profile" else included_detections).append(section)
             else:
                 self.last_inclusion[key] = (False, "global_context_limit")
+                self.last_representation[key] = "excluded"
                 logger.warning(
                     "event=product_context_not_included request_id=%s provider=%s target_ip=%s raw_json_approx_tokens=%s reason=global_context_limit raw_payload_preserved=true",
                     request_id,
@@ -105,6 +128,7 @@ class ContextComposer:
                 )
                 graph_text = ""
         self.last_inclusion["graph"] = (graph_included, None if graph_included else "global_context_limit")
+        self.last_representation["graph"] = "full" if graph_included else "excluded"
 
         manifest = self._compose_provider_manifest(package, graph_included=graph_included)
         profile_text = "\n\n".join(included_profiles)
@@ -133,6 +157,317 @@ class ContextComposer:
         return text
 
     @staticmethod
+    def _is_exhaustive_graph_request(package: CopilotContextPackage) -> bool:
+        if not package.graph:
+            return False
+        context = package.graph.context or {}
+        return bool(
+            context.get("scope") == "full_neighbors"
+            or context.get("requested_scope") == "full_neighbors"
+            or context.get("exhaustive_connections_requested")
+        )
+
+    def _compose_exhaustive_graph_context(
+        self,
+        package: CopilotContextPackage,
+        profile_sections: list[tuple[str, str, str]],
+        detection_sections: list[tuple[str, str, str]],
+        *,
+        max_dynamic_tokens: int,
+        request_id: str,
+    ) -> str:
+        """Allocate exhaustive graph context before narrative provider detail."""
+        self.last_inclusion = {}
+        self.last_representation = {}
+        result_lookup = {
+            ("asset_profile", item.ip): item for item in package.asset_profiles
+        }
+        result_lookup.update({("detection", item.ip): item for item in package.detections})
+        candidates: list[dict[str, str]] = []
+        for provider_name, ip, full_section in [*profile_sections, *detection_sections]:
+            key = f"{provider_name}:{ip}"
+            compact_section = self._compact_product_section(
+                result_lookup[(provider_name, ip)],
+                provider_name,
+                ip,
+                token_budget=COMPACT_PRODUCT_TARGET_TOKENS,
+            )
+            candidates.append(
+                {
+                    "provider": provider_name,
+                    "ip": ip,
+                    "key": key,
+                    "full": full_section,
+                    "compact": compact_section,
+                }
+            )
+            self.last_inclusion[key] = (True, "route_aware_compaction")
+            self.last_representation[key] = "compact"
+
+        provisional_manifest = self._compose_provider_manifest(package, graph_included=True)
+        compact_product_tokens = sum(approx_tokens(item["compact"]) for item in candidates)
+        graph_budget = min(
+            max(0, int(self.settings.graph_max_context_tokens)),
+            max(
+                0,
+                max_dynamic_tokens
+                - approx_tokens(provisional_manifest)
+                - compact_product_tokens,
+            ),
+        )
+        self.last_budget.update(
+            {
+                "manifest_tokens": approx_tokens(provisional_manifest),
+                "compact_product_tokens": compact_product_tokens,
+                "graph_budget_tokens": graph_budget,
+            }
+        )
+
+        graph_text = ""
+        graph_included = False
+        if graph_budget >= MIN_EXHAUSTIVE_GRAPH_TOKENS:
+            graph_text = self._compose_graph(
+                package,
+                request_id=request_id,
+                token_budget=graph_budget,
+            )
+            graph_included = bool(graph_text) and approx_tokens(graph_text) <= graph_budget
+
+        if not graph_included:
+            self._mark_graph_excluded(package, "insufficient_global_context_budget")
+            self.required_context_missing = True
+            self.last_inclusion["graph"] = (False, "insufficient_global_context_budget")
+            self.last_representation["graph"] = "excluded"
+            logger.error(
+                "event=required_graph_context_not_included request_id=%s requested_scope=full_neighbors graph_budget_tokens=%s max_dynamic_tokens=%s safe_failure=true",
+                request_id,
+                graph_budget,
+                max_dynamic_tokens,
+            )
+        else:
+            self.last_inclusion["graph"] = (True, None)
+            self.last_representation["graph"] = (
+                "compact" if (package.graph and package.graph.context.get("context_mode") == "compact_enumerated") else "full"
+            )
+
+        selected_sections = {item["key"]: item["compact"] for item in candidates}
+        manifest = self._compose_provider_manifest(package, graph_included=graph_included)
+        for item in candidates:
+            key = item["key"]
+            trial_sections = dict(selected_sections)
+            trial_sections[key] = item["full"]
+            self.last_representation[key] = "full"
+            self.last_inclusion[key] = (True, None)
+            trial_manifest = self._compose_provider_manifest(package, graph_included=graph_included)
+            trial_text = "\n\n".join(
+                part
+                for part in (
+                    trial_manifest,
+                    *trial_sections.values(),
+                    graph_text,
+                )
+                if part
+            )
+            if approx_tokens(trial_text) <= max_dynamic_tokens:
+                selected_sections = trial_sections
+                manifest = trial_manifest
+            else:
+                self.last_representation[key] = "compact"
+                self.last_inclusion[key] = (True, "route_aware_compaction")
+
+        manifest = self._compose_provider_manifest(package, graph_included=graph_included)
+        profile_text = "\n\n".join(
+            selected_sections[item["key"]]
+            for item in candidates
+            if item["provider"] == "asset_profile"
+        )
+        detection_text = "\n\n".join(
+            selected_sections[item["key"]]
+            for item in candidates
+            if item["provider"] == "detection"
+        )
+        limitation = ""
+        if self.required_context_missing:
+            limitation = (
+                "[SOORIN_CONTEXT_LIMITATION]\n"
+                "The requested current exhaustive graph evidence could not fit safely. "
+                "Do not answer from previous assistant claims or stale peer lists.\n"
+                "[/SOORIN_CONTEXT_LIMITATION]"
+            )
+        parts = [part for part in (manifest, profile_text, detection_text, graph_text, limitation) if part]
+        text = "\n\n".join(parts)
+
+        if graph_included and approx_tokens(text) > max_dynamic_tokens:
+            overflow = approx_tokens(text) - max_dynamic_tokens
+            reduced_budget = max(
+                MIN_EXHAUSTIVE_GRAPH_TOKENS,
+                graph_budget - overflow - 64,
+            )
+            graph_text = self._compose_graph(
+                package,
+                request_id=request_id,
+                token_budget=reduced_budget,
+            )
+            manifest = self._compose_provider_manifest(package, graph_included=bool(graph_text))
+            parts = [part for part in (manifest, profile_text, detection_text, graph_text) if part]
+            text = "\n\n".join(parts)
+
+        if graph_included and (not graph_text or approx_tokens(text) > max_dynamic_tokens):
+            self._mark_graph_excluded(package, "insufficient_global_context_budget")
+            self.required_context_missing = True
+            graph_text = ""
+            self.last_inclusion["graph"] = (False, "insufficient_global_context_budget")
+            self.last_representation["graph"] = "excluded"
+            limitation = (
+                "[SOORIN_CONTEXT_LIMITATION]\n"
+                "The requested current exhaustive graph evidence could not fit safely. "
+                "Do not answer from previous assistant claims or stale peer lists.\n"
+                "[/SOORIN_CONTEXT_LIMITATION]"
+            )
+            manifest = self._compose_provider_manifest(package, graph_included=False)
+            text = "\n\n".join(
+                part for part in (manifest, profile_text, detection_text, limitation) if part
+            )
+
+        self.last_parts = {
+            "status": manifest,
+            "asset_profile": profile_text,
+            "detection": detection_text,
+            "graph": graph_text,
+            "fusion": "",
+        }
+        self.last_budget["total_dynamic_tokens"] = approx_tokens(text)
+        logger.info(
+            "event=context_composed_route_aware request_id=%s requested_scope=full_neighbors graph_included=%s graph_representation=%s graph_tokens=%s asset_profile_tokens=%s detection_tokens=%s total_dynamic_tokens=%s max_dynamic_tokens=%s required_context_missing=%s",
+            request_id,
+            graph_included and bool(graph_text),
+            self.last_representation.get("graph", "excluded"),
+            approx_tokens(graph_text),
+            approx_tokens(profile_text),
+            approx_tokens(detection_text),
+            approx_tokens(text),
+            max_dynamic_tokens,
+            self.required_context_missing,
+        )
+        return text
+
+    def _compact_product_section(
+        self,
+        result: Any,
+        provider_name: str,
+        ip: str,
+        *,
+        token_budget: int,
+    ) -> str:
+        tag = "ASSET_PROFILE_COMPACT_JSON" if provider_name == "asset_profile" else "ASSET_DETECTION_COMPACT_JSON"
+        try:
+            source = json.loads(result.serialized_json)
+        except (TypeError, ValueError):
+            source = result.raw_payload
+        priority_keys = (
+            "id",
+            "ip",
+            "ip_address",
+            "assetFound",
+            "name",
+            "hostname",
+            "classification",
+            "role",
+            "confidence",
+            "risk_score",
+            "os",
+            "services",
+            "matchedRules",
+            "signals",
+            "conflicts",
+            "metrics",
+            "identity",
+        )
+        compact: dict[str, Any] = {
+            "representation": "compact",
+            "target_ip": ip,
+        }
+        if isinstance(source, dict):
+            ordered_keys = [key for key in priority_keys if key in source]
+            ordered_keys.extend(sorted(key for key in source if key not in ordered_keys))
+            included_keys: list[str] = []
+            for key in ordered_keys:
+                trial = dict(compact)
+                trial[key] = self._compact_json_value(source[key])
+                section = self._tagged_json(tag, ip, trial)
+                if approx_tokens(section) <= token_budget:
+                    compact = trial
+                    included_keys.append(key)
+            compact["source_top_level_key_count"] = len(source)
+            compact["included_top_level_key_count"] = len(included_keys)
+            compact["omitted_top_level_key_count"] = max(0, len(source) - len(included_keys))
+        elif isinstance(source, list):
+            compact["items"] = [self._compact_json_value(item) for item in source[:3]]
+            compact["source_item_count"] = len(source)
+            compact["omitted_item_count"] = max(0, len(source) - 3)
+        return self._tagged_json(tag, ip, compact)
+
+    @classmethod
+    def _compact_json_value(cls, value: Any, depth: int = 0) -> Any:
+        if isinstance(value, str):
+            return value if len(value) <= 160 else value[:157] + "..."
+        if value is None or isinstance(value, (bool, int, float)):
+            return value
+        if depth >= 2:
+            if isinstance(value, dict):
+                return {"summary": "nested_object", "key_count": len(value)}
+            if isinstance(value, list):
+                return {"summary": "nested_array", "item_count": len(value)}
+            return str(value)[:160]
+        if isinstance(value, list):
+            items = [cls._compact_json_value(item, depth + 1) for item in value[:4]]
+            if len(value) > 4:
+                items.append({"omitted_item_count": len(value) - 4})
+            return items
+        if isinstance(value, dict):
+            keys = list(value)[:12]
+            compact = {key: cls._compact_json_value(value[key], depth + 1) for key in keys}
+            if len(value) > len(keys):
+                compact["omitted_key_count"] = len(value) - len(keys)
+            return compact
+        return str(value)[:160]
+
+    @staticmethod
+    def _tagged_json(tag: str, ip: str, payload: dict[str, Any]) -> str:
+        return "\n".join(
+            (
+                f'[{tag} ip="{ip}"]',
+                json.dumps(payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True),
+                f'[/{tag}]',
+            )
+        )
+
+    @staticmethod
+    def _mark_graph_excluded(package: CopilotContextPackage, reason: str) -> None:
+        if not package.graph:
+            return
+        context = package.graph.context
+        context.update(
+            {
+                "included_node_count": 0,
+                "included_edge_count": 0,
+                "context_node_count": 0,
+                "context_edge_count": 0,
+                "inbound_context_included": 0,
+                "outbound_context_included": 0,
+                "bidirectional_context_included": 0,
+                "serialized_context_complete_for_retrieved_subset": False,
+                "serialized_context_truncated": True,
+                "serialized_context_truncation_reason": reason,
+                "context_truncated": True,
+                "context_truncation_reason": reason,
+                "complete_for_user_request": False,
+                "model_input_graph_included": False,
+                "model_input_graph_complete": False,
+            }
+        )
+
+    @staticmethod
     def _compose_json_sections(results: list[Any], tag: str) -> list[tuple[str, str, str]]:
         sections: list[tuple[str, str, str]] = []
         provider_name = "asset_profile" if tag == "ASSET_PROFILE_JSON" else "detection"
@@ -158,11 +493,15 @@ class ContextComposer:
     def _product_coverage(self, results: list[Any], provider_name: str) -> dict[str, Any]:
         entities: dict[str, Any] = {}
         for item in results:
-            included = self.last_inclusion.get(f"{provider_name}:{item.ip}", (False, None))[0]
+            key = f"{provider_name}:{item.ip}"
+            included = self.last_inclusion.get(key, (False, None))[0]
+            representation = self.last_representation.get(key, "excluded")
             entities[item.ip] = {
                 "status": item.status,
                 "payload_included": included,
-                "payload_complete": bool(item.full_payload_fetched),
+                "payload_complete": bool(item.full_payload_fetched and representation == "full"),
+                "source_payload_complete": bool(item.full_payload_fetched),
+                "representation": representation,
                 "stale": bool(item.stale),
             }
         return {
@@ -193,6 +532,11 @@ class ContextComposer:
                 "returned_node_count": context.get("retrieved_node_count", context.get("returned_node_count", 0)),
                 "candidate_edge_count": context.get("candidate_edge_count", 0),
                 "returned_edge_count": context.get("retrieved_edge_count", context.get("returned_edge_count", 0)),
+                "included_node_count": context.get("included_node_count", context.get("context_node_count", 0)),
+                "included_edge_count": context.get("included_edge_count", context.get("context_edge_count", 0)),
+                "inbound_context_included": context.get("inbound_context_included", 0),
+                "outbound_context_included": context.get("outbound_context_included", 0),
+                "bidirectional_context_included": context.get("bidirectional_context_included", 0),
                 "retrieval_complete": context.get("retrieval_complete", False),
                 "retrieval_truncated": context.get("retrieval_truncated", False),
                 "retrieval_truncation_reason": context.get("retrieval_truncation_reason"),
@@ -200,6 +544,11 @@ class ContextComposer:
                 "serialized_context_truncated": context.get("serialized_context_truncated", False),
                 "serialized_context_truncation_reason": context.get("serialized_context_truncation_reason"),
                 "requested_scope_complete": context.get("requested_scope_complete", False),
+                "model_input_graph_included": graph_included,
+                "model_input_graph_complete": bool(
+                    graph_included
+                    and context.get("serialized_context_complete_for_retrieved_subset", False)
+                ),
                 "complete_for_user_request": bool(graph_included and context.get("complete_for_user_request", False)),
             }
         target_entities = [entity.value for entity in package.entities.entities]
@@ -217,7 +566,13 @@ class ContextComposer:
         }
         return "[SOORIN_PROVIDER_MANIFEST]\n" + json.dumps(manifest, ensure_ascii=False, separators=(",", ":"), sort_keys=True) + "\n[/SOORIN_PROVIDER_MANIFEST]"
 
-    def _compose_graph(self, package: CopilotContextPackage, *, request_id: str = "") -> str:
+    def _compose_graph(
+        self,
+        package: CopilotContextPackage,
+        *,
+        request_id: str = "",
+        token_budget: int | None = None,
+    ) -> str:
         graph = package.graph
         if not graph or graph.status not in {"available", "not_found"}:
             return ""
@@ -319,6 +674,12 @@ class ContextComposer:
                 "nodes": context.get("path_nodes", []),
             }
         text = "[SOORIN_GRAPH_CONTEXT_JSON]\n" + json.dumps(payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True) + "\n[/SOORIN_GRAPH_CONTEXT_JSON]"
+        if token_budget is not None and approx_tokens(text) > token_budget:
+            return self._compose_compact_graph(
+                package,
+                token_budget=token_budget,
+                request_id=request_id,
+            )
         logger.info(
             "event=context_composer_graph_complete request_id=%s graph_status=%s requested_scope=%s retrieval_complete=%s serialized_context_complete_for_retrieved_subset=%s requested_scope_complete=%s complete_for_user_request=%s returned_nodes=%s serialized_nodes=%s returned_edges=%s serialized_edges=%s context_chars=%s",
             request_id,
@@ -333,6 +694,258 @@ class ContextComposer:
             payload["counts"]["returned_edges"],
             len(edges),
             len(text),
+        )
+        return text
+
+    def _compose_compact_graph(
+        self,
+        package: CopilotContextPackage,
+        *,
+        token_budget: int,
+        request_id: str,
+    ) -> str:
+        graph = package.graph
+        if not graph:
+            return ""
+        context = graph.context
+        target_ip = str(context.get("target_ip") or "")
+        all_nodes = [dict(node) for node in context.get("nodes", []) if node.get("id")]
+        target_nodes = [node for node in all_nodes if str(node.get("id")) == target_ip]
+        peers = [node for node in all_nodes if str(node.get("id")) != target_ip]
+        all_edges = [dict(edge) for edge in (context.get("edges") or context.get("path_edges") or [])]
+
+        def edge_weight(edge: dict[str, Any]) -> float:
+            try:
+                return float(edge.get("weight", 1) or 1)
+            except (TypeError, ValueError):
+                return 1.0
+
+        exceptional_peers = {
+            endpoint
+            for edge in all_edges
+            if edge_weight(edge) > 1
+            for endpoint in (str(edge.get("source")), str(edge.get("target")))
+            if endpoint != target_ip
+        }
+
+        def peer_priority(node: dict[str, Any]) -> tuple[int, str]:
+            node_id = str(node.get("id"))
+            if node.get("bidirectional") or (node.get("inbound") and node.get("outbound")):
+                rank = 0
+            elif node.get("outbound"):
+                rank = 1
+            elif node_id in exceptional_peers:
+                rank = 2
+            elif node.get("inbound"):
+                rank = 3
+            else:
+                rank = 4
+            return rank, node_id
+
+        peers.sort(key=peer_priority)
+        rank_by_id = {str(node.get("id")): index for index, node in enumerate(peers)}
+        all_edges.sort(
+            key=lambda edge: (
+                -edge_weight(edge),
+                min(
+                    rank_by_id.get(str(edge.get("source")), len(peers)),
+                    rank_by_id.get(str(edge.get("target")), len(peers)),
+                ),
+                str(edge.get("source")),
+                str(edge.get("target")),
+            )
+        )
+
+        subnet_groups: dict[str, dict[str, int]] = {}
+        for node in peers:
+            subnet = str(node.get("subnet") or "unknown")
+            group = subnet_groups.setdefault(
+                subnet,
+                {"peer_count": 0, "inbound": 0, "outbound": 0, "bidirectional": 0},
+            )
+            group["peer_count"] += 1
+            group["inbound"] += int(bool(node.get("inbound")))
+            group["outbound"] += int(bool(node.get("outbound")))
+            group["bidirectional"] += int(
+                bool(node.get("bidirectional") or (node.get("inbound") and node.get("outbound")))
+            )
+
+        def build(peer_limit: int, edge_limit: int) -> tuple[str, dict[str, Any], list[dict[str, Any]], list[dict[str, Any]]]:
+            selected_peers = peers[:peer_limit]
+            selected_ids = {target_ip, *(str(node.get("id")) for node in selected_peers)}
+            eligible_edges = [
+                edge
+                for edge in all_edges
+                if str(edge.get("source")) in selected_ids and str(edge.get("target")) in selected_ids
+            ]
+            selected_edges = eligible_edges[:edge_limit]
+            selected_nodes = [*target_nodes[:1], *selected_peers]
+            direction_counts = self._included_direction_counts(selected_nodes, target_ip)
+            nodes_complete = len(selected_nodes) == len(all_nodes)
+            edges_complete = len(selected_edges) == len(all_edges)
+            serialized_complete = nodes_complete and edges_complete
+            reasons = []
+            if not nodes_complete:
+                reasons.append("graph_budget_peer_limit")
+            if not edges_complete:
+                reasons.append("graph_budget_edge_limit")
+            coverage = {
+                "retrieval_complete": context.get("retrieval_complete", False),
+                "retrieval_truncated": context.get("retrieval_truncated", False),
+                "retrieval_truncation_reason": context.get("retrieval_truncation_reason"),
+                "serialized_context_complete_for_retrieved_subset": serialized_complete,
+                "serialized_context_truncated": not serialized_complete,
+                "serialized_context_truncation_reason": reasons[0] if reasons else None,
+                "requested_scope_complete": context.get("requested_scope_complete", False),
+                "complete_for_user_request": bool(
+                    context.get("requested_scope_complete", False) and serialized_complete
+                ),
+            }
+            compact_peers = []
+            for node in selected_peers:
+                direction = (
+                    "bidirectional"
+                    if node.get("bidirectional") or (node.get("inbound") and node.get("outbound"))
+                    else "outbound"
+                    if node.get("outbound")
+                    else "inbound"
+                    if node.get("inbound")
+                    else "observed"
+                )
+                compact_peers.append(
+                    {
+                        "id": str(node.get("id")),
+                        "direction": direction,
+                        "subnet": node.get("subnet"),
+                    }
+                )
+            payload = {
+                "status": graph.status,
+                "representation": "compact",
+                "target_ip": target_ip,
+                "target_ips": context.get("target_ips", [target_ip] if target_ip else []),
+                "requested_scope": context.get("requested_scope", context.get("scope", "none")),
+                "direction": context.get("direction", "none"),
+                "depth": context.get("depth", 0),
+                "coverage": coverage,
+                "counts": {
+                    "candidate_nodes": context.get("candidate_node_count", 0),
+                    "returned_nodes": context.get("retrieved_node_count", context.get("returned_node_count", 0)),
+                    "serialized_nodes": len(selected_nodes),
+                    "candidate_edges": context.get("candidate_edge_count", 0),
+                    "returned_edges": context.get("retrieved_edge_count", context.get("returned_edge_count", 0)),
+                    "serialized_edges": len(selected_edges),
+                },
+                "relationships": {
+                    "inbound": {
+                        "total": context.get("inbound_total", 0),
+                        "returned": context.get("inbound_retrieved", context.get("inbound_returned", 0)),
+                        "included": direction_counts["inbound"],
+                    },
+                    "outbound": {
+                        "total": context.get("outbound_total", 0),
+                        "returned": context.get("outbound_retrieved", context.get("outbound_returned", 0)),
+                        "included": direction_counts["outbound"],
+                    },
+                    "bidirectional": {
+                        "total": context.get("bidirectional_total", 0),
+                        "returned": context.get("bidirectional_retrieved", context.get("bidirectional_returned", 0)),
+                        "included": direction_counts["bidirectional"],
+                    },
+                },
+                "subnet_groups": [
+                    {"subnet": subnet, **counts}
+                    for subnet, counts in sorted(subnet_groups.items())
+                ],
+                "peers": compact_peers,
+                "edges": [
+                    [edge.get("source"), edge.get("target"), edge.get("weight", 1)]
+                    for edge in selected_edges
+                ],
+                "limitations": list(context.get("limitations") or graph.limitations or []),
+                "grounding_rules": GRAPH_GROUNDING_RULES,
+            }
+            text = "[SOORIN_GRAPH_CONTEXT_JSON]\n" + json.dumps(
+                payload,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            ) + "\n[/SOORIN_GRAPH_CONTEXT_JSON]"
+            return text, payload, selected_nodes, selected_edges
+
+        all_peer_count = len(peers)
+        text, payload, selected_nodes, selected_edges = build(all_peer_count, len(all_edges))
+        if approx_tokens(text) > token_budget:
+            low, high, best_edges = 0, len(all_edges), 0
+            while low <= high:
+                middle = (low + high) // 2
+                trial_text, _, _, _ = build(all_peer_count, middle)
+                if approx_tokens(trial_text) <= token_budget:
+                    best_edges = middle
+                    low = middle + 1
+                else:
+                    high = middle - 1
+            text, payload, selected_nodes, selected_edges = build(all_peer_count, best_edges)
+
+        if approx_tokens(text) > token_budget:
+            low, high, best_peers = 0, all_peer_count, -1
+            while low <= high:
+                middle = (low + high) // 2
+                trial_text, _, _, _ = build(middle, 0)
+                if approx_tokens(trial_text) <= token_budget:
+                    best_peers = middle
+                    low = middle + 1
+                else:
+                    high = middle - 1
+            if best_peers < 0:
+                return ""
+            low, high, best_edges = 0, len(all_edges), 0
+            while low <= high:
+                middle = (low + high) // 2
+                trial_text, _, _, _ = build(best_peers, middle)
+                if approx_tokens(trial_text) <= token_budget:
+                    best_edges = middle
+                    low = middle + 1
+                else:
+                    high = middle - 1
+            text, payload, selected_nodes, selected_edges = build(best_peers, best_edges)
+
+        coverage = payload["coverage"]
+        direction_counts = self._included_direction_counts(selected_nodes, target_ip)
+        context.update(
+            {
+                "included_node_count": len(selected_nodes),
+                "included_edge_count": len(selected_edges),
+                "context_node_count": len(selected_nodes),
+                "context_edge_count": len(selected_edges),
+                "inbound_context_included": direction_counts["inbound"],
+                "outbound_context_included": direction_counts["outbound"],
+                "bidirectional_context_included": direction_counts["bidirectional"],
+                "serialized_context_complete_for_retrieved_subset": coverage["serialized_context_complete_for_retrieved_subset"],
+                "serialized_context_truncated": coverage["serialized_context_truncated"],
+                "serialized_context_truncation_reason": coverage["serialized_context_truncation_reason"],
+                "context_truncated": coverage["serialized_context_truncated"],
+                "context_truncation_reason": coverage["serialized_context_truncation_reason"],
+                "context_mode": "compact_enumerated",
+                "aggregate_only_context": False,
+                "complete_for_user_request": coverage["complete_for_user_request"],
+                "model_input_graph_included": True,
+                "model_input_graph_complete": coverage["serialized_context_complete_for_retrieved_subset"],
+            }
+        )
+        logger.info(
+            "event=context_composer_graph_budgeted request_id=%s requested_scope=%s graph_budget_tokens=%s graph_tokens=%s returned_nodes=%s included_nodes=%s returned_edges=%s included_edges=%s retrieval_complete=%s serialization_complete=%s complete_for_user_request=%s",
+            request_id,
+            payload["requested_scope"],
+            token_budget,
+            approx_tokens(text),
+            payload["counts"]["returned_nodes"],
+            payload["counts"]["serialized_nodes"],
+            payload["counts"]["returned_edges"],
+            payload["counts"]["serialized_edges"],
+            coverage["retrieval_complete"],
+            coverage["serialized_context_complete_for_retrieved_subset"],
+            coverage["complete_for_user_request"],
         )
         return text
 

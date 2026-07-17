@@ -166,10 +166,19 @@ class CopilotService:
     ) -> None:
         fetched = [item for item in results if item.status in {"available", "not_found"} and item.raw_payload_present]
         inclusion = [self.context_composer.last_inclusion.get(f"{provider_name}:{item.ip}", (False, None)) for item in fetched]
+        representations = [
+            self.context_composer.last_representation.get(f"{provider_name}:{item.ip}", "excluded")
+            for item in fetched
+        ]
         reasons = [reason for included, reason in inclusion if not included and reason]
+        if any(representation == "compact" for representation in representations):
+            reasons.append("route_aware_compaction")
         trace.put(
             section,
-            full_payload_included=bool(fetched) and all(included for included, _ in inclusion),
+            full_payload_included=bool(fetched)
+            and all(included for included, _ in inclusion)
+            and all(representation == "full" for representation in representations),
+            context_representation=", ".join(representations),
             context_chars=len(context_text),
             context_approx_tokens=approx_tokens(context_text),
             context_truncated=bool(reasons),
@@ -801,6 +810,59 @@ class CopilotService:
             else None
         )
         history = conversation_snapshot.messages if conversation_snapshot else []
+        history_tokens_before_budget = sum(
+            approx_tokens(item.get("content", "")) for item in history
+        )
+        history_message_count_before_budget = len(history)
+        history_budget_tokens = history_tokens_before_budget
+        exhaustive_graph_request = bool(
+            route.use_graph
+            and (
+                route.scope == "full_neighbors"
+                or route.exhaustive_connections_requested
+            )
+        )
+        if exhaustive_graph_request:
+            input_capacity = max(
+                0,
+                self.settings.llm_context_window_tokens
+                - self.settings.llm_reserved_output_tokens
+                - self.settings.llm_context_safety_margin_tokens,
+            )
+            fixed_tokens = approx_tokens(self.system_prompt) + approx_tokens(user_text)
+            compact_product_reserve = 384 * (
+                len(asset_profile_results) + len(detection_results)
+            )
+            desired_dynamic_reserve = min(
+                max(0, input_capacity - fixed_tokens),
+                max(0, self.settings.graph_max_context_tokens)
+                + compact_product_reserve
+                + 1024,
+            )
+            history_budget_tokens = max(
+                0,
+                input_capacity - fixed_tokens - desired_dynamic_reserve,
+            )
+            history = self.memory_store.fit_messages_to_budget(
+                history,
+                history_budget_tokens,
+                prefer_current_evidence=True,
+            )
+            logger.info(
+                "event=conversation_history_route_budgeted request_id=%s requested_scope=%s history_budget_tokens=%s history_tokens_before=%s history_tokens_after=%s messages_before=%s messages_after=%s assistant_messages_dropped=%s",
+                request_id,
+                route.scope,
+                history_budget_tokens,
+                history_tokens_before_budget,
+                sum(approx_tokens(item.get("content", "")) for item in history),
+                history_message_count_before_budget,
+                len(history),
+                max(
+                    0,
+                    sum(1 for item in (conversation_snapshot.messages if conversation_snapshot else []) if item.get("role") == "assistant")
+                    - sum(1 for item in history if item.get("role") == "assistant"),
+                ),
+            )
         base_input_tokens = approx_tokens(self.system_prompt) + approx_tokens(user_text) + sum(
             approx_tokens(item.get("content", "")) for item in history
         )
@@ -855,6 +917,12 @@ class CopilotService:
             conversation_tokens_after_compaction=conversation_snapshot.tokens_after_compaction if conversation_snapshot else 0,
             conversation_summary_updated=conversation_snapshot.summary_updated if conversation_snapshot else False,
             conversation_summary_error=conversation_snapshot.summary_error if conversation_snapshot else "",
+            route_aware_history_budget_applied=exhaustive_graph_request,
+            history_budget_tokens=history_budget_tokens,
+            history_message_count_before_budget=history_message_count_before_budget,
+            history_message_count_after_budget=len(history),
+            history_tokens_before_budget=history_tokens_before_budget,
+            history_tokens_after_budget=sum(approx_tokens(item.get("content", "")) for item in history),
         )
 
         messages = [
@@ -930,7 +998,29 @@ class CopilotService:
             "stream_error_type": "",
         }
         try:
-            if stream_sink is not None:
+            if self.context_composer.required_context_missing:
+                safe_answer = (
+                    "I cannot safely analyze all requested connections because the current "
+                    "graph evidence could not fit within the model context budget. No prior "
+                    "assistant peer list was used as current evidence."
+                )
+                result = LLMProviderResult(
+                    text=safe_answer,
+                    provider="deterministic",
+                    model="context-budget-guard",
+                    deployment="deterministic",
+                    finish_reason=None,
+                )
+                final_synthesis_status = "context_insufficient"
+                fallback_answer_used = True
+                response_warnings.append("graph_context_budget_insufficient")
+                if stream_sink is not None:
+                    stream_sink(LLMStreamEvent("answer_delta", text=safe_answer))
+                logger.error(
+                    "event=final_synthesis_skipped request_id=%s reason=required_graph_context_missing stale_history_used=false",
+                    request_id,
+                )
+            elif stream_sink is not None:
                 result = self._stream_final_model(
                     messages,
                     request_id=request_id,
