@@ -60,3 +60,15 @@ docker-compose.override.yml
 .codex/
 .agent/
 .agents/
+
+# Compose deployment configuration
+compose.env
+compose.env.*
+!compose.env.example
+
+# Runtime graph data is provided through a named volume
+data/
+
+# Exported Docker images must never enter the build context
+*.tar
+*.tar.gz

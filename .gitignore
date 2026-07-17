@@ -130,3 +130,4 @@ desktop.ini
 # Python virtual environments
 .venv/
 venv/
+compose.env
