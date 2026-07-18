@@ -442,8 +442,9 @@ class ArvanProvider:
                 )
 
             stream_done = False
+            response.encoding = "utf-8"
             for raw_line in response.iter_lines(chunk_size=1, decode_unicode=True):
-                line = raw_line.decode("utf-8", errors="replace") if isinstance(raw_line, bytes) else str(raw_line or "")
+                line = raw_line.decode("utf-8") if isinstance(raw_line, bytes) else str(raw_line or "")
                 line = line.strip()
                 if not line or line.startswith(":"):
                     continue

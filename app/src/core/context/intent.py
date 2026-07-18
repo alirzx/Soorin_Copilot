@@ -223,11 +223,12 @@ ROUTER_SYSTEM_PROMPT_FALLBACK = (
     "Choose entity_binding from explicit, ui, active_single, active_pair, none. "
     "Allowed scopes include none, node_summary, one_hop, full_neighbors, two_hop, path, "
     "and multi_entity_comparison. Select graph, detection, and asset_profile independently. "
+    "Set requires_knowledge for approved cybersecurity documentation or procedural knowledge. "
     "Detection always means complete JSON. Never request depth greater than 2."
 )
 ROUTER_REPAIR_SYSTEM_PROMPT = (
     "Repair one Soorin routing object. Return JSON only. Required keys: intent, scope, direction, depth, "
-    "requires_graph, requires_detection, requires_asset_profile, entity_binding, requires_multiple_entities, "
+    "requires_graph, requires_detection, requires_asset_profile, requires_knowledge, entity_binding, requires_multiple_entities, "
     "is_followup, classification_confidence, reason. Allowed intents: general_knowledge, asset_investigation, "
     "graph_neighbors, graph_relationships, graph_path, graph_followup, unclear. Allowed scopes: none, "
     "node_summary, one_hop, full_neighbors, two_hop, path, multi_entity_comparison. Allowed directions: none, "
@@ -339,7 +340,7 @@ def validate_router_payload(
         "classification_confidence",
         "reason",
     }
-    if unexpected := sorted(set(payload).difference(required | {"entity_binding"})):
+    if unexpected := sorted(set(payload).difference(required | {"entity_binding", "requires_knowledge"})):
         raise ValueError(f"schema_validation_failed:unexpected={','.join(unexpected)}")
     if missing := sorted(required.difference(payload)):
         raise ValueError(f"schema_validation_failed:missing={','.join(missing)}")
@@ -385,6 +386,9 @@ def validate_router_payload(
     requires_graph = payload["requires_graph"]
     requires_detection = payload["requires_detection"]
     requires_asset_profile = payload["requires_asset_profile"]
+    if "requires_knowledge" in payload and not isinstance(payload["requires_knowledge"], bool):
+        raise ValueError("schema_validation_failed:requires_knowledge")
+    requires_knowledge = bool(payload.get("requires_knowledge", False))
     requires_multiple = payload["requires_multiple_entities"]
     exhaustive_connections = is_exhaustive_connection_request(message)
 
@@ -457,6 +461,8 @@ def validate_router_payload(
         if any((requires_graph, requires_detection, requires_asset_profile)):
             normalize("general_skips_product_context")
         requires_graph = requires_detection = requires_asset_profile = False
+        if intent == "unclear":
+            requires_knowledge = False
         scope, direction, depth, requires_multiple = "none", "none", 0, False
     elif intent == "asset_investigation" and entity_count in {1, 2} and not any((requires_graph, requires_detection, requires_asset_profile)):
         requires_asset_profile = True
@@ -538,6 +544,7 @@ def validate_router_payload(
         requires_graph=requires_graph,
         requires_detection=requires_detection,
         requires_asset_profile=requires_asset_profile,
+        requires_knowledge=requires_knowledge,
         entity_binding=entity_binding,
         requested_entity_binding=requested_entity_binding,
         binding_source=binding_source,
@@ -871,7 +878,7 @@ class SemanticIntentRouter:
             }
         )
         logger.info(
-            "event=intent_router_complete request_id=%s decision_source=%s intent=%s scope=%s direction=%s depth=%s requires_graph=%s requires_detection=%s requires_asset_profile=%s entity_binding=%s binding_source=%s binding_available=%s binding_normalized=%s binding_normalization_reason=%s materialized_entity_count=%s route_normalized=%s route_normalization_reason=%s confidence=%s retry_count=%s latency_ms=%s finish_reason=%s content_present=%s completion_tokens=%s",
+            "event=intent_router_complete request_id=%s decision_source=%s intent=%s scope=%s direction=%s depth=%s requires_graph=%s requires_detection=%s requires_asset_profile=%s requires_knowledge=%s entity_binding=%s binding_source=%s binding_available=%s binding_normalized=%s binding_normalization_reason=%s materialized_entity_count=%s route_normalized=%s route_normalization_reason=%s confidence=%s retry_count=%s latency_ms=%s finish_reason=%s content_present=%s completion_tokens=%s",
             request_id,
             decision.decision_source,
             decision.intent,
@@ -881,6 +888,7 @@ class SemanticIntentRouter:
             decision.requires_graph,
             decision.requires_detection,
             decision.requires_asset_profile,
+            decision.requires_knowledge,
             decision.entity_binding,
             decision.binding_source,
             decision.binding_available,

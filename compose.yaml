@@ -164,6 +164,21 @@ services:
     networks:
       - copilot-network
 
+  qdrant:
+    image: qdrant/qdrant:v1.18.2
+    profiles:
+      - rag
+    container_name: soorin-copilot-qdrant
+    ports:
+      - "${SOORIN_QDRANT_BIND_IP:-127.0.0.1}:${SOORIN_QDRANT_PORT:-6333}:6333"
+    volumes:
+      - copilot-qdrant:/qdrant/storage
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      - copilot-network
+
 networks:
   copilot-network:
     driver: bridge
@@ -171,3 +186,4 @@ networks:
 volumes:
   copilot-data:
   copilot-cache:
+  copilot-qdrant:

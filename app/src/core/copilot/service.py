@@ -12,6 +12,9 @@ from typing import Any
 from uuid import uuid4
 
 from src.config.settings import Settings
+from src.core.agent.registry import build_capability_registry
+from src.core.agent.task_mapping import bounded_plan_placeholder, task_spec_from_route
+from src.core.agent.workflow import BoundedCopilotWorkflow
 from src.core.context import ContextComposer, DeterministicFallbackRouter, EntityResolver, SemanticIntentRouter, normalize_intent_route
 from src.core.context.intent import SECURITY_ANALYSIS_WORDS, build_routing_context, resolution_from_materialized_decision
 from src.core.context.models import (
@@ -34,6 +37,7 @@ from src.core.copilot.fallback_answer import build_evidence_fallback_answer
 from src.core.graph.loader import get_graph_metadata
 from src.core.graph.refresh import get_refresh_status
 from src.core.product_client import ProductApiClient
+from src.core.rag.service import KnowledgeSearchService
 
 
 logger = logging.getLogger(__name__)
@@ -78,7 +82,15 @@ class CopilotService:
         product_client = ProductApiClient(settings)
         self.detection_provider = DetectionContextProvider(settings, product_client)
         self.asset_profile_provider = AssetProfileContextProvider(settings, product_client)
+        self.knowledge_service = KnowledgeSearchService(settings)
+        self.capability_registry = build_capability_registry(
+            asset_profile_provider=self.asset_profile_provider,
+            detection_provider=self.detection_provider,
+            graph_provider=self.graph_provider,
+            knowledge_service=self.knowledge_service,
+        )
         self.context_composer = ContextComposer(settings)
+        self.workflow = BoundedCopilotWorkflow()
 
     def _load_system_prompt(self) -> str:
         prompt_path = Path(self.settings.system_prompt_path)
@@ -434,6 +446,25 @@ class CopilotService:
         request_id: str | None = None,
         stream_sink: Callable[[LLMStreamEvent], None] | None = None,
     ) -> dict[str, Any]:
+        resolved_request_id = request_id or uuid4().hex[:12]
+        return self.workflow.run(
+            message=message,
+            session_id=session_id,
+            ui_context=ui_context,
+            request_id=resolved_request_id,
+            stream_sink=stream_sink,
+            direct_executor=self._chat_direct,
+        )
+
+    def _chat_direct(
+        self,
+        message: str,
+        session_id: str | None = None,
+        *,
+        ui_context: dict[str, Any] | None = None,
+        request_id: str | None = None,
+        stream_sink: Callable[[LLMStreamEvent], None] | None = None,
+    ) -> dict[str, Any]:
         request_id = request_id or uuid4().hex[:12]
         session = (session_id or "").strip() or uuid4().hex
         user_text = message.strip()
@@ -533,6 +564,19 @@ class CopilotService:
                 }
             )
 
+        task_spec = task_spec_from_route(route, user_text)
+        plan_placeholder = bounded_plan_placeholder(task_spec)
+        logger.info(
+            "event=agent_task_mapped request_id=%s decision_source=%s workflow_mode=%s capabilities=%s max_steps=%s plan_steps=%s plan_validated=%s planner_called=false",
+            request_id,
+            task_spec.semantic_decision_source,
+            task_spec.workflow_mode,
+            ",".join(task_spec.required_capabilities) or "none",
+            task_spec.max_steps,
+            len(plan_placeholder.steps),
+            plan_placeholder.validated,
+        )
+
         router_deployment = self.settings.deployment_for_purpose("intent_router")
         router_repair_deployment = self.settings.deployment_for_purpose("intent_router_repair")
         trace.put(
@@ -553,6 +597,7 @@ class CopilotService:
             requires_graph=route.use_graph,
             requires_detection=route.use_detection,
             requires_asset_profile=route.use_asset_profile,
+            requires_knowledge=route.use_knowledge,
             entity_binding=route.entity_binding,
             requires_multiple_entities=route.requires_multiple_entities,
             is_followup=route.followup_detected,
@@ -597,6 +642,7 @@ class CopilotService:
                     ("graph", route.use_graph),
                     ("detection", route.use_detection),
                     ("asset_profile", route.use_asset_profile),
+                    ("knowledge", route.use_knowledge),
                 ]
                 if enabled
             )
@@ -623,6 +669,7 @@ class CopilotService:
         graph_result = None
         detection_results: list[DetectionProviderResult] = []
         asset_profile_results: list[AssetProfileProviderResult] = []
+        knowledge_result = None
         provenance: list[ProviderProvenance] = []
         limitations: list[str] = []
         response_warnings: list[str] = []
@@ -704,6 +751,14 @@ class CopilotService:
                     response_warnings.append(
                         "asset_profile_not_found" if result.status == "not_found" else "asset_profile_unavailable"
                     )
+        if route.use_knowledge:
+            knowledge_result = self.knowledge_service.search(
+                user_text,
+                request_id=request_id,
+            )
+            limitations.extend(knowledge_result.limitations)
+            if knowledge_result.status in {"not_configured", "unavailable", "invalid"}:
+                response_warnings.append(f"knowledge_evidence_{knowledge_result.status}")
         graph_context = graph_result.context if graph_result else {}
         graph_metadata = get_graph_metadata()
         refresh_status = get_refresh_status()
@@ -765,6 +820,7 @@ class CopilotService:
             graph=graph_result,
             detections=detection_results,
             asset_profiles=asset_profile_results,
+            knowledge=knowledge_result,
             provenance=provenance,
             limitations=limitations,
         )
@@ -772,35 +828,43 @@ class CopilotService:
             "graph": graph_result.status if graph_result else "skipped",
             "detection": self._combined_status(detection_results),
             "asset_profile": self._combined_status(asset_profile_results),
+            "knowledge": knowledge_result.status if knowledge_result else "skipped",
         }
         logger.info(
-            "event=provider_statuses request_id=%s graph=%s detection=%s asset_profile=%s",
+            "event=provider_statuses request_id=%s graph=%s detection=%s asset_profile=%s knowledge=%s",
             request_id,
             provider_statuses["graph"],
             provider_statuses["detection"],
             provider_statuses["asset_profile"],
+            provider_statuses["knowledge"],
         )
         requested_statuses = [
             provider_statuses[name]
-            for name, requested in (("graph", route.use_graph), ("detection", route.use_detection), ("asset_profile", route.use_asset_profile))
+            for name, requested in (("graph", route.use_graph), ("detection", route.use_detection), ("asset_profile", route.use_asset_profile), ("knowledge", route.use_knowledge))
             if requested
         ]
-        if "partial" in requested_statuses or ("available" in requested_statuses and any(status != "available" for status in requested_statuses)):
+        available_statuses = {"available", "ok"}
+        if "partial" in requested_statuses or (
+            any(status in available_statuses for status in requested_statuses)
+            and any(status not in available_statuses for status in requested_statuses)
+        ):
             logger.info(
-                "event=partial_provider_result request_id=%s graph=%s detection=%s asset_profile=%s synthesis_continues=true",
+                "event=partial_provider_result request_id=%s graph=%s detection=%s asset_profile=%s knowledge=%s synthesis_continues=true",
                 request_id,
                 provider_statuses["graph"],
                 provider_statuses["detection"],
                 provider_statuses["asset_profile"],
+                provider_statuses["knowledge"],
             )
         logger.info(
-            "event=context_package_created request_id=%s entity_status=%s entity_count=%s graph_status=%s detection_status=%s asset_profile_status=%s provenance_count=%s limitation_count=%s",
+            "event=context_package_created request_id=%s entity_status=%s entity_count=%s graph_status=%s detection_status=%s asset_profile_status=%s knowledge_status=%s provenance_count=%s limitation_count=%s",
             request_id,
             route_entities.status,
             len(route_entities.entities),
             graph_result.status if graph_result else "skipped",
             provider_statuses["detection"],
             provider_statuses["asset_profile"],
+            provider_statuses["knowledge"],
             len(provenance),
             len(limitations),
         )
@@ -875,6 +939,7 @@ class CopilotService:
         graph_dynamic_context = self.context_composer.last_parts.get("graph", "")
         detection_dynamic_context = self.context_composer.last_parts.get("detection", "")
         fusion_dynamic_context = self.context_composer.last_parts.get("fusion", "")
+        knowledge_dynamic_context = self.context_composer.last_parts.get("knowledge", "")
         self._update_product_inclusion_trace(trace, "ASSET PROFILE", "asset_profile", asset_profile_results, profile_dynamic_context)
         self._update_product_inclusion_trace(trace, "ASSET DETECTION", "detection", detection_results, detection_dynamic_context)
         if any(
@@ -889,6 +954,8 @@ class CopilotService:
             if item.status in {"available", "not_found"} and item.raw_payload_present
         ):
             response_warnings.append("asset_profile_context_too_large")
+        if route.use_knowledge and not self.context_composer.last_inclusion.get("knowledge", (False, None))[0]:
+            response_warnings.append("knowledge_context_not_included")
         trace.put(
             "GRAPH RETRIEVAL",
             inbound_context_included=graph_context.get("inbound_context_included", "") if isinstance(graph_context, dict) else "",
@@ -939,7 +1006,7 @@ class CopilotService:
         conversation_chars = sum(len(item.get("content", "")) for item in history) + len(user_text)
         total_chars = sum(len(item.get("content", "")) for item in messages)
         logger.info(
-            "event=model_input_prepared request_id=%s deployment=%s provider=%s model=%s message_count=%s roles=%s system_chars=%s system_approx_tokens=%s asset_profile_dynamic_approx_tokens=%s detection_dynamic_approx_tokens=%s graph_dynamic_approx_tokens=%s fusion_dynamic_approx_tokens=%s dynamic_context_chars=%s dynamic_context_approx_tokens=%s conversation_chars=%s conversation_approx_tokens=%s total_input_chars=%s total_input_approx_tokens=%s",
+            "event=model_input_prepared request_id=%s deployment=%s provider=%s model=%s message_count=%s roles=%s system_chars=%s system_approx_tokens=%s asset_profile_dynamic_approx_tokens=%s detection_dynamic_approx_tokens=%s graph_dynamic_approx_tokens=%s knowledge_dynamic_approx_tokens=%s fusion_dynamic_approx_tokens=%s dynamic_context_chars=%s dynamic_context_approx_tokens=%s conversation_chars=%s conversation_approx_tokens=%s total_input_chars=%s total_input_approx_tokens=%s",
             request_id,
             chat_deployment.name,
             chat_deployment.provider_type,
@@ -951,6 +1018,7 @@ class CopilotService:
             approx_tokens(profile_dynamic_context),
             approx_tokens(detection_dynamic_context),
             approx_tokens(graph_dynamic_context),
+            approx_tokens(knowledge_dynamic_context),
             approx_tokens(fusion_dynamic_context),
             dynamic_context_chars,
             approx_tokens(dynamic_context),
@@ -969,6 +1037,7 @@ class CopilotService:
             system_tokens_approx=approx_tokens(self.system_prompt),
             asset_profile_dynamic_tokens_approx=approx_tokens(profile_dynamic_context),
             graph_dynamic_tokens_approx=approx_tokens(graph_dynamic_context),
+            knowledge_dynamic_tokens_approx=approx_tokens(knowledge_dynamic_context),
             detection_dynamic_tokens_approx=approx_tokens(detection_dynamic_context),
             fusion_dynamic_tokens_approx=approx_tokens(fusion_dynamic_context),
             dynamic_tokens_approx=approx_tokens(dynamic_context),
@@ -1209,6 +1278,7 @@ class CopilotService:
         graph_available = bool(graph_result and graph_result.status == "available")
         detection_available = any(item.status == "available" for item in detection_results)
         asset_profile_available = any(item.status == "available" for item in asset_profile_results)
+        knowledge_available = bool(knowledge_result and knowledge_result.status in {"ok", "partial"})
         evidence_execution_succeeded = graph_execution_succeeded or detection_execution_succeeded or asset_profile_execution_succeeded
         used_providers = tuple(
             provider
@@ -1324,7 +1394,7 @@ class CopilotService:
             errors=trace.errors,
             providers_requested=", ".join(
                 provider
-                for provider, enabled in [("graph", route.use_graph), ("detection", route.use_detection), ("asset_profile", route.use_asset_profile)]
+                for provider, enabled in [("graph", route.use_graph), ("detection", route.use_detection), ("asset_profile", route.use_asset_profile), ("knowledge", route.use_knowledge)]
                 if enabled
             )
             or "none",
@@ -1334,6 +1404,7 @@ class CopilotService:
                     ("graph", graph_available),
                     ("detection", detection_available),
                     ("asset_profile", asset_profile_available),
+                    ("knowledge", knowledge_available),
                 ]
                 if available
             )
@@ -1344,6 +1415,7 @@ class CopilotService:
                     ("graph", bool(route.use_graph and graph_result and graph_result.status == "not_found")),
                     ("detection", bool(route.use_detection and any(item.status == "not_found" for item in detection_results))),
                     ("asset_profile", bool(route.use_asset_profile and any(item.status == "not_found" for item in asset_profile_results))),
+                    ("knowledge", bool(route.use_knowledge and knowledge_result and knowledge_result.status == "empty")),
                 ]
                 if not_found
             )
@@ -1354,6 +1426,7 @@ class CopilotService:
                     ("graph", bool(route.use_graph and graph_result and graph_result.status == "unavailable")),
                     ("detection", bool(route.use_detection and any(item.status == "unavailable" for item in detection_results))),
                     ("asset_profile", bool(route.use_asset_profile and any(item.status == "unavailable" for item in asset_profile_results))),
+                    ("knowledge", bool(route.use_knowledge and knowledge_result and knowledge_result.status in {"not_configured", "unavailable", "invalid"})),
                 ]
                 if unavailable
             )

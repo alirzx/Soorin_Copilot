@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import codecs
 import json
 from collections.abc import Iterable, Iterator
 from typing import Any
@@ -14,6 +15,8 @@ class ChatStreamProtocolError(ValueError):
 def parse_sse_events(lines: Iterable[str | bytes]) -> Iterator[dict[str, Any]]:
     """Parse SSE data records while ignoring comments and unknown fields."""
     data_lines: list[str] = []
+    decoder = codecs.getincrementaldecoder("utf-8")()
+    pending = ""
 
     def decode_event() -> dict[str, Any] | None:
         if not data_lines:
@@ -28,22 +31,45 @@ def parse_sse_events(lines: Iterable[str | bytes]) -> Iterator[dict[str, Any]]:
             raise ChatStreamProtocolError("The backend returned an invalid stream event.")
         return event
 
-    for raw_line in lines:
-        line = raw_line.decode("utf-8", errors="replace") if isinstance(raw_line, bytes) else str(raw_line)
+    def iter_complete_lines(fragment: str) -> Iterator[str]:
+        nonlocal pending
+        pending += fragment
+        while "\n" in pending:
+            line, pending = pending.split("\n", 1)
+            yield line
+
+    def handle_line(line: str) -> Iterator[dict[str, Any]]:
         line = line.rstrip("\r\n")
         if not line:
             event = decode_event()
             if event is not None:
                 yield event
-            continue
+            return
         if line.startswith(":") or line.startswith("event:"):
-            continue
+            return
         if line.startswith("data:"):
             data_lines.append(line[5:].lstrip())
 
-    event = decode_event()
-    if event is not None:
-        yield event
+    saw_byte_chunks = False
+    for raw_line in lines:
+        if isinstance(raw_line, bytes):
+            saw_byte_chunks = True
+            for line in iter_complete_lines(decoder.decode(raw_line)):
+                yield from handle_line(line)
+            continue
+
+        for line in str(raw_line).splitlines() or [""]:
+            yield from handle_line(line)
+
+    if saw_byte_chunks:
+        tail = pending + decoder.decode(b"", final=True)
+        pending = ""
+        if tail:
+            yield from handle_line(tail)
+
+    final_event = decode_event()
+    if final_event is not None:
+        yield final_event
 
 
 def collect_visible_stream(events: Iterable[dict[str, Any]]) -> tuple[str, str, bool, str]:

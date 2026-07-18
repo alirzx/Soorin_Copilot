@@ -274,6 +274,7 @@ def normalize_intent_route(decision: IntentDecision, entities: EntityResolution)
     requires_graph = bool(decision.requires_graph and supported)
     requires_detection = bool(decision.requires_detection and supported)
     requires_asset_profile = bool(decision.requires_asset_profile and supported)
+    requires_knowledge = bool(decision.requires_knowledge)
     target_entity = target_entities[0] if count == 1 else None
     if count > 2 or count == 0:
         requires_graph = requires_detection = requires_asset_profile = False
@@ -282,6 +283,7 @@ def normalize_intent_route(decision: IntentDecision, entities: EntityResolution)
         reason=decision.route_normalization_reason or ("semantic_route" if decision.decision_source.startswith("semantic_router") else decision.fallback_reason or "router_no_provider"),
         use_detection=requires_detection,
         use_asset_profile=requires_asset_profile,
+        use_knowledge=requires_knowledge,
         entity_binding=decision.entity_binding,
         requested_entity_binding=decision.requested_entity_binding,
         resolved_entity_binding=decision.entity_binding,

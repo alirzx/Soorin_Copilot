@@ -19,6 +19,12 @@ APP_DIR = Path(__file__).resolve().parents[2]
 ENV_PATH = APP_DIR / ".env"
 logger = logging.getLogger(__name__)
 
+DEFAULT_RAG_EMBEDDING_MODEL = "BAAI/bge-base-en-v1.5"
+DEFAULT_RAG_EMBEDDING_DIMENSION = 768
+DEFAULT_RAG_COLLECTION = "soorin_soc_knowledge_bge_base_v1"
+LEGACY_RAG_EMBEDDING_MODELS = {"ehsanaghaei/securebert"}
+LEGACY_RAG_COLLECTIONS = {"soorin_soc_knowledge"}
+
 
 def _load_env_file(path: Path) -> bool:
     if not path.exists():
@@ -175,6 +181,24 @@ class Settings:
     graph_context_max_enumerated_edges: int
     graph_comparison_max_peers_per_entity: int
     graph_comparison_max_shared_peers: int
+    rag_enabled: bool
+    rag_source_root: str
+    rag_backend: str
+    rag_collection: str
+    rag_top_k: int
+    rag_score_threshold: float
+    rag_qdrant_mode: str
+    rag_qdrant_url: str
+    rag_qdrant_path: str
+    rag_qdrant_api_key: str
+    rag_qdrant_timeout_seconds: float
+    rag_embedding_model: str
+    rag_embedding_dimension: int
+    rag_distance: str
+    rag_max_context_tokens: int
+    rag_chunk_size_chars: int
+    rag_chunk_overlap_chars: int
+    rag_upsert_batch_size: int
     intent_router_enabled: bool
     intent_router_system_prompt_path: str
     intent_router_min_confidence: float
@@ -263,6 +287,38 @@ class Settings:
         """Validate asset path templates without exposing configured URLs."""
         if self.product_asset_profile_path.count("{ip}") != 1 or ".." in self.product_asset_profile_path:
             raise ValueError("SOORIN_PRODUCT_ASSET_PROFILE_PATH must contain exactly one safe {ip} placeholder.")
+
+    def validate_rag_qdrant_configuration(self) -> None:
+        """Validate Qdrant settings only when RAG actually uses Qdrant."""
+        if not self.rag_enabled or self.rag_backend != "qdrant":
+            return
+
+        if self.rag_qdrant_mode not in {"server", "local"}:
+            raise ValueError("SOORIN_RAG_QDRANT_MODE must be either server or local.")
+
+        if self.rag_qdrant_mode == "local" and not self.rag_qdrant_path:
+            raise ValueError("SOORIN_RAG_QDRANT_PATH is required when SOORIN_RAG_QDRANT_MODE=local.")
+
+        if self.rag_qdrant_mode == "server" and not self.rag_qdrant_url:
+            raise ValueError("SOORIN_RAG_QDRANT_URL is required when SOORIN_RAG_QDRANT_MODE=server.")
+
+    def validate_rag_embedding_configuration(self) -> None:
+        """Prevent silent reuse of incompatible embedding collections."""
+        if not self.rag_enabled:
+            return
+
+        if self.rag_embedding_model.lower() in LEGACY_RAG_EMBEDDING_MODELS:
+            raise ValueError("SecureBERT is no longer supported for Soorin RAG embeddings.")
+
+        if self.rag_embedding_model == DEFAULT_RAG_EMBEDDING_MODEL:
+            if self.rag_embedding_dimension != DEFAULT_RAG_EMBEDDING_DIMENSION:
+                raise ValueError("BAAI/bge-base-en-v1.5 requires SOORIN_RAG_EMBEDDING_DIMENSION=768.")
+
+            if self.rag_collection in LEGACY_RAG_COLLECTIONS:
+                raise ValueError(
+                    "BAAI/bge-base-en-v1.5 must not reuse a legacy RAG collection. "
+                    f"Use SOORIN_RAG_COLLECTION={DEFAULT_RAG_COLLECTION} or another freshly indexed collection."
+                )
 
 
 @lru_cache(maxsize=1)
@@ -396,6 +452,27 @@ def get_settings() -> Settings:
         graph_context_max_enumerated_edges=_int("SOORIN_GRAPH_CONTEXT_MAX_ENUMERATED_EDGES", 500),
         graph_comparison_max_peers_per_entity=_int("SOORIN_GRAPH_COMPARISON_MAX_PEERS_PER_ENTITY", 100),
         graph_comparison_max_shared_peers=_int("SOORIN_GRAPH_COMPARISON_MAX_SHARED_PEERS", 100),
+        rag_enabled=_bool("SOORIN_RAG_ENABLED", False),
+        rag_source_root=os.getenv("SOORIN_RAG_SOURCE_ROOT", "").strip(),
+        rag_backend=os.getenv("SOORIN_RAG_BACKEND", "qdrant").strip().lower(),
+        rag_collection=os.getenv("SOORIN_RAG_COLLECTION", DEFAULT_RAG_COLLECTION).strip(),
+        rag_top_k=max(1, _int("SOORIN_RAG_TOP_K", 5)),
+        rag_score_threshold=min(1.0, max(0.0, _float("SOORIN_RAG_SCORE_THRESHOLD", 0.35))),
+        rag_qdrant_mode=os.getenv("SOORIN_RAG_QDRANT_MODE", "server").strip().lower(),
+        rag_qdrant_url=os.getenv("SOORIN_RAG_QDRANT_URL", "http://127.0.0.1:6333").strip().rstrip("/"),
+        rag_qdrant_path=os.getenv("SOORIN_RAG_QDRANT_PATH", "").strip(),
+        rag_qdrant_api_key=os.getenv("SOORIN_RAG_QDRANT_API_KEY", "").strip(),
+        rag_qdrant_timeout_seconds=max(0.1, _float("SOORIN_RAG_QDRANT_TIMEOUT_SECONDS", 10.0)),
+        rag_embedding_model=os.getenv(
+            "SOORIN_RAG_EMBEDDING_MODEL",
+            DEFAULT_RAG_EMBEDDING_MODEL,
+        ).strip(),
+        rag_embedding_dimension=max(1, _int("SOORIN_RAG_EMBEDDING_DIMENSION", DEFAULT_RAG_EMBEDDING_DIMENSION)),
+        rag_distance=os.getenv("SOORIN_RAG_DISTANCE", "cosine").strip().lower(),
+        rag_max_context_tokens=max(256, _int("SOORIN_RAG_MAX_CONTEXT_TOKENS", 3000)),
+        rag_chunk_size_chars=max(200, _int("SOORIN_RAG_CHUNK_SIZE_CHARS", 1200)),
+        rag_chunk_overlap_chars=max(0, _int("SOORIN_RAG_CHUNK_OVERLAP_CHARS", 150)),
+        rag_upsert_batch_size=max(1, _int("SOORIN_RAG_UPSERT_BATCH_SIZE", 64)),
         intent_router_enabled=_bool("SOORIN_INTENT_ROUTER_ENABLED", True),
         intent_router_system_prompt_path=os.getenv(
             "SOORIN_INTENT_ROUTER_SYSTEM_PROMPT_PATH",
@@ -420,7 +497,7 @@ def get_settings() -> Settings:
     )
     settings.validate_product_paths()
     logger.info(
-        "event=settings_loaded env_file_path=%s env_file_loaded=%s router_deployment=%s chat_deployment=%s product_base_url_configured=%s product_token_present=%s product_hwid_present=%s product_username_present=%s product_password_present=%s product_captcha_bypass_present=%s",
+        "event=settings_loaded env_file_path=%s env_file_loaded=%s router_deployment=%s chat_deployment=%s product_base_url_configured=%s product_token_present=%s product_hwid_present=%s product_username_present=%s product_password_present=%s product_captcha_bypass_present=%s rag_enabled=%s rag_backend=%s rag_source_configured=%s rag_qdrant_mode=%s rag_qdrant_configured=%s",
         ENV_PATH,
         env_file_loaded,
         settings.intent_router_deployment,
@@ -431,5 +508,10 @@ def get_settings() -> Settings:
         bool(settings.product_username),
         bool(settings.product_password),
         bool(settings.product_captcha_bypass),
+        settings.rag_enabled,
+        settings.rag_backend,
+        bool(settings.rag_source_root),
+        settings.rag_qdrant_mode,
+        bool(settings.rag_qdrant_path if settings.rag_qdrant_mode == "local" else settings.rag_qdrant_url),
     )
     return settings
