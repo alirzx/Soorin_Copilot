@@ -132,4 +132,5 @@ desktop.ini
 venv/
 compose.env
 
-data/qdrant-local/
+data/qdrant-local/*.tar
+*.tar.gz
