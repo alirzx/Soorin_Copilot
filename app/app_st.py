@@ -186,6 +186,7 @@ def stream_copilot(message: str):
             stream=True,
         ) as response:
             response.raise_for_status()
+            response.encoding = "utf-8"
             for event in parse_sse_events(
                 response.iter_lines(chunk_size=1, decode_unicode=True)
             ):

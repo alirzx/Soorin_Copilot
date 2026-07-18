@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import codecs
 import json
 import unittest
 from dataclasses import replace
@@ -35,6 +36,15 @@ GENERAL_ROUTE = json.dumps(
         "reason": "general",
     }
 )
+
+UNICODE_TEXT = (
+    "So the question is not \u201cis this DC broken?\u201d "
+    "\u2018smart single quotes\u2019 "
+    "em dash \u2014 arrow \u2192 "
+    "Persian text: \u0627\u06cc\u0646 \u06cc\u06a9 \u062a\u0633\u062a \u0627\u0633\u062a "
+    "emoji: \u2705"
+)
+MOJIBAKE_MARKERS = ("\u00e2\u0080\u009c", "\u00e2\u0080\u0099", "\u00e2\u0080\u0094", "\u00e2\u0086\u0092")
 
 
 def deployment() -> ArvanDeploymentConfig:
@@ -95,8 +105,38 @@ class FakeStreamResponse:
         self.closed = True
 
 
+class SplitByteStreamResponse:
+    def __init__(self, chunks: list[bytes], status_code: int = 200) -> None:
+        self.chunks = chunks
+        self.status_code = status_code
+        self.encoding: str | None = None
+        self.closed = False
+
+    def iter_lines(self, chunk_size: int = 512, decode_unicode: bool = False):
+        del chunk_size
+        decoder = codecs.getincrementaldecoder(self.encoding or "utf-8")()
+        pending = ""
+        for chunk in self.chunks:
+            fragment = decoder.decode(chunk) if decode_unicode else chunk.decode("utf-8")
+            pending += fragment
+            while "\n" in pending:
+                line, pending = pending.split("\n", 1)
+                yield line
+        tail = pending + (decoder.decode(b"", final=True) if decode_unicode else "")
+        if tail:
+            yield tail
+
+    def close(self) -> None:
+        self.closed = True
+
+
 def sse(payload: dict[str, Any]) -> str:
-    return f"data: {json.dumps(payload)}"
+    return f"data: {json.dumps(payload, ensure_ascii=False)}"
+
+
+def assert_no_mojibake(test_case: unittest.TestCase, text: str) -> None:
+    for marker in MOJIBAKE_MARKERS:
+        test_case.assertNotIn(marker, text)
 
 
 class ArvanProviderStreamingTests(unittest.TestCase):
@@ -168,6 +208,32 @@ class ArvanProviderStreamingTests(unittest.TestCase):
                     )
                 )
         post.assert_not_called()
+
+    def test_unicode_answer_survives_split_utf8_transport_chunks(self) -> None:
+        wire_text = "\n".join(
+            [
+                sse({"choices": [{"delta": {"content": UNICODE_TEXT}, "finish_reason": "stop"}]}),
+                "data: [DONE]",
+                "",
+            ]
+        )
+        response = SplitByteStreamResponse([bytes([value]) for value in wire_text.encode("utf-8")])
+
+        with patch("src.core.llm.providers.arvan.requests.post", return_value=response):
+            events = list(
+                ArvanProvider(deployment()).stream_chat(
+                    [{"role": "user", "content": "unicode"}],
+                    max_tokens=128,
+                    temperature=0.2,
+                    top_p=0.9,
+                    timeout_seconds=20,
+                )
+            )
+
+        answer = "".join(event.text for event in events if event.type == "answer_delta")
+        self.assertEqual(answer, UNICODE_TEXT)
+        assert_no_mojibake(self, answer)
+        self.assertTrue(response.closed)
 
 
 class FakeStreamingLLM:
@@ -327,6 +393,16 @@ class CopilotServiceStreamingTests(unittest.TestCase):
         self.assertEqual([call["purpose"] for call in llm.chat_calls], ["intent_router", "chat"])
         self.assertEqual(llm.stream_calls, [])
 
+    def test_existing_non_streaming_chat_path_preserves_unicode(self) -> None:
+        llm = FakeStreamingLLM([], fallback_text=UNICODE_TEXT)
+        service = CopilotService(service_settings(), llm, MemoryStore(10))  # type: ignore[arg-type]
+
+        result = service.chat("Unicode please", "non-stream-unicode", request_id="non-stream-unicode")
+
+        self.assertEqual(result["answer"], UNICODE_TEXT)
+        assert_no_mojibake(self, result["answer"])
+        self.assertEqual(llm.stream_calls, [])
+
     @staticmethod
     def _metrics() -> dict[str, Any]:
         return {
@@ -353,6 +429,29 @@ class SSEAndStreamlitContractTests(unittest.TestCase):
         parsed = list(parse_sse_events(lines))
 
         self.assertEqual(collect_visible_stream(parsed), ("why", "what", True, ""))
+
+    def test_sse_unicode_round_trip_is_valid_and_survives_split_bytes(self) -> None:
+        records = [
+            encode_sse_event(LLMStreamEvent("answer_delta", text=UNICODE_TEXT)),
+            encode_sse_event(LLMStreamEvent("done")),
+        ]
+        wire_text = "".join(records)
+        byte_chunks = [bytes([value]) for value in wire_text.encode("utf-8")]
+
+        parsed = list(parse_sse_events(byte_chunks))
+        _, answer, completed, error = collect_visible_stream(parsed)
+
+        self.assertEqual(answer, UNICODE_TEXT)
+        self.assertTrue(completed)
+        self.assertEqual(error, "")
+        assert_no_mojibake(self, wire_text)
+        assert_no_mojibake(self, answer)
+        for event in parsed:
+            json.dumps(event, ensure_ascii=False)
+
+    def test_streaming_response_declares_utf8_sse_media_type(self) -> None:
+        source = (Path(__file__).resolve().parents[1] / "api" / "routes.py").read_text(encoding="utf-8")
+        self.assertIn('media_type="text/event-stream; charset=utf-8"', source)
 
     def test_missing_reasoning_still_completes_answer_normally(self) -> None:
         events = [
