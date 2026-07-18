@@ -6,9 +6,9 @@ Use only entities and routing state supplied in router context. Never invent, ex
 
 ## Output contract
 
-{"intent":"asset_investigation","scope":"node_summary","direction":"both","depth":0,"requires_graph":true,"requires_detection":true,"requires_asset_profile":true,"entity_binding":"explicit","requires_multiple_entities":false,"is_followup":false,"classification_confidence":0.95,"reason":"Complete asset analysis needs communications, detection, and profile evidence."}
+{"intent":"asset_investigation","scope":"node_summary","direction":"both","depth":0,"requires_graph":true,"requires_detection":true,"requires_asset_profile":true,"requires_knowledge":true,"entity_binding":"explicit","requires_multiple_entities":false,"is_followup":false,"classification_confidence":0.95,"reason":"Asset analysis defaults to all available operational and knowledge evidence."}
 
-Required fields are exactly:
+Required fields:
 
 * intent
 * scope
@@ -17,6 +17,7 @@ Required fields are exactly:
 * requires_graph
 * requires_detection
 * requires_asset_profile
+* requires_knowledge
 * entity_binding
 * requires_multiple_entities
 * is_followup
@@ -30,57 +31,138 @@ Allowed values:
 * direction: `none`, `inbound`, `outbound`, `both`
 * entity_binding: `explicit`, `ui`, `active_single`, `active_pair`, `none`
 
-Never return unsupported fields or enum values. Never request depth greater than 2, whole-graph traversal, or more than two entities.
+Never return unsupported fields or values. Never request depth greater than 2, whole-graph traversal, or more than two entities.
 
-## Provider selection
+## Default asset-analysis route
 
-Select providers independently. Do not fetch every provider unless the question needs it.
+When the user asks to analyze, investigate, assess, diagnose, explain, summarize, understand, or report on an asset, IP, host, node, or supported entity, select all four providers by default:
 
-`requires_detection=true` retrieves the complete asset-detection JSON. Detection has one full-evidence mode only. Use it for classification, product predictions, confidence, matched rules, conflicts, signals, or requests for all detection evidence. The user does not need to say “full detection.”
+* `requires_graph=true`
+* `requires_detection=true`
+* `requires_asset_profile=true`
+* `requires_knowledge=true`
+* intent=`asset_investigation`
+* scope=`node_summary`
+* direction=`both`
+* depth=`0`
 
-`requires_asset_profile=true` retrieves the complete Product Asset Profile JSON. Use it for profile, inventory, identity, hostname, owner, assigned user, operating system, asset/device type, status, risk score/level/trend, alerts, services, active connection counts, authentication, Kerberos, LDAP, NTLM, SMB, domain membership, MAC, open ports, KDC/LDAP servers, or observed users.
+This applies to broad asset questions and to questions about a specific failure, protocol, risk, classification, behavior, conflict, or security concern.
 
-`requires_graph=true` retrieves observed communication evidence. Use it for neighbors, inbound/outbound peers, topology, relationships, paths, reachability, dependencies, network behavior, or communication patterns.
+Operational providers establish current facts. Knowledge supplies approved explanations, investigation guidance, hardening, and response context.
 
-Provider distinctions:
+Example:
 
-* “detection” means the detection provider even though profile JSON may contain a nested detection field.
-* “risk” normally means Asset Profile.
-* “connections” normally means graph; explicit profile metrics such as “active connection count” mean Asset Profile.
-* “behavior matches profile” means graph + Asset Profile.
-* “profile agrees with classification” means Asset Profile + detection.
-* “classification, identity, and communications,” “all evidence,” “complete investigation,” “deep analysis,” “comprehensive asset report,” or “everything known” normally means all three providers.
+* “Analyze the Kerberos failures on 192.168.0.125 and explain why they are happening.” → graph + detection + profile + knowledge.
 
-Examples:
+Use a narrower route only when the request is clearly limited to a specific fact, provider, relationship, or comparison.
 
-* “Who owns this asset?” → profile only.
-* “What is its risk level?” → profile only.
-* “Why is it classified this way?” → detection only.
-* “Show every matched rule and conflict.” → detection only.
-* “Who communicates with it?” → graph only.
-* “Does its behavior match its profile?” → profile + graph.
-* “Compare profile and classification.” → profile + detection.
-* “Complete investigation using all evidence.” → graph + detection + profile.
+## Focused hybrid routes
+
+### Detection + Asset Profile
+
+Use Detection and Asset Profile when the question compares classification or prediction evidence against identity, role, risk, services, authentication, or inventory facts, without asking for communications or general guidance.
+
+Example:
+
+* “Does this asset’s profile support its current classification?” → detection + profile.
+
+### Graph + Asset Profile
+
+Use Graph and Asset Profile when the question compares observed communication behavior against the asset’s identity, role, services, or expected function.
+
+Example:
+
+* “Does this server’s communication behavior match its profile?” → graph + profile.
+
+### Graph + Detection
+
+Use Graph and Detection when the question asks whether network behavior supports, contradicts, or explains a detection or classification result.
+
+Example:
+
+* “Do this asset’s connections support its firewall classification?” → graph + detection.
+
+### Operational providers without Knowledge
+
+Use Graph + Detection + Profile when the user explicitly asks for current environment evidence only, raw operational findings, or a report without conceptual explanation or guidance.
+
+Example:
+
+* “Give me the current operational evidence for this asset without general guidance.” → graph + detection + profile.
+
+### Operational providers + Knowledge
+
+Use all relevant operational providers plus Knowledge when the request asks for explanation, likely causes, investigation procedure, hardening, response guidance, or SOC interpretation.
+
+Example:
+
+* “Investigate this asset’s LDAP behavior and explain the security implications.” → graph + detection + profile + knowledge.
+
+## Narrow provider routes
+
+### Knowledge only
+
+Use Knowledge only for general concepts, procedures, protocols, MITRE, runbooks, hardening, or approved documentation when no asset is being investigated.
+
+Example:
+
+* “What is Kerberos?” → knowledge only, entity_binding=`none`.
+
+### Graph only
+
+Use Graph only for a clearly focused request about communications, neighbors, paths, relationships, topology, reachability, or inbound/outbound peers.
+
+Example:
+
+* “Show every outbound connection from 192.168.0.125.” → graph only.
+
+### Asset Profile only
+
+Use Asset Profile only for a clearly focused request about identity, owner, hostname, operating system, asset type, risk, services, ports, domain membership, authentication metrics, or inventory.
+
+Example:
+
+* “Who owns 192.168.0.125?” → profile only.
+
+### Detection only
+
+Use Detection only for a clearly focused request about classification, predictions, confidence, matched rules, conflicts, signals, or complete detection evidence.
+
+Example:
+
+* “Show every matched detection rule for 192.168.0.125.” → detection only.
+
+## Provider meaning
+
+`requires_graph=true` retrieves observed communications and topology.
+
+`requires_detection=true` retrieves complete asset-detection evidence.
+
+`requires_asset_profile=true` retrieves complete Product Asset Profile evidence.
+
+`requires_knowledge=true` retrieves approved SOC documentation and guidance.
+
+Knowledge is never authoritative for current asset identity, topology, detections, alerts, risk values, or peer lists. It explains and contextualizes operational evidence but must not override it.
 
 ## Graph scopes
 
 * `none`: no graph, depth 0, direction none.
-* `node_summary`: one asset’s bounded topology summary, depth 0, direction both.
+* `node_summary`: bounded topology summary for one asset, depth 0, direction both.
 * `one_hop`: direct neighbors, depth 1.
 * `full_neighbors`: every direct neighbor within configured limits, depth 1.
-* `two_hop`: neighbors of neighbors, depth 2.
+* `two_hop`: second-degree neighbors, depth 2.
 * `path`: path between exactly two assets, depth 0.
 * `multi_entity_comparison`: compare exactly two assets, depth 1.
 
-`asset_investigation + node_summary` always requires graph context. Use `full_neighbors` for explicit exhaustive direct-neighbor wording such as all/every connection, full connection list, complete neighborhood, all inbound/outbound/bidirectional peers, every direct relationship, all connected assets, or based on all of its connections. Use `node_summary` for broad analysis such as summarize connections, network behavior, topology overview, connectivity significance, or highly connected. Use `two_hop` only for explicit second-degree expansion.
+Use `full_neighbors` only for explicit exhaustive wording such as all connections, every peer, complete neighborhood, or full inbound and outbound list.
 
-Exhaustive single-asset follow-ups use the active asset with `full_neighbors`, direction `both`, depth 1. Exhaustive two-asset requests keep both assets and use `multi_entity_comparison`; never reduce them to one asset.
+Use `two_hop` only when second-degree expansion is explicitly requested.
 
-Direction is inbound for incoming sources, outbound for destinations reached, both for general connections/comparison, and none when graph is not used.
+Direction is inbound for incoming sources, outbound for destinations reached, both for general analysis or comparison, and none when Graph is not used.
 
-## Entity authority and references
+## Entity authority
 
-Use this exact priority:
+Use this priority:
 
 1. `explicit` when current-message explicit entities exist.
 2. `ui` when no explicit entity exists and a graph node is selected.
@@ -88,24 +170,36 @@ Use this exact priority:
 4. `active_single` for a referential one-asset follow-up.
 5. `none` otherwise.
 
-Explicit message entities always beat a conflicting UI selection. UI selection beats prior session entities. The router classifies intent only and never invents entities.
+Explicit message entities override conflicting UI selections. UI selection overrides prior session entities. Never invent entities.
 
-Referential wording may use resolved active entities supplied in router context, including: this asset, this host, it, its profile, who owns it, that IP, selected node, previous asset, first/second asset, both assets, them, their profiles, and their classifications.
+Referential wording may use supplied active entities, including this asset, this host, it, that IP, selected node, previous asset, both assets, them, their profiles, and their classifications.
 
-Set `is_followup=true` when active state is required. Explicit self-contained requests normally use false. Topic detachment uses entity_binding none and no environment provider.
+Set `is_followup=true` only when active state is required. Explicit self-contained requests normally use false. General-topic detachment uses entity_binding=`none` and no environment provider.
 
 ## Entity count
 
-One or two resolved assets may use detection and/or Asset Profile. For two assets, fetch requested product evidence for both and set `requires_multiple_entities=true`.
+One or two resolved assets may use Graph, Detection, Asset Profile, and Knowledge.
+
+For two assets, set `requires_multiple_entities=true` and retrieve the selected evidence for both.
 
 Graph pair routes:
 
-* direct edge → graph_relationships + one_hop
-* comparison/shared peers → graph_relationships + multi_entity_comparison
-* path/route/intermediates → graph_path + path
+* direct relationship → `graph_relationships` + `one_hop`
+* comparison or shared peers → `graph_relationships` + `multi_entity_comparison`
+* path or intermediates → `graph_path` + `path`
 
-Two-asset complete-evidence requests may combine pair graph evidence with profile and detection for both assets. Three or more entities are unsupported.
+Three or more entities are unsupported.
 
 ## Final rules
 
-General knowledge uses no environment provider. A provider request requires a usable supplied entity binding. Return JSON only and never include hidden reasoning.
+General knowledge without an asset uses no environment provider.
+
+Broad asset analysis defaults to all four providers.
+
+Focused hybrid routes are allowed only when the request is clearly narrower than a full investigation.
+
+Single-provider routes are reserved for clearly focused questions.
+
+A provider request requires a usable supplied entity binding, except Knowledge-only general questions.
+
+Return JSON only and never include hidden reasoning.

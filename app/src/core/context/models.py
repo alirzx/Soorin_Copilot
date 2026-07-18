@@ -5,6 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
+from src.core.rag.models import KnowledgeSearchResult
+
 EntitySource = Literal["message", "ui", "conversation"]
 EntityType = Literal["ip"]
 ProviderStatus = Literal["available", "not_found", "unavailable", "context_too_large", "skipped"]
@@ -69,6 +71,7 @@ class IntentDecision:
     requires_graph: bool
     requires_detection: bool = False
     requires_asset_profile: bool = False
+    requires_knowledge: bool = False
     entity_binding: EntityBinding = "none"
     requested_entity_binding: str = "none"
     binding_source: str = ""
@@ -108,6 +111,10 @@ class IntentDecision:
         return self.requires_asset_profile
 
     @property
+    def use_knowledge(self) -> bool:
+        return self.requires_knowledge
+
+    @property
     def confidence(self) -> float:
         return self.classification_confidence
 
@@ -118,6 +125,7 @@ class RouteDecision:
     reason: str
     use_detection: bool = False
     use_asset_profile: bool = False
+    use_knowledge: bool = False
     entity_binding: EntityBinding = "none"
     requested_entity_binding: str = "none"
     resolved_entity_binding: EntityBinding = "none"
@@ -238,6 +246,7 @@ class CopilotContextPackage:
     graph: GraphProviderResult | None = None
     detections: list[DetectionProviderResult] = field(default_factory=list)
     asset_profiles: list[AssetProfileProviderResult] = field(default_factory=list)
+    knowledge: KnowledgeSearchResult | None = None
     provenance: list[ProviderProvenance] = field(default_factory=list)
     limitations: list[str] = field(default_factory=list)
 
@@ -247,6 +256,7 @@ class CopilotContextPackage:
             (self.graph and self.graph.status in {"available", "not_found"})
             or any(item.status in {"available", "not_found"} for item in self.detections)
             or any(item.status in {"available", "not_found"} for item in self.asset_profiles)
+            or bool(self.knowledge and self.knowledge.status in {"ok", "partial", "empty"})
         )
 
     @property

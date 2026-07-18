@@ -25,6 +25,10 @@ PROVIDER_SEMANTICS = {
         "description": "Observed communication topology.",
         "limitation": "Does not by itself prove protocol purpose, trust, service dependency, successful authentication, compromise, routing capability, or attack paths; coverage may be partial.",
     },
+    "knowledge": {
+        "description": "Approved SOC documentation, runbooks, protocol knowledge, hardening guidance, and investigation procedures.",
+        "limitation": "Documentation is not authoritative for current assets, graph relationships, detections, alerts, risk values, or peer lists.",
+    },
 }
 
 VALUE_SEMANTICS = (
@@ -55,12 +59,14 @@ class ContextComposer:
             "asset_profile": "",
             "detection": "",
             "graph": "",
+            "knowledge": "",
             "fusion": "",
         }
         self.last_inclusion: dict[str, tuple[bool, str | None]] = {}
         self.last_representation: dict[str, str] = {}
         self.required_context_missing = False
         self.last_budget: dict[str, int] = {}
+        self.last_knowledge_included_count = 0
 
     def compose(self, package: CopilotContextPackage, *, request_id: str = "", base_input_tokens: int = 0) -> str:
         profile_sections = self._compose_json_sections(package.asset_profiles, "ASSET_PROFILE_JSON")
@@ -86,10 +92,16 @@ class ContextComposer:
                 request_id=request_id,
             )
 
-        graph_candidate = self._compose_graph(package, request_id=request_id)
-
         self.last_inclusion = {}
         self.last_representation = {}
+        self.last_knowledge_included_count = 0
+        graph_candidate = self._compose_graph(package, request_id=request_id)
+        knowledge_candidate = self._compose_knowledge(
+            package,
+            token_budget=min(self.settings.rag_max_context_tokens, max_dynamic_tokens),
+        )
+        self.last_inclusion["knowledge"] = (False, "not_included")
+        self.last_representation["knowledge"] = "excluded"
         provisional = self._compose_provider_manifest(package, graph_included=bool(graph_candidate))
         used_tokens = approx_tokens(provisional)
         included_profiles: list[str] = []
@@ -130,26 +142,49 @@ class ContextComposer:
         self.last_inclusion["graph"] = (graph_included, None if graph_included else "global_context_limit")
         self.last_representation["graph"] = "full" if graph_included else "excluded"
 
+        knowledge_text = ""
+        if knowledge_candidate:
+            knowledge_tokens = approx_tokens(knowledge_candidate)
+            if used_tokens + knowledge_tokens <= max_dynamic_tokens:
+                knowledge_text = knowledge_candidate
+                used_tokens += knowledge_tokens
+                self.last_inclusion["knowledge"] = (True, None)
+                self.last_representation["knowledge"] = (
+                    "full"
+                    if package.knowledge and self.last_knowledge_included_count == package.knowledge.included_count
+                    else "compact"
+                )
+            else:
+                self.last_knowledge_included_count = 0
+                self.last_inclusion["knowledge"] = (False, "global_context_limit")
+                logger.warning(
+                    "event=knowledge_context_not_included request_id=%s context_approx_tokens=%s reason=global_context_limit",
+                    request_id,
+                    knowledge_tokens,
+                )
+
         manifest = self._compose_provider_manifest(package, graph_included=graph_included)
         profile_text = "\n\n".join(included_profiles)
         detection_text = "\n\n".join(included_detections)
-        parts = [part for part in (manifest, profile_text, detection_text, graph_text) if part]
+        parts = [part for part in (manifest, profile_text, detection_text, graph_text, knowledge_text) if part]
         text = "\n\n".join(parts)
         self.last_parts = {
             "status": manifest,
             "asset_profile": profile_text,
             "detection": detection_text,
             "graph": graph_text,
+            "knowledge": knowledge_text,
             "fusion": "",
         }
         logger.info(
-            "event=context_composed request_id=%s providers=%s manifest_chars=%s asset_profile_chars=%s detection_chars=%s graph_chars=%s total_dynamic_chars=%s total_dynamic_approx_tokens=%s max_dynamic_tokens=%s",
+            "event=context_composed request_id=%s providers=%s manifest_chars=%s asset_profile_chars=%s detection_chars=%s graph_chars=%s knowledge_chars=%s total_dynamic_chars=%s total_dynamic_approx_tokens=%s max_dynamic_tokens=%s",
             request_id,
-            ",".join(name for name, value in (("manifest", manifest), ("asset_profile", profile_text), ("detection", detection_text), ("graph", graph_text)) if value),
+            ",".join(name for name, value in (("manifest", manifest), ("asset_profile", profile_text), ("detection", detection_text), ("graph", graph_text), ("knowledge", knowledge_text)) if value),
             len(manifest),
             len(profile_text),
             len(detection_text),
             len(graph_text),
+            len(knowledge_text),
             len(text),
             approx_tokens(text),
             max_dynamic_tokens,
@@ -179,6 +214,9 @@ class ContextComposer:
         """Allocate exhaustive graph context before narrative provider detail."""
         self.last_inclusion = {}
         self.last_representation = {}
+        self.last_knowledge_included_count = 0
+        self.last_inclusion["knowledge"] = (False, "not_included")
+        self.last_representation["knowledge"] = "excluded"
         result_lookup = {
             ("asset_profile", item.ip): item for item in package.asset_profiles
         }
@@ -329,22 +367,54 @@ class ContextComposer:
                 part for part in (manifest, profile_text, detection_text, limitation) if part
             )
 
+        knowledge_text = self._compose_knowledge(
+            package,
+            token_budget=min(self.settings.rag_max_context_tokens, max_dynamic_tokens),
+        )
+        if knowledge_text:
+            self.last_inclusion["knowledge"] = (True, None)
+            self.last_representation["knowledge"] = (
+                "full"
+                if package.knowledge and self.last_knowledge_included_count == package.knowledge.included_count
+                else "compact"
+            )
+            trial_manifest = self._compose_provider_manifest(package, graph_included=bool(graph_text))
+            trial_text = "\n\n".join(
+                part
+                for part in (trial_manifest, profile_text, detection_text, graph_text, knowledge_text, limitation)
+                if part
+            )
+            if approx_tokens(trial_text) <= max_dynamic_tokens:
+                manifest = trial_manifest
+                text = trial_text
+            else:
+                knowledge_text = ""
+                self.last_knowledge_included_count = 0
+                self.last_inclusion["knowledge"] = (False, "global_context_limit")
+                self.last_representation["knowledge"] = "excluded"
+                manifest = self._compose_provider_manifest(package, graph_included=bool(graph_text))
+                text = "\n\n".join(
+                    part for part in (manifest, profile_text, detection_text, graph_text, limitation) if part
+                )
+
         self.last_parts = {
             "status": manifest,
             "asset_profile": profile_text,
             "detection": detection_text,
             "graph": graph_text,
+            "knowledge": knowledge_text,
             "fusion": "",
         }
         self.last_budget["total_dynamic_tokens"] = approx_tokens(text)
         logger.info(
-            "event=context_composed_route_aware request_id=%s requested_scope=full_neighbors graph_included=%s graph_representation=%s graph_tokens=%s asset_profile_tokens=%s detection_tokens=%s total_dynamic_tokens=%s max_dynamic_tokens=%s required_context_missing=%s",
+            "event=context_composed_route_aware request_id=%s requested_scope=full_neighbors graph_included=%s graph_representation=%s graph_tokens=%s asset_profile_tokens=%s detection_tokens=%s knowledge_tokens=%s total_dynamic_tokens=%s max_dynamic_tokens=%s required_context_missing=%s",
             request_id,
             graph_included and bool(graph_text),
             self.last_representation.get("graph", "excluded"),
             approx_tokens(graph_text),
             approx_tokens(profile_text),
             approx_tokens(detection_text),
+            approx_tokens(knowledge_text),
             approx_tokens(text),
             max_dynamic_tokens,
             self.required_context_missing,
@@ -551,6 +621,32 @@ class ContextComposer:
                 ),
                 "complete_for_user_request": bool(graph_included and context.get("complete_for_user_request", False)),
             }
+        if package.knowledge:
+            requested.append("knowledge")
+            knowledge_included = self.last_inclusion.get("knowledge", (False, None))[0]
+            coverage["knowledge"] = {
+                "status": package.knowledge.status,
+                "backend": package.knowledge.backend,
+                "retrieved_at": package.knowledge.retrieved_at,
+                "freshness": package.knowledge.freshness,
+                "total_candidates": package.knowledge.total_candidates,
+                "retrieved_chunk_count": package.knowledge.included_count,
+                "included_chunk_count": self.last_knowledge_included_count if knowledge_included else 0,
+                "retrieval_truncated": package.knowledge.truncated,
+                "model_input_knowledge_included": knowledge_included,
+                "model_input_omission_reason": self.last_inclusion.get("knowledge", (False, None))[1]
+                if not knowledge_included
+                else None,
+                "model_input_knowledge_complete": bool(
+                    knowledge_included
+                    and self.last_knowledge_included_count == package.knowledge.included_count
+                ),
+                "serialized_context_truncated": bool(
+                    knowledge_included
+                    and self.last_knowledge_included_count < package.knowledge.included_count
+                ),
+                "limitations": list(package.knowledge.limitations),
+            }
         target_entities = [entity.value for entity in package.entities.entities]
         if not target_entities and package.graph:
             target_entities = [str(item) for item in package.graph.context.get("target_ips", []) if item]
@@ -565,6 +661,68 @@ class ContextComposer:
             "value_semantics": VALUE_SEMANTICS,
         }
         return "[SOORIN_PROVIDER_MANIFEST]\n" + json.dumps(manifest, ensure_ascii=False, separators=(",", ":"), sort_keys=True) + "\n[/SOORIN_PROVIDER_MANIFEST]"
+
+    def _compose_knowledge(self, package: CopilotContextPackage, *, token_budget: int) -> str:
+        result = package.knowledge
+        self.last_knowledge_included_count = 0
+        if not result or result.status not in {"ok", "partial", "empty"}:
+            return ""
+        base = {
+            "status": result.status,
+            "query": result.query,
+            "backend": result.backend,
+            "retrieved_at": result.retrieved_at,
+            "freshness": result.freshness,
+            "total_candidates": result.total_candidates,
+            "retrieved_chunk_count": result.included_count,
+            "retrieval_truncated": result.truncated,
+            "limitations": list(result.limitations),
+            "grounding_rule": "Use this only as documentation evidence; current operational providers outrank it.",
+        }
+        selected: list[dict[str, Any]] = []
+        text = ""
+        for chunk in result.chunks:
+            candidate = {
+                "chunk_id": chunk.chunk_id,
+                "document_id": chunk.document_id,
+                "relative_path": chunk.relative_path,
+                "section": chunk.section,
+                "category": chunk.category,
+                "title": chunk.title,
+                "score": chunk.score,
+                "indexed_at": chunk.indexed_at,
+                "source_version": chunk.source_version,
+                "text": chunk.text,
+            }
+            trial = [*selected, candidate]
+            payload = {
+                **base,
+                "included_chunk_count": len(trial),
+                "serialized_context_truncated": len(trial) < result.included_count,
+                "chunks": trial,
+            }
+            candidate_text = "[SOORIN_KNOWLEDGE_CONTEXT_JSON]\n" + json.dumps(
+                payload,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            ) + "\n[/SOORIN_KNOWLEDGE_CONTEXT_JSON]"
+            if approx_tokens(candidate_text) > max(0, token_budget):
+                break
+            selected = trial
+            text = candidate_text
+        if result.status == "empty" and not result.chunks:
+            payload = {**base, "included_chunk_count": 0, "serialized_context_truncated": False, "chunks": []}
+            text = "[SOORIN_KNOWLEDGE_CONTEXT_JSON]\n" + json.dumps(
+                payload,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            ) + "\n[/SOORIN_KNOWLEDGE_CONTEXT_JSON]"
+            if approx_tokens(text) > max(0, token_budget):
+                return ""
+        self.last_knowledge_included_count = len(selected)
+        return text
 
     def _compose_graph(
         self,
