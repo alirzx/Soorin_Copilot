@@ -33,7 +33,10 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1 \
     PYTHONPATH=/workspace/app \
     SOORIN_HOST=0.0.0.0 \
-    SOORIN_PORT=6998
+    SOORIN_PORT=6998 \
+    HF_HOME=/home/soorin/.cache/huggingface \
+    HF_HUB_DISABLE_TELEMETRY=1 \
+    TOKENIZERS_PARALLELISM=false
 
 WORKDIR /workspace
 
@@ -44,6 +47,12 @@ RUN groupadd --gid "${APP_GID}" soorin \
         --create-home \
         --shell /usr/sbin/nologin \
         soorin
+
+# libgomp1 is commonly required by CPU Torch runtimes.
+RUN apt-get update \
+    && apt-get install --no-install-recommends -y \
+        libgomp1 \
+    && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /build/wheels /tmp/wheels
 COPY requirements.txt /tmp/requirements.txt
@@ -58,11 +67,14 @@ COPY --chown=soorin:soorin app ./app
 COPY --chown=soorin:soorin lib ./lib
 COPY --chown=soorin:soorin script ./script
 
-# Graph artifacts are generated/fetched at runtime.
-# These directories seed the named Docker volume with correct ownership.
+# Keep the approved SOC corpus available for index rebuilding.
+COPY --chown=soorin:soorin docs ./docs
+
 RUN mkdir -p \
         /workspace/data/raw \
         /workspace/data/processed \
+        /workspace/data/qdrant-local \
+        /home/soorin/.cache/huggingface \
     && chown -R soorin:soorin \
         /workspace/data \
         /home/soorin
@@ -72,4 +84,3 @@ USER soorin
 EXPOSE 6998 8501
 
 CMD ["python", "-m", "uvicorn", "src.api.main:app", "--host", "0.0.0.0", "--port", "6998"]
-

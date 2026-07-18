@@ -1,86 +1,102 @@
 SHELL := /bin/bash
 
-COMPOSE := docker compose
 COMPOSE_ENV ?= compose.env
+COMPOSE := docker compose --env-file $(COMPOSE_ENV)
 
-IMAGE := soorin-copilot
-TAG ?= local
+IMAGE_TAG := $(or $(shell sed -n 's/^SOORIN_IMAGE_TAG=//p' $(COMPOSE_ENV)),rag-local)
+IMAGE := soorin-copilot:$(IMAGE_TAG)
 
-DC := SOORIN_IMAGE_TAG=$(TAG) $(COMPOSE) --env-file $(COMPOSE_ENV)
+API_PORT := $(or $(shell sed -n 's/^SOORIN_API_PORT=//p' $(COMPOSE_ENV)),6998)
+UI_PORT := $(or $(shell sed -n 's/^SOORIN_UI_PORT=//p' $(COMPOSE_ENV)),8503)
+
+APP_UID := $(or $(shell sed -n 's/^APP_UID=//p' $(COMPOSE_ENV)),10001)
+APP_GID := $(or $(shell sed -n 's/^APP_GID=//p' $(COMPOSE_ENV)),10001)
+
+QDRANT_VOLUME := soorin-copilot_copilot-qdrant
 
 .PHONY: \
-	help build build-no-cache up down restart logs ps health \
-	test config clean purge export
+	help build build-no-cache seed-qdrant \
+	up down restart logs ps health test config export
 
 help:
 	@echo "Available targets:"
 	@echo "  make build            Build using Docker cache"
-	@echo "  make build-no-cache   Build completely without cache"
+	@echo "  make build-no-cache   Build without cache or registry pull"
+	@echo "  make seed-qdrant      Copy data/qdrant-local into the Qdrant volume"
 	@echo "  make up               Start the existing image"
-	@echo "  make down             Remove containers/network; keep volumes"
+	@echo "  make down             Stop stack and preserve volumes"
 	@echo "  make restart          Recreate containers without rebuilding"
-	@echo "  make logs             Follow logs"
+	@echo "  make logs             Follow container logs"
 	@echo "  make ps               Show service status"
-	@echo "  make health           Verify API, OpenAPI, UI, and source file"
+	@echo "  make health           Check API, OpenAPI and UI"
 	@echo "  make test             Run tests inside the image"
-	@echo "  make config           Validate Compose"
-	@echo "  make clean            Remove stack and image; keep volumes"
-	@echo "  make purge            Remove stack, image, and volumes"
-	@echo "  make export           Export image to tar"
+	@echo "  make config           Validate Compose configuration"
+	@echo "  make export           Export image and checksum"
 
 build:
-	DOCKER_BUILDKIT=1 $(DC) build api
+	DOCKER_BUILDKIT=1 $(COMPOSE) build api
 
 build-no-cache:
-	DOCKER_BUILDKIT=1 $(DC) build --no-cache --pull api
+	DOCKER_BUILDKIT=1 $(COMPOSE) build --no-cache api
+
+seed-qdrant:
+	@test -d data/qdrant-local || \
+		(echo "Missing data/qdrant-local"; exit 1)
+	@docker volume create $(QDRANT_VOLUME) >/dev/null
+	docker run --rm \
+		--user 0:0 \
+		-v "$(CURDIR)/data/qdrant-local:/source:ro" \
+		-v "$(QDRANT_VOLUME):/destination" \
+		--entrypoint sh \
+		$(IMAGE) \
+		-lc ' \
+			find /destination \
+				-mindepth 1 \
+				-maxdepth 1 \
+				-exec rm -rf -- {} +; \
+			cp -a /source/. /destination/; \
+			chown -R $(APP_UID):$(APP_GID) /destination; \
+			du -sh /destination \
+		'
 
 up:
-	$(DC) up -d --force-recreate --no-build
+	$(COMPOSE) up -d --force-recreate --no-build
 
 down:
-	$(DC) down --remove-orphans
+	$(COMPOSE) down --remove-orphans
 
 restart:
-	$(DC) up -d --force-recreate --no-build
+	$(COMPOSE) up -d --force-recreate --no-build
 
 logs:
-	$(DC) logs -f --tail=200
+	$(COMPOSE) logs -f --tail=200
 
 ps:
-	$(DC) ps
+	$(COMPOSE) ps
 
 health:
-	@curl -fsS http://127.0.0.1:$${SOORIN_API_PORT:-6998}/health
+	@curl -fsS http://127.0.0.1:$(API_PORT)/health
 	@echo
-	@curl -fsS http://127.0.0.1:$${SOORIN_API_PORT:-6998}/openapi.json >/dev/null
+	@curl -fsS http://127.0.0.1:$(API_PORT)/openapi.json >/dev/null
 	@echo "OpenAPI OK"
-	@curl -fsS http://127.0.0.1:$${SOORIN_UI_PORT:-8503}/_stcore/health
+	@curl -fsS http://127.0.0.1:$(UI_PORT)/_stcore/health
 	@echo
-	@docker exec soorin-copilot-ui \
-		python -c 'from pathlib import Path; print(Path("/workspace/app/app_st.py").stat())'
 
 test:
-	$(DC) run --rm --no-deps api \
+	$(COMPOSE) run --rm --no-deps api \
 		python -m unittest discover \
 		-s app/src/tests \
 		-p "test_*.py" \
 		-v
 
 config:
-	$(DC) config --quiet
+	$(COMPOSE) config --quiet
 	@echo "Compose configuration is valid."
-
-clean:
-	$(DC) down --remove-orphans
-	docker image rm $(IMAGE):$(TAG) 2>/dev/null || true
-	docker image prune -f
-
-purge:
-	$(DC) down --volumes --remove-orphans
-	docker image rm $(IMAGE):$(TAG) 2>/dev/null || true
-	docker image prune -f
 
 export:
 	docker save \
-		-o $(IMAGE)-$(TAG).tar \
-		$(IMAGE):$(TAG)
+		-o soorin-copilot-$(IMAGE_TAG).tar \
+		$(IMAGE)
+	sha256sum \
+		soorin-copilot-$(IMAGE_TAG).tar \
+		> soorin-copilot-$(IMAGE_TAG).tar.sha256

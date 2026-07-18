@@ -1,6 +1,6 @@
 name: soorin-copilot
 
-x-app-image: &app-image soorin-copilot:${SOORIN_IMAGE_TAG:-local}
+x-app-image: &app-image soorin-copilot:${SOORIN_IMAGE_TAG:-rag-local}
 
 services:
   api:
@@ -17,7 +17,6 @@ services:
 
     container_name: soorin-copilot-api
 
-    # Use the project launcher so configure_logging() runs before Uvicorn.
     command:
       - python
       - app/run.py
@@ -29,13 +28,11 @@ services:
     environment:
       PYTHONPATH: /workspace/app
 
-      # Settings consumed by app/run.py.
       API_HOST: 0.0.0.0
       API_PORT: "6998"
       API_RELOAD: "false"
       LOG_LEVEL: "${SOORIN_LOG_LEVEL:-INFO}"
 
-      # Retained for components using SOORIN-prefixed settings.
       SOORIN_HOST: 0.0.0.0
       SOORIN_PORT: "6998"
 
@@ -43,12 +40,18 @@ services:
       - "${SOORIN_API_BIND_IP:-127.0.0.1}:${SOORIN_API_PORT:-6998}:6998"
 
     volumes:
+      # Graph, topology and other shared runtime data.
       - copilot-data:/workspace/data
+
+      # Embedded Qdrant storage. API is the only owner.
+      - copilot-qdrant:/workspace/data/qdrant-local
+
+      # Hugging Face model cache.
       - copilot-cache:/home/soorin/.cache
 
     restart: unless-stopped
     init: true
-    stop_grace_period: 30s
+    stop_grace_period: 60s
 
     healthcheck:
       test:
@@ -67,8 +70,8 @@ services:
           ).read()
       interval: 30s
       timeout: 15s
-      start_period: 60s
-      retries: 4
+      start_period: 120s
+      retries: 6
 
     logging:
       driver: json-file
@@ -88,7 +91,6 @@ services:
 
     container_name: soorin-copilot-ui
 
-    # Keep Streamlit on its normal internal container port.
     command:
       - python
       - -m
@@ -106,23 +108,21 @@ services:
     environment:
       PYTHONPATH: /workspace/app
 
-      # The UI calls the API through the internal Docker network.
       SOORIN_API_BASE_URL: http://api:6998
       SOORIN_COPILOT_API_URL: http://api:6998
 
-      # Internal Streamlit configuration.
       STREAMLIT_SERVER_ADDRESS: 0.0.0.0
       STREAMLIT_SERVER_PORT: "8501"
       STREAMLIT_SERVER_HEADLESS: "true"
       STREAMLIT_BROWSER_GATHER_USAGE_STATS: "false"
 
     ports:
+      # Host port remains 8503; container port remains 8501.
       - "${SOORIN_UI_BIND_IP:-127.0.0.1}:${SOORIN_UI_PORT:-8503}:8501"
 
     volumes:
-      # Shared because the topology UI may directly read graph artifacts.
-      - copilot-data:/workspace/data
-      - copilot-cache:/home/soorin/.cache
+      # UI can read topology data but cannot modify it.
+      - copilot-data:/workspace/data:ro
 
     depends_on:
       api:
@@ -149,8 +149,8 @@ services:
           ).read()
       interval: 30s
       timeout: 10s
-      start_period: 60s
-      retries: 4
+      start_period: 90s
+      retries: 5
 
     logging:
       driver: json-file
@@ -161,21 +161,6 @@ services:
     security_opt:
       - no-new-privileges:true
 
-    networks:
-      - copilot-network
-
-  qdrant:
-    image: qdrant/qdrant:v1.18.2
-    profiles:
-      - rag
-    container_name: soorin-copilot-qdrant
-    ports:
-      - "${SOORIN_QDRANT_BIND_IP:-127.0.0.1}:${SOORIN_QDRANT_PORT:-6333}:6333"
-    volumes:
-      - copilot-qdrant:/qdrant/storage
-    restart: unless-stopped
-    security_opt:
-      - no-new-privileges:true
     networks:
       - copilot-network
 

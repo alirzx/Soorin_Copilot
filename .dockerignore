@@ -1,74 +1,54 @@
 # Git
-.git/
-.gitattributes
+.git
+.gitmodules
 
-# Local Python environments
-.venv/
-venv/
-env/
-ENV/
+# Python environments
+.venv
+venv
+env
 
-# Python cache and build artifacts
-**/__pycache__/
-**/*.py[cod]
-**/*.pyo
-**/*.pyd
-**/.pytest_cache/
-**/.mypy_cache/
-**/.ruff_cache/
-**/.coverage
-**/htmlcov/
-build/
-dist/
-*.egg-info/
+# Python caches
+__pycache__
+**/__pycache__
+*.py[cod]
+.pytest_cache
+.mypy_cache
+.ruff_cache
+.coverage
+htmlcov
 
-# Secrets
-.env
-.env.*
-!.env.example
-
+# Local secrets
 app/.env
 app/.env.*
-!app/.env.example
-
-# Local tests and runtime output
-copilot_test_results/
-logs/
-*.log
-tmp/
-temp/
-
-# IDE
-.vscode/
-.idea/
-*.swp
-*.swo
-*~
-
-# OS files
-.DS_Store
-Thumbs.db
-
-# Docker files not required inside the image
-compose.yaml
-compose.override.yaml
-compose.local.yaml
-docker-compose.yml
-docker-compose.override.yml
-
-# Agent state
-.codex/
-.agent/
-.agents/
-
-# Compose deployment configuration
 compose.env
 compose.env.*
+
+# Keep safe examples available
+!app/.env.example
 !compose.env.example
 
-# Runtime graph data is provided through a named volume
+# Generated and runtime data
 data/
+copilot_test_results/
 
-# Exported Docker images must never enter the build context
+# Local model caches
+.cache/
+**/.cache/
+
+# Exported Docker images
 *.tar
 *.tar.gz
+*.tar.sha256
+
+# Temporary files
+*.log
+*.tmp
+*.swp
+*~
+
+# IDE files
+.vscode
+.idea
+
+# Temporary Dockerfiles
+Dockerfile.rebase

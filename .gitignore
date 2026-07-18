@@ -134,3 +134,6 @@ compose.env
 
 data/qdrant-local/*.tar
 *.tar.gz
+compose.env.*
+!compose.env.example
+*.tar
