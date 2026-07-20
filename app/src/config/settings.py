@@ -70,6 +70,11 @@ def _optional_float(name: str) -> float | None:
     return float(value)
 
 
+def _choice(name: str, default: str, choices: set[str]) -> str:
+    value = (os.getenv(name) or default).split(" #", 1)[0].strip().lower()
+    return value if value in choices else default
+
+
 def _deployment_name(name: str, default: LLMDeploymentName = "glm") -> LLMDeploymentName:
     value = (os.getenv(name) or default).strip().lower()
     if value not in VALID_LLM_DEPLOYMENTS:
@@ -82,6 +87,13 @@ class Settings:
     api_port: int
     api_reload: bool
     log_level: str
+    log_format: str
+    log_color: str
+    log_file_enabled: bool
+    log_file_path: str
+    log_file_level: str
+    log_file_max_bytes: int
+    log_file_backup_count: int
     api_base_url: str
     api_timeout_seconds: int
     streamlit_server_port: int
@@ -140,6 +152,7 @@ class Settings:
     llm_context_window_tokens: int
     llm_reserved_output_tokens: int
     llm_context_safety_margin_tokens: int
+    llm_token_estimate_multiplier: float
     llm_expose_reasoning: bool
     llm_log_raw_response: bool
     chat_store_history: bool
@@ -203,6 +216,9 @@ class Settings:
     rag_qdrant_timeout_seconds: float
     rag_embedding_model: str
     rag_embedding_dimension: int
+    rag_embedding_local_files_only: bool
+    rag_embedding_cache_dir: str
+    rag_embedding_revision: str
     rag_distance: str
     rag_max_context_tokens: int
     rag_chunk_size_chars: int
@@ -226,6 +242,14 @@ class Settings:
     graph_refresh_max_node_drop_ratio: float
     graph_refresh_max_edge_drop_ratio: float
     copilot_human_trace_enabled: bool
+    copilot_human_trace_detail: str
+    evidence_snapshot_enabled: bool
+    evidence_snapshot_mode: str
+    evidence_snapshot_root: str
+    evidence_snapshot_ttl_hours: int
+    evidence_snapshot_max_requests: int
+    evidence_snapshot_max_total_bytes: int
+    evidence_snapshot_max_bytes: int
 
     def deployment(self, name: LLMDeploymentName) -> ArvanDeploymentConfig:
         """Build either deployment through the same typed configuration contract."""
@@ -337,6 +361,18 @@ class Settings:
                     f"Use SOORIN_RAG_COLLECTION={DEFAULT_RAG_COLLECTION} or another freshly indexed collection."
                 )
 
+    def validate_observability_configuration(self) -> None:
+        if self.log_format not in {"console", "json"}:
+            raise ValueError("SOORIN_LOG_FORMAT must be console or json.")
+        if self.log_color not in {"auto", "always", "never"}:
+            raise ValueError("SOORIN_LOG_COLOR must be auto, always, or never.")
+        if self.copilot_human_trace_detail not in {"summary", "detailed"}:
+            raise ValueError("SOORIN_HUMAN_TRACE_DETAIL must be summary or detailed.")
+        if self.evidence_snapshot_mode not in {"none", "metadata", "summary", "redacted"}:
+            raise ValueError(
+                "SOORIN_EVIDENCE_SNAPSHOT_MODE must be none, metadata, summary, or redacted."
+            )
+
 
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:
@@ -346,6 +382,15 @@ def get_settings() -> Settings:
         api_port=_int("API_PORT", 6998),
         api_reload=_bool("API_RELOAD", True),
         log_level=os.getenv("LOG_LEVEL", "INFO"),
+        log_format=os.getenv("SOORIN_LOG_FORMAT", "console").strip().lower(),
+        log_color=os.getenv("SOORIN_LOG_COLOR", "auto").strip().lower(),
+        log_file_enabled=_bool("SOORIN_LOG_FILE_ENABLED", True),
+        log_file_path=os.getenv(
+            "SOORIN_LOG_FILE_PATH", "data/runtime/logs/soorin-copilot.log"
+        ).strip(),
+        log_file_level=os.getenv("SOORIN_LOG_FILE_LEVEL", "INFO").strip().upper(),
+        log_file_max_bytes=max(1024, _int("SOORIN_LOG_FILE_MAX_BYTES", 20971520)),
+        log_file_backup_count=max(0, _int("SOORIN_LOG_FILE_BACKUP_COUNT", 10)),
         api_base_url=os.getenv("SOORIN_API_BASE_URL", "http://127.0.0.1:6998").strip().rstrip("/"),
         api_timeout_seconds=_int("SOORIN_API_TIMEOUT_SECONDS", 120),
         streamlit_server_port=_int("STREAMLIT_SERVER_PORT", 8503),
@@ -428,6 +473,7 @@ def get_settings() -> Settings:
         llm_context_window_tokens=_int("SOORIN_LLM_CONTEXT_WINDOW_TOKENS", 32768),
         llm_reserved_output_tokens=_int("SOORIN_LLM_RESERVED_OUTPUT_TOKENS", 12288),
         llm_context_safety_margin_tokens=_int("SOORIN_LLM_CONTEXT_SAFETY_MARGIN_TOKENS", 2048),
+        llm_token_estimate_multiplier=max(1.0, _float("SOORIN_LLM_TOKEN_ESTIMATE_MULTIPLIER", 1.35)),
         llm_expose_reasoning=_bool("SOORIN_LLM_EXPOSE_REASONING", False),
         llm_log_raw_response=_bool("SOORIN_LLM_LOG_RAW_RESPONSE", False),
         chat_store_history=_bool("SOORIN_CHAT_STORE_HISTORY", True),
@@ -497,6 +543,12 @@ def get_settings() -> Settings:
             DEFAULT_RAG_EMBEDDING_MODEL,
         ).strip(),
         rag_embedding_dimension=max(1, _int("SOORIN_RAG_EMBEDDING_DIMENSION", DEFAULT_RAG_EMBEDDING_DIMENSION)),
+        rag_embedding_local_files_only=_bool("SOORIN_RAG_EMBEDDING_LOCAL_FILES_ONLY", True),
+        rag_embedding_cache_dir=os.getenv("SOORIN_RAG_EMBEDDING_CACHE_DIR", "").strip(),
+        rag_embedding_revision=os.getenv(
+            "SOORIN_RAG_EMBEDDING_REVISION",
+            "a5beb1e3e68b9ab74eb54cfd186867f64f240e1a",
+        ).strip(),
         rag_distance=os.getenv("SOORIN_RAG_DISTANCE", "cosine").strip().lower(),
         rag_max_context_tokens=max(256, _int("SOORIN_RAG_MAX_CONTEXT_TOKENS", 3000)),
         rag_chunk_size_chars=max(200, _int("SOORIN_RAG_CHUNK_SIZE_CHARS", 1200)),
@@ -522,9 +574,35 @@ def get_settings() -> Settings:
         graph_refresh_min_edges=_int("SOORIN_GRAPH_REFRESH_MIN_EDGES", 0),
         graph_refresh_max_node_drop_ratio=_float("SOORIN_GRAPH_REFRESH_MAX_NODE_DROP_RATIO", 0.80),
         graph_refresh_max_edge_drop_ratio=_float("SOORIN_GRAPH_REFRESH_MAX_EDGE_DROP_RATIO", 0.90),
-        copilot_human_trace_enabled=_bool("SOORIN_COPILOT_HUMAN_TRACE_ENABLED", True),
+        copilot_human_trace_enabled=_bool(
+            "SOORIN_HUMAN_TRACE_ENABLED",
+            _bool("SOORIN_COPILOT_HUMAN_TRACE_ENABLED", True),
+        ),
+        copilot_human_trace_detail=_choice(
+            "SOORIN_HUMAN_TRACE_DETAIL", "detailed", {"summary", "detailed"}
+        ),
+        evidence_snapshot_enabled=_bool("SOORIN_EVIDENCE_SNAPSHOT_ENABLED", False),
+        evidence_snapshot_mode=_choice(
+            "SOORIN_EVIDENCE_SNAPSHOT_MODE",
+            "summary",
+            {"none", "metadata", "summary", "redacted"},
+        ),
+        evidence_snapshot_root=os.getenv(
+            "SOORIN_EVIDENCE_SNAPSHOT_ROOT", "data/runtime/evidence"
+        ).strip(),
+        evidence_snapshot_ttl_hours=max(1, _int("SOORIN_EVIDENCE_SNAPSHOT_TTL_HOURS", 48)),
+        evidence_snapshot_max_requests=max(
+            1, _int("SOORIN_EVIDENCE_SNAPSHOT_MAX_REQUESTS", 100)
+        ),
+        evidence_snapshot_max_total_bytes=max(
+            1024, _int("SOORIN_EVIDENCE_SNAPSHOT_MAX_TOTAL_BYTES", 268435456)
+        ),
+        evidence_snapshot_max_bytes=max(
+            1024, _int("SOORIN_EVIDENCE_SNAPSHOT_MAX_BYTES", 5242880)
+        ),
     )
     settings.validate_product_paths()
+    settings.validate_observability_configuration()
     logger.info(
         "event=settings_loaded env_file_path=%s env_file_loaded=%s router_deployment=%s chat_deployment=%s product_base_url_configured=%s product_token_present=%s product_hwid_present=%s product_username_present=%s product_password_present=%s product_captcha_bypass_present=%s rag_enabled=%s rag_backend=%s rag_source_configured=%s rag_qdrant_mode=%s rag_qdrant_configured=%s",
         ENV_PATH,

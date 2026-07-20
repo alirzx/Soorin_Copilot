@@ -65,6 +65,8 @@ temp/
 .cache/
 script/router_e2e_results/
 data/
+data/runtime/evidence/
+data/runtime/logs/
 
 # ============================================================
 # Local graph/generated data

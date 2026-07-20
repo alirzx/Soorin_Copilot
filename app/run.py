@@ -10,15 +10,11 @@ import sys
 import uvicorn
 
 from src.config.settings import get_settings
+from src.core.observability.logging import configure_application_logging
 
 
 def configure_logging() -> None:
-    settings = get_settings()
-    logging.basicConfig(
-        level=getattr(logging, settings.log_level.upper(), logging.INFO),
-        format="%(asctime)s %(levelname)s %(name)s %(message)s",
-        force=True,
-    )
+    configure_application_logging(get_settings())
 
 
 def run_api() -> None:
