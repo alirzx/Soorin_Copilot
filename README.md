@@ -54,13 +54,15 @@ Four roles remain deliberately separate:
 - **Reviewer:** deterministically decides whether evidence is sufficient, limited, missing, or unsafe for synthesis.
 - **Synthesizer:** explains reviewed evidence; it does not select providers or mutate session state.
 
-Direct profile, detection, graph, pair/path, and knowledge requests compile deterministic plans and skip the Planner. Multi-step requests can use one Planner proposal and one schema-repair attempt only when `SOORIN_PLANNER_ENABLED=true`. The conservative default is disabled for rollout parity.
+Direct profile, detection, graph, pair/path, and knowledge requests compile deterministic plans and skip the Planner. Multi-step requests can use one Planner proposal and one schema-repair attempt only when `SOORIN_PLANNER_ENABLED=true`. The deployment remains configurable; GPT-5.5 is the currently recommended Planner deployment.
 
 `CapabilityRegistry` is the only normal provider execution boundary. Independent Graph and Knowledge steps may overlap. Product Profile and Detection steps are serialized because they share one Product client/session. Tool outputs become canonical `ToolResult` records, including status, freshness, completeness, counts, limitations, citations, and the original typed provider result.
 
 The first review evaluates retrieval sufficiency and may authorize one supplemental capability. Its complete final arguments are validated before execution. The second review evaluates what the Context Composer actually included after budgeting. A safe-failure decision skips the final LLM.
 
 Workflow events use compact allowlisted metadata with request, trace, plan, and step IDs. System logs retain deployment, status, count, latency, cache, freshness, and completeness metadata without secrets, prompts, raw provider payloads, hidden reasoning, or full model responses.
+
+Phase 2.1 adds bounded Product evidence views, request-scoped one-fetch reuse, validated Knowledge deduplication, request-specific graph completeness, conservative deployment-aware token estimates, strict offline BGE loading, optional secure evidence snapshots, and an exact greeting/thanks fast path. Detection views are `overview`, `identity_role`, `anomaly_risk`, `behavior`, and `evidence_deep`; Profile views are `overview`, `identity_role`, `services_software`, `security_posture`, and `evidence_deep`. `TaskSpec.recommended_steps` describes semantic complexity only; `PlanValidator` and configured limits remain the security boundary.
 
 ## Repository Layout
 
@@ -76,6 +78,7 @@ app/
   src/core/graph/            NetworkX graph build, storage, refresh, retrieval, visualization
   src/core/llm/              Provider-neutral LLM client and Arvan adapter
   src/core/memory/           In-memory conversation and routing state
+  src/core/observability/    Safe logging and optional evidence snapshots
   src/core/product_client/   Product API auth/client/schemas
   src/core/rag/              Qdrant-backed SOC knowledge retrieval foundation
   src/tests/                 Offline focused tests
@@ -144,13 +147,38 @@ SOORIN_PRODUCT_HWID=
 
 SOORIN_RAG_ENABLED=false
 SOORIN_RAG_BACKEND=qdrant
-SOORIN_RAG_QDRANT_MODE=server
+SOORIN_RAG_QDRANT_MODE=local
 SOORIN_RAG_QDRANT_URL=http://127.0.0.1:6333
 SOORIN_RAG_QDRANT_PATH=data/qdrant-local
 SOORIN_RAG_EMBEDDING_MODEL=BAAI/bge-base-en-v1.5
 SOORIN_RAG_EMBEDDING_DIMENSION=768
 SOORIN_RAG_COLLECTION=soorin_soc_knowledge_bge_base_v1
+SOORIN_RAG_EMBEDDING_LOCAL_FILES_ONLY=true
+SOORIN_RAG_EMBEDDING_REVISION=a5beb1e3e68b9ab74eb54cfd186867f64f240e1a
+HF_HUB_OFFLINE=1
+TRANSFORMERS_OFFLINE=1
+
+SOORIN_LLM_TOKEN_ESTIMATE_MULTIPLIER=1.35
+SOORIN_LOG_FORMAT=console
+SOORIN_LOG_COLOR=auto
+SOORIN_LOG_FILE_ENABLED=true
+SOORIN_LOG_FILE_PATH=data/runtime/logs/soorin-copilot.log
+SOORIN_LOG_FILE_LEVEL=INFO
+SOORIN_LOG_FILE_MAX_BYTES=20971520
+SOORIN_LOG_FILE_BACKUP_COUNT=10
+SOORIN_HUMAN_TRACE_ENABLED=true
+SOORIN_HUMAN_TRACE_DETAIL=detailed
+SOORIN_EVIDENCE_SNAPSHOT_ENABLED=false
+SOORIN_EVIDENCE_SNAPSHOT_MODE=summary
+SOORIN_EVIDENCE_SNAPSHOT_TTL_HOURS=48
+SOORIN_EVIDENCE_SNAPSHOT_MAX_REQUESTS=100
+SOORIN_EVIDENCE_SNAPSHOT_MAX_TOTAL_BYTES=268435456
+SOORIN_EVIDENCE_SNAPSHOT_MAX_BYTES=5242880
 ```
+
+Normal `app/run.py` startup writes authoritative terminal output and, when enabled, a UTF-8 rotating runtime log. Human traces support compact `summary` and section-by-section `detailed` modes. Terminal color is TTY-aware and never reaches JSON or file logs. File rotation retains one 20 MiB active file plus 10 backups, approximately 200 MiB total. This standard-library rotation is intended for the current single-process API; future multi-worker deployments should aggregate stdout or use an external process-safe collector.
+
+Evidence snapshots support `none`, shape-only `metadata`, safe workflow `summary`, and deeper mandatory-`redacted` modes. Summary snapshots include bounded task, plan, tool-result, review, and manifest metadata but never raw Product payloads, full model context, prompts, responses, credentials, or reasoning. Retention is bounded by 48 hours, 100 request directories, 256 MiB total, and 5 MiB per request. In Compose, API logs and evidence use the existing persistent `/workspace/data/runtime/` mount; stdout remains the container logging authority.
 
 Use `SOORIN_RAG_QDRANT_MODE=local` with `SOORIN_RAG_QDRANT_PATH` for embedded local Qdrant storage, or `server` with `SOORIN_RAG_QDRANT_URL` for an external Qdrant server.
 
@@ -214,6 +242,8 @@ The Compose stack runs:
 
 - `api`: FastAPI on container port `6998`, mapped to host `${SOORIN_API_PORT:-6998}`.
 - `ui`: Streamlit on container port `8501`, mapped to host `${SOORIN_UI_PORT:-8503}`.
+
+Local `app/.env` paths remain host-local. Compose overrides the corpus, local Qdrant, and Hugging Face paths for the API container. `compose.env` supplies `SOORIN_RAG_SOURCE_HOST_PATH` and `SOORIN_HF_CACHE_HOST_PATH`; both mounts are read-only, and the UI receives neither mount.
 
 Stop while preserving volumes:
 

@@ -1,6 +1,6 @@
 # Soorin Copilot Current Architecture
 
-Audit date: 2026-07-19.
+Audit date: 2026-07-20.
 
 This document describes the implemented repository state. It distinguishes working behavior from partial foundations, placeholders, and deferred work. It should be updated after architecture-changing code changes.
 
@@ -91,12 +91,13 @@ Settings are loaded from `app/.env` if present, then from environment variables.
 Major groups:
 
 - API/UI: `API_HOST`, `API_PORT`, `API_RELOAD`, `SOORIN_API_BASE_URL`, `SOORIN_API_TIMEOUT_SECONDS`, `STREAMLIT_SERVER_PORT`.
-- LLM: selected router/chat deployments plus per-deployment Arvan base URL, model, API key, timeouts, token limits, and sampling support.
+- LLM: selected router/chat deployments plus per-deployment Arvan base URL, model, API key, timeouts, token limits, sampling support, and conservative estimate multiplier.
 - Product API: base URL, topology path, profile path, detection path, login path, token, login credentials, captcha bypass, HWID, retry and timeout settings.
 - Graph: artifact paths, UI limits, API limits, retrieval limits, context limits, refresh policy, validation thresholds.
-- RAG: enabled flag, source root, backend, Qdrant mode/server URL/local path, collection, score threshold, BGE embedding model and dimension, chunking and upsert limits.
+- RAG: enabled flag, source root, backend, Qdrant mode/server URL/local path, collection, score threshold, BGE model/dimension/revision/cache/local-only policy, chunking and upsert limits.
 - Prompts and router: system prompt path, router prompt path, confidence threshold, repair retry flag.
 - Conversation: history storage and deterministic summary limits.
+- Observability: console/JSON terminal logs, bounded rotating UTF-8 file logs, summary/detailed human traces, TTY-aware color, and disabled-by-default evidence snapshots.
 
 Validation currently enforces:
 
@@ -106,6 +107,7 @@ Validation currently enforces:
 - RAG Qdrant server mode requires a URL.
 - BGE default dimension must be 768.
 - Legacy SecureBERT model and collection values are rejected when RAG is enabled.
+- Log format, color, human-trace detail, and evidence snapshot modes are validated.
 
 ## 5. LLM Deployments
 
@@ -219,6 +221,8 @@ Contracts:
 - `EvidencePack`
 - `ReviewDecision`
 - `CapabilitySpec`
+
+`TaskSpec.recommended_steps` is a semantic complexity recommendation. Its temporary read-only `max_steps` property is compatibility-only. Hard limits remain in `ExecutionPlan.maximum_allowed_calls`, configured agent limits, and `PlanValidator`.
 
 Capability registry entries:
 
@@ -368,6 +372,8 @@ Outcomes:
 
 There is no LLM evidence reviewer.
 
+Graph completeness is evaluated in authority order: `complete_for_user_request`, then `requested_scope_complete`, then `serialized_context_complete_for_retrieved_subset`, and only then general retrieval completeness. A complete `node_summary` remains complete when a broader neighborhood was bounded; that broader truncation is retained as an informational limitation.
+
 If all required evidence is unavailable, synthesis is skipped and the application returns a deterministic safe-failure explanation. If some valid evidence remains, the Reviewer allows synthesis with explicit limitations. A missing, not-yet-executed required capability may trigger one supplemental call; duplicate equivalent retrieval is rejected and a second supplemental call is impossible.
 
 Two review stages have distinct responsibilities:
@@ -400,10 +406,13 @@ Product endpoints:
 
 Detection and profile providers:
 
-- Fetch full JSON without reshaping product fields.
+- Fetch full JSON once per provider/entity/request and preserve the unchanged typed raw provider result.
 - Cache by normalized IP using the detection cache settings.
 - Can return stale cached evidence on provider error if configured.
 - Track raw JSON size, approximate tokens, top-level key counts, cache hit/miss/stale status, HTTP status, and safe error classification.
+- Create safe path/type/length payload inventories and deterministic question-specific local projections.
+
+Detection supports exactly `overview`, `identity_role`, `anomaly_risk`, `behavior`, and `evidence_deep`. Profile supports exactly `overview`, `identity_role`, `services_software`, `security_posture`, and `evidence_deep`. Comprehensive requests combine all approved views under a hard token budget rather than adding an unbounded sixth view. A reviewer-approved supplemental Product view reuses the request-scoped raw result and cannot cause another Product fetch.
 
 ## 11. Graph Topology
 
@@ -486,6 +495,8 @@ Default model:
 - L2 normalization
 - identical document and query embedding pipelines
 - lazy loading on first real embedding call
+- pinned revision and optional cache directory forwarded to both tokenizer and model
+- strict `local_files_only` loading by default with no network fallback
 
 Qdrant:
 
@@ -494,6 +505,8 @@ Qdrant:
 - Validates collection dimension and distance.
 - Supports stable IDs, payload metadata, simple payload filters, batched upsert, delete, health, and collection info.
 - Does not launch a Qdrant server by itself.
+
+When local-only embedding is enabled, a missing model or revision cache entry returns a safe classified unavailable result. Compose mounts the host Hugging Face cache read-only and sets `HF_HUB_OFFLINE`, `TRANSFORMERS_OFFLINE`, and telemetry disable flags.
 
 Knowledge statuses:
 
@@ -505,6 +518,8 @@ Knowledge statuses:
 - `partial`
 
 RAG is appropriate for SOC runbooks, NDR documentation, MITRE/protocol explanations, hardening guidance, investigation procedures, and approved product documentation. It is not source of truth for current asset identity, current graph relationships, live detections, current alerts, risk values, or exact current peer lists.
+
+Knowledge normally permits one search. A second call requires a distinct approved purpose and meaningfully different normalized query. More than two or equivalent calls are rejected before execution; accepted chunks and citations are aggregated and deduplicated.
 
 ## 14. Context Composition and Budgeting
 
@@ -521,7 +536,7 @@ The context composer produces a dynamic system message with:
 - Explicit warning that operational evidence outranks documentation.
 - A compact reviewed-EvidencePack summary containing plan identity, provider coverage, graph completeness, review outcome, missing evidence, contradictions, and limitations.
 
-The composer input is rebuilt from canonical `ToolResult.provider_result` objects in the reviewed `EvidencePack`; it no longer independently initiates or owns provider truth. Complete Product Profile and Detection payload objects remain unchanged through conversion and are serialized by the existing lossless composer.
+The composer input is rebuilt from canonical reviewed `ToolResult` objects. Complete Product Profile and Detection provider objects remain unchanged, while bounded `view_payload` projections become the exact model-facing Product context. There is no raw provider side channel.
 
 Final synthesis receives the global system prompt, a compact reviewed EvidencePack summary, dynamic context reconstructed from EvidencePack provider results, bounded conversation history, and the current user request. No old provider loop or raw provider side channel can add current evidence outside that boundary. If retrieval review, context review, or required graph-context budgeting produces a safe-failure condition, the final LLM is not called. Streaming and non-streaming requests share this same orchestration and differ only in final model transport.
 
@@ -532,6 +547,8 @@ Budget controls:
 - Product payloads can be compacted when exhaustive graph context needs priority.
 - Required graph context that cannot fit creates a safe context limitation.
 - Knowledge context participates in the same budget and may be omitted with logged reason.
+
+Input estimates are deployment/model labeled and multiplied by `SOORIN_LLM_TOKEN_ESTIMATE_MULTIPLIER` (default `1.35`). Output reservation is dynamic: brief uses 1,536 tokens, standard uses 4,096, and deep/report uses up to 6,144, always capped by the deployment. Composition preserves the invariant that calibrated input, output reservation, and safety margin fit the configured context window. Provider prompt usage is compared only as safe numeric calibration metadata when available.
 
 Conversation history is trimmed to fit budget, preferring current evidence over old assistant claims.
 
@@ -559,15 +576,21 @@ Routing state:
 
 Each successful service request constructs one new `SessionRoutingState` and calls the state store once. Explicit-message, UI, and session entity authority remains owned by the resolver/router normalization path. General detached turns preserve useful active entity state. Safe-failure requests preserve prior active state unless the current request supplied a valid explicit or UI-authoritative investigation entity; Planner arguments and final prose are never state inputs.
 
-## 16. Phase 2 Observability
+## 16. Phase 2.1 Observability
 
-Workflow logs use compact `event=<name> key=value` metadata with request, trace, session, plan, and step identifiers. One trace ID is created by workflow dispatch and propagated into the service and failure logs. Events cover request start, entity resolution, semantic routing and fallback, task/plan selection, Planner/repair/fallback/skipping, plan validation, step scheduling/start/completion/partial/failure/skipping/cancellation, EvidencePack construction, deterministic review, supplemental retrieval, synthesis and first streamed token, state update, completion, safe failure, and workflow failure.
+Machine workflow events use compact allowlisted metadata with request, trace, session, plan, and step identifiers and support console or JSON formatting. They never contain complete prompts, full model responses, raw Product JSON, credentials, headers, or hidden reasoning.
 
 Recorded timings include router, Planner, validation, per-capability, initial execution wall time, EvidencePack construction, review, supplemental retrieval, first streamed answer token, synthesis, and total request latency.
 
-Human-readable traces include `AGENT TASK`, `WORKFLOW SELECTION`, `EXECUTION PLAN`, `PLAN VALIDATION`, `CAPABILITY STEPS`, `KNOWLEDGE RETRIEVAL`, `GRAPH COVERAGE`, `EVIDENCE COVERAGE`, `REVIEW DECISION`, `SUPPLEMENTAL RETRIEVAL`, `SYNTHESIS`, and `STATE UPDATE` sections derived from runtime objects.
+The human trace has two modes. `summary` retains the compact routing/plan/execution/review/synthesis/result view. `detailed` restores bounded section-by-section visibility for router input and state, entity authority, Planner source and latency, validated plan, capability results, Product evidence views, graph request completeness, Knowledge purpose/hash, evidence review, context inclusion, calibrated token budget, provider usage, snapshot result, state update, and final result. It never renders payloads, prompts, responses, credentials, headers, or reasoning. Unicode tree markers are used only on UTF-8 output. Color is automatic only for a TTY, respects `NO_COLOR`, and is disabled for redirected and JSON output.
+
+Normal `app/run.py` startup configures terminal logging plus an optional UTF-8 `RotatingFileHandler` at `data/runtime/logs/soorin-copilot.log`. The default is a 20 MiB active file with 10 backups, approximately 200 MiB retained. File output strips ANSI and includes structured events and complete human trace blocks. Terminal/stdout remains authoritative for containers. Standard-library rotation targets the current single-process API; a future multi-worker deployment should aggregate stdout or use an external process-safe collector.
+
+Optional request-scoped evidence snapshots are disabled by default and support `none`, shape-only `metadata`, safe actual-value `summary`, and deeper mandatory-`redacted` modes. Summary mode stores bounded task, plan, tool-result, review, and manifest values while excluding raw Product JSON, full model context, prompts, assistant responses, credentials, headers, and reasoning. Writes are atomic with `0700` root/date/request directories and `0600` files. Retention prunes complete request directories by age (48 hours), count (100), aggregate size (256 MiB), and per-request size (5 MiB), never removing the current write. Cleanup failures are non-fatal. Host storage is under ignored `data/runtime/evidence`; Compose overrides logs and snapshots to the existing persistent `/workspace/data/runtime/` API mount without adding a UI mount.
 
 The event logger uses an allowlist and silently discards unknown fields. API keys, bearer tokens, Authorization headers, passwords, captcha values, complete Product payloads, prompts, full model responses, and hidden reasoning are not event fields. Existing system logs retain only bounded message/answer previews and safe deployment, status, count, latency, cache, freshness, completeness, and failure-class metadata.
+
+Exact English/Persian greetings and thanks use a deterministic fast path that preserves non-streaming and SSE contracts while skipping entity resolution, Router, Planner, providers, and final LLM. It does not mutate operational routing state. Substantive greeting-prefixed messages use the normal workflow.
 
 ## 17. Streaming and Unicode
 
@@ -625,7 +648,9 @@ Docker:
 - Volumes:
   - `copilot-data` for graph/runtime data.
   - `copilot-qdrant` for local Qdrant path.
-  - `copilot-cache` for Hugging Face cache.
+  - Host SOC corpus and Hugging Face cache bind-mounted read-only into the API only.
+
+Local `app/.env` keeps host-local paths. Compose overrides the corpus root, local Qdrant path, and Hugging Face cache path for the API container. Host bind sources are configured in untracked `compose.env`; the UI does not receive RAG source or model-cache mounts.
 
 Compose currently does not define a separate Qdrant server container. Use local Qdrant mode for embedded file-backed Qdrant storage, or configure an external Qdrant server URL.
 
