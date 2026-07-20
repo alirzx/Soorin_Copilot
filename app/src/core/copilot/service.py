@@ -1,28 +1,31 @@
-"""Baseline Copilot chat service."""
+"""Bounded evidence-driven Copilot chat service."""
 
 from __future__ import annotations
 
+import json
 import logging
 import time
 from collections.abc import Callable, Iterator
+from dataclasses import replace
 from pathlib import Path
 from queue import SimpleQueue
-from threading import Thread
+from threading import RLock, Thread
 from typing import Any
 from uuid import uuid4
 
 from src.config.settings import Settings
+from src.core.agent.evidence import apply_context_inclusion, context_package_from_evidence, safe_review_summary
+from src.core.agent.events import WorkflowEventContext, WorkflowEventLogger
+from src.core.agent.executor import CapabilityExecutor
+from src.core.agent.plan_validator import PlanValidationError, PlanValidator
+from src.core.agent.planner import BoundedPlanner, PlannerError
 from src.core.agent.registry import build_capability_registry
-from src.core.agent.task_mapping import bounded_plan_placeholder, task_spec_from_route
+from src.core.agent.reviewer import EvidenceReviewer
+from src.core.agent.task_mapping import compile_direct_plan, compile_supplemental_plan, task_spec_from_route
 from src.core.agent.workflow import BoundedCopilotWorkflow
 from src.core.context import ContextComposer, DeterministicFallbackRouter, EntityResolver, SemanticIntentRouter, normalize_intent_route
 from src.core.context.intent import SECURITY_ANALYSIS_WORDS, build_routing_context, resolution_from_materialized_decision
 from src.core.context.models import (
-    AssetProfileProviderResult,
-    CopilotContextPackage,
-    DetectionProviderResult,
-    GraphProviderResult,
-    ProviderProvenance,
     approx_tokens,
     compact_preview,
 )
@@ -83,14 +86,69 @@ class CopilotService:
         self.detection_provider = DetectionContextProvider(settings, product_client)
         self.asset_profile_provider = AssetProfileContextProvider(settings, product_client)
         self.knowledge_service = KnowledgeSearchService(settings)
+        self._capability_runtime_lock = RLock()
         self.capability_registry = build_capability_registry(
             asset_profile_provider=self.asset_profile_provider,
             detection_provider=self.detection_provider,
             graph_provider=self.graph_provider,
             knowledge_service=self.knowledge_service,
         )
+        self.plan_validator = PlanValidator(
+            self.capability_registry,
+            max_calls=settings.agent_max_capability_calls,
+            max_entities=settings.agent_max_entities,
+            max_graph_depth=settings.agent_max_graph_depth,
+        )
+        self.capability_executor = CapabilityExecutor(
+            self.capability_registry,
+            max_concurrency=settings.agent_executor_max_concurrency,
+            max_calls=settings.agent_max_capability_calls,
+            total_timeout_seconds=settings.agent_request_timeout_seconds,
+        )
+        self.planner = BoundedPlanner(
+            llm_client,
+            repair_enabled=settings.planner_repair_enabled,
+        )
+        self.evidence_reviewer = EvidenceReviewer()
+        self._capability_provider_ids = self._current_capability_provider_ids()
         self.context_composer = ContextComposer(settings)
         self.workflow = BoundedCopilotWorkflow()
+
+    def _current_capability_provider_ids(self) -> tuple[int, int, int, int]:
+        return (
+            id(self.asset_profile_provider),
+            id(self.detection_provider),
+            id(self.graph_provider),
+            id(self.knowledge_service),
+        )
+
+    def _capability_runtime_snapshot(self) -> tuple[Any, PlanValidator, CapabilityExecutor]:
+        """Return one internally consistent runtime, rebinding injected providers atomically."""
+        with self._capability_runtime_lock:
+            current_ids = self._current_capability_provider_ids()
+            if current_ids != self._capability_provider_ids:
+                registry = build_capability_registry(
+                    asset_profile_provider=self.asset_profile_provider,
+                    detection_provider=self.detection_provider,
+                    graph_provider=self.graph_provider,
+                    knowledge_service=self.knowledge_service,
+                )
+                self.capability_registry = registry
+                self.plan_validator = PlanValidator(
+                    registry,
+                    max_calls=self.settings.agent_max_capability_calls,
+                    max_entities=self.settings.agent_max_entities,
+                    max_graph_depth=self.settings.agent_max_graph_depth,
+                )
+                self.capability_executor = CapabilityExecutor(
+                    registry,
+                    max_concurrency=self.settings.agent_executor_max_concurrency,
+                    max_calls=self.settings.agent_max_capability_calls,
+                    total_timeout_seconds=self.settings.agent_request_timeout_seconds,
+                )
+                self._capability_provider_ids = current_ids
+                logger.info("event=capability_runtime_rebound reason=provider_injection")
+            return self.capability_registry, self.plan_validator, self.capability_executor
 
     def _load_system_prompt(self) -> str:
         prompt_path = Path(self.settings.system_prompt_path)
@@ -453,6 +511,7 @@ class CopilotService:
             ui_context=ui_context,
             request_id=resolved_request_id,
             stream_sink=stream_sink,
+            typed_executor=self._chat_phase2,
             direct_executor=self._chat_direct,
         )
 
@@ -463,12 +522,44 @@ class CopilotService:
         *,
         ui_context: dict[str, Any] | None = None,
         request_id: str | None = None,
+        trace_id: str | None = None,
+        stream_sink: Callable[[LLMStreamEvent], None] | None = None,
+    ) -> dict[str, Any]:
+        """Compatibility alias for callers that still pass the historical callback name."""
+        logger.info(
+            "event=phase2_compatibility_alias request_id=%s fallback_used=false",
+            request_id or "",
+        )
+        return self._chat_phase2(
+            message,
+            session_id,
+            ui_context=ui_context,
+            request_id=request_id,
+            trace_id=trace_id,
+            stream_sink=stream_sink,
+        )
+
+    def _chat_phase2(
+        self,
+        message: str,
+        session_id: str | None = None,
+        *,
+        ui_context: dict[str, Any] | None = None,
+        request_id: str | None = None,
+        trace_id: str | None = None,
         stream_sink: Callable[[LLMStreamEvent], None] | None = None,
     ) -> dict[str, Any]:
         request_id = request_id or uuid4().hex[:12]
+        capability_registry, plan_validator, capability_executor = self._capability_runtime_snapshot()
         session = (session_id or "").strip() or uuid4().hex
         user_text = message.strip()
         request_started = time.perf_counter()
+        trace_id = trace_id or uuid4().hex[:16]
+        events = WorkflowEventLogger(
+            logger,
+            WorkflowEventContext(request_id=request_id, trace_id=trace_id, session_id=session),
+        )
+        events.emit("request_received", entity_count=0)
         trace = CopilotRequestTrace(
             request_id=request_id,
             session_id=session,
@@ -504,7 +595,26 @@ class CopilotService:
             routing_state.active_ip or "",
             routing_state.last_provider or "",
         )
-        entities = self.entity_resolver.resolve(user_text, ui_context, routing_state, request_id=request_id)
+        entity_started = time.perf_counter()
+        events.emit("entity_resolution_started")
+        try:
+            entities = self.entity_resolver.resolve(user_text, ui_context, routing_state, request_id=request_id)
+        except Exception as exc:
+            events.emit(
+                "entity_resolution_failed",
+                level=logging.ERROR,
+                latency_ms=int((time.perf_counter() - entity_started) * 1000),
+                error_class=type(exc).__name__,
+                safe_error_code="entity_resolution_failed",
+            )
+            raise
+        events.emit(
+            "entity_resolution_completed",
+            status=entities.status,
+            entity_count=len(entities.entities),
+            entity_binding_source=entities.primary_entity.source if entities.primary_entity else "none",
+            latency_ms=int((time.perf_counter() - entity_started) * 1000),
+        )
         trace.put(
             "ENTITY",
             status=entities.status,
@@ -523,6 +633,8 @@ class CopilotService:
         )
         routing_context = build_routing_context(user_text, entities, routing_state, ui_context=ui_context)
         trace.put("ROUTER INPUT", **routing_context)
+        router_started = time.perf_counter()
+        events.emit("router_started", entity_count=len(entities.entities))
         intent_decision = self.intent_router.classify(
             user_text,
             entities,
@@ -556,6 +668,35 @@ class CopilotService:
             route_entities = resolution_from_materialized_decision(intent_decision, entities)
             route = normalize_intent_route(intent_decision, route_entities)
 
+        router_latency_ms = int((time.perf_counter() - router_started) * 1000)
+        if route.fallback_used:
+            events.emit(
+                "router_failed",
+                level=logging.WARNING,
+                latency_ms=router_latency_ms,
+                error_class=route.semantic_router_error or route.fallback_reason or "router_failed",
+                safe_error_code=route.fallback_reason or "router_failed",
+            )
+            events.emit(
+                "router_fallback_used",
+                intent=route.intent,
+                entity_count=len(route_entities.entities),
+                entity_binding_source=route.binding_source,
+                latency_ms=router_latency_ms,
+                fallback_used=True,
+                reason=route.fallback_reason or route.reason,
+            )
+        else:
+            events.emit(
+                "router_completed",
+                intent=route.intent,
+                entity_count=len(route_entities.entities),
+                entity_binding_source=route.binding_source,
+                latency_ms=router_latency_ms,
+                fallback_used=False,
+                reason=route.reason,
+            )
+
         if SECURITY_ANALYSIS_WORDS.search(user_text) and "security_or_anomaly" not in route.matched_signals:
             route = type(route)(
                 **{
@@ -564,17 +705,146 @@ class CopilotService:
                 }
             )
 
-        task_spec = task_spec_from_route(route, user_text)
-        plan_placeholder = bounded_plan_placeholder(task_spec)
+        events.emit("task_validation_started", intent=route.intent, entity_count=len(route_entities.entities))
+        try:
+            task_spec = task_spec_from_route(route, user_text)
+        except Exception as exc:
+            events.emit(
+                "task_validation_failed",
+                level=logging.ERROR,
+                intent=route.intent,
+                error_class=type(exc).__name__,
+                safe_error_code="task_validation_failed",
+            )
+            raise
+        events.emit(
+            "task_validation_completed",
+            intent=task_spec.intent,
+            complexity=task_spec.workflow_mode,
+            entity_count=len(task_spec.entities),
+        )
+        events.emit(
+            "workflow_selected",
+            intent=task_spec.intent,
+            complexity=task_spec.workflow_mode,
+            planner_called=task_spec.workflow_mode == "multi_step" and self.settings.planner_enabled,
+        )
+
+        planner_called = False
+        planner_fallback_used = False
+        if task_spec.workflow_mode == "multi_step" and self.settings.planner_enabled:
+            planner_called = True
+            planner_started = time.perf_counter()
+            events.emit("planner_started", intent=task_spec.intent, complexity=task_spec.workflow_mode, planner_called=True)
+            try:
+                execution_plan = self.planner.plan(
+                    task_spec,
+                    capability_registry.list(planner_visible=True),
+                    request_id=request_id,
+                    events=events,
+                )
+                events.emit(
+                    "planner_completed",
+                    plan_id=execution_plan.plan_id,
+                    latency_ms=int((time.perf_counter() - planner_started) * 1000),
+                    tool_call_count=len(execution_plan.steps),
+                    planner_called=True,
+                )
+            except PlannerError as exc:
+                planner_fallback_used = True
+                events.emit(
+                    "planner_failed",
+                    level=logging.WARNING,
+                    latency_ms=int((time.perf_counter() - planner_started) * 1000),
+                    planner_called=True,
+                    error_class=exc.code,
+                    safe_error_code=exc.code,
+                )
+                execution_plan = replace(
+                    compile_direct_plan(task_spec),
+                    source="deterministic_fallback",
+                    planner_called=True,
+                )
+                events.emit("planner_fallback_used", plan_id=execution_plan.plan_id, planner_called=True, fallback_used=True)
+        else:
+            execution_plan = compile_direct_plan(task_spec)
+            events.emit("planner_skipped", plan_id=execution_plan.plan_id, complexity=task_spec.workflow_mode, planner_called=False)
+            events.emit("direct_plan_compiled", plan_id=execution_plan.plan_id, tool_call_count=len(execution_plan.steps))
+
+        validation_started = time.perf_counter()
+        events.emit("plan_validation_started", plan_id=execution_plan.plan_id, tool_call_count=len(execution_plan.steps))
+        try:
+            execution_plan = plan_validator.validate(execution_plan)
+        except PlanValidationError as exc:
+            events.emit(
+                "plan_validation_rejected",
+                level=logging.WARNING,
+                plan_id=execution_plan.plan_id,
+                error_class=exc.code,
+                safe_error_code=exc.code,
+            )
+            if execution_plan.source != "llm":
+                raise
+            planner_fallback_used = True
+            execution_plan = plan_validator.validate(
+                replace(
+                    compile_direct_plan(task_spec),
+                    source="deterministic_fallback",
+                    planner_called=True,
+                )
+            )
+            events.emit("planner_fallback_used", plan_id=execution_plan.plan_id, planner_called=True, fallback_used=True)
+        events.emit(
+            "plan_validation_completed",
+            plan_id=execution_plan.plan_id,
+            latency_ms=int((time.perf_counter() - validation_started) * 1000),
+            tool_call_count=len(execution_plan.steps),
+            planner_called=planner_called,
+            fallback_used=planner_fallback_used,
+        )
         logger.info(
-            "event=agent_task_mapped request_id=%s decision_source=%s workflow_mode=%s capabilities=%s max_steps=%s plan_steps=%s plan_validated=%s planner_called=false",
+            "event=agent_task_mapped request_id=%s decision_source=%s workflow_mode=%s capabilities=%s max_steps=%s plan_id=%s plan_source=%s plan_steps=%s plan_validated=%s planner_called=%s",
             request_id,
             task_spec.semantic_decision_source,
             task_spec.workflow_mode,
             ",".join(task_spec.required_capabilities) or "none",
             task_spec.max_steps,
-            len(plan_placeholder.steps),
-            plan_placeholder.validated,
+            execution_plan.plan_id,
+            execution_plan.source,
+            len(execution_plan.steps),
+            execution_plan.validated,
+            planner_called,
+        )
+        trace.put(
+            "AGENT TASK",
+            intent=task_spec.intent,
+            complexity=task_spec.workflow_mode,
+            entities=", ".join(task_spec.entities),
+            required_capabilities=", ".join(task_spec.required_capabilities),
+            detail_level=task_spec.detail_level,
+            freshness_requirement=task_spec.freshness_requirement,
+        )
+        trace.put(
+            "WORKFLOW SELECTION",
+            mode=task_spec.workflow_mode,
+            planner_called=planner_called,
+            planner_fallback_used=planner_fallback_used,
+        )
+        trace.put(
+            "EXECUTION PLAN",
+            plan_id=execution_plan.plan_id,
+            source=execution_plan.source,
+            goal=execution_plan.goal,
+            step_count=len(execution_plan.steps),
+            steps=", ".join(f"{step.id}:{step.capability}" for step in execution_plan.steps),
+            maximum_allowed_calls=execution_plan.maximum_allowed_calls,
+        )
+        trace.put(
+            "PLAN VALIDATION",
+            validated=execution_plan.validated,
+            max_entities=self.settings.agent_max_entities,
+            max_graph_depth=self.settings.agent_max_graph_depth,
+            max_calls=self.settings.agent_max_capability_calls,
         )
 
         router_deployment = self.settings.deployment_for_purpose("intent_router")
@@ -666,99 +936,238 @@ class CopilotService:
             ",".join(route.materialized_entities),
         )
 
-        graph_result = None
-        detection_results: list[DetectionProviderResult] = []
-        asset_profile_results: list[AssetProfileProviderResult] = []
-        knowledge_result = None
-        provenance: list[ProviderProvenance] = []
-        limitations: list[str] = []
-        response_warnings: list[str] = []
-        if route.use_graph and (route.target_entity or route.target_entities):
-            try:
-                graph_result = self.graph_provider.provide(route.target_entity, route=route, request_id=request_id)
-            except Exception as exc:
-                logger.warning(
-                    "event=graph_context_provider_failed request_id=%s error_type=%s",
-                    request_id,
-                    type(exc).__name__,
-                )
-                graph_result = GraphProviderResult(
-                    provider="graph",
-                    status="unavailable",
-                    target_entity=route.target_entity,
-                    provenance=ProviderProvenance(source="observed_communication_graph", status="unavailable"),
-                    limitations=["Graph evidence was unavailable for this request."],
-                    error_reason=type(exc).__name__,
-                )
-            if graph_result and graph_result.provenance:
-                provenance.append(graph_result.provenance)
-            if graph_result:
-                limitations.extend(graph_result.limitations)
-            if graph_result and graph_result.status == "unavailable":
-                response_warnings.append("graph_evidence_unavailable")
-        product_targets = route.target_entities[:2]
-        if route.use_detection:
-            for target_entity in product_targets:
-                try:
-                    result = self.detection_provider.fetch(target_entity.value, request_id, session_id=session)
-                except Exception as exc:
-                    logger.warning(
-                        "event=detection_provider_failed request_id=%s target_ip=%s status=unavailable error_type=%s stale_fallback=false latency_ms=0",
-                        request_id,
-                        target_entity.value,
-                        type(exc).__name__,
-                    )
-                    result = DetectionProviderResult(
-                        provider="detection",
-                        status="unavailable",
-                        ip=target_entity.value,
-                        error_type=type(exc).__name__,
-                        safe_error="Detection provider failed.",
-                        limitations=["Detection evidence was unavailable for this request."],
-                    )
-                detection_results.append(result)
-                if result.provenance:
-                    provenance.append(result.provenance)
-                limitations.extend(result.limitations)
-                if result.status in {"not_found", "unavailable"}:
-                    response_warnings.append(
-                        "detection_evidence_not_found" if result.status == "not_found" else "detection_evidence_unavailable"
-                    )
-        if route.use_asset_profile:
-            for target_entity in product_targets:
-                try:
-                    result = self.asset_profile_provider.fetch(target_entity.value, request_id, session_id=session)
-                except Exception as exc:
-                    logger.warning(
-                        "event=asset_profile_provider_failed request_id=%s target_ip=%s status=unavailable error_type=%s stale_fallback=false latency_ms=0",
-                        request_id,
-                        target_entity.value,
-                        type(exc).__name__,
-                    )
-                    result = AssetProfileProviderResult(
-                        provider="asset_profile",
-                        status="unavailable",
-                        ip=target_entity.value,
-                        error_type=type(exc).__name__,
-                        safe_error="Asset Profile provider failed.",
-                        limitations=["Asset Profile evidence was unavailable for this request."],
-                    )
-                asset_profile_results.append(result)
-                if result.provenance:
-                    provenance.append(result.provenance)
-                limitations.extend(result.limitations)
-                if result.status in {"not_found", "unavailable"}:
-                    response_warnings.append(
-                        "asset_profile_not_found" if result.status == "not_found" else "asset_profile_unavailable"
-                    )
-        if route.use_knowledge:
-            knowledge_result = self.knowledge_service.search(
-                user_text,
+        execution_started = time.perf_counter()
+        tool_results = capability_executor.execute(
+            execution_plan,
+            base_payload={"request_id": request_id, "session_id": session, "route": route},
+            events=events,
+        )
+        initial_execution_ms = int((time.perf_counter() - execution_started) * 1000)
+        trace.put(
+            "CAPABILITY STEPS",
+            initial_execution_wall_ms=initial_execution_ms,
+            tool_call_count=len(tool_results),
+            statuses=", ".join(
+                f"{result.step_id}:{result.source_capability}:{result.status}" for result in tool_results
+            ),
+            total_step_latency_ms=sum(result.latency_ms for result in tool_results),
+        )
+
+        pack_started = time.perf_counter()
+        events.emit(
+            "evidence_pack_build_started",
+            plan_id=execution_plan.plan_id,
+            reason="retrieval_review",
+        )
+        try:
+            evidence_pack = self.evidence_reviewer.build_pack(
+                task_spec,
+                tool_results,
+                plan=execution_plan,
                 request_id=request_id,
+                trace_id=trace_id,
             )
-            limitations.extend(knowledge_result.limitations)
-            if knowledge_result.status in {"not_configured", "unavailable", "invalid"}:
-                response_warnings.append(f"knowledge_evidence_{knowledge_result.status}")
+        except Exception as exc:
+            events.emit(
+                "evidence_pack_failed",
+                level=logging.ERROR,
+                plan_id=execution_plan.plan_id,
+                error_class=type(exc).__name__,
+                safe_error_code="evidence_pack_build_failed",
+            )
+            raise
+        events.emit(
+            "evidence_pack_built",
+            plan_id=execution_plan.plan_id,
+            latency_ms=int((time.perf_counter() - pack_started) * 1000),
+            tool_call_count=len(tool_results),
+            reason="retrieval_review",
+        )
+
+        review_started = time.perf_counter()
+        events.emit("evidence_review_started", plan_id=execution_plan.plan_id)
+        review_decision = self.evidence_reviewer.review(
+            task_spec,
+            tool_results,
+            allow_supplemental=self.settings.agent_max_supplemental_retrievals > 0,
+        )
+        events.emit(
+            "evidence_review_completed",
+            plan_id=execution_plan.plan_id,
+            review_outcome=review_decision.outcome,
+            latency_ms=int((time.perf_counter() - review_started) * 1000),
+            supplemental_retrieval_count=0,
+        )
+
+        supplemental_history: tuple[dict[str, Any], ...] = ()
+        supplemental_count = 0
+        if (
+            review_decision.outcome == "missing_required_evidence"
+            and review_decision.supplemental_allowed
+            and review_decision.next_capability
+            and review_decision.next_arguments is not None
+        ):
+            events.emit(
+                "supplemental_retrieval_requested",
+                plan_id=execution_plan.plan_id,
+                capability=review_decision.next_capability,
+            )
+            already_executed = any(
+                result.source_capability == review_decision.next_capability
+                and tuple(review_decision.next_arguments.get("entities") or ()) == result.entities
+                for result in tool_results
+            )
+            if already_executed:
+                events.emit(
+                    "supplemental_retrieval_rejected",
+                    plan_id=execution_plan.plan_id,
+                    capability=review_decision.next_capability,
+                    reason="duplicate_equivalent_call",
+                )
+            else:
+                events.emit(
+                    "supplemental_retrieval_approved",
+                    plan_id=execution_plan.plan_id,
+                    capability=review_decision.next_capability,
+                )
+                supplemental_plan = plan_validator.validate(
+                    compile_supplemental_plan(
+                        task_spec,
+                        review_decision.next_capability,
+                        review_decision.next_arguments,
+                        plan_id=execution_plan.plan_id,
+                    )
+                )
+                events.emit(
+                    "supplemental_retrieval_started",
+                    plan_id=execution_plan.plan_id,
+                    capability=review_decision.next_capability,
+                )
+                supplemental_started = time.perf_counter()
+                try:
+                    supplemental_results = capability_executor.execute(
+                        supplemental_plan,
+                        base_payload={"request_id": request_id, "session_id": session, "route": route},
+                        events=events,
+                    )
+                except Exception as exc:
+                    events.emit(
+                        "supplemental_retrieval_failed",
+                        level=logging.ERROR,
+                        plan_id=execution_plan.plan_id,
+                        capability=review_decision.next_capability,
+                        error_class=type(exc).__name__,
+                        safe_error_code="supplemental_execution_failed",
+                    )
+                    raise
+                tool_results.extend(supplemental_results)
+                supplemental_count = 1
+                supplemental_history = (
+                    {
+                        "capability": review_decision.next_capability,
+                        "status": supplemental_results[0].status if supplemental_results else "unavailable",
+                    },
+                )
+                events.emit(
+                    "supplemental_retrieval_completed",
+                    plan_id=execution_plan.plan_id,
+                    capability=review_decision.next_capability,
+                    status=supplemental_results[0].status if supplemental_results else "unavailable",
+                    latency_ms=int((time.perf_counter() - supplemental_started) * 1000),
+                    supplemental_retrieval_count=1,
+                )
+                pack_started = time.perf_counter()
+                events.emit(
+                    "evidence_pack_build_started",
+                    plan_id=execution_plan.plan_id,
+                    reason="post_supplemental_review",
+                )
+                evidence_pack = self.evidence_reviewer.build_pack(
+                    task_spec,
+                    tool_results,
+                    plan=execution_plan,
+                    request_id=request_id,
+                    trace_id=trace_id,
+                    supplemental_history=supplemental_history,
+                )
+                events.emit(
+                    "evidence_pack_built",
+                    plan_id=execution_plan.plan_id,
+                    latency_ms=int((time.perf_counter() - pack_started) * 1000),
+                    tool_call_count=len(tool_results),
+                    reason="post_supplemental_review",
+                )
+                review_started = time.perf_counter()
+                events.emit("evidence_review_started", plan_id=execution_plan.plan_id, supplemental_retrieval_count=1)
+                review_decision = self.evidence_reviewer.review(task_spec, tool_results, allow_supplemental=False)
+                events.emit(
+                    "evidence_review_completed",
+                    plan_id=execution_plan.plan_id,
+                    review_outcome=review_decision.outcome,
+                    latency_ms=int((time.perf_counter() - review_started) * 1000),
+                    supplemental_retrieval_count=1,
+                )
+
+        if supplemental_count == 0:
+            events.emit(
+                "supplemental_retrieval_skipped",
+                plan_id=execution_plan.plan_id,
+                supplemental_retrieval_count=0,
+                reason="not_required_or_not_approved",
+            )
+        evidence_pack = self.evidence_reviewer.with_review(evidence_pack, review_decision)
+        trace.put(
+            "EVIDENCE COVERAGE",
+            plan_id=evidence_pack.plan_id,
+            provider_coverage=", ".join(
+                f"{capability}:{status}" for capability, status in evidence_pack.provider_coverage.items()
+            ),
+            graph_completeness=evidence_pack.graph_completeness,
+            limitation_count=len(evidence_pack.limitations),
+            contradiction_count=len(evidence_pack.contradictions),
+            missing_evidence=", ".join(evidence_pack.missing_evidence),
+        )
+        trace.put(
+            "REVIEW DECISION",
+            outcome=review_decision.outcome,
+            reasons=", ".join(review_decision.reasons),
+            missing_capabilities=", ".join(review_decision.missing_capabilities),
+            supplemental_allowed=review_decision.supplemental_allowed,
+        )
+        trace.put(
+            "SUPPLEMENTAL RETRIEVAL",
+            count=supplemental_count,
+            history=", ".join(
+                f"{item.get('capability')}:{item.get('status')}" for item in supplemental_history
+            ),
+        )
+        context_package = context_package_from_evidence(evidence_pack, route_entities)
+        graph_result = context_package.graph
+        detection_results = context_package.detections
+        asset_profile_results = context_package.asset_profiles
+        knowledge_result = context_package.knowledge
+        provenance = context_package.provenance
+        limitations = context_package.limitations
+        response_warnings: list[str] = []
+        for tool_result in tool_results:
+            if tool_result.source_capability == "asset.get_detection" and tool_result.status in {"not_found", "unavailable"}:
+                response_warnings.append("detection_evidence_not_found" if tool_result.status == "not_found" else "detection_evidence_unavailable")
+            elif tool_result.source_capability == "asset.get_profile" and tool_result.status in {"not_found", "unavailable"}:
+                response_warnings.append("asset_profile_not_found" if tool_result.status == "not_found" else "asset_profile_unavailable")
+            elif tool_result.source_capability.startswith("graph.") and tool_result.status == "unavailable":
+                response_warnings.append("graph_evidence_unavailable")
+            elif tool_result.source_capability == "knowledge.search" and tool_result.status in {"not_configured", "unavailable", "invalid"}:
+                response_warnings.append(f"knowledge_evidence_{tool_result.status}")
+        if graph_result and graph_result.status == "unavailable":
+            response_warnings.append("graph_evidence_unavailable")
+        for result in detection_results:
+            if result.status in {"not_found", "unavailable"}:
+                response_warnings.append("detection_evidence_not_found" if result.status == "not_found" else "detection_evidence_unavailable")
+        for result in asset_profile_results:
+            if result.status in {"not_found", "unavailable"}:
+                response_warnings.append("asset_profile_not_found" if result.status == "not_found" else "asset_profile_unavailable")
+        if knowledge_result and knowledge_result.status in {"not_configured", "unavailable", "invalid"}:
+            response_warnings.append(f"knowledge_evidence_{knowledge_result.status}")
         graph_context = graph_result.context if graph_result else {}
         graph_metadata = get_graph_metadata()
         refresh_status = get_refresh_status()
@@ -814,16 +1223,27 @@ class CopilotService:
             requested_scope_complete=graph_context.get("requested_scope_complete", False) if isinstance(graph_context, dict) else False,
             complete_for_user_request=graph_context.get("complete_for_user_request", False) if isinstance(graph_context, dict) else False,
         )
-
-        context_package = CopilotContextPackage(
-            entities=route_entities,
-            graph=graph_result,
-            detections=detection_results,
-            asset_profiles=asset_profile_results,
-            knowledge=knowledge_result,
-            provenance=provenance,
-            limitations=limitations,
+        trace.put(
+            "KNOWLEDGE RETRIEVAL",
+            status=knowledge_result.status if knowledge_result else "skipped",
+            backend=knowledge_result.backend if knowledge_result else "",
+            freshness=knowledge_result.freshness if knowledge_result else "",
+            total_candidates=knowledge_result.total_candidates if knowledge_result else "",
+            included_count=knowledge_result.included_count if knowledge_result else 0,
+            truncated=knowledge_result.truncated if knowledge_result else False,
+            citation_count=len(knowledge_result.citations) if knowledge_result else 0,
         )
+        trace.put(
+            "GRAPH COVERAGE",
+            status=graph_result.status if graph_result else "skipped",
+            scope=route.scope,
+            retrieval_complete=graph_context.get("retrieval_complete", False) if isinstance(graph_context, dict) else False,
+            complete_for_user_request=graph_context.get("complete_for_user_request", False) if isinstance(graph_context, dict) else False,
+            candidate_nodes=graph_context.get("candidate_node_count", 0) if isinstance(graph_context, dict) else 0,
+            included_nodes=graph_context.get("context_node_count", 0) if isinstance(graph_context, dict) else 0,
+            truncated=graph_context.get("retrieval_truncated", False) if isinstance(graph_context, dict) else False,
+        )
+
         provider_statuses = {
             "graph": graph_result.status if graph_result else "skipped",
             "detection": self._combined_status(detection_results),
@@ -927,7 +1347,8 @@ class CopilotService:
                     - sum(1 for item in history if item.get("role") == "assistant"),
                 ),
             )
-        base_input_tokens = approx_tokens(self.system_prompt) + approx_tokens(user_text) + sum(
+        # Reserve a compact immutable summary of the reviewed EvidencePack.
+        base_input_tokens = 512 + approx_tokens(self.system_prompt) + approx_tokens(user_text) + sum(
             approx_tokens(item.get("content", "")) for item in history
         )
         dynamic_context = self.context_composer.compose(
@@ -956,6 +1377,60 @@ class CopilotService:
             response_warnings.append("asset_profile_context_too_large")
         if route.use_knowledge and not self.context_composer.last_inclusion.get("knowledge", (False, None))[0]:
             response_warnings.append("knowledge_context_not_included")
+        tool_results = apply_context_inclusion(tool_results, self.context_composer.last_inclusion)
+        pack_started = time.perf_counter()
+        events.emit(
+            "evidence_pack_build_started",
+            plan_id=execution_plan.plan_id,
+            reason="context_review",
+        )
+        evidence_pack = self.evidence_reviewer.build_pack(
+            task_spec,
+            tool_results,
+            plan=execution_plan,
+            request_id=request_id,
+            trace_id=trace_id,
+            supplemental_history=supplemental_history,
+        )
+        events.emit(
+            "evidence_pack_built",
+            plan_id=execution_plan.plan_id,
+            latency_ms=int((time.perf_counter() - pack_started) * 1000),
+            tool_call_count=len(tool_results),
+            reason="context_review",
+        )
+        final_review_started = time.perf_counter()
+        events.emit(
+            "evidence_review_started",
+            plan_id=execution_plan.plan_id,
+            supplemental_retrieval_count=supplemental_count,
+        )
+        review_decision = self.evidence_reviewer.review(task_spec, tool_results, allow_supplemental=False)
+        evidence_pack = self.evidence_reviewer.with_review(evidence_pack, review_decision)
+        events.emit(
+            "evidence_review_completed",
+            plan_id=execution_plan.plan_id,
+            review_outcome=review_decision.outcome,
+            latency_ms=int((time.perf_counter() - final_review_started) * 1000),
+            supplemental_retrieval_count=supplemental_count,
+        )
+        trace.put(
+            "REVIEW DECISION",
+            stage="context",
+            outcome=review_decision.outcome,
+            reasons=", ".join(review_decision.reasons),
+            missing_capabilities=", ".join(review_decision.missing_capabilities),
+            supplemental_allowed=False,
+        )
+        reviewed_summary = json.dumps(
+            safe_review_summary(evidence_pack),
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        dynamic_context = (
+            f"{dynamic_context}\n\n<SOORIN_REVIEWED_EVIDENCE_SUMMARY_JSON>\n"
+            f"{reviewed_summary}\n</SOORIN_REVIEWED_EVIDENCE_SUMMARY_JSON>"
+        ).strip()
         trace.put(
             "GRAPH RETRIEVAL",
             inbound_context_included=graph_context.get("inbound_context_included", "") if isinstance(graph_context, dict) else "",
@@ -1066,8 +1541,50 @@ class CopilotService:
             "stream_completed": False,
             "stream_error_type": "",
         }
+        synthesis_started = time.perf_counter()
+        events.emit(
+            "synthesis_started",
+            plan_id=execution_plan.plan_id,
+            review_outcome=review_decision.outcome,
+            deployment=chat_deployment.name,
+            model=chat_deployment.model,
+        )
+        trace.put(
+            "SYNTHESIS",
+            review_outcome=review_decision.outcome,
+            reviewed_evidence_only=True,
+            streaming=stream_sink is not None,
+            deployment=chat_deployment.name,
+            model=chat_deployment.model,
+        )
+        if stream_sink is not None:
+            events.emit("synthesis_stream_started", plan_id=execution_plan.plan_id)
         try:
-            if self.context_composer.required_context_missing:
+            if review_decision.outcome in {"safe_failure", "missing_required_evidence"}:
+                missing = ", ".join(review_decision.missing_capabilities) or "the required current evidence"
+                safe_answer = (
+                    "I cannot safely complete this investigation because "
+                    f"{missing} is unavailable. No unsupported conclusion was generated."
+                )
+                result = LLMProviderResult(
+                    text=safe_answer,
+                    provider="deterministic",
+                    model="evidence-review-guard",
+                    deployment="deterministic",
+                    finish_reason=None,
+                )
+                final_synthesis_status = "safe_failure"
+                fallback_answer_used = True
+                response_warnings.append("required_evidence_unavailable")
+                if stream_sink is not None:
+                    stream_sink(LLMStreamEvent("answer_delta", text=safe_answer))
+                events.emit(
+                    "workflow_safe_failure",
+                    plan_id=execution_plan.plan_id,
+                    review_outcome=review_decision.outcome,
+                    reason="required_evidence_unavailable",
+                )
+            elif self.context_composer.required_context_missing:
                 safe_answer = (
                     "I cannot safely analyze all requested connections because the current "
                     "graph evidence could not fit within the model context budget. No prior "
@@ -1111,6 +1628,14 @@ class CopilotService:
                     purpose="chat",
                 )
         except LLMError as exc:
+            events.emit(
+                "synthesis_failed",
+                level=logging.WARNING,
+                plan_id=execution_plan.plan_id,
+                latency_ms=int((time.perf_counter() - synthesis_started) * 1000),
+                error_class=exc.reason,
+                safe_error_code=exc.reason,
+            )
             partial_stream = bool(exc.details.get("partial_output"))
             fallback_answer = "" if partial_stream else build_evidence_fallback_answer(
                 graph_result,
@@ -1167,6 +1692,22 @@ class CopilotService:
                 exc.reason,
                 requested_max_tokens,
             )
+        if stream_metrics["first_answer_chunk_latency_ms"] is not None:
+            events.emit(
+                "synthesis_first_token",
+                plan_id=execution_plan.plan_id,
+                latency_ms=stream_metrics["first_answer_chunk_latency_ms"],
+            )
+        events.emit(
+            "synthesis_completed",
+            plan_id=execution_plan.plan_id,
+            status=final_synthesis_status,
+            latency_ms=int((time.perf_counter() - synthesis_started) * 1000),
+            deployment=result.deployment,
+            provider=result.provider,
+            model=result.model,
+            review_outcome=review_decision.outcome,
+        )
         logger.info(
             "event=conversation_response request_id=%s session_id=%s provider=%s model=%s assistant_chars=%s assistant_approx_tokens=%s assistant_preview=%r",
             request_id,
@@ -1307,6 +1848,7 @@ class CopilotService:
         updated_previous_requires_asset_profile = (
             route.use_asset_profile if evidence_execution_succeeded else routing_state.previous_requires_asset_profile
         )
+        events.emit("state_update_started", plan_id=execution_plan.plan_id)
         new_routing_state = SessionRoutingState(
             active_ip=updated_active_ip,
             active_entities=updated_active_entities,
@@ -1321,8 +1863,31 @@ class CopilotService:
             previous_depth=updated_previous_depth,
             previous_requires_detection=updated_previous_requires_detection,
             previous_requires_asset_profile=updated_previous_requires_asset_profile,
+            last_plan_id=execution_plan.plan_id,
+            last_review_outcome=review_decision.outcome,
+            last_evidence_ids=tuple(result.step_id for result in tool_results if result.step_id),
+            last_capability_statuses=tuple(
+                f"{result.source_capability}:{result.status}" for result in tool_results
+            ),
         )
-        self.routing_state_store.set(session, new_routing_state)
+        try:
+            self.routing_state_store.set(session, new_routing_state)
+        except Exception as exc:
+            events.emit(
+                "state_update_failed",
+                level=logging.ERROR,
+                plan_id=execution_plan.plan_id,
+                error_class=type(exc).__name__,
+                safe_error_code="state_update_failed",
+            )
+            raise
+        events.emit(
+            "state_updated",
+            plan_id=execution_plan.plan_id,
+            review_outcome=review_decision.outcome,
+            entity_count=len(new_routing_state.active_entities) or int(bool(new_routing_state.active_ip)),
+            tool_call_count=len(tool_results),
+        )
         if new_routing_state != routing_state:
             logger.info(
                 "event=session_routing_state_updated request_id=%s session_id=%s previous_active_ip=%s active_ip=%s previous_active_entities=%s active_entities=%s previous_last_provider=%s last_provider=%s last_providers=%s previous_intent=%s previous_scope=%s previous_direction=%s previous_depth=%s update_reason=%s",
@@ -1437,10 +2002,33 @@ class CopilotService:
         if self.settings.copilot_human_trace_enabled:
             render_human_copilot_trace(trace)
 
+        events.emit(
+            "workflow_completed",
+            plan_id=execution_plan.plan_id,
+            status="ok",
+            latency_ms=trace.total_latency_ms,
+            review_outcome=review_decision.outcome,
+            supplemental_retrieval_count=supplemental_count,
+            tool_call_count=len(tool_results),
+            planner_called=planner_called,
+            fallback_used=planner_fallback_used or fallback_answer_used,
+        )
+
         return {
             "session_id": session,
             "answer": result.text,
             "provider": result.provider,
             "model": result.model,
             "_warnings": response_warnings,
+            "_phase2_state": {
+                "task": task_spec,
+                "execution_plan": execution_plan,
+                "tool_results": tool_results,
+                "evidence_pack": evidence_pack,
+                "review_decision": review_decision,
+                "workflow_mode": task_spec.workflow_mode,
+                "planner_called": planner_called,
+                "fallback_used": planner_fallback_used or fallback_answer_used,
+                "supplemental_retrieval_count": supplemental_count,
+            },
         }

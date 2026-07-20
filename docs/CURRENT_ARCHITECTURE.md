@@ -1,6 +1,6 @@
 # Soorin Copilot Current Architecture
 
-Audit date: 2026-07-18.
+Audit date: 2026-07-19.
 
 This document describes the implemented repository state. It distinguishes working behavior from partial foundations, placeholders, and deferred work. It should be updated after architecture-changing code changes.
 
@@ -27,20 +27,29 @@ sequenceDiagram
     participant Entity as EntityResolver
     participant Router as SemanticIntentRouter
     participant Workflow as BoundedCopilotWorkflow
+    participant Planner as Bounded Planner
+    participant Executor as Capability Executor
+    participant Reviewer as Evidence Reviewer
     participant Providers as Evidence providers
     participant Composer as ContextComposer
     participant LLM as Arvan chat deployment
 
     UI->>API: POST /chat or /chat/stream
     API->>Service: message, session_id, optional ui_context
-    Service->>Workflow: run direct bounded workflow
-    Workflow->>Service: direct executor callback
+    Service->>Workflow: dispatch one bounded executor callback
+    Workflow->>Service: invoke Phase 2 executor exactly once
     Service->>Entity: resolve explicit/UI/session entities
     Service->>Router: classify with GLM/GPT deployment
     Router->>Service: JSON route decision
     Service->>Service: validate, normalize, fallback if needed
-    Service->>Providers: graph/profile/detection/knowledge as selected
-    Providers->>Service: typed provider results
+    Service->>Planner: multi-step only; one structured proposal
+    Service->>Service: deterministic plan validation
+    Service->>Executor: validated registered read-only plan
+    Executor->>Providers: dependency-aware bounded execution
+    Providers->>Executor: canonical ToolResults with raw provider objects preserved
+    Executor->>Reviewer: canonical EvidencePack
+    Reviewer->>Executor: at most one approved supplemental retrieval
+    Reviewer->>Service: sufficient, limitations, missing evidence, or safe failure
     Service->>Composer: bounded model context
     Composer->>Service: tagged dynamic context
     Service->>LLM: final chat request or stream
@@ -193,11 +202,11 @@ Important normalization rules:
 
 Deterministic fallback is present but intentionally secondary. Its operational provider logging currently covers graph, detection, and asset profile; semantic routes can also select knowledge.
 
-## 8. Agentic Foundation
+## 8. Active Bounded Investigation Workflow
 
 Implemented in `app/src/core/agent`.
 
-Current status: partial foundation, direct bounded workflow active, full planner deferred.
+Current status: Phase 2 typed execution is the normal request path. `_chat_direct` is a compatibility alias that delegates to `_chat_phase2`; it is not an independent legacy implementation and must not be described as a fallback.
 
 Contracts:
 
@@ -222,23 +231,120 @@ Capability registry entries:
 - `graph.find_path`
 - `knowledge.search`
 
-Current workflow:
+Active workflow:
 
-- `BoundedCopilotWorkflow` uses LangGraph `StateGraph` when installed.
-- If LangGraph is unavailable, it uses a deterministic compatibility runner.
-- Nodes are `resolve`, `route`, `validate_task`, `select_workflow`, `execute_direct`, `build_evidence`, `review_evidence`, and `synthesize`.
-- Recursion limit is 12.
-- The actual current request path is still the direct `CopilotService._chat_direct` executor.
-- No unrestricted tool loop exists.
-- No LLM planner exists.
-- Multi-step task classification creates a bounded placeholder plan only.
-- The deterministic evidence reviewer exists, but current active synthesis still relies on provider-specific context composition inside the direct executor rather than a full agent evidence-pack pipeline.
+```text
+Entity resolution
+-> semantic routing
+-> validated TaskSpec
+-> deterministic direct plan OR one bounded Planner pass
+-> deterministic PlanValidator
+-> dependency-aware CapabilityExecutor
+-> canonical ToolResults
+-> canonical EvidencePack
+-> deterministic EvidenceReviewer
+-> at most one supplemental capability call
+-> reviewed context composition
+-> final synthesis or deterministic safe failure
+-> deterministic state update
+```
+
+- Direct tasks use `compile_direct_plan`; the Planner is skipped.
+- Multi-step tasks use the existing provider-neutral LLM client with `SOORIN_PLANNER_DEPLOYMENT`.
+- Planner output is a proposal. It cannot execute tools, invent entities, introduce URLs, change permissions, or mutate state.
+- One malformed Planner response may receive one compact schema-repair attempt.
+- Planner failure or plan rejection falls back explicitly to a deterministic plan when one is safe.
+- `PlanValidator` enforces known/planner-visible/read-only capabilities, entity authority, cardinality, argument schemas, dependency references, DAG structure, duplicate-call rejection, six-call maximum, two-entity maximum, and graph depth two.
+- `CapabilityExecutor` runs independent steps concurrently with a maximum of four workers by default. Profile and Detection are serialized because they share a Product client/session; Graph and Knowledge can overlap safely.
+- Provider exceptions become safe typed failures; successful and partial results are preserved.
+- LangGraph remains bounded at recursion limit 12 and carries the actual Phase 2 task, plan, results, pack, review, and final response through workflow state. It is currently a dispatch/state shell: detailed entity, routing, planning, execution, context, synthesis, and state-update mechanics remain in `CopilotService._chat_phase2`.
+- LangGraph and the deterministic compatibility runner each choose and invoke exactly one executor callback. They do not run typed and compatibility callbacks together.
+- When LangGraph is unavailable, the deterministic compatibility runner executes the same `_chat_phase2` implementation. This is runtime compatibility, not a separate legacy request path.
+- There is no unrestricted tool loop or autonomous action path.
+
+### Active call graph and ownership
+
+```text
+BoundedCopilotWorkflow.run
+-> exactly one selected callback
+-> CopilotService._chat_phase2
+   -> EntityResolver
+   -> SemanticIntentRouter and deterministic normalization/fallback
+   -> task_spec_from_route
+   -> compile_direct_plan OR BoundedPlanner
+   -> PlanValidator
+   -> CapabilityExecutor and CapabilityRegistry
+   -> EvidencePack construction and EvidenceReviewer
+   -> optional validated supplemental plan
+   -> ContextComposer and final context review
+   -> final LLM synthesis OR deterministic safe failure
+   -> one conversation/routing-state update
+```
+
+The service contains no legacy direct provider loop. Normal Profile, Detection, Graph, and Knowledge calls occur only through registered capability handlers. The service consumes provider results only after they have been converted to `ToolResult` and associated with the EvidencePack.
+
+### Planner behavior
+
+Direct requests always use deterministic plans and do not call the Planner. Multi-step requests call the Planner only when `SOORIN_PLANNER_ENABLED=true`. Planner output is JSON-only, receives no generic transient retry, and may receive at most one schema-repair request. Extra prose is rejected and enters that repair path. A Planner failure or rejected model plan uses a logged deterministic fallback plan only when the existing semantic task can be compiled safely.
+
+The Planner cannot execute tools. Entity authority, known capability selection, read-only policy, entity cardinality, Pydantic arguments, dependency references, DAG validity, duplicate calls, graph depth, and call budgets remain deterministic `PlanValidator` responsibilities.
+
+### Capability runtime and execution
+
+The registry, validator, and executor are initialized once. Tests may replace provider objects; in that case `CopilotService` atomically rebuilds all three under a lock and each request retains one consistent runtime snapshot. Normal requests do not rebuild the registry.
+
+The executor:
+
+- accepts only plans marked validated by the application path;
+- schedules dependency-ready steps in deterministic plan order;
+- overlaps independent steps up to the configured worker bound;
+- serializes Product Profile and Detection through the `product` concurrency lock;
+- allows Graph and Knowledge to overlap;
+- skips every downstream step whose dependency failed, including optional steps;
+- preserves partial and successful results when another step fails;
+- applies capability and total request time bounds;
+- always shuts down its thread pool.
+
+Already-running synchronous provider threads cannot be forcibly terminated after timeout. Native Product/Qdrant transport timeouts remain the primary hard bounds, and a timed-out request does not treat late work as evidence.
+
+### ToolResult and EvidencePack
+
+`ToolResult` is the canonical capability-output contract. Product raw JSON objects retain identity and are not reshaped. The original typed provider result remains in `provider_result`. Graph retrieval/serialization completeness, counts, truncation, and limitations survive conversion. Knowledge chunks, scores through the original result, citations, counts, backend, and freshness survive conversion. Unknown provider statuses fail closed as `invalid`; they are never normalized to success.
+
+`EvidencePack` is constructed only from `ToolResult` records. It carries request/trace/plan IDs, resolved entities, plan summary, provider coverage, graph completeness, citations, missing evidence, limitations, contradictions, supplemental history, and review outcome.
+
+### Supplemental validation
+
+The only allowed sequence is implemented:
+
+```text
+Reviewer proposes a registered capability and final arguments
+-> compile the complete one-step supplemental plan
+-> PlanValidator validates the final step
+-> CapabilityExecutor executes the validated plan
+```
+
+Arguments are never replaced after validation. Duplicate equivalent calls are rejected before execution, the supplemental plan has a one-call budget, and `allow_supplemental=false` after the first attempt makes a second retrieval impossible.
+
+### Planner and execution settings
+
+- `SOORIN_PLANNER_ENABLED`
+- `SOORIN_PLANNER_DEPLOYMENT`
+- `SOORIN_PLANNER_REPAIR_ENABLED`
+- `SOORIN_AGENT_MAX_SUPPLEMENTAL_RETRIEVALS` (hard-capped at 1)
+- `SOORIN_AGENT_MAX_CAPABILITY_CALLS` (hard-capped at 6)
+- `SOORIN_AGENT_MAX_ENTITIES` (hard-capped at 2)
+- `SOORIN_AGENT_MAX_GRAPH_DEPTH` (hard-capped at 2)
+- `SOORIN_AGENT_EXECUTOR_MAX_CONCURRENCY` (hard-capped at 4)
+- `SOORIN_AGENT_REQUEST_TIMEOUT_SECONDS`
+
+`SOORIN_PLANNER_ENABLED` defaults to `false`. One Planner proposal is an architectural fixed bound rather than a misleading configurable planning-pass value. Enable Planner testing explicitly with `SOORIN_PLANNER_ENABLED=true` and `SOORIN_PLANNER_DEPLOYMENT=gpt55`.
 
 ## 9. Evidence Reviewer
 
 Implemented in `app/src/core/agent/reviewer.py`.
 
-Current status: deterministic reviewer implemented, partially integrated structurally.
+Current status: deterministic reviewer is authoritative before synthesis.
 
 Checks include:
 
@@ -261,6 +367,15 @@ Outcomes:
 - `safe_failure`
 
 There is no LLM evidence reviewer.
+
+If all required evidence is unavailable, synthesis is skipped and the application returns a deterministic safe-failure explanation. If some valid evidence remains, the Reviewer allows synthesis with explicit limitations. A missing, not-yet-executed required capability may trigger one supplemental call; duplicate equivalent retrieval is rejected and a second supplemental call is impossible.
+
+Two review stages have distinct responsibilities:
+
+1. Retrieval review checks required capability execution, entity coverage, status, freshness, completeness, truncation, limitations, contradictions, and whether one bounded supplemental retrieval can fill a missing capability.
+2. Context review runs after Context Composer budgeting updates each `ToolResult.context_included` value. It decides whether synthesis can use the evidence actually present in model context.
+
+The retrieval stage may repeat once after an approved supplemental call. That repeat is not a second autonomous review loop. The final context review never authorizes another retrieval.
 
 ## 10. Product API Integration
 
@@ -404,6 +519,11 @@ The context composer produces a dynamic system message with:
 - Tagged knowledge JSON and citations when selected and budget permits.
 - Source semantics and limitations.
 - Explicit warning that operational evidence outranks documentation.
+- A compact reviewed-EvidencePack summary containing plan identity, provider coverage, graph completeness, review outcome, missing evidence, contradictions, and limitations.
+
+The composer input is rebuilt from canonical `ToolResult.provider_result` objects in the reviewed `EvidencePack`; it no longer independently initiates or owns provider truth. Complete Product Profile and Detection payload objects remain unchanged through conversion and are serialized by the existing lossless composer.
+
+Final synthesis receives the global system prompt, a compact reviewed EvidencePack summary, dynamic context reconstructed from EvidencePack provider results, bounded conversation history, and the current user request. No old provider loop or raw provider side channel can add current evidence outside that boundary. If retrieval review, context review, or required graph-context budgeting produces a safe-failure condition, the final LLM is not called. Streaming and non-streaming requests share this same orchestration and differ only in final model transport.
 
 Budget controls:
 
@@ -434,8 +554,22 @@ Routing state:
 - Successful single-IP graph requests preserve active IP and node-summary route state.
 - General or unclear detached turns do not erase active IP.
 - Knowledge-only routes can be selected and included in trace/provider status, but current persisted `last_provider`/`last_providers` are operational-provider oriented and do not persist `knowledge` as a last provider.
+- Stores safe Phase 2 continuity metadata: last plan ID, last review outcome, step evidence IDs, and capability statuses.
+- Planner output and synthesizer prose cannot mutate routing state.
 
-## 16. Streaming and Unicode
+Each successful service request constructs one new `SessionRoutingState` and calls the state store once. Explicit-message, UI, and session entity authority remains owned by the resolver/router normalization path. General detached turns preserve useful active entity state. Safe-failure requests preserve prior active state unless the current request supplied a valid explicit or UI-authoritative investigation entity; Planner arguments and final prose are never state inputs.
+
+## 16. Phase 2 Observability
+
+Workflow logs use compact `event=<name> key=value` metadata with request, trace, session, plan, and step identifiers. One trace ID is created by workflow dispatch and propagated into the service and failure logs. Events cover request start, entity resolution, semantic routing and fallback, task/plan selection, Planner/repair/fallback/skipping, plan validation, step scheduling/start/completion/partial/failure/skipping/cancellation, EvidencePack construction, deterministic review, supplemental retrieval, synthesis and first streamed token, state update, completion, safe failure, and workflow failure.
+
+Recorded timings include router, Planner, validation, per-capability, initial execution wall time, EvidencePack construction, review, supplemental retrieval, first streamed answer token, synthesis, and total request latency.
+
+Human-readable traces include `AGENT TASK`, `WORKFLOW SELECTION`, `EXECUTION PLAN`, `PLAN VALIDATION`, `CAPABILITY STEPS`, `KNOWLEDGE RETRIEVAL`, `GRAPH COVERAGE`, `EVIDENCE COVERAGE`, `REVIEW DECISION`, `SUPPLEMENTAL RETRIEVAL`, `SYNTHESIS`, and `STATE UPDATE` sections derived from runtime objects.
+
+The event logger uses an allowlist and silently discards unknown fields. API keys, bearer tokens, Authorization headers, passwords, captcha values, complete Product payloads, prompts, full model responses, and hidden reasoning are not event fields. Existing system logs retain only bounded message/answer previews and safe deployment, status, count, latency, cache, freshness, completeness, and failure-class metadata.
+
+## 17. Streaming and Unicode
 
 Streaming path:
 
@@ -457,7 +591,7 @@ Covered Unicode cases:
 
 Non-streaming chat remains unchanged and preserves Unicode text.
 
-## 17. Streamlit UI
+## 18. Streamlit UI
 
 Implemented in `app/app_st.py` and `app/src/web`.
 
@@ -472,11 +606,7 @@ Current UI:
 - Help content explains asset authority, evidence sources, example prompts, and precision tips.
 - Topology page is embedded beside the chat area.
 
-Current known UI wording issue:
-
-- The main chat description still contains legacy wording that says asset, RAG, and graph context will be added later, even though graph/product evidence and optional RAG foundations are now implemented. This is documentation-only audit information; no UI code was changed by this document update.
-
-## 18. Deployment
+## 19. Deployment
 
 Local launcher:
 
@@ -499,7 +629,7 @@ Docker:
 
 Compose currently does not define a separate Qdrant server container. Use local Qdrant mode for embedded file-backed Qdrant storage, or configure an external Qdrant server URL.
 
-## 19. Tests
+## 20. Tests
 
 Current focused tests:
 
@@ -511,6 +641,7 @@ Current focused tests:
 - `test_detection_phase12.py`: additional detection/profile/cache/context protections.
 - `test_llm_deployments.py`: multi-deployment settings and LLM health.
 - `test_llm_retry.py`: transient retry and non-retry behavior.
+- `test_phase2_agent_workflow.py`: plan validation, planner JSON/repair boundaries, DAG execution, concurrency, cancellation, safe failures, raw payload preservation, EvidencePack/reviewer behavior, event safety, and typed workflow dispatch.
 
 Common commands:
 
@@ -518,14 +649,14 @@ Common commands:
 PYTHONPATH=app python -m compileall -q app
 PYTHONPATH=app python -m pytest app/src/tests/test_agentic_rag_foundation.py -q
 PYTHONPATH=app python -m pytest app/src/tests/test_chat_streaming.py -q
+PYTHONPATH=app python -m pytest app/src/tests/test_phase2_agent_workflow.py -q
 PYTHONPATH=app python -m unittest app.src.tests.test_context_routing -v
-PYTHONPATH=app python -m unittest discover -s app/src/tests -p "test_*.py" -v
 git diff --check
 ```
 
 Live Product API, Arvan, embedding downloads, Qdrant server, graph refresh, and indexing should be tested only deliberately, never as default offline verification.
 
-## 20. Implemented, Partial, Deferred
+## 21. Implemented, Partial, Deferred
 
 Implemented:
 
@@ -542,18 +673,20 @@ Implemented:
 - In-memory conversation and routing state.
 - UTF-8-safe SSE streaming.
 - Bounded typed agent contracts, registry, task mapping, and reviewer foundation.
+- Active deterministic direct-plan compiler and bounded multi-step Planner.
+- Deterministic plan validation and dependency-aware capability execution.
+- Canonical ToolResult conversion and reviewed EvidencePack synthesis source.
+- Two-stage deterministic review, one-supplemental retrieval policy, and deterministic safe failure.
+- Request/trace/plan/step workflow observability.
 
 Partial or structural:
 
-- LangGraph workflow currently wraps the existing direct request path.
-- Multi-step plan is a bounded placeholder, not an autonomous planner.
-- Evidence reviewer exists but does not yet drive a full pre-synthesis evidence-pack control loop in the active direct path.
-- Capability registry wraps current providers but active Copilot execution still calls providers directly.
+- LangGraph dispatches and carries the typed Phase 2 runtime state, while detailed provider/context/synthesis mechanics remain methods on `CopilotService`; further node-level extraction is possible without changing contracts.
+- LangGraph nodes currently mark and carry workflow stages; the detailed phase mechanics remain in the single `_chat_phase2` service executor.
 - RAG has service and indexer support, but no dedicated public API endpoint and no automatic index build.
 
 Deferred or not implemented:
 
-- Full LLM planner.
 - LLM evidence reviewer.
 - Neo4j, Cypher, text-to-Cypher, Graph Data Science.
 - MCP.
@@ -565,3 +698,15 @@ Deferred or not implemented:
 - Human approval workflows.
 - Automatic remediation.
 - Microsoft Global or DRIFT GraphRAG.
+
+## 22. Remaining Risks and Phase 3 Entry Point
+
+Remaining risks:
+
+- `CopilotService._chat_phase2` remains large and owns most detailed orchestration. Future extraction should move verified stages into dedicated LangGraph nodes without changing the contracts or provider boundary.
+- Synchronous provider calls cannot be killed after a Python future timeout; transport-native timeouts must remain correctly configured.
+- Planner mode is offline-tested with fakes but requires deliberate manual parity testing before broad enablement.
+- Conversation and routing state are process-local and do not coordinate concurrent workers.
+- RAG availability and freshness depend on an externally maintained Qdrant collection; the application does not index at startup.
+
+The safest Phase 3 entry point is to preserve the current `TaskSpec`, `ExecutionPlan`, `CapabilityRegistry`, `ToolResult`, `EvidencePack`, and Reviewer contracts while extracting service stages into real LangGraph nodes. Neo4j can then be introduced behind the existing graph capability boundary with bounded parameterized read-only queries. Planner expansion, Cypher generation, additional integrations, and side-effecting actions should remain deferred until node-level parity, evidence evaluation, and durable state design are verified.

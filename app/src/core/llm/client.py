@@ -15,7 +15,7 @@ from src.core.llm.providers.base import LLMProviderResult, LLMStreamEvent
 
 
 logger = logging.getLogger(__name__)
-ROUTER_PURPOSES = {"intent_router", "intent_router_repair"}
+STRUCTURED_PURPOSES = {"intent_router", "intent_router_repair", "planner", "planner_repair"}
 
 
 class LLMClient:
@@ -24,7 +24,11 @@ class LLMClient:
         self.providers: dict[str, ArvanProvider] = {}
         if settings.llm_provider == "arvan":
             selected_aliases = dict.fromkeys(
-                (settings.intent_router_deployment, settings.chat_deployment)
+                (
+                    settings.intent_router_deployment,
+                    settings.chat_deployment,
+                    *([settings.planner_deployment] if settings.planner_enabled else []),
+                )
             )
             for alias in selected_aliases:
                 deployment = settings.deployment(alias)
@@ -35,13 +39,18 @@ class LLMClient:
         self.provider = self.providers.get(settings.chat_deployment)
         router = settings.deployment(settings.intent_router_deployment)
         chat = settings.deployment(settings.chat_deployment)
+        planner = settings.deployment(settings.planner_deployment)
         logger.info(
-            "event=provider_initialization provider=%s enabled=%s router_deployment=%s router_model=%s router_host=%s chat_deployment=%s chat_model=%s chat_host=%s ready=%s",
+            "event=provider_initialization provider=%s enabled=%s router_deployment=%s router_model=%s router_host=%s planner_enabled=%s planner_deployment=%s planner_model=%s planner_host=%s chat_deployment=%s chat_model=%s chat_host=%s ready=%s",
             settings.llm_provider,
             settings.llm_enabled,
             router.name,
             router.model,
             router.safe_host,
+            settings.planner_enabled,
+            planner.name,
+            planner.model,
+            planner.safe_host,
             chat.name,
             chat.model,
             chat.safe_host,
@@ -94,7 +103,7 @@ class LLMClient:
 
         configured_retries = max(0, int(self.settings.llm_max_transient_retries))
         requested_retries = configured_retries if transient_retries is None else max(0, int(transient_retries))
-        max_retries = 0 if purpose in ROUTER_PURPOSES else min(1, requested_retries)
+        max_retries = 0 if purpose in STRUCTURED_PURPOSES else min(1, requested_retries)
 
         for attempt in range(max_retries + 1):
             attempt_started = time.perf_counter()
@@ -259,6 +268,11 @@ class LLMClient:
 
         router = self.providers[self.settings.intent_router_deployment].health()
         chat = self.providers[self.settings.chat_deployment].health()
+        planner = (
+            self.providers[self.settings.planner_deployment].health()
+            if self.settings.planner_enabled
+            else {"enabled": False, "ready": True, "deployment": self.settings.planner_deployment}
+        )
         return {
             "enabled": self.settings.llm_enabled,
             "ready": bool(router["ready"] and chat["ready"]),
@@ -266,5 +280,6 @@ class LLMClient:
             "model": chat["model"],
             "deployment": chat["deployment"],
             "router": router,
+            "planner": planner,
             "chat": chat,
         }

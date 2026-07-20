@@ -20,6 +20,10 @@ class SessionRoutingState:
     previous_depth: int | None = None
     previous_requires_detection: bool = False
     previous_requires_asset_profile: bool = False
+    last_plan_id: str | None = None
+    last_review_outcome: str | None = None
+    last_evidence_ids: tuple[str, ...] = ()
+    last_capability_statuses: tuple[str, ...] = ()
 
 
 class SessionRoutingStateStore:

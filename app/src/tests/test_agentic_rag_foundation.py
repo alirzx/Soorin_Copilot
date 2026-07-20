@@ -14,7 +14,7 @@ from src.config.settings import get_settings
 from src.core.agent.contracts import EvidenceFact, TaskSpec, ToolResult
 from src.core.agent.registry import build_capability_registry
 from src.core.agent.reviewer import EvidenceReviewer
-from src.core.agent.task_mapping import bounded_plan_placeholder, task_spec_from_route
+from src.core.agent.task_mapping import compile_direct_plan, task_spec_from_route
 from src.core.agent.workflow import BoundedCopilotWorkflow
 from src.core.context.composer import ContextComposer
 from src.core.context.intent import validate_router_payload
@@ -371,8 +371,8 @@ class RoutingWorkflowAndReviewerTests(unittest.TestCase):
         self.assertEqual(task.entities, ())
         self.assertEqual(task.required_capabilities, ("knowledge.search",))
         self.assertEqual(task.semantic_decision_source, "semantic_router")
-        plan = bounded_plan_placeholder(task)
-        self.assertTrue(plan.validated)
+        plan = compile_direct_plan(task)
+        self.assertFalse(plan.validated)
         self.assertEqual(plan.max_iterations, 1)
 
     def test_direct_workflow_calls_executor_once_and_preserves_response(self) -> None:

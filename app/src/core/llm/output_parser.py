@@ -63,3 +63,21 @@ def extract_last_json_object(text: str) -> dict[str, Any]:
         "LLM JSON response must be an object.",
         reason="validation_failed",
     )
+
+
+def parse_json_object(text: str) -> dict[str, Any]:
+    """Parse one JSON-only object, allowing only an optional Markdown code fence."""
+    cleaned = clean_llm_text(text)
+    try:
+        parsed = json.loads(cleaned)
+    except json.JSONDecodeError as exc:
+        raise LLMJSONError(
+            "LLM response must contain exactly one JSON object and no extra prose.",
+            reason="validation_failed",
+        ) from exc
+    if not isinstance(parsed, dict):
+        raise LLMJSONError(
+            "LLM JSON response must be an object.",
+            reason="validation_failed",
+        )
+    return parsed

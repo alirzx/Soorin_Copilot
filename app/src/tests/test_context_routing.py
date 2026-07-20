@@ -88,6 +88,8 @@ def make_settings(**overrides):
         "llm_provider": "fake",
         "intent_router_deployment": "glm",
         "chat_deployment": "glm",
+        "planner_enabled": False,
+        "planner_deployment": "glm",
         "glm_model": "fake",
         "copilot_human_trace_enabled": False,
         "intent_router_enabled": True,

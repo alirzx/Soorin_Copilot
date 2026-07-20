@@ -29,14 +29,20 @@ def create_app() -> FastAPI:
         chat_deployment = settings.deployment_for_purpose("chat")
         logger.info("==================== API STARTUP ====================")
         logger.info(
-            "event=application_startup host=%s port=%s provider=%s router_deployment=%s router_model=%s chat_deployment=%s chat_model=%s",
+            "event=application_startup host=%s port=%s provider=%s router_deployment=%s router_model=%s planner_enabled=%s planner_deployment=%s planner_model=%s chat_deployment=%s chat_model=%s agent_max_calls=%s agent_max_graph_depth=%s agent_max_concurrency=%s",
             settings.api_host,
             settings.api_port,
             settings.llm_provider,
             router_deployment.name,
             router_deployment.model,
+            settings.planner_enabled,
+            settings.planner_deployment,
+            settings.deployment_for_purpose("planner").model,
             chat_deployment.name,
             chat_deployment.model,
+            settings.agent_max_capability_calls,
+            settings.agent_max_graph_depth,
+            settings.agent_executor_max_concurrency,
         )
         refresh_service = get_api_graph_refresh_service()
         set_graph_refresh_service(refresh_service)

@@ -39,6 +39,8 @@ def make_settings(**overrides: Any):
         "llm_provider": "fake",
         "intent_router_deployment": "glm",
         "chat_deployment": "glm",
+        "planner_enabled": False,
+        "planner_deployment": "glm",
         "glm_model": "fake-router",
         "copilot_human_trace_enabled": False,
         "chat_store_history": False,
@@ -707,7 +709,7 @@ class CopilotProductOrchestrationTests(unittest.TestCase):
         self.assertIn("Complete Asset Profile JSON was retrieved", response["answer"])
         self.assertIn("final_synthesis_fallback_used", response["_warnings"])
 
-    def test_final_model_failure_without_usable_evidence_propagates(self) -> None:
+    def test_unusable_required_evidence_returns_deterministic_safe_failure(self) -> None:
         route = self.single_route_json(graph=False, detection=True, profile=True)
         llm = FakeLLMClient([llm_result(route), LLMError("failed", reason="provider_http_error")])
         service = CopilotService(make_settings(), llm, MemoryStore(max_messages=4))
@@ -718,8 +720,10 @@ class CopilotProductOrchestrationTests(unittest.TestCase):
             {"192.0.2.10": profile_result("192.0.2.10", status="unavailable")}
         )  # type: ignore[assignment]
 
-        with self.assertRaises(LLMError):
-            service.chat("Analyze 192.0.2.10.", request_id="req-no-evidence")
+        response = service.chat("Analyze 192.0.2.10.", request_id="req-no-evidence")
+        self.assertEqual(response["provider"], "deterministic")
+        self.assertIn("cannot safely complete", response["answer"])
+        self.assertIn("required_evidence_unavailable", response["_warnings"])
 
     def test_final_synthesis_keeps_configured_chat_timeout_and_token_budget(self) -> None:
         route = self.single_route_json(graph=False, detection=True, profile=False)

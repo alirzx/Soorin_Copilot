@@ -15,16 +15,52 @@ flowchart TD
     Service --> Entity[Deterministic entity resolver]
     Entity --> Router[Semantic LLM router]
     Router --> Validate[Deterministic validation and normalization]
-    Validate --> Workflow[Bounded LangGraph workflow]
-    Workflow --> Providers[Evidence providers]
+    Validate --> Plan[Direct compiler or bounded Planner]
+    Plan --> Executor[Validated capability executor]
+    Executor --> Providers[Registered evidence capabilities]
     Providers --> Graph[NetworkX graph artifacts]
     Providers --> Product[Product API profile and detection]
     Providers --> RAG[Optional Qdrant knowledge.search]
-    Workflow --> Context[Context composer and budgeter]
+    Providers --> Review[EvidencePack and deterministic review]
+    Review --> Context[Context composer and budgeter]
     Context --> LLM[Arvan chat deployment]
     LLM --> API
     API --> UI
 ```
+
+## Phase 2 Workflow
+
+The active request path is:
+
+```text
+Entity Resolver
+-> Semantic Router and deterministic normalization
+-> TaskSpec
+-> deterministic direct compiler OR bounded Planner
+-> PlanValidator
+-> CapabilityExecutor
+-> ToolResults and EvidencePack
+-> deterministic Evidence Reviewer
+-> optional one validated supplemental retrieval
+-> reviewed Context Composer
+-> Synthesizer or deterministic safe failure
+-> one routing-state update
+```
+
+Four roles remain deliberately separate:
+
+- **Planner:** proposes a structured plan only for multi-step investigations. It cannot execute tools or change entity authority.
+- **Executor:** runs only validated, registered, read-only capability steps under call, depth, entity, concurrency, and timeout bounds.
+- **Reviewer:** deterministically decides whether evidence is sufficient, limited, missing, or unsafe for synthesis.
+- **Synthesizer:** explains reviewed evidence; it does not select providers or mutate session state.
+
+Direct profile, detection, graph, pair/path, and knowledge requests compile deterministic plans and skip the Planner. Multi-step requests can use one Planner proposal and one schema-repair attempt only when `SOORIN_PLANNER_ENABLED=true`. The conservative default is disabled for rollout parity.
+
+`CapabilityRegistry` is the only normal provider execution boundary. Independent Graph and Knowledge steps may overlap. Product Profile and Detection steps are serialized because they share one Product client/session. Tool outputs become canonical `ToolResult` records, including status, freshness, completeness, counts, limitations, citations, and the original typed provider result.
+
+The first review evaluates retrieval sufficiency and may authorize one supplemental capability. Its complete final arguments are validated before execution. The second review evaluates what the Context Composer actually included after budgeting. A safe-failure decision skips the final LLM.
+
+Workflow events use compact allowlisted metadata with request, trace, plan, and step IDs. System logs retain deployment, status, count, latency, cache, freshness, and completeness metadata without secrets, prompts, raw provider payloads, hidden reasoning, or full model responses.
 
 ## Repository Layout
 
@@ -90,6 +126,11 @@ STREAMLIT_SERVER_PORT=8503
 
 SOORIN_INTENT_ROUTER_DEPLOYMENT=gpt55
 SOORIN_CHAT_DEPLOYMENT=gpt55
+SOORIN_PLANNER_ENABLED=false
+SOORIN_PLANNER_DEPLOYMENT=gpt55
+SOORIN_AGENT_MAX_CAPABILITY_CALLS=6
+SOORIN_AGENT_MAX_SUPPLEMENTAL_RETRIEVALS=1
+SOORIN_AGENT_EXECUTOR_MAX_CONCURRENCY=4
 SOORIN_LLM_GLM_BASE_URL=
 SOORIN_LLM_GLM_API_KEY=
 SOORIN_LLM_GPT55_BASE_URL=
@@ -113,6 +154,21 @@ SOORIN_RAG_COLLECTION=soorin_soc_knowledge_bge_base_v1
 
 Use `SOORIN_RAG_QDRANT_MODE=local` with `SOORIN_RAG_QDRANT_PATH` for embedded local Qdrant storage, or `server` with `SOORIN_RAG_QDRANT_URL` for an external Qdrant server.
 
+Planner rollout modes:
+
+```env
+# Safe parity mode (default)
+SOORIN_PLANNER_ENABLED=false
+```
+
+```env
+# Explicit Phase 2 Planner test mode
+SOORIN_PLANNER_ENABLED=true
+SOORIN_PLANNER_DEPLOYMENT=gpt55
+```
+
+Execution remains capped at six capability calls, two resolved entities, graph depth two, four executor workers, and one supplemental retrieval. The Planner always has one proposal pass; the repair setting permits at most one schema-repair call.
+
 ## Local Run
 
 Start the API:
@@ -126,6 +182,18 @@ Start the Streamlit workspace in another shell:
 ```bash
 PYTHONPATH=app python app/run.py --web
 ```
+
+Suggested manual checks after explicitly configuring providers:
+
+- General knowledge question.
+- Direct Profile request.
+- Direct Detection request.
+- Direct graph-neighbor request.
+- Direct pair comparison or path request.
+- Multi-step asset investigation with Planner test mode enabled.
+- Multi-step relationship investigation with Planner test mode enabled.
+- Partial-provider response and limitation handling.
+- Persian, smart-quote, arrow, em-dash, and emoji streaming.
 
 Default local URLs:
 
@@ -231,13 +299,8 @@ Focused tests:
 ```bash
 PYTHONPATH=app python -m pytest app/src/tests/test_agentic_rag_foundation.py -q
 PYTHONPATH=app python -m pytest app/src/tests/test_chat_streaming.py -q
+PYTHONPATH=app python -m pytest app/src/tests/test_phase2_agent_workflow.py -q
 PYTHONPATH=app python -m unittest app.src.tests.test_context_routing -v
-```
-
-Full offline test discovery:
-
-```bash
-PYTHONPATH=app python -m unittest discover -s app/src/tests -p "test_*.py" -v
 ```
 
 Compile:
@@ -251,6 +314,10 @@ PYTHONPATH=app python -m compileall -q app
 - The graph is an observed communication graph, not proof of physical routing, trust, compromise, or reachability.
 - Product profile and detection providers return current product evidence when configured; failures are surfaced as unavailable or stale fallback, not verified facts.
 - RAG is optional and documentation-oriented. It is not source of truth for current assets, detections, graph edges, alerts, risk values, or peer lists.
-- The LangGraph workflow is bounded and direct. A full planner, Neo4j, SIEM actions, MCP, remediation, durable checkpoints, and long-term memory are deferred.
+- Direct requests use deterministic plans and never pay Planner overhead. Multi-step investigations may use one structured Planner pass, but every plan is deterministically validated and limited to six registered read-only calls, two entities, graph depth two, and one reviewer-approved supplemental retrieval.
+- The active synthesis path consumes a reviewed canonical EvidencePack. Provider failures, omissions, freshness, truncation, graph coverage, and RAG citations remain explicit.
+- LangGraph currently provides bounded dispatch, typed state transport, stage visibility, and recursion control; detailed orchestration remains in `CopilotService`.
+- Already-running synchronous provider calls cannot be forcibly terminated after an executor timeout; provider-native timeouts remain the primary transport bound.
+- Neo4j, SIEM actions, MCP, remediation, durable checkpoints, and long-term memory are deferred.
 - Conversation and routing state are in-memory per process.
 - Streaming preserves Unicode over SSE; clients should parse UTF-8 SSE events instead of re-decoding text manually.

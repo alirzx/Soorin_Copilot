@@ -89,6 +89,15 @@ class Settings:
     llm_provider: str
     intent_router_deployment: LLMDeploymentName
     chat_deployment: LLMDeploymentName
+    planner_enabled: bool
+    planner_deployment: LLMDeploymentName
+    planner_repair_enabled: bool
+    agent_max_supplemental_retrievals: int
+    agent_max_capability_calls: int
+    agent_max_entities: int
+    agent_max_graph_depth: int
+    agent_executor_max_concurrency: int
+    agent_request_timeout_seconds: float
     glm_base_url: str
     glm_chat_path: str
     glm_model: str
@@ -268,14 +277,22 @@ class Settings:
         raise ValueError(f"Invalid LLM deployment alias. Valid aliases: {valid}")
 
     def deployment_for_purpose(self, purpose: str) -> ArvanDeploymentConfig:
-        alias = self.chat_deployment if purpose == "chat" else self.intent_router_deployment
+        if purpose == "chat":
+            alias = self.chat_deployment
+        elif purpose in {"planner", "planner_repair"}:
+            alias = self.planner_deployment
+        else:
+            alias = self.intent_router_deployment
         return self.deployment(alias)
 
     def validate_selected_llm_deployments(self) -> None:
         """Fail startup safely when an enabled selected deployment has no endpoint."""
         if not self.llm_enabled or self.llm_provider != "arvan":
             return
-        selected = dict.fromkeys((self.intent_router_deployment, self.chat_deployment))
+        aliases = [self.intent_router_deployment, self.chat_deployment]
+        if self.planner_enabled:
+            aliases.append(self.planner_deployment)
+        selected = dict.fromkeys(aliases)
         missing = [alias for alias in selected if not self.deployment(alias).base_url]
         if missing:
             raise ValueError(
@@ -336,6 +353,18 @@ def get_settings() -> Settings:
         llm_provider=os.getenv("SOORIN_LLM_PROVIDER", "arvan").strip().lower(),
         intent_router_deployment=_deployment_name("SOORIN_INTENT_ROUTER_DEPLOYMENT"),
         chat_deployment=_deployment_name("SOORIN_CHAT_DEPLOYMENT"),
+        planner_enabled=_bool("SOORIN_PLANNER_ENABLED", False),
+        planner_deployment=_deployment_name(
+            "SOORIN_PLANNER_DEPLOYMENT",
+            _deployment_name("SOORIN_INTENT_ROUTER_DEPLOYMENT"),
+        ),
+        planner_repair_enabled=_bool("SOORIN_PLANNER_REPAIR_ENABLED", True),
+        agent_max_supplemental_retrievals=max(0, min(1, _int("SOORIN_AGENT_MAX_SUPPLEMENTAL_RETRIEVALS", 1))),
+        agent_max_capability_calls=max(1, min(6, _int("SOORIN_AGENT_MAX_CAPABILITY_CALLS", 6))),
+        agent_max_entities=max(1, min(2, _int("SOORIN_AGENT_MAX_ENTITIES", 2))),
+        agent_max_graph_depth=max(0, min(2, _int("SOORIN_AGENT_MAX_GRAPH_DEPTH", 2))),
+        agent_executor_max_concurrency=max(1, min(4, _int("SOORIN_AGENT_EXECUTOR_MAX_CONCURRENCY", 4))),
+        agent_request_timeout_seconds=max(1.0, _float("SOORIN_AGENT_REQUEST_TIMEOUT_SECONDS", 120.0)),
         glm_base_url=os.getenv("SOORIN_LLM_GLM_BASE_URL", "").strip().rstrip("/"),
         glm_chat_path=os.getenv("SOORIN_LLM_GLM_CHAT_PATH", "/chat/completions").strip(),
         glm_model=os.getenv("SOORIN_LLM_GLM_MODEL", "GLM-5.2").strip(),

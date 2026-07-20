@@ -130,6 +130,8 @@ class DeploymentConfigurationTests(unittest.TestCase):
 
         self.assertEqual(settings.intent_router_deployment, "glm")
         self.assertEqual(settings.chat_deployment, "glm")
+        self.assertFalse(settings.planner_enabled)
+        self.assertEqual(settings.planner_deployment, "glm")
         self.assertEqual(settings.deployment("glm").endpoint, GLM_ENDPOINT)
         self.assertEqual(settings.deployment("glm").model, "GLM-5.2")
 

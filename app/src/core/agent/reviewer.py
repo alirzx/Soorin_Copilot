@@ -2,14 +2,23 @@
 
 from __future__ import annotations
 
-from src.core.agent.contracts import EvidencePack, ReviewDecision, TaskSpec, ToolResult
+from dataclasses import replace
+from typing import Any
+
+from src.core.agent.contracts import EvidencePack, ExecutionPlan, ReviewDecision, TaskSpec, ToolResult
 
 
 class EvidenceReviewer:
-    def review(self, task: TaskSpec, results: list[ToolResult]) -> ReviewDecision:
+    def review(
+        self,
+        task: TaskSpec,
+        results: list[ToolResult],
+        *,
+        allow_supplemental: bool = False,
+    ) -> ReviewDecision:
         required_cardinality = {
-            "asset.get_profile": (1, 1),
-            "asset.get_detection": (1, 1),
+            "asset.get_profile": (1, 2),
+            "asset.get_detection": (1, 2),
             "graph.get_summary": (1, 1),
             "graph.get_neighbors": (1, 1),
             "graph.get_relationship": (2, 2),
@@ -31,19 +40,39 @@ class EvidenceReviewer:
                 reasons=("Required capability entity binding was not available.",),
                 missing_capabilities=invalid_bindings,
             )
-        by_capability = {result.source_capability: result for result in results}
+        by_capability: dict[str, list[ToolResult]] = {}
+        for result in results:
+            by_capability.setdefault(result.source_capability, []).append(result)
         missing = tuple(
             capability
             for capability in task.required_capabilities
             if capability not in by_capability
         )
         if missing:
+            next_capability = missing[0] if allow_supplemental else None
             return ReviewDecision(
                 outcome="missing_required_evidence",
                 reasons=("One or more required capabilities were not executed.",),
                 missing_capabilities=missing,
+                supplemental_allowed=bool(next_capability),
+                next_capability=next_capability,
+                next_arguments=self._arguments(task, next_capability) if next_capability else None,
             )
-        required = [by_capability[name] for name in task.required_capabilities]
+        for capability in ("asset.get_profile", "asset.get_detection"):
+            if capability not in task.required_capabilities:
+                continue
+            covered = {entity for result in by_capability[capability] for entity in result.entities}
+            missing_entities = [entity for entity in task.entities if entity not in covered]
+            if missing_entities:
+                return ReviewDecision(
+                    outcome="missing_required_evidence",
+                    reasons=("Required capability did not cover every resolved entity.",),
+                    missing_capabilities=(capability,),
+                    supplemental_allowed=allow_supplemental,
+                    next_capability=capability if allow_supplemental else None,
+                    next_arguments={"entities": [missing_entities[0]]} if allow_supplemental else None,
+                )
+        required = [result for name in task.required_capabilities for result in by_capability[name]]
         if required and all(
             result.status in {"unavailable", "not_configured", "invalid"}
             for result in required
@@ -59,9 +88,12 @@ class EvidenceReviewer:
         )
         if failed:
             return ReviewDecision(
-                outcome="missing_required_evidence",
+                outcome="answer_with_limitations",
                 reasons=("Required evidence was unavailable.",),
                 missing_capabilities=failed,
+                limitations=tuple(
+                    f"{capability} was unavailable for this request." for capability in failed
+                ),
             )
         limitations: list[str] = []
         for result in required:
@@ -80,10 +112,36 @@ class EvidenceReviewer:
             return ReviewDecision(
                 outcome="answer_with_limitations",
                 reasons=tuple(dict.fromkeys(limitations)),
+                conflicts=tuple(dict.fromkeys(item for result in required for item in result.contradictions)),
+                limitations=tuple(dict.fromkeys(limitations)),
             )
         return ReviewDecision(outcome="sufficient")
 
-    def build_pack(self, task: TaskSpec, results: list[ToolResult]) -> EvidencePack:
+    def build_pack(
+        self,
+        task: TaskSpec,
+        results: list[ToolResult],
+        *,
+        plan: ExecutionPlan | None = None,
+        request_id: str = "",
+        trace_id: str = "",
+        supplemental_history: tuple[dict[str, Any], ...] = (),
+        review: ReviewDecision | None = None,
+    ) -> EvidencePack:
+        coverage = {result.source_capability: result.status for result in results}
+        missing = tuple(
+            capability for capability in task.required_capabilities if capability not in coverage
+        )
+        graph_results = [result for result in results if result.source_capability.startswith("graph.")]
+        graph_completeness = (
+            "not_requested"
+            if not any(capability.startswith("graph.") for capability in task.required_capabilities)
+            else "complete"
+            if graph_results and all(result.completeness == "complete" and not result.truncated for result in graph_results)
+            else "partial"
+            if graph_results
+            else "missing"
+        )
         return EvidencePack(
             task=task,
             tool_results=tuple(results),
@@ -94,4 +152,43 @@ class EvidenceReviewer:
             contradictions=tuple(
                 dict.fromkeys(item for result in results for item in result.contradictions)
             ),
+            request_id=request_id,
+            trace_id=trace_id,
+            plan_id=plan.plan_id if plan else "",
+            goal=(plan.goal if plan else "") or task.request,
+            resolved_entities=task.entities,
+            plan_summary=tuple(
+                {
+                    "step_id": step.id,
+                    "capability": step.capability,
+                    "depends_on": list(step.depends_on),
+                    "requirement": step.requirement,
+                }
+                for step in (plan.steps if plan else ())
+            ),
+            provider_coverage=coverage,
+            graph_completeness=graph_completeness,
+            rag_citations=tuple(citation for result in results for citation in result.citations),
+            missing_evidence=missing,
+            supplemental_history=supplemental_history,
+            review_outcome=review.outcome if review else None,
         )
+
+    @staticmethod
+    def with_review(pack: EvidencePack, review: ReviewDecision) -> EvidencePack:
+        return replace(
+            pack,
+            review_outcome=review.outcome,
+            missing_evidence=review.missing_capabilities,
+            limitations=tuple(dict.fromkeys((*pack.limitations, *review.limitations, *review.reasons))),
+            contradictions=tuple(dict.fromkeys((*pack.contradictions, *review.conflicts))),
+        )
+
+    @staticmethod
+    def _arguments(task: TaskSpec, capability: str | None) -> dict[str, Any] | None:
+        if not capability:
+            return None
+        if capability == "knowledge.search":
+            return {"query": task.request}
+        minimum_entities = 2 if capability in {"graph.get_relationship", "graph.compare_assets", "graph.find_path"} else 1
+        return {"entities": list(task.entities[:minimum_entities])}

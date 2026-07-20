@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Callable
 from typing import Any
+from uuid import uuid4
 
 from src.core.agent.contracts import InvestigationState, TaskSpec
 from src.core.agent.reviewer import EvidenceReviewer
@@ -32,6 +33,11 @@ class BoundedCopilotWorkflow:
             self._start = START
             self._end = END
             self.runtime = "langgraph"
+        logger.info(
+            "event=langgraph_initialized runtime=%s bounded=true recursion_limit=%s",
+            self.runtime,
+            self.recursion_limit,
+        )
 
     @staticmethod
     def _stage(name: str) -> Callable[[InvestigationState], dict[str, Any]]:
@@ -49,9 +55,11 @@ class BoundedCopilotWorkflow:
         request_id: str,
         stream_sink: Any,
         direct_executor: DirectExecutor,
+        typed_executor: DirectExecutor | None = None,
     ) -> dict[str, Any]:
         initial: InvestigationState = {
             "request_id": request_id,
+            "trace_id": uuid4().hex[:16],
             "session_id": session_id or "",
             "message": message,
             "ui_context": ui_context,
@@ -68,23 +76,40 @@ class BoundedCopilotWorkflow:
             ),
         }
 
-        def execute_direct(state: InvestigationState) -> dict[str, Any]:
-            response = direct_executor(
-                state["message"],
-                state.get("session_id") or None,
-                ui_context=state.get("ui_context"),
-                request_id=state["request_id"],
-                stream_sink=stream_sink,
-            )
+        selected_executor = typed_executor or direct_executor
+
+        def execute_phase2(state: InvestigationState) -> dict[str, Any]:
+            try:
+                response = selected_executor(
+                    state["message"],
+                    state.get("session_id") or None,
+                    ui_context=state.get("ui_context"),
+                    request_id=state["request_id"],
+                    trace_id=state["trace_id"],
+                    stream_sink=stream_sink,
+                )
+            except Exception as exc:
+                logger.error(
+                    "event=workflow_failed request_id=%s trace_id=%s session_id=%s error_class=%s safe_error_code=phase2_execution_failed",
+                    state["request_id"],
+                    state["trace_id"],
+                    state.get("session_id") or "",
+                    type(exc).__name__,
+                )
+                raise
+            phase2_state = response.pop("_phase2_state", {})
             return {
-                "stages": [*(state.get("stages") or []), "execute_direct"],
+                "stages": [*(state.get("stages") or []), "execute_phase2"],
                 "final_response": response,
                 "iteration_count": 1,
+                **phase2_state,
             }
 
         reviewer = EvidenceReviewer()
 
         def build_evidence(state: InvestigationState) -> dict[str, Any]:
+            if state.get("evidence_pack") is not None:
+                return {"stages": [*(state.get("stages") or []), "build_evidence"]}
             results = state.get("tool_results") or []
             return {
                 "stages": [*(state.get("stages") or []), "build_evidence"],
@@ -92,6 +117,8 @@ class BoundedCopilotWorkflow:
             }
 
         def review(state: InvestigationState) -> dict[str, Any]:
+            if state.get("review_decision") is not None:
+                return {"stages": [*(state.get("stages") or []), "review_evidence"]}
             return {
                 "stages": [*(state.get("stages") or []), "review_evidence"],
                 "review_decision": reviewer.review(
@@ -104,7 +131,7 @@ class BoundedCopilotWorkflow:
             state = initial
             for name in ("resolve", "route", "validate_task", "select_workflow"):
                 state.update(self._stage(name)(state))
-            state.update(execute_direct(state))
+            state.update(execute_phase2(state))
             state.update(build_evidence(state))
             state.update(review(state))
             state.update(self._stage("synthesize")(state))
@@ -113,7 +140,7 @@ class BoundedCopilotWorkflow:
             graph = self._state_graph_type(InvestigationState)
             for name in ("resolve", "route", "validate_task", "select_workflow"):
                 graph.add_node(name, self._stage(name))
-            graph.add_node("execute_direct", execute_direct)
+            graph.add_node("execute_phase2", execute_phase2)
             graph.add_node("build_evidence", build_evidence)
             graph.add_node("review_evidence", review)
             graph.add_node("synthesize", self._stage("synthesize"))
@@ -122,7 +149,7 @@ class BoundedCopilotWorkflow:
                 "route",
                 "validate_task",
                 "select_workflow",
-                "execute_direct",
+                "execute_phase2",
                 "build_evidence",
                 "review_evidence",
                 "synthesize",
@@ -134,9 +161,11 @@ class BoundedCopilotWorkflow:
             final = graph.compile().invoke(initial, config={"recursion_limit": self.recursion_limit})
             result = final["final_response"]
         logger.info(
-            "event=agent_workflow_complete request_id=%s runtime=%s mode=direct bounded=true recursion_limit=%s",
+            "event=agent_workflow_complete request_id=%s trace_id=%s runtime=%s mode=phase2_typed bounded=true recursion_limit=%s executor=%s",
             request_id,
+            initial["trace_id"],
             self.runtime,
             self.recursion_limit,
+            "typed" if typed_executor is not None else "compatibility_alias",
         )
         return result
