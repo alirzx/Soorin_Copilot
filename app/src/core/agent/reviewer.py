@@ -6,6 +6,7 @@ from dataclasses import replace
 from typing import Any
 
 from src.core.agent.contracts import EvidencePack, ExecutionPlan, ReviewDecision, TaskSpec, ToolResult
+from src.core.context.product_views import approved_views
 
 
 class EvidenceReviewer:
@@ -95,6 +96,35 @@ class EvidenceReviewer:
                     f"{capability} was unavailable for this request." for capability in failed
                 ),
             )
+        if allow_supplemental and task.detail_level in {"detailed", "deep", "report"}:
+            for result in required:
+                provider = (
+                    "asset_profile"
+                    if result.source_capability == "asset.get_profile"
+                    else "detection"
+                    if result.source_capability == "asset.get_detection"
+                    else None
+                )
+                if not provider or not result.selected_views:
+                    continue
+                missing_views = [
+                    view for view in approved_views(provider) if view not in result.selected_views
+                ]
+                if missing_views:
+                    return ReviewDecision(
+                        outcome="missing_required_evidence",
+                        reasons=("A bounded local Product evidence view can complete the deep request.",),
+                        missing_capabilities=(result.source_capability,),
+                        supplemental_allowed=True,
+                        next_capability=result.source_capability,
+                        next_arguments={
+                            "entities": list(result.entities),
+                            "views": missing_views,
+                            "detail": "deep",
+                            "max_context_tokens": 2000,
+                            "purpose": "supplemental_evidence",
+                        },
+                    )
         limitations: list[str] = []
         for result in required:
             if result.status in {"partial", "empty", "not_found"}:

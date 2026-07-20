@@ -19,6 +19,7 @@ from src.core.context.models import (
     approx_tokens,
 )
 from src.core.memory.store import MemoryStore
+from src.core.llm.token_estimator import TokenEstimator
 
 
 TARGET = "192.168.30.115"
@@ -302,6 +303,30 @@ class ExhaustiveGraphBudgetTests(unittest.TestCase):
             CopilotContextPackage(entities=EntityResolver().resolve(TARGET), graph=direct)
         )
         self.assertIn('"direct_relationship"', composer.last_parts["graph"])
+
+    def test_calibrated_estimate_and_dynamic_output_reservation_are_bounded(self) -> None:
+        estimator = TokenEstimator(deployment="gpt55", model="fixture", multiplier=1.35)
+        estimate = estimator.estimate_text("x" * 4000)
+        self.assertEqual(estimate.raw_tokens, 1000)
+        self.assertEqual(estimate.calibrated_tokens, 1350)
+        self.assertEqual(estimator.output_reservation("brief", 12000), 1536)
+        self.assertEqual(estimator.output_reservation("standard", 12000), 4096)
+        self.assertEqual(estimator.output_reservation("deep", 5000), 5000)
+
+        composer = ContextComposer(settings(llm_context_window_tokens=8000))
+        composer.compose(
+            CopilotContextPackage(entities=EntityResolver().resolve(TARGET)),
+            base_input_tokens=1000,
+            reserved_output_tokens=1536,
+        )
+        budget = composer.last_budget
+        self.assertLessEqual(
+            budget["base_input_tokens"]
+            + budget["calibrated_dynamic_capacity"]
+            + budget["reserved_output_tokens"]
+            + composer.settings.llm_context_safety_margin_tokens,
+            composer.settings.llm_context_window_tokens,
+        )
 
 
 if __name__ == "__main__":

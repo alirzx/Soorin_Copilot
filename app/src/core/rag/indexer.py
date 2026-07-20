@@ -54,6 +54,9 @@ def build_index(
     active_embedder = embedder or HuggingFaceTextEmbedder(
         settings.rag_embedding_model,
         settings.rag_embedding_dimension,
+        local_files_only=settings.rag_embedding_local_files_only,
+        cache_dir=settings.rag_embedding_cache_dir,
+        revision=settings.rag_embedding_revision,
     )
     store = vector_store or QdrantVectorStore(
         mode=settings.rag_qdrant_mode,

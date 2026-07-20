@@ -33,6 +33,7 @@ from src.core.context.providers import AssetProfileContextProvider, DetectionCon
 from src.core.llm.client import LLMClient
 from src.core.llm.errors import LLMError
 from src.core.llm.providers.base import LLMProviderResult, LLMStreamEvent
+from src.core.llm.token_estimator import TokenEstimator
 from src.core.memory.routing_state import SessionRoutingState, SessionRoutingStateStore
 from src.core.memory.store import MemoryStore
 from src.core.copilot.trace import CopilotRequestTrace, render_human_copilot_trace
@@ -41,6 +42,7 @@ from src.core.graph.loader import get_graph_metadata
 from src.core.graph.refresh import get_refresh_status
 from src.core.product_client import ProductApiClient
 from src.core.rag.service import KnowledgeSearchService
+from src.core.observability import EvidenceSnapshotWriter
 
 
 logger = logging.getLogger(__name__)
@@ -53,6 +55,17 @@ FALLBACK_SYSTEM_PROMPT = (
     "When unsure, say what information is missing. Do not invent product data or "
     "expose hidden reasoning, secrets, API keys, or internal prompts."
 )
+
+TRIVIAL_RESPONSES = {
+    "hi": "Hello. How can I help with your cybersecurity question?",
+    "hello": "Hello. How can I help with your cybersecurity question?",
+    "hey": "Hello. How can I help with your cybersecurity question?",
+    "thanks": "You're welcome.",
+    "thank you": "You're welcome.",
+    "سلام": "سلام. چطور می‌توانم در پرسش امنیت سایبری کمک کنم؟",
+    "ممنون": "خواهش می‌کنم.",
+    "مرسی": "خواهش می‌کنم.",
+}
 
 
 def _preview(text: str) -> str:
@@ -112,6 +125,7 @@ class CopilotService:
         self.evidence_reviewer = EvidenceReviewer()
         self._capability_provider_ids = self._current_capability_provider_ids()
         self.context_composer = ContextComposer(settings)
+        self.snapshot_writer = EvidenceSnapshotWriter(settings)
         self.workflow = BoundedCopilotWorkflow()
 
     def _current_capability_provider_ids(self) -> tuple[int, int, int, int]:
@@ -225,6 +239,53 @@ class CopilotService:
         if len(statuses) == 1:
             return next(iter(statuses))
         return "partial"
+
+    @staticmethod
+    def _trace_capability_details(tool_results: list[Any]) -> list[dict[str, Any]]:
+        """Project canonical ToolResults into bounded, payload-free trace metadata."""
+        details: list[dict[str, Any]] = []
+        for result in tool_results:
+            inventory = result.payload_inventory or {}
+            item: dict[str, Any] = {
+                "step_id": result.step_id,
+                "capability": result.source_capability,
+                "provider": result.provider,
+                "status": result.status,
+                "entities": ", ".join(result.entities),
+                "latency_ms": result.latency_ms,
+                "freshness": result.freshness,
+                "completeness": result.completeness,
+                "views": ", ".join(result.selected_views),
+                "detail": result.detail,
+                "purpose": result.purpose,
+                "raw_bytes": inventory.get("raw_bytes", ""),
+                "raw_chars": inventory.get("raw_chars", ""),
+                "raw_tokens": inventory.get("approx_tokens", ""),
+                "projected_tokens": result.view_token_estimate or "",
+                "included_path_count": len(result.included_paths),
+                "omitted_path_count": result.omitted_section_count,
+                "context_included": result.context_included,
+                "truncated": result.truncated,
+                "safe_error_code": result.safe_error_code or "",
+                "normalized_query_hash": result.normalized_query_hash,
+                "supplemental_local_view": result.purpose == "supplemental_evidence"
+                or result.step_id.startswith("supplemental"),
+            }
+            if result.source_capability.startswith("graph."):
+                context = getattr(result.provider_result, "context", None)
+                if not isinstance(context, dict) and isinstance(result.raw_payload, dict):
+                    context = result.raw_payload
+                context = context if isinstance(context, dict) else {}
+                item.update(
+                    {
+                        "requested_scope_complete": context.get("requested_scope_complete", False),
+                        "complete_for_user_request": context.get("complete_for_user_request", False),
+                        "retrieval_complete": context.get("retrieval_complete", False),
+                        "broader_retrieval": "bounded" if result.truncated else "complete",
+                    }
+                )
+            details.append(item)
+        return details
 
     def _update_product_inclusion_trace(
         self,
@@ -505,6 +566,27 @@ class CopilotService:
         stream_sink: Callable[[LLMStreamEvent], None] | None = None,
     ) -> dict[str, Any]:
         resolved_request_id = request_id or uuid4().hex[:12]
+        trivial = self._trivial_response(message)
+        if trivial is not None:
+            session = (session_id or "").strip() or uuid4().hex
+            if self.settings.chat_store_history:
+                self.memory_store.append(session, "user", message.strip())
+                self.memory_store.append(session, "assistant", trivial)
+            if stream_sink is not None:
+                stream_sink(LLMStreamEvent("answer_delta", text=trivial))
+            logger.info(
+                "event=trivial_message_fast_path request_id=%s session_id=%s streaming=%s router_called=false planner_called=false provider_called=false routing_state_mutated=false",
+                resolved_request_id,
+                session,
+                stream_sink is not None,
+            )
+            return {
+                "session_id": session,
+                "answer": trivial,
+                "provider": "deterministic",
+                "model": "trivial-message-fast-path",
+                "_warnings": [],
+            }
         return self.workflow.run(
             message=message,
             session_id=session_id,
@@ -514,6 +596,11 @@ class CopilotService:
             typed_executor=self._chat_phase2,
             direct_executor=self._chat_direct,
         )
+
+    @staticmethod
+    def _trivial_response(message: str) -> str | None:
+        normalized = " ".join(message.strip().casefold().split())
+        return TRIVIAL_RESPONSES.get(normalized)
 
     def _chat_direct(
         self,
@@ -732,6 +819,7 @@ class CopilotService:
 
         planner_called = False
         planner_fallback_used = False
+        planner_latency_ms = 0
         if task_spec.workflow_mode == "multi_step" and self.settings.planner_enabled:
             planner_called = True
             planner_started = time.perf_counter()
@@ -743,19 +831,21 @@ class CopilotService:
                     request_id=request_id,
                     events=events,
                 )
+                planner_latency_ms = int((time.perf_counter() - planner_started) * 1000)
                 events.emit(
                     "planner_completed",
                     plan_id=execution_plan.plan_id,
-                    latency_ms=int((time.perf_counter() - planner_started) * 1000),
+                    latency_ms=planner_latency_ms,
                     tool_call_count=len(execution_plan.steps),
                     planner_called=True,
                 )
             except PlannerError as exc:
                 planner_fallback_used = True
+                planner_latency_ms = int((time.perf_counter() - planner_started) * 1000)
                 events.emit(
                     "planner_failed",
                     level=logging.WARNING,
-                    latency_ms=int((time.perf_counter() - planner_started) * 1000),
+                    latency_ms=planner_latency_ms,
                     planner_called=True,
                     error_class=exc.code,
                     safe_error_code=exc.code,
@@ -803,12 +893,12 @@ class CopilotService:
             fallback_used=planner_fallback_used,
         )
         logger.info(
-            "event=agent_task_mapped request_id=%s decision_source=%s workflow_mode=%s capabilities=%s max_steps=%s plan_id=%s plan_source=%s plan_steps=%s plan_validated=%s planner_called=%s",
+            "event=agent_task_mapped request_id=%s decision_source=%s workflow_mode=%s capabilities=%s recommended_steps=%s plan_id=%s plan_source=%s plan_steps=%s plan_validated=%s planner_called=%s",
             request_id,
             task_spec.semantic_decision_source,
             task_spec.workflow_mode,
             ",".join(task_spec.required_capabilities) or "none",
-            task_spec.max_steps,
+            task_spec.recommended_steps,
             execution_plan.plan_id,
             execution_plan.source,
             len(execution_plan.steps),
@@ -821,6 +911,7 @@ class CopilotService:
             complexity=task_spec.workflow_mode,
             entities=", ".join(task_spec.entities),
             required_capabilities=", ".join(task_spec.required_capabilities),
+            recommended_steps=task_spec.recommended_steps,
             detail_level=task_spec.detail_level,
             freshness_requirement=task_spec.freshness_requirement,
         )
@@ -829,6 +920,14 @@ class CopilotService:
             mode=task_spec.workflow_mode,
             planner_called=planner_called,
             planner_fallback_used=planner_fallback_used,
+        )
+        trace.put(
+            "PLANNER",
+            called=planner_called,
+            source=execution_plan.source,
+            plan_id=execution_plan.plan_id,
+            latency_ms=planner_latency_ms,
+            fallback_used=planner_fallback_used,
         )
         trace.put(
             "EXECUTION PLAN",
@@ -1015,6 +1114,8 @@ class CopilotService:
             already_executed = any(
                 result.source_capability == review_decision.next_capability
                 and tuple(review_decision.next_arguments.get("entities") or ()) == result.entities
+                and tuple(review_decision.next_arguments.get("views") or ()) == result.selected_views
+                and str(review_decision.next_arguments.get("purpose") or "") == result.purpose
                 for result in tool_results
             )
             if already_executed:
@@ -1223,6 +1324,10 @@ class CopilotService:
             requested_scope_complete=graph_context.get("requested_scope_complete", False) if isinstance(graph_context, dict) else False,
             complete_for_user_request=graph_context.get("complete_for_user_request", False) if isinstance(graph_context, dict) else False,
         )
+        knowledge_tool_result = next(
+            (result for result in tool_results if result.source_capability == "knowledge.search"),
+            None,
+        )
         trace.put(
             "KNOWLEDGE RETRIEVAL",
             status=knowledge_result.status if knowledge_result else "skipped",
@@ -1232,6 +1337,9 @@ class CopilotService:
             included_count=knowledge_result.included_count if knowledge_result else 0,
             truncated=knowledge_result.truncated if knowledge_result else False,
             citation_count=len(knowledge_result.citations) if knowledge_result else 0,
+            purpose=knowledge_tool_result.purpose if knowledge_tool_result else "",
+            normalized_query_hash=knowledge_tool_result.normalized_query_hash if knowledge_tool_result else "",
+            safe_error_code=knowledge_tool_result.safe_error_code if knowledge_tool_result else "",
         )
         trace.put(
             "GRAPH COVERAGE",
@@ -1288,6 +1396,17 @@ class CopilotService:
             len(provenance),
             len(limitations),
         )
+        chat_deployment = self.settings.deployment_for_purpose("chat")
+        chat_request = chat_deployment.request_config("chat")
+        token_estimator = TokenEstimator(
+            deployment=chat_deployment.name,
+            model=chat_deployment.model,
+            multiplier=self.settings.llm_token_estimate_multiplier,
+        )
+        selected_output_reservation = token_estimator.output_reservation(
+            task_spec.detail_level,
+            chat_request.max_tokens,
+        )
         conversation_snapshot = (
             self.memory_store.prepare_for_model(session, self.settings, routing_state, request_id=request_id)
             if self.settings.chat_store_history
@@ -1309,9 +1428,14 @@ class CopilotService:
         if exhaustive_graph_request:
             input_capacity = max(
                 0,
-                self.settings.llm_context_window_tokens
-                - self.settings.llm_reserved_output_tokens
-                - self.settings.llm_context_safety_margin_tokens,
+                int(
+                    (
+                        self.settings.llm_context_window_tokens
+                        - selected_output_reservation
+                        - self.settings.llm_context_safety_margin_tokens
+                    )
+                    / self.settings.llm_token_estimate_multiplier
+                ),
             )
             fixed_tokens = approx_tokens(self.system_prompt) + approx_tokens(user_text)
             compact_product_reserve = 384 * (
@@ -1348,13 +1472,16 @@ class CopilotService:
                 ),
             )
         # Reserve a compact immutable summary of the reviewed EvidencePack.
-        base_input_tokens = 512 + approx_tokens(self.system_prompt) + approx_tokens(user_text) + sum(
-            approx_tokens(item.get("content", "")) for item in history
+        base_text = "\n".join(
+            [self.system_prompt, user_text, *(item.get("content", "") for item in history)]
         )
+        base_estimate = token_estimator.estimate_text(base_text)
+        base_input_tokens = 512 + base_estimate.calibrated_tokens
         dynamic_context = self.context_composer.compose(
             context_package,
             request_id=request_id,
             base_input_tokens=base_input_tokens,
+            reserved_output_tokens=selected_output_reservation,
         )
         profile_dynamic_context = self.context_composer.last_parts.get("asset_profile", "")
         graph_dynamic_context = self.context_composer.last_parts.get("graph", "")
@@ -1378,6 +1505,23 @@ class CopilotService:
         if route.use_knowledge and not self.context_composer.last_inclusion.get("knowledge", (False, None))[0]:
             response_warnings.append("knowledge_context_not_included")
         tool_results = apply_context_inclusion(tool_results, self.context_composer.last_inclusion)
+        trace.put(
+            "CAPABILITY STEPS",
+            details=self._trace_capability_details(tool_results),
+        )
+        trace.put(
+            "CONTEXT",
+            asset_profile_tokens=approx_tokens(profile_dynamic_context),
+            detection_tokens=approx_tokens(detection_dynamic_context),
+            graph_tokens=approx_tokens(graph_dynamic_context),
+            knowledge_tokens=approx_tokens(knowledge_dynamic_context),
+            fusion_tokens=approx_tokens(fusion_dynamic_context),
+            dynamic_tokens=approx_tokens(dynamic_context),
+            context_inclusion=", ".join(
+                f"{key}:{'included' if value[0] else 'omitted'}"
+                for key, value in self.context_composer.last_inclusion.items()
+            ),
+        )
         pack_started = time.perf_counter()
         events.emit(
             "evidence_pack_build_started",
@@ -1431,6 +1575,85 @@ class CopilotService:
             f"{dynamic_context}\n\n<SOORIN_REVIEWED_EVIDENCE_SUMMARY_JSON>\n"
             f"{reviewed_summary}\n</SOORIN_REVIEWED_EVIDENCE_SUMMARY_JSON>"
         ).strip()
+        try:
+            self.snapshot_writer.write(
+                request_id,
+                {
+                    "manifest": {
+                        "request_id": request_id,
+                        "trace_id": trace_id,
+                        "plan_id": execution_plan.plan_id,
+                        "providers": [result.source_capability for result in tool_results],
+                        "targets": list(task_spec.entities),
+                        "context_inclusion": self.context_composer.last_inclusion,
+                        "context_tokens": approx_tokens(dynamic_context),
+                    },
+                    "task": task_spec,
+                    "plan": execution_plan,
+                    "tool-results": tool_results,
+                    "profile.inventory": [
+                        result.payload_inventory
+                        for result in tool_results
+                        if result.source_capability == "asset.get_profile"
+                    ],
+                    "detection.inventory": [
+                        result.payload_inventory
+                        for result in tool_results
+                        if result.source_capability == "asset.get_detection"
+                    ],
+                    "profile.views": [
+                        {
+                            "entity": result.entities,
+                            "views": result.selected_views,
+                            "purpose": result.purpose,
+                            "included_paths": result.included_paths,
+                            "omitted_section_count": result.omitted_section_count,
+                            "token_estimate": result.view_token_estimate,
+                        }
+                        for result in tool_results
+                        if result.source_capability == "asset.get_profile"
+                    ],
+                    "detection.views": [
+                        {
+                            "entity": result.entities,
+                            "views": result.selected_views,
+                            "purpose": result.purpose,
+                            "included_paths": result.included_paths,
+                            "omitted_section_count": result.omitted_section_count,
+                            "token_estimate": result.view_token_estimate,
+                        }
+                        for result in tool_results
+                        if result.source_capability == "asset.get_detection"
+                    ],
+                    "context-inclusion": self.context_composer.last_inclusion,
+                    "review": review_decision,
+                    "model-context.redacted": {"content": dynamic_context},
+                },
+            )
+            snapshot_result = self.snapshot_writer.last_result
+            trace.put(
+                "SNAPSHOT",
+                enabled=self.snapshot_writer.enabled,
+                status=snapshot_result.get("status", "unknown"),
+                mode=snapshot_result.get("mode", self.snapshot_writer.mode),
+                files=snapshot_result.get("file_count", 0),
+                bytes=snapshot_result.get("bytes", 0),
+                path=snapshot_result.get("relative_path", ""),
+                safe_error_code=snapshot_result.get("safe_error_code", ""),
+            )
+        except Exception as exc:
+            logger.warning(
+                "event=evidence_snapshot_failed request_id=%s error_class=%s safe_error_code=snapshot_write_failed",
+                request_id,
+                type(exc).__name__,
+            )
+            trace.put(
+                "SNAPSHOT",
+                enabled=self.snapshot_writer.enabled,
+                status="failed",
+                mode=self.snapshot_writer.mode,
+                safe_error_code="snapshot_write_failed",
+            )
         trace.put(
             "GRAPH RETRIEVAL",
             inbound_context_included=graph_context.get("inbound_context_included", "") if isinstance(graph_context, dict) else "",
@@ -1474,14 +1697,18 @@ class CopilotService:
             messages.append({"role": "system", "content": dynamic_context})
         messages.extend([*history, {"role": "user", "content": user_text}])
 
-        chat_deployment = self.settings.deployment_for_purpose("chat")
-        chat_request = chat_deployment.request_config("chat")
         system_chars = len(self.system_prompt)
         dynamic_context_chars = len(dynamic_context)
         conversation_chars = sum(len(item.get("content", "")) for item in history) + len(user_text)
         total_chars = sum(len(item.get("content", "")) for item in messages)
+        input_estimate = token_estimator.estimate_messages(messages)
+        remaining_safety = (
+            self.settings.llm_context_window_tokens
+            - input_estimate.calibrated_tokens
+            - selected_output_reservation
+        )
         logger.info(
-            "event=model_input_prepared request_id=%s deployment=%s provider=%s model=%s message_count=%s roles=%s system_chars=%s system_approx_tokens=%s asset_profile_dynamic_approx_tokens=%s detection_dynamic_approx_tokens=%s graph_dynamic_approx_tokens=%s knowledge_dynamic_approx_tokens=%s fusion_dynamic_approx_tokens=%s dynamic_context_chars=%s dynamic_context_approx_tokens=%s conversation_chars=%s conversation_approx_tokens=%s total_input_chars=%s total_input_approx_tokens=%s",
+            "event=model_input_prepared request_id=%s deployment=%s provider=%s model=%s message_count=%s roles=%s system_chars=%s system_approx_tokens=%s asset_profile_dynamic_approx_tokens=%s detection_dynamic_approx_tokens=%s graph_dynamic_approx_tokens=%s knowledge_dynamic_approx_tokens=%s fusion_dynamic_approx_tokens=%s dynamic_context_chars=%s dynamic_context_approx_tokens=%s conversation_chars=%s conversation_approx_tokens=%s total_input_chars=%s raw_input_estimate=%s calibrated_input_estimate=%s estimate_multiplier=%s selected_output_reservation=%s remaining_safety_margin=%s",
             request_id,
             chat_deployment.name,
             chat_deployment.provider_type,
@@ -1500,7 +1727,11 @@ class CopilotService:
             conversation_chars,
             approx_tokens("x" * conversation_chars),
             total_chars,
-            approx_tokens("x" * total_chars),
+            input_estimate.raw_tokens,
+            input_estimate.calibrated_tokens,
+            input_estimate.multiplier,
+            selected_output_reservation,
+            remaining_safety,
         )
         trace.put(
             "MODEL INPUT",
@@ -1518,6 +1749,19 @@ class CopilotService:
             dynamic_tokens_approx=approx_tokens(dynamic_context),
             conversation_tokens_approx=approx_tokens("x" * conversation_chars),
             total_tokens_approx=approx_tokens("x" * total_chars),
+            calibrated_total_tokens_approx=input_estimate.calibrated_tokens,
+            estimate_multiplier=input_estimate.multiplier,
+            selected_output_reservation=selected_output_reservation,
+            remaining_safety_margin=remaining_safety,
+        )
+        trace.put(
+            "TOKEN BUDGET",
+            raw_estimate=input_estimate.raw_tokens,
+            calibrated_estimate=input_estimate.calibrated_tokens,
+            multiplier=input_estimate.multiplier,
+            selected_output_reservation=selected_output_reservation,
+            llm_context_safety_margin_tokens=self.settings.llm_context_safety_margin_tokens,
+            remaining_safety_margin=remaining_safety,
         )
         logger.info(
             "event=conversation_request request_id=%s session_id=%s message_count=%s provider_message_count=%s user_preview=%r",
@@ -1527,7 +1771,7 @@ class CopilotService:
             len(messages),
             _preview(user_text),
         )
-        requested_max_tokens = chat_request.max_tokens
+        requested_max_tokens = selected_output_reservation
         final_synthesis_status = "ok"
         fallback_answer_used = False
         stream_metrics: dict[str, Any] = {
@@ -1719,6 +1963,24 @@ class CopilotService:
             _preview(result.text),
         )
         usage = result.usage or {}
+        provider_prompt_tokens = usage.get("prompt_tokens") or usage.get("input_tokens")
+        estimate_to_actual_ratio = (
+            round(input_estimate.calibrated_tokens / provider_prompt_tokens, 3)
+            if isinstance(provider_prompt_tokens, (int, float)) and provider_prompt_tokens > 0
+            else ""
+        )
+        logger.info(
+            "event=token_estimate_calibrated request_id=%s deployment=%s model=%s raw_estimate=%s multiplied_estimate=%s provider_prompt_usage=%s estimate_to_actual_ratio=%s selected_output_reservation=%s remaining_safety_margin=%s",
+            request_id,
+            chat_deployment.name,
+            chat_deployment.model,
+            input_estimate.raw_tokens,
+            input_estimate.calibrated_tokens,
+            provider_prompt_tokens or "",
+            estimate_to_actual_ratio,
+            selected_output_reservation,
+            remaining_safety,
+        )
         completion_tokens = usage.get("completion_tokens", "")
         output_tokens = usage.get("output_tokens", "")
         answer_truncated = _answer_truncated(result.finish_reason, completion_tokens, requested_max_tokens)
@@ -1762,6 +2024,7 @@ class CopilotService:
             provider_status=result.status_code or "",
             provider_latency_ms=result.latency_ms,
             prompt_tokens=usage.get("prompt_tokens", ""),
+            estimate_to_actual_ratio=estimate_to_actual_ratio,
             requested_max_tokens=requested_max_tokens,
             finish_reason=result.finish_reason or "",
             completion_tokens=completion_tokens,
@@ -1773,6 +2036,11 @@ class CopilotService:
             answer_chars=len(result.text),
             answer_tokens_approx=approx_tokens(result.text),
             **stream_metrics,
+        )
+        trace.put(
+            "TOKEN BUDGET",
+            provider_prompt_usage=usage.get("prompt_tokens", ""),
+            estimate_to_actual_ratio=estimate_to_actual_ratio,
         )
 
         if self.settings.chat_store_history:

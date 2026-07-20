@@ -52,6 +52,15 @@ class ToolResult:
     citations: tuple[dict[str, Any], ...] = ()
     raw_payload: Any = None
     provider_result: Any = None
+    selected_views: tuple[str, ...] = ()
+    detail: str = "standard"
+    purpose: str = ""
+    view_payload: Any = None
+    payload_inventory: dict[str, Any] = field(default_factory=dict)
+    included_paths: tuple[str, ...] = ()
+    omitted_section_count: int = 0
+    view_token_estimate: int = 0
+    normalized_query_hash: str = ""
 
 
 @dataclass(frozen=True)
@@ -65,12 +74,17 @@ class TaskSpec:
     workflow_mode: WorkflowMode = "direct"
     semantic_decision_source: str = "unknown"
     requires_multiple_entities: bool = False
-    max_steps: int = 1
+    recommended_steps: int = 1
     detail_level: str = "standard"
     freshness_requirement: str = "current_when_available"
     is_followup: bool = False
     graph_depth: int = 0
     relationship_mode: str = "none"
+
+    @property
+    def max_steps(self) -> int:
+        """Temporary read-only compatibility alias; plan limits live elsewhere."""
+        return self.recommended_steps
 
 
 @dataclass(frozen=True)

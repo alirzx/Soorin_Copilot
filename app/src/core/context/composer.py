@@ -68,20 +68,37 @@ class ContextComposer:
         self.last_budget: dict[str, int] = {}
         self.last_knowledge_included_count = 0
 
-    def compose(self, package: CopilotContextPackage, *, request_id: str = "", base_input_tokens: int = 0) -> str:
+    def compose(
+        self,
+        package: CopilotContextPackage,
+        *,
+        request_id: str = "",
+        base_input_tokens: int = 0,
+        reserved_output_tokens: int | None = None,
+    ) -> str:
         profile_sections = self._compose_json_sections(package.asset_profiles, "ASSET_PROFILE_JSON")
         detection_sections = self._compose_json_sections(package.detections, "ASSET_DETECTION_JSON")
-        max_dynamic_tokens = max(
+        output_reserve = (
+            self.settings.llm_reserved_output_tokens
+            if reserved_output_tokens is None
+            else max(1, int(reserved_output_tokens))
+        )
+        calibrated_capacity = max(
             0,
             self.settings.llm_context_window_tokens
-            - self.settings.llm_reserved_output_tokens
+            - output_reserve
             - self.settings.llm_context_safety_margin_tokens
             - base_input_tokens,
+        )
+        max_dynamic_tokens = int(
+            calibrated_capacity / max(1.0, self.settings.llm_token_estimate_multiplier)
         )
         self.required_context_missing = False
         self.last_budget = {
             "base_input_tokens": base_input_tokens,
             "max_dynamic_tokens": max_dynamic_tokens,
+            "reserved_output_tokens": output_reserve,
+            "calibrated_dynamic_capacity": calibrated_capacity,
         }
         if self._is_exhaustive_graph_request(package):
             return self._compose_exhaustive_graph_context(

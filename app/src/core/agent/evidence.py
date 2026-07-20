@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import json
 from typing import Any
 
 from src.core.agent.contracts import EvidencePack, ToolResult
@@ -25,20 +26,43 @@ def context_package_from_evidence(
     detections: list[DetectionProviderResult] = []
     profiles: list[AssetProfileProviderResult] = []
     knowledge: KnowledgeSearchResult | None = None
+    knowledge_results: list[KnowledgeSearchResult] = []
     provenance = []
     for result in pack.tool_results:
         provider_result = result.provider_result
         if isinstance(provider_result, GraphProviderResult):
             graph = provider_result
         elif isinstance(provider_result, DetectionProviderResult):
+            if result.view_payload is not None:
+                serialized = json.dumps(result.view_payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+                provider_result = replace(
+                    provider_result,
+                    raw_payload=result.view_payload,
+                    serialized_json=serialized,
+                    full_payload_included=False,
+                    context_truncated=result.omitted_section_count > 0,
+                    context_truncation_reason="question_specific_view" if result.omitted_section_count else None,
+                )
             detections.append(provider_result)
         elif isinstance(provider_result, AssetProfileProviderResult):
+            if result.view_payload is not None:
+                serialized = json.dumps(result.view_payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+                provider_result = replace(
+                    provider_result,
+                    raw_payload=result.view_payload,
+                    serialized_json=serialized,
+                    full_payload_included=False,
+                    context_truncated=result.omitted_section_count > 0,
+                    context_truncation_reason="question_specific_view" if result.omitted_section_count else None,
+                )
             profiles.append(provider_result)
         elif isinstance(provider_result, KnowledgeSearchResult):
-            knowledge = provider_result
+            knowledge_results.append(provider_result)
         item_provenance = getattr(provider_result, "provenance", None)
         if item_provenance:
             provenance.append(item_provenance)
+    if knowledge_results:
+        knowledge = _merge_knowledge_results(knowledge_results)
     return CopilotContextPackage(
         entities=entities,
         graph=graph,
@@ -47,6 +71,34 @@ def context_package_from_evidence(
         knowledge=knowledge,
         provenance=provenance,
         limitations=list(pack.limitations),
+    )
+
+
+def _merge_knowledge_results(results: list[KnowledgeSearchResult]) -> KnowledgeSearchResult:
+    """Aggregate at most two validated searches and deduplicate chunks/citations."""
+    primary = results[0]
+    chunks = {}
+    citations = {}
+    for item in results:
+        for chunk in item.chunks:
+            current = chunks.get(chunk.chunk_id)
+            if current is None or chunk.score > current.score:
+                chunks[chunk.chunk_id] = chunk
+        for citation in item.citations:
+            citations[citation.chunk_id] = citation
+    ordered = tuple(sorted(chunks.values(), key=lambda item: (-item.score, item.chunk_id)))
+    statuses = {item.status for item in results}
+    status = "ok" if ordered and statuses <= {"ok", "empty"} else "partial" if ordered else primary.status
+    return replace(
+        primary,
+        status=status,
+        query="; ".join(item.query for item in results),
+        chunks=ordered,
+        citations=tuple(citations[key] for key in sorted(citations)),
+        limitations=tuple(dict.fromkeys(limitation for item in results for limitation in item.limitations)),
+        total_candidates=sum(item.total_candidates or 0 for item in results),
+        included_count=len(ordered),
+        truncated=any(item.truncated for item in results),
     )
 
 

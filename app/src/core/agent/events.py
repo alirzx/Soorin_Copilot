@@ -15,6 +15,10 @@ SAFE_EVENT_FIELDS = {
     "truncated", "review_outcome", "supplemental_retrieval_count", "tool_call_count",
     "planner_called", "fallback_used", "error_class", "safe_error_code", "reason",
     "max_concurrency", "max_calls", "max_graph_depth", "runtime", "bounded",
+    "phase", "purpose", "normalized_query_hash", "views", "detail",
+    "raw_estimate", "calibrated_estimate", "output_reservation",
+    "path_kind", "file_count", "removed_requests", "freed_bytes", "mode",
+    "max_bytes", "backup_count",
 }
 
 
@@ -51,4 +55,3 @@ class WorkflowEventLogger:
         if isinstance(value, (tuple, list, set)):
             return ",".join(str(item).replace("\n", " ")[:80] for item in value)
         return str(value).replace("\n", " ")[:160]
-

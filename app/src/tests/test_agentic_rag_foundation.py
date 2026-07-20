@@ -5,10 +5,11 @@ from __future__ import annotations
 import json
 import tempfile
 import unittest
+from types import ModuleType
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from src.config.settings import get_settings
 from src.core.agent.contracts import EvidenceFact, TaskSpec, ToolResult
@@ -21,7 +22,7 @@ from src.core.context.intent import validate_router_payload
 from src.core.context.models import CopilotContextPackage, EntityResolution
 from src.core.context.router import normalize_intent_route
 from src.core.rag.chunker import chunk_document
-from src.core.rag.embeddings import EmbeddingHealth, HuggingFaceTextEmbedder
+from src.core.rag.embeddings import EmbeddingHealth, EmbeddingLoadError, HuggingFaceTextEmbedder
 from src.core.rag.models import KnowledgeChunk, KnowledgeSearchResult
 from src.core.rag.qdrant_store import QdrantVectorStore
 from src.core.rag.service import KnowledgeSearchService
@@ -164,6 +165,48 @@ class SourceAndEmbeddingTests(unittest.TestCase):
         embedder = HuggingFaceTextEmbedder("fixture", 768)
         self.assertIsNone(embedder._model)
         self.assertIsNone(embedder._tokenizer)
+
+    def test_offline_embedding_arguments_are_forwarded_without_network_fallback(self) -> None:
+        transformers = ModuleType("transformers")
+        tokenizer_loader = MagicMock(return_value=object())
+        model = SimpleNamespace(config=SimpleNamespace(hidden_size=768), eval=MagicMock())
+        model_loader = MagicMock(return_value=model)
+        transformers.AutoTokenizer = SimpleNamespace(from_pretrained=tokenizer_loader)
+        transformers.AutoModel = SimpleNamespace(from_pretrained=model_loader)
+        torch = ModuleType("torch")
+        embedder = HuggingFaceTextEmbedder(
+            "BAAI/bge-base-en-v1.5",
+            768,
+            local_files_only=True,
+            cache_dir="/fixture/cache",
+            revision="pinned-revision",
+        )
+        with patch.dict("sys.modules", {"torch": torch, "transformers": transformers}):
+            embedder._ensure_loaded()
+        expected = {
+            "cache_dir": "/fixture/cache",
+            "revision": "pinned-revision",
+            "local_files_only": True,
+        }
+        tokenizer_loader.assert_called_once_with("BAAI/bge-base-en-v1.5", **expected)
+        model_loader.assert_called_once_with("BAAI/bge-base-en-v1.5", **expected)
+
+    def test_missing_offline_revision_has_safe_classification_and_no_retry(self) -> None:
+        transformers = ModuleType("transformers")
+        tokenizer_loader = MagicMock(side_effect=OSError("not cached"))
+        transformers.AutoTokenizer = SimpleNamespace(from_pretrained=tokenizer_loader)
+        transformers.AutoModel = SimpleNamespace(from_pretrained=MagicMock())
+        embedder = HuggingFaceTextEmbedder(
+            "BAAI/bge-base-en-v1.5",
+            768,
+            local_files_only=True,
+            revision="missing-revision",
+        )
+        with patch.dict("sys.modules", {"torch": ModuleType("torch"), "transformers": transformers}):
+            with self.assertRaises(EmbeddingLoadError) as captured:
+                embedder._ensure_loaded()
+        self.assertEqual(captured.exception.code, "embedding_revision_not_cached")
+        self.assertEqual(tokenizer_loader.call_count, 1)
 
     def test_bge_default_rejects_legacy_collection_when_enabled(self) -> None:
         configured = settings(

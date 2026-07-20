@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import logging
+import hashlib
+import re
+import threading
 from dataclasses import replace
 from datetime import datetime, timezone
-from typing import Any, Callable
+from typing import Any, Callable, Literal
 
 from pydantic import BaseModel, Field
 
@@ -16,6 +19,13 @@ from src.core.agent.contracts import (
     ToolResult,
 )
 from src.core.rag.models import KnowledgeSearchResult
+from src.core.context.product_views import (
+    MAX_PRODUCT_VIEW_TOKENS,
+    ProductEvidenceView,
+    approved_views,
+    build_product_view,
+    normalize_purpose,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -30,6 +40,10 @@ class EntityInput(BaseModel):
     direction: str | None = None
     depth: int | None = Field(default=None, ge=0, le=2)
     relationship_mode: str | None = None
+    views: list[str] = Field(default_factory=list, max_length=5)
+    detail: Literal["brief", "standard", "deep"] = "standard"
+    max_context_tokens: int = Field(default=3000, ge=1, le=MAX_PRODUCT_VIEW_TOKENS)
+    purpose: str = Field(default="", max_length=64, pattern=r"^[A-Za-z0-9_-]*$")
 
 
 class KnowledgeInput(BaseModel):
@@ -37,6 +51,8 @@ class KnowledgeInput(BaseModel):
     top_k: int | None = Field(default=None, ge=1, le=20)
     filters: dict[str, Any] | None = None
     request_id: str = ""
+    purpose: str = Field(default="general_reference", max_length=64, pattern=r"^[A-Za-z0-9_-]+$")
+    max_context_tokens: int = Field(default=3000, ge=1, le=8000)
 
 
 CapabilityHandler = Callable[[BaseModel], ToolResult]
@@ -87,7 +103,13 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def _provider_result(capability: str, entities: tuple[str, ...], result: Any) -> ToolResult:
+def _provider_result(
+    capability: str,
+    entities: tuple[str, ...],
+    result: Any,
+    *,
+    evidence_view: ProductEvidenceView | None = None,
+) -> ToolResult:
     provider_status = str(getattr(result, "status", "unavailable"))
     status_map = {"available": "ok", "not_found": "not_found"}
     status = status_map.get(provider_status, provider_status)
@@ -107,10 +129,20 @@ def _provider_result(capability: str, entities: tuple[str, ...], result: Any) ->
         serialization_complete = bool(
             payload.get("serialized_context_complete_for_retrieved_subset", True)
         )
-        request_complete = bool(payload.get("complete_for_user_request", retrieval_complete))
-        complete = retrieval_complete and serialization_complete and request_complete
+        if "complete_for_user_request" in payload:
+            request_complete = bool(payload["complete_for_user_request"])
+        elif "requested_scope_complete" in payload:
+            request_complete = bool(payload["requested_scope_complete"])
+        else:
+            request_complete = retrieval_complete
+        complete = request_complete and serialization_complete
         if capability.startswith("graph.") and not retrieval_complete:
-            limitations = (*limitations, "Graph retrieval was incomplete.")
+            limitations = (
+                *limitations,
+                "Broader graph retrieval was bounded; requested-scope completeness is reported separately."
+                if request_complete
+                else "Graph retrieval was incomplete for the requested scope.",
+            )
         if capability.startswith("graph.") and not serialization_complete:
             limitations = (*limitations, "Graph serialization was incomplete.")
     total_count: int | None = 1 if payload is not None else 0
@@ -137,6 +169,7 @@ def _provider_result(capability: str, entities: tuple[str, ...], result: Any) ->
         if invalid_provider_status
         else getattr(result, "error_type", None) or getattr(result, "error_reason", None)
     )
+    fact_payload = evidence_view.payload if evidence_view else payload
     return ToolResult(
         status=status,  # type: ignore[arg-type]
         entities=entities,
@@ -144,8 +177,8 @@ def _provider_result(capability: str, entities: tuple[str, ...], result: Any) ->
         retrieved_at=_now(),
         freshness="stale" if stale else "current" if status in {"ok", "not_found"} else "unknown",
         completeness=completeness,  # type: ignore[arg-type]
-        facts=(EvidenceFact(capability, "Provider evidence payload", payload, entities[0] if len(entities) == 1 else None),)
-        if payload is not None
+        facts=(EvidenceFact(capability, "Provider evidence payload", fact_payload, entities[0] if len(entities) == 1 else None),)
+        if fact_payload is not None
         else (),
         limitations=limitations,
         total_count=total_count,
@@ -161,6 +194,14 @@ def _provider_result(capability: str, entities: tuple[str, ...], result: Any) ->
         evidence_type="graph_topology" if capability.startswith("graph.") else "operational_product",
         raw_payload=payload,
         provider_result=result,
+        selected_views=evidence_view.selected_views if evidence_view else (),
+        detail=evidence_view.detail if evidence_view else "standard",
+        purpose=evidence_view.purpose if evidence_view else "",
+        view_payload=evidence_view.payload if evidence_view else None,
+        payload_inventory=evidence_view.inventory.as_dict() if evidence_view else {},
+        included_paths=evidence_view.included_paths if evidence_view else (),
+        omitted_section_count=evidence_view.omitted_path_count if evidence_view else 0,
+        view_token_estimate=evidence_view.token_estimate if evidence_view else 0,
     )
 
 
@@ -172,16 +213,56 @@ def build_capability_registry(
     knowledge_service: Any,
 ) -> CapabilityRegistry:
     registry = CapabilityRegistry()
+    product_fetches: dict[tuple[str, str, str], Any] = {}
+    product_fetch_lock = threading.Lock()
+
+    def fetch_product_once(provider: str, ip: str, request_id: str, session_id: str) -> Any:
+        key = (request_id, provider, ip)
+        with product_fetch_lock:
+            if key in product_fetches:
+                return product_fetches[key]
+            source = asset_profile_provider if provider == "asset_profile" else detection_provider
+            result = source.fetch(ip, request_id, session_id=session_id)
+            product_fetches[key] = result
+            if len(product_fetches) > 512:
+                product_fetches.pop(next(iter(product_fetches)))
+            return result
+
+    def product_result(capability: str, provider: str, payload: EntityInput) -> ToolResult:
+        ip = payload.entities[0]
+        result = fetch_product_once(provider, ip, payload.request_id, payload.session_id)
+        if getattr(result, "raw_payload", None) is None:
+            return _provider_result(capability, (ip,), result)
+        selected = tuple(payload.views) or ("overview",)
+        if any(view not in approved_views(provider) for view in selected):
+            raise ValueError("Product capability requested an unapproved evidence view.")
+        view = build_product_view(
+            result.raw_payload,
+            provider=provider,
+            views=selected,
+            detail=payload.detail,
+            max_context_tokens=payload.max_context_tokens,
+            purpose=normalize_purpose(payload.purpose, "general_assessment"),
+        )
+        logger.info(
+            "event=product_evidence_view_built request_id=%s provider=%s target_ip=%s views=%s detail=%s purpose=%s included_paths=%s omitted_paths=%s view_tokens=%s raw_payload_preserved=true",
+            payload.request_id,
+            provider,
+            ip,
+            ",".join(view.selected_views),
+            view.detail,
+            view.purpose,
+            len(view.included_paths),
+            view.omitted_path_count,
+            view.token_estimate,
+        )
+        return _provider_result(capability, (ip,), result, evidence_view=view)
 
     def profile(payload: EntityInput) -> ToolResult:
-        ip = payload.entities[0]
-        result = asset_profile_provider.fetch(ip, payload.request_id, session_id=payload.session_id)
-        return _provider_result("asset.get_profile", (ip,), result)
+        return product_result("asset.get_profile", "asset_profile", payload)
 
     def detection(payload: EntityInput) -> ToolResult:
-        ip = payload.entities[0]
-        result = detection_provider.fetch(ip, payload.request_id, session_id=payload.session_id)
-        return _provider_result("asset.get_detection", (ip,), result)
+        return product_result("asset.get_detection", "detection", payload)
 
     def graph(capability: str) -> CapabilityHandler:
         def run(payload: EntityInput) -> ToolResult:
@@ -211,11 +292,23 @@ def build_capability_registry(
         return run
 
     def knowledge(payload: KnowledgeInput) -> ToolResult:
+        normalized_query = re.sub(r"\s+", " ", payload.query.casefold().strip())
+        query_hash = hashlib.sha256(normalized_query.encode("utf-8")).hexdigest()[:16]
+        purpose = normalize_purpose(payload.purpose, "general_reference")
         result: KnowledgeSearchResult = knowledge_service.search(
             payload.query,
             top_k=payload.top_k,
             filters=payload.filters,
             request_id=payload.request_id,
+        )
+        logger.info(
+            "event=knowledge_capability_result request_id=%s purpose=%s normalized_query_hash=%s status=%s included=%s truncated=%s",
+            payload.request_id,
+            purpose,
+            query_hash,
+            result.status,
+            result.included_count,
+            result.truncated,
         )
         return ToolResult(
             status=result.status,
@@ -250,6 +343,8 @@ def build_capability_registry(
             else None,
             raw_payload=result,
             provider_result=result,
+            purpose=purpose,
+            normalized_query_hash=query_hash,
         )
 
     specs = (

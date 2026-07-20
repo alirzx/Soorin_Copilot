@@ -8,6 +8,7 @@ from typing import Any
 from uuid import uuid4
 
 from src.core.agent.contracts import ExecutionPlan, PlanStep, TaskSpec
+from src.core.context.product_views import select_product_views
 
 
 MULTI_STEP_WORDING = re.compile(
@@ -19,6 +20,7 @@ MULTI_STEP_WORDING = re.compile(
 
 
 def task_spec_from_route(route: Any, request: str) -> TaskSpec:
+    request_lower = request.lower()
     capabilities: list[str] = []
     if getattr(route, "use_asset_profile", False):
         capabilities.append("asset.get_profile")
@@ -55,8 +57,14 @@ def task_spec_from_route(route: Any, request: str) -> TaskSpec:
         workflow_mode="multi_step" if multi_step else "direct",
         semantic_decision_source=str(getattr(route, "decision_source", "unknown")),
         requires_multiple_entities=bool(getattr(route, "requires_multiple_entities", False)),
-        max_steps=min(4, max(1, len(capabilities))),
-        detail_level="detailed" if "detailed" in request.lower() else "brief" if any(word in request.lower() for word in ("brief", "short")) else "standard",
+        recommended_steps=min(4, max(1, len(capabilities))),
+        detail_level=(
+            "deep"
+            if any(word in request_lower for word in ("detailed", "deep", "comprehensive", "report"))
+            else "brief"
+            if any(word in request_lower for word in ("brief", "short"))
+            else "standard"
+        ),
         is_followup=bool(getattr(route, "followup_detected", False)),
         graph_depth=int(getattr(route, "depth", 0) or 0),
         relationship_mode=str(getattr(route, "relationship_mode", "none")),
@@ -69,12 +77,28 @@ def compile_direct_plan(task: TaskSpec, *, plan_id: str | None = None) -> Execut
     for capability in task.required_capabilities:
         if capability in {"asset.get_profile", "asset.get_detection"}:
             targets = task.entities[:2]
+            provider = "asset_profile" if capability == "asset.get_profile" else "detection"
+            detail = "deep" if task.detail_level in {"detailed", "deep", "report"} else task.detail_level
+            views = select_product_views(provider, task.request, detail)
+            purpose = (
+                "assess_anomaly"
+                if provider == "detection" and any(view in views for view in ("anomaly_risk", "behavior"))
+                else "establish_identity"
+                if "identity_role" in views
+                else "asset_summary"
+            )
             for entity in targets:
                 steps.append(
                     PlanStep(
                         id=f"step-{len(steps) + 1}",
                         capability=capability,
-                        arguments={"entities": [entity]},
+                        arguments={
+                            "entities": [entity],
+                            "views": list(views),
+                            "detail": detail,
+                            "max_context_tokens": 5000 if detail == "deep" else 3000,
+                            "purpose": purpose,
+                        },
                         expected_evidence_type="operational_product",
                     )
                 )
@@ -83,7 +107,11 @@ def compile_direct_plan(task: TaskSpec, *, plan_id: str | None = None) -> Execut
                 PlanStep(
                     id=f"step-{len(steps) + 1}",
                     capability=capability,
-                    arguments={"query": task.request},
+                    arguments={
+                        "query": task.request,
+                        "purpose": "interpret_evidence",
+                        "max_context_tokens": 3000,
+                    },
                     expected_evidence_type="documentation",
                 )
             )
@@ -128,7 +156,7 @@ def compile_supplemental_plan(
     supplemental_task = replace(
         task,
         required_capabilities=(capability,),
-        max_steps=1,
+        recommended_steps=1,
     )
     evidence_type = (
         "documentation"

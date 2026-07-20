@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import logging
+import json
+import tempfile
 import threading
 import time
 from dataclasses import replace
 from types import SimpleNamespace
+from pathlib import Path
 
 import pytest
 from pydantic import BaseModel, Field
@@ -24,11 +27,13 @@ from src.core.agent.events import WorkflowEventContext, WorkflowEventLogger
 from src.core.agent.executor import CapabilityExecutor
 from src.core.agent.plan_validator import PlanValidationError, PlanValidator
 from src.core.agent.planner import BoundedPlanner, PlannerError
-from src.core.agent.registry import CapabilityRegistry, _provider_result
+from src.core.agent.registry import CapabilityRegistry, _provider_result, build_capability_registry
 from src.core.agent.reviewer import EvidenceReviewer
 from src.core.agent.task_mapping import compile_direct_plan, compile_supplemental_plan
 from src.core.agent.workflow import BoundedCopilotWorkflow
-from src.core.context.models import AssetProfileProviderResult, ProviderProvenance
+from src.core.context.models import AssetProfileProviderResult, DetectionProviderResult, ProviderProvenance
+from src.config.settings import get_settings
+from src.core.observability import EvidenceSnapshotWriter
 
 
 class Input(BaseModel):
@@ -81,7 +86,7 @@ def task(*capabilities, entities=("192.0.2.10",), mode="direct"):
         required_capabilities=tuple(capabilities),
         workflow_mode=mode,
         graph_depth=0,
-        max_steps=6,
+        recommended_steps=6,
     )
 
 
@@ -162,6 +167,32 @@ class TestPlanValidation:
         with pytest.raises(PlanValidationError) as captured:
             self.validator.validate(proposed)
         assert captured.value.code == "entity_authority_violation"
+
+    def test_knowledge_second_call_requires_distinct_purpose_and_query(self):
+        registry = registry_with(
+            {"knowledge.search": lambda payload: result("knowledge.search")},
+            cardinality=(0, 0),
+        )
+        current = task("knowledge.search", entities=())
+        duplicate = ExecutionPlan(
+            current,
+            (
+                PlanStep("k1", "knowledge.search", arguments={"query": "Kerberos risks", "purpose": "interpret_evidence"}),
+                PlanStep("k2", "knowledge.search", arguments={"query": "Kerberos risks!", "purpose": "response_actions"}),
+            ),
+        )
+        with pytest.raises(PlanValidationError) as captured:
+            PlanValidator(registry).validate(duplicate)
+        assert captured.value.code == "duplicate_knowledge_search"
+
+        distinct = replace(
+            duplicate,
+            steps=(
+                duplicate.steps[0],
+                replace(duplicate.steps[1], arguments={"query": "Containment actions for ticket abuse", "purpose": "response_actions"}),
+            ),
+        )
+        assert PlanValidator(registry).validate(distinct).validated
 
 
 class TestPlanner:
@@ -413,6 +444,129 @@ class TestEvidenceAndReview:
         assert converted.completeness == "unknown"
         assert converted.safe_error_code == "invalid_provider_status"
 
+    def test_graph_completeness_prioritizes_the_requested_scope(self):
+        summary = SimpleNamespace(
+            status="available",
+            provider="graph",
+            context={
+                "retrieval_complete": False,
+                "requested_scope_complete": True,
+                "complete_for_user_request": True,
+                "serialized_context_complete_for_retrieved_subset": True,
+            },
+            limitations=(),
+        )
+        converted = _provider_result("graph.get_summary", ("192.0.2.10",), summary)
+        assert converted.completeness == "complete"
+        assert not converted.truncated
+        assert any("Broader graph retrieval" in item for item in converted.limitations)
+
+        incomplete = _provider_result(
+            "graph.get_neighbors",
+            ("192.0.2.10",),
+            SimpleNamespace(
+                **{**vars(summary), "context": {**summary.context, "complete_for_user_request": False}}
+            ),
+        )
+        assert incomplete.completeness == "partial"
+        assert incomplete.truncated
+
+        serialization = _provider_result(
+            "graph.get_summary",
+            ("192.0.2.10",),
+            SimpleNamespace(
+                **{
+                    **vars(summary),
+                    "context": {
+                        **summary.context,
+                        "serialized_context_complete_for_retrieved_subset": False,
+                    },
+                }
+            ),
+        )
+        assert serialization.completeness == "partial"
+
+    def test_multiple_product_views_reuse_one_request_scoped_fetch(self):
+        calls = []
+        settings = SimpleNamespace(
+            detection_cache_enabled=False,
+            product_read_timeout_seconds=1,
+            rag_qdrant_timeout_seconds=1,
+            rag_top_k=3,
+            agent_request_timeout_seconds=1,
+            graph_full_neighbors_hard_max=10,
+        )
+
+        class Provider:
+            def __init__(self, result_type, name):
+                self.settings = settings
+                self.result_type = result_type
+                self.name = name
+
+            def fetch(self, ip, request_id, session_id=""):
+                calls.append((self.name, ip, request_id, session_id))
+                return self.result_type(
+                    provider=self.name,
+                    status="available",
+                    ip=ip,
+                    raw_payload={
+                        "identity": {"hostname": "dc-1", "role": "server"},
+                        "risk": {"score": 7},
+                        "services": ["kerberos", "ldap"],
+                        "events": [{"rule": "fixture-rule", "token": "must-not-appear"}],
+                    },
+                    provenance=ProviderProvenance(f"fixture_{self.name}", "available"),
+                )
+
+        profile = Provider(AssetProfileProviderResult, "asset_profile")
+        detection = Provider(DetectionProviderResult, "detection")
+        registry = build_capability_registry(
+            asset_profile_provider=profile,
+            detection_provider=detection,
+            graph_provider=SimpleNamespace(settings=settings),
+            knowledge_service=SimpleNamespace(settings=settings),
+        )
+        base = {"entities": ["192.0.2.10"], "request_id": "r1", "session_id": "s1"}
+        first = registry.execute(
+            "asset.get_profile",
+            {**base, "views": ["overview", "identity_role"], "purpose": "summary"},
+        )
+        deep_task = TaskSpec(
+            request="Prepare a deep report",
+            intent="asset_investigation",
+            scope="node_summary",
+            direction="both",
+            entities=("192.0.2.10",),
+            required_capabilities=("asset.get_profile",),
+            detail_level="deep",
+        )
+        decision = EvidenceReviewer().review(deep_task, [first], allow_supplemental=True)
+        assert decision.supplemental_allowed
+        supplemental = PlanValidator(registry).validate(
+            compile_supplemental_plan(
+                deep_task,
+                decision.next_capability,
+                decision.next_arguments,
+                plan_id="p1",
+            )
+        )
+        second = CapabilityExecutor(registry).execute(
+            supplemental,
+            base_payload={"request_id": "r1", "session_id": "s1"},
+        )[0]
+        assert len(calls) == 1
+        assert first.provider_result is second.provider_result
+        assert first.raw_payload is second.raw_payload
+        assert first.selected_views == ("overview", "identity_role")
+        assert second.selected_views == ("services_software", "security_posture", "evidence_deep")
+        assert first.view_payload != first.raw_payload
+        assert "must-not-appear" not in json.dumps(second.view_payload)
+
+    def test_task_steps_are_recommendations_not_plan_security_limits(self):
+        current = task("a")
+        assert current.recommended_steps == 6
+        assert current.max_steps == current.recommended_steps
+
     def test_reviewer_authorizes_one_missing_capability_and_then_limits(self):
         current = task("a", "b")
         reviewer = EvidenceReviewer()
@@ -527,3 +681,29 @@ class TestWorkflowAndLogging:
         assert "trace_id=t1" in output
         assert "plan_id=p1" in output
         assert "must-not-appear" not in output
+
+    def test_evidence_snapshot_is_bounded_private_and_redacted(self):
+        with tempfile.TemporaryDirectory() as directory:
+            settings = replace(
+                get_settings(),
+                evidence_snapshot_enabled=True,
+                evidence_snapshot_mode="redacted",
+                evidence_snapshot_root=directory,
+                evidence_snapshot_max_bytes=100_000,
+            )
+            path = EvidenceSnapshotWriter(settings).write(
+                "request-1",
+                {
+                    "tool-results": {
+                        "raw_payload": {"hostname": "dc-1", "api_key": "must-not-appear"},
+                        "reasoning_content": "must-not-appear",
+                    }
+                },
+            )
+            assert path is not None
+            snapshot = next(Path(path).glob("*.json"))
+            assert snapshot.stat().st_mode & 0o777 == 0o600
+            content = snapshot.read_text(encoding="utf-8")
+            assert "dc-1" not in content
+            assert "must-not-appear" not in content
+            assert json.loads(content)["raw_payload"] == "[OMITTED]"
