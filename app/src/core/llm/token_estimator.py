@@ -16,6 +16,17 @@ class TokenEstimate:
     multiplier: float
 
 
+@dataclass(frozen=True)
+class TokenWindowBudget:
+    context_window: int
+    calibrated_input: int
+    output_reservation: int
+    configured_safety_margin: int
+    remaining_before_safety: int
+    remaining_usable_tokens: int
+    fits: bool
+
+
 class TokenEstimator:
     def __init__(self, *, deployment: str, model: str, multiplier: float = 1.35) -> None:
         self.deployment = deployment
@@ -37,3 +48,32 @@ class TokenEstimator:
             4096,
         )
         return max(1, min(int(deployment_max_tokens), requested))
+
+    @staticmethod
+    def minimum_output_reservation(detail: str) -> int:
+        return {
+            "brief": 512,
+            "standard": 1024,
+            "detailed": 1536,
+            "deep": 1536,
+            "report": 1536,
+        }.get(detail, 1024)
+
+    @staticmethod
+    def window_budget(
+        calibrated_input: int,
+        output_reservation: int,
+        configured_safety_margin: int,
+        context_window: int,
+    ) -> TokenWindowBudget:
+        before_safety = int(context_window) - int(calibrated_input) - int(output_reservation)
+        usable = before_safety - int(configured_safety_margin)
+        return TokenWindowBudget(
+            context_window=int(context_window),
+            calibrated_input=int(calibrated_input),
+            output_reservation=int(output_reservation),
+            configured_safety_margin=int(configured_safety_margin),
+            remaining_before_safety=before_safety,
+            remaining_usable_tokens=usable,
+            fits=usable >= 0,
+        )

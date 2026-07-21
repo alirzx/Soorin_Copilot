@@ -256,7 +256,7 @@ Entity resolution
 - Direct tasks use `compile_direct_plan`; the Planner is skipped.
 - Multi-step tasks use the existing provider-neutral LLM client with `SOORIN_PLANNER_DEPLOYMENT`.
 - Planner output is a proposal. It cannot execute tools, invent entities, introduce URLs, change permissions, or mutate state.
-- One malformed Planner response may receive one compact schema-repair attempt.
+- Planner receives one model call only. A rejected plan may receive one deterministic mechanical repair for known structural defects; malformed model output falls back safely without another Planner call.
 - Planner failure or plan rejection falls back explicitly to a deterministic plan when one is safe.
 - `PlanValidator` enforces known/planner-visible/read-only capabilities, entity authority, cardinality, argument schemas, dependency references, DAG structure, duplicate-call rejection, six-call maximum, two-entity maximum, and graph depth two.
 - `CapabilityExecutor` runs independent steps concurrently with a maximum of four workers by default. Profile and Detection are serialized because they share a Product client/session; Graph and Knowledge can overlap safely.
@@ -289,7 +289,7 @@ The service contains no legacy direct provider loop. Normal Profile, Detection, 
 
 ### Planner behavior
 
-Direct requests always use deterministic plans and do not call the Planner. Multi-step requests call the Planner only when `SOORIN_PLANNER_ENABLED=true`. Planner output is JSON-only, receives no generic transient retry, and may receive at most one schema-repair request. Extra prose is rejected and enters that repair path. A Planner failure or rejected model plan uses a logged deterministic fallback plan only when the existing semantic task can be compiled safely.
+Direct requests always use deterministic plans and do not call the Planner. Multi-step requests call the Planner only when `SOORIN_PLANNER_ENABLED=true`. The tracked prompt is `app/prompts/planner_system_prompt.md`; its capability catalog is generated from the registry. Planner output is JSON-only, receives no generic transient retry, and is never sent to a second Planner call. Extra prose or malformed JSON is rejected. Valid JSON with a mechanically repairable structural defect may be repaired once in deterministic code, revalidated, then replaced by a logged deterministic fallback plan if still invalid.
 
 The Planner cannot execute tools. Entity authority, known capability selection, read-only policy, entity cardinality, Pydantic arguments, dependency references, DAG validity, duplicate calls, graph depth, and call budgets remain deterministic `PlanValidator` responsibilities.
 
@@ -313,9 +313,9 @@ Already-running synchronous provider threads cannot be forcibly terminated after
 
 ### ToolResult and EvidencePack
 
-`ToolResult` is the canonical capability-output contract. Product raw JSON objects retain identity and are not reshaped. The original typed provider result remains in `provider_result`. Graph retrieval/serialization completeness, counts, truncation, and limitations survive conversion. Knowledge chunks, scores through the original result, citations, counts, backend, and freshness survive conversion. Unknown provider statuses fail closed as `invalid`; they are never normalized to success.
+`ToolResult` is the canonical capability-output contract. It includes a stable model-context identity plus explicit inclusion, omission reason, representation, and token metadata. Product raw JSON remains internal in `raw_payload`/`provider_result`; only projected facts enter model context. Graph retrieval/serialization completeness, counts, truncation, and limitations survive conversion. Knowledge chunks, scores through the original result, citations, counts, backend, and freshness survive conversion. Unknown provider statuses fail closed as `invalid`; they are never normalized to success.
 
-`EvidencePack` is constructed only from `ToolResult` records. It carries request/trace/plan IDs, resolved entities, plan summary, provider coverage, graph completeness, citations, missing evidence, limitations, contradictions, supplemental history, and review outcome.
+`EvidencePack` is constructed only from `ToolResult` records. It carries request/trace/plan IDs, resolved entities, plan summary, capability coverage, identity-keyed result coverage, graph completeness, citations, missing evidence, limitations, contradictions, supplemental history, and review outcome. Repeated capabilities remain separate ToolResults.
 
 ### Supplemental validation
 
@@ -374,6 +374,8 @@ There is no LLM evidence reviewer.
 
 Graph completeness is evaluated in authority order: `complete_for_user_request`, then `requested_scope_complete`, then `serialized_context_complete_for_retrieved_subset`, and only then general retrieval completeness. A complete `node_summary` remains complete when a broader neighborhood was bounded; that broader truncation is retained as an informational limitation.
 
+Graph scope, traversal, retrieval, and model serialization are separate contracts. `node_summary` serializes target identity and aggregate degree/direction/subnet/importance metadata without a hidden peer sample. One-hop and full-neighbor retrieval use their configured safety ceilings; two-hop uses its own node setting and a named code-level edge ceiling. Relationship and path are pair-specific. Comparison retains both summaries, shared/distinct peer totals, degree/subnet differences, and direct relationship evidence. Every result uses a capability/entity/scope identity; commutative comparison identities normalize entity order, while path/relationship order is preserved.
+
 If all required evidence is unavailable, synthesis is skipped and the application returns a deterministic safe-failure explanation. If some valid evidence remains, the Reviewer allows synthesis with explicit limitations. A missing, not-yet-executed required capability may trigger one supplemental call; duplicate equivalent retrieval is rejected and a second supplemental call is impossible.
 
 Two review stages have distinct responsibilities:
@@ -412,7 +414,7 @@ Detection and profile providers:
 - Track raw JSON size, approximate tokens, top-level key counts, cache hit/miss/stale status, HTTP status, and safe error classification.
 - Create safe path/type/length payload inventories and deterministic question-specific local projections.
 
-Detection supports exactly `overview`, `identity_role`, `anomaly_risk`, `behavior`, and `evidence_deep`. Profile supports exactly `overview`, `identity_role`, `services_software`, `security_posture`, and `evidence_deep`. Comprehensive requests combine all approved views under a hard token budget rather than adding an unbounded sixth view. A reviewer-approved supplemental Product view reuses the request-scoped raw result and cannot cause another Product fetch.
+Detection supports exactly `overview`, `identity_role`, `anomaly_risk`, `behavior`, and `evidence_deep`. Profile supports exactly `overview`, `identity_role`, `services_software`, `security_posture`, and `evidence_deep`. Selected fields become canonical path/value facts, ranked by request relevance, confidence, conflict, anomaly/risk severity, and identity importance. Facts are deduplicated before one merged projected block is serialized per provider/entity. `evidence_deep` contributes only remaining facts. Comprehensive requests remain under a hard token budget. A reviewer-approved supplemental Product view reuses the request-scoped raw result and cannot cause another Product fetch.
 
 ## 11. Graph Topology
 
@@ -548,7 +550,7 @@ Budget controls:
 - Required graph context that cannot fit creates a safe context limitation.
 - Knowledge context participates in the same budget and may be omitted with logged reason.
 
-Input estimates are deployment/model labeled and multiplied by `SOORIN_LLM_TOKEN_ESTIMATE_MULTIPLIER` (default `1.35`). Output reservation is dynamic: brief uses 1,536 tokens, standard uses 4,096, and deep/report uses up to 6,144, always capped by the deployment. Composition preserves the invariant that calibrated input, output reservation, and safety margin fit the configured context window. Provider prompt usage is compared only as safe numeric calibration metadata when available.
+Input estimates are deployment/model labeled and multiplied by `SOORIN_LLM_TOKEN_ESTIMATE_MULTIPLIER` (default `1.35`). Output reservation is dynamic: brief uses 1,536 tokens, standard uses 4,096, and deep/report uses up to 6,144, always capped by the deployment. Immediately before synthesis, a hard guard enforces `calibrated input + selected output reservation + configured safety margin <= context window`. It removes eligible history, performs one bounded context recomposition, and may reduce output only to a detail-policy floor. If the invariant still fails, the provider is not called. Traces report remaining-before-safety and remaining-usable tokens separately.
 
 Conversation history is trimmed to fit budget, preferring current evidence over old assistant claims.
 
@@ -562,7 +564,11 @@ Conversation memory:
 
 - Stores user and assistant messages when enabled.
 - Truncates to configured maximum messages.
-- Builds deterministic compact summaries when token thresholds are exceeded.
+- Uses a typed `MemoryContextKey` over normalized entities, topic family, relationship mode, and scope family.
+- Keeps bounded current Working Memory and in-process Episodic Session Memory.
+- Builds deterministic compact summaries when token thresholds are exceeded or an episode closes.
+- Detaches raw history when entity, pair, or topic changes; a previous episode summary re-enters only for a matching context key.
+- Retains bounded old episode records without treating them as current provider evidence.
 - Does not use an LLM for summaries.
 
 Routing state:

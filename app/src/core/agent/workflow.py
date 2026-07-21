@@ -53,13 +53,14 @@ class BoundedCopilotWorkflow:
         session_id: str | None,
         ui_context: dict[str, Any] | None,
         request_id: str,
+        trace_id: str | None,
         stream_sink: Any,
         direct_executor: DirectExecutor,
         typed_executor: DirectExecutor | None = None,
     ) -> dict[str, Any]:
         initial: InvestigationState = {
             "request_id": request_id,
-            "trace_id": uuid4().hex[:16],
+            "trace_id": trace_id or uuid4().hex[:16],
             "session_id": session_id or "",
             "message": message,
             "ui_context": ui_context,

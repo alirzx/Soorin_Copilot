@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from src.core.agent.contracts import ExecutionPlan, PlanStep, ToolResult
+from src.core.agent.context_identity import identity_for_tool_result
 from src.core.agent.events import WorkflowEventLogger
 from src.core.agent.registry import CapabilityRegistry
 
@@ -162,6 +163,10 @@ class CapabilityExecutor:
             latency_ms=result.latency_ms or latency_ms,
             provider=result.provider or spec.concurrency_group,
             evidence_type=result.evidence_type or spec.evidence_type,
+        )
+        result = replace(
+            result,
+            context_identity=result.context_identity or identity_for_tool_result(result),
         )
         if events:
             event = "step_completed" if result.status in {"ok", "empty", "not_found"} else "step_partial" if result.status == "partial" else "step_failed"

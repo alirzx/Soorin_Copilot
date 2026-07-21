@@ -21,6 +21,7 @@ from src.core.agent.contracts import (
 from src.core.rag.models import KnowledgeSearchResult
 from src.core.context.product_views import (
     MAX_PRODUCT_VIEW_TOKENS,
+    MIN_PRODUCT_VIEW_TOKENS,
     ProductEvidenceView,
     approved_views,
     build_product_view,
@@ -42,7 +43,11 @@ class EntityInput(BaseModel):
     relationship_mode: str | None = None
     views: list[str] = Field(default_factory=list, max_length=5)
     detail: Literal["brief", "standard", "deep"] = "standard"
-    max_context_tokens: int = Field(default=3000, ge=1, le=MAX_PRODUCT_VIEW_TOKENS)
+    max_context_tokens: int = Field(
+        default=3000,
+        ge=MIN_PRODUCT_VIEW_TOKENS,
+        le=MAX_PRODUCT_VIEW_TOKENS,
+    )
     purpose: str = Field(default="", max_length=64, pattern=r"^[A-Za-z0-9_-]*$")
 
 
@@ -202,6 +207,11 @@ def _provider_result(
         included_paths=evidence_view.included_paths if evidence_view else (),
         omitted_section_count=evidence_view.omitted_path_count if evidence_view else 0,
         view_token_estimate=evidence_view.token_estimate if evidence_view else 0,
+        source_payload_complete=evidence_view.source_payload_complete if evidence_view else payload is not None,
+        projection_usable=evidence_view.projection_usable if evidence_view else payload is not None,
+        usable_fact_count=evidence_view.usable_fact_count if evidence_view else int(payload is not None),
+        projection_truncated=evidence_view.truncated if evidence_view else False,
+        projection_omitted_count=evidence_view.projection_omitted_count if evidence_view else 0,
     )
 
 
@@ -245,15 +255,14 @@ def build_capability_registry(
             purpose=normalize_purpose(payload.purpose, "general_assessment"),
         )
         logger.info(
-            "event=product_evidence_view_built request_id=%s provider=%s target_ip=%s views=%s detail=%s purpose=%s included_paths=%s omitted_paths=%s view_tokens=%s raw_payload_preserved=true",
+            "event=product_evidence_view_built request_id=%s provider=%s target_ip=%s views=%s detail=%s purpose=%s usable_fact_count=%s omitted_paths=0 view_tokens=%s raw_payload_retained_internally=true model_representation=full_minified",
             payload.request_id,
             provider,
             ip,
             ",".join(view.selected_views),
             view.detail,
             view.purpose,
-            len(view.included_paths),
-            view.omitted_path_count,
+            view.usable_fact_count,
             view.token_estimate,
         )
         return _provider_result(capability, (ip,), result, evidence_view=view)
@@ -370,6 +379,27 @@ def build_capability_registry(
         else:
             timeout_seconds = min(30.0, float(getattr(graph_settings, "agent_request_timeout_seconds", 30)))
             maximum_result_scope = int(getattr(graph_settings, "graph_full_neighbors_hard_max", 5000))
+        allowed_scopes = {
+            "graph.get_summary": ("node_summary",),
+            "graph.get_neighbors": ("one_hop", "two_hop", "full_neighbors"),
+            "graph.get_relationship": ("one_hop",),
+            "graph.compare_assets": ("multi_entity_comparison",),
+            "graph.find_path": ("path",),
+        }.get(name, ())
+        allowed_depths = {
+            "graph.get_summary": (0,),
+            "graph.get_neighbors": (1, 2),
+            "graph.get_relationship": (1,),
+            "graph.compare_assets": (1,),
+            "graph.find_path": (0,),
+        }.get(name, ())
+        planner_arguments = (
+            ("entities", "views", "detail", "max_context_tokens", "purpose")
+            if group == "product"
+            else ("entities",)
+            if group == "graph"
+            else ("query", "top_k", "filters", "purpose", "max_context_tokens")
+        )
         registry.register(
             CapabilitySpec(
                 name=name,
@@ -390,6 +420,23 @@ def build_capability_registry(
                 maximum_result_scope=maximum_result_scope,
                 required_permissions=("read",),
                 concurrency_group=group,
+                allowed_arguments=planner_arguments,
+                allowed_views=approved_views("asset_profile" if name == "asset.get_profile" else "detection")
+                if group == "product"
+                else (),
+                allowed_detail_levels=("brief", "standard", "deep") if group == "product" else (),
+                allowed_purposes=(
+                    "general_reference",
+                    "interpret_evidence",
+                    "recommended_response_actions",
+                    "response_actions",
+                    "investigation_procedure",
+                    "hardening_guidance",
+                ) if group == "knowledge" else (),
+                allowed_scopes=allowed_scopes,
+                allowed_depths=allowed_depths,
+                reusable_locally=group == "product",
+                parallelization="serialized_per_product" if group == "product" else "independent_when_dependencies_allow",
             ),
             handler,
         )

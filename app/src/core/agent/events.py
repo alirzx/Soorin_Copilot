@@ -19,6 +19,7 @@ SAFE_EVENT_FIELDS = {
     "raw_estimate", "calibrated_estimate", "output_reservation",
     "path_kind", "file_count", "removed_requests", "freed_bytes", "mode",
     "max_bytes", "backup_count",
+    "field", "validation_rule",
 }
 
 

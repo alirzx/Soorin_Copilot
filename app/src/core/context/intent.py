@@ -25,6 +25,7 @@ from src.core.llm.client import LLMClient
 from src.core.llm.errors import LLMError
 from src.core.memory.routing_state import SessionRoutingState
 from src.core.context.router import is_exhaustive_connection_request
+from src.core.context.entities import IPV4_CANDIDATE_RE, _extract_subnets
 
 
 logger = logging.getLogger(__name__)
@@ -138,6 +139,7 @@ def materialize_entity_binding(
     routing_state: SessionRoutingState | None = None,
     *,
     ui_context: dict[str, Any] | None = None,
+    requires_multiple_entities: bool = False,
 ) -> tuple[EntityResolution, str]:
     """Materialize one router-selected binding from already-known candidates."""
     if entity_binding == "none":
@@ -147,7 +149,20 @@ def materialize_entity_binding(
         explicit = [entity for entity in entities.entities if entity.source == "message"]
         if not explicit:
             raise ValueError("entity_requirement_failed")
-        return _resolution_from_entities(entities, explicit), "message"
+        resolved = list(explicit)
+        if requires_multiple_entities and len(resolved) == 1:
+            known_values = {entity.value for entity in resolved}
+            conversation = [
+                entity
+                for entity in entities.entities
+                if entity.source == "conversation" and entity.value not in known_values
+            ]
+            active_ip = _valid_ipv4(routing_state.active_ip if routing_state else None)
+            if conversation:
+                resolved.append(conversation[0])
+            elif active_ip and active_ip not in known_values:
+                resolved.append(ResolvedEntity(type="ip", value=active_ip, source="conversation"))
+        return _resolution_from_entities(entities, resolved[:2]), "message"
 
     if entity_binding == "ui":
         ui_ip = _valid_ipv4(str((ui_context or {}).get("selected_ip") or ""))
@@ -192,8 +207,13 @@ def resolution_from_materialized_decision(
         source = "message"
     elif decision.binding_source == "ui":
         source = "ui"
+    original_sources = {entity.value: entity.source for entity in original_entities.entities}
     resolved = [
-        ResolvedEntity(type="ip", value=value, source=source)  # type: ignore[arg-type]
+        ResolvedEntity(
+            type="ip",
+            value=value,
+            source=original_sources.get(value, source),  # type: ignore[arg-type]
+        )
         for value in decision.materialized_entities
     ]
     return _resolution_from_entities(original_entities, resolved) if resolved else _empty_resolution(original_entities)
@@ -282,9 +302,25 @@ def build_routing_context(
     routing_state: SessionRoutingState,
     *,
     ui_context: dict[str, Any] | None = None,
+    recent_messages: list[dict[str, str]] | None = None,
 ) -> dict[str, Any]:
     primary = entities.primary_entity
     explicit_entities = [entity for entity in entities.entities if entity.source == "message"]
+    recent_turns = [
+        {
+            "role": item.get("role", "")[:20],
+            "content": compact_preview(item.get("content", ""), limit=220),
+        }
+        for item in (recent_messages or [])[-4:]
+        if item.get("role") in {"user", "assistant"} and item.get("content")
+    ]
+    recent_entity_candidates: list[str] = []
+    for item in reversed(recent_messages or []):
+        _subnets, host_text = _extract_subnets(item.get("content", ""))
+        for candidate in IPV4_CANDIDATE_RE.findall(host_text):
+            ip = _valid_ipv4(candidate)
+            if ip and ip not in recent_entity_candidates:
+                recent_entity_candidates.append(ip)
     return {
         "message": compact_preview(message, limit=360),
         "entity_status": entities.status,
@@ -302,6 +338,10 @@ def build_routing_context(
         "active_pair_present": len(routing_state.active_entities) >= 2,
         "active_entities_present": bool(routing_state.active_entities),
         "active_entity_count": len(routing_state.active_entities),
+        "active_entities": list(routing_state.active_entities),
+        "recent_turns": recent_turns,
+        "recent_entity_candidates": recent_entity_candidates[:2],
+        "recent_turn_count": len(recent_turns),
         "ui_entity_present": bool((ui_context or {}).get("selected_ip")),
         "ui_selected_entity_present": bool((ui_context or {}).get("selected_ip")),
         "previous_provider": routing_state.last_provider,
@@ -391,6 +431,13 @@ def validate_router_payload(
     requires_knowledge = bool(payload.get("requires_knowledge", False))
     requires_multiple = payload["requires_multiple_entities"]
     exhaustive_connections = is_exhaustive_connection_request(message)
+    graph_like_scope = scope in {"node_summary", "one_hop", "full_neighbors", "two_hop", "path", "multi_entity_comparison"}
+    if (
+        len(entities.entities) > 2
+        and intent not in {"general_knowledge", "unclear"}
+        and (requires_graph or graph_like_scope or requires_multiple)
+    ):
+        raise ValueError("entity_requirement_failed:too_many_entities")
 
     requested_entity_binding = str(payload.get("entity_binding") or "")
     binding_normalized = False
@@ -434,6 +481,7 @@ def validate_router_payload(
         entities,
         routing_state,
         ui_context=ui_context,
+        requires_multiple_entities=requires_multiple or scope == "multi_entity_comparison",
     )
     entity_count = len(materialized_entities.entities)
     is_followup = payload["is_followup"]
@@ -625,17 +673,26 @@ class SemanticIntentRouter:
         routing_state: SessionRoutingState,
         *,
         ui_context: dict[str, Any] | None = None,
+        recent_messages: list[dict[str, str]] | None = None,
+        trace_id: str = "",
         request_id: str = "",
     ) -> IntentDecision:
         if not self.settings.intent_router_enabled:
             return self.disabled_decision()
 
-        routing_context = build_routing_context(message, entities, routing_state, ui_context=ui_context)
+        routing_context = build_routing_context(
+            message,
+            entities,
+            routing_state,
+            ui_context=ui_context,
+            recent_messages=recent_messages,
+        )
         return self._classify_with_context(
             routing_context,
             entities,
             routing_state=routing_state,
             ui_context=ui_context,
+            trace_id=trace_id,
             request_id=request_id,
         )
 
@@ -646,6 +703,7 @@ class SemanticIntentRouter:
         *,
         routing_state: SessionRoutingState | None = None,
         ui_context: dict[str, Any] | None = None,
+        trace_id: str = "",
         request_id: str = "",
     ) -> IntentDecision:
         started = time.perf_counter()
@@ -678,6 +736,7 @@ class SemanticIntentRouter:
                 timeout_seconds=router_request.read_timeout_seconds,
                 purpose="intent_router",
                 transient_retries=0,
+                trace_id=trace_id,
             )
         except LLMError as exc:
             logger.warning(
@@ -751,6 +810,7 @@ class SemanticIntentRouter:
                 timeout_seconds=repair_request.read_timeout_seconds,
                 purpose="intent_router_repair",
                 transient_retries=0,
+                trace_id=trace_id,
             )
         except LLMError as exc:
             logger.warning(

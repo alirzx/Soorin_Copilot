@@ -63,6 +63,22 @@ class FakeSession:
             raise response
         return response
 
+    def request(
+        self,
+        method: str,
+        url: str,
+        *,
+        headers: dict[str, str],
+        timeout: tuple[int, int],
+        json: dict[str, Any] | None = None,
+    ) -> FakeResponse:
+        method = method.upper()
+        if method == "GET":
+            return self.get(url, headers=headers, timeout=timeout)
+        if method == "POST":
+            return self.post(url, headers=headers, json=json or {}, timeout=timeout)
+        raise AssertionError(f"Unsupported method in FakeSession: {method}")
+
 
 def make_settings(**overrides: Any):
     values = {
@@ -198,6 +214,35 @@ class ProductAssetEndpointTests(unittest.TestCase):
         )
         self.assertEqual(session.get_calls[1]["headers"]["Authorization"], "Bearer refreshed-token")
         self.assertEqual(session.get_calls[1]["headers"]["x-hwid"], "test-hwid")
+
+    def test_post_json_reuses_shared_login_hwid_and_idempotency_header(self) -> None:
+        session = FakeSession(
+            [],
+            post_responses=[
+                FakeResponse(401, {}),
+                FakeResponse(200, {"accessToken": "refreshed-token"}),
+                FakeResponse(200, {"accepted": True}),
+            ],
+        )
+        client = self.client(session)
+
+        payload, status_code, _elapsed = client.post_json(
+            "http://backend.example.com/internal/llm-usage/requests",
+            {"request_id": "req-usage", "call_count": 1},
+            request_id="req-usage",
+            idempotency_key="req-usage",
+        )
+
+        self.assertEqual(status_code, 200)
+        self.assertEqual(payload, {"accepted": True})
+        self.assertEqual(len(session.post_calls), 3)
+        self.assertEqual(session.post_calls[0]["url"], "http://backend.example.com/internal/llm-usage/requests")
+        self.assertEqual(session.post_calls[1]["url"], "http://product.invalid/auth/login")
+        self.assertEqual(session.post_calls[2]["url"], "http://backend.example.com/internal/llm-usage/requests")
+        self.assertEqual(session.post_calls[2]["headers"]["Authorization"], "Bearer refreshed-token")
+        self.assertEqual(session.post_calls[2]["headers"]["x-hwid"], "test-hwid")
+        self.assertEqual(session.post_calls[2]["headers"]["Idempotency-Key"], "req-usage")
+        self.assertEqual(session.post_calls[2]["timeout"], (7, 11))
 
     def test_second_401_and_other_http_failures_remain_typed(self) -> None:
         session = FakeSession(

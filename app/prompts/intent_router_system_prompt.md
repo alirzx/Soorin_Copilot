@@ -174,6 +174,8 @@ Explicit message entities override conflicting UI selections. UI selection overr
 
 Referential wording may use supplied active entities, including this asset, this host, it, that IP, selected node, previous asset, both assets, them, their profiles, and their classifications.
 
+For comparison references, use supplied active entities and recent turns instead of returning `unclear` when the pair is resolvable.
+
 Set `is_followup=true` only when active state is required. Explicit self-contained requests normally use false. General-topic detachment uses entity_binding=`none` and no environment provider.
 
 ## Entity count
@@ -181,6 +183,8 @@ Set `is_followup=true` only when active state is required. Explicit self-contain
 One or two resolved assets may use Graph, Detection, Asset Profile, and Knowledge.
 
 For two assets, set `requires_multiple_entities=true` and retrieve the selected evidence for both.
+
+When one explicit entity is compared with it, this asset, previous asset, prior host, or another supplied recent entity, route as a two-asset comparison using `entity_binding="explicit"`.
 
 Graph pair routes:
 

@@ -164,14 +164,12 @@ class ExhaustiveGraphBudgetTests(unittest.TestCase):
     def test_large_complete_graph_is_compacted_instead_of_dropped(self) -> None:
         composer = ContextComposer(settings())
         context_package = package()
-        full_candidate_tokens = approx_tokens(composer._compose_graph(context_package))
-
         text = composer.compose(context_package, base_input_tokens=5500, request_id="budget-large")
 
-        self.assertGreater(full_candidate_tokens, 8000)
         self.assertTrue(composer.last_parts["graph"])
         self.assertEqual(composer.last_inclusion["graph"], (True, None))
-        self.assertEqual(composer.last_representation["graph"], "compact")
+        self.assertEqual(composer.last_representation["graph"], "full_neighbors_summary")
+        self.assertLessEqual(approx_tokens(composer.last_parts["graph"]), 3000)
         self.assertLessEqual(approx_tokens(text), 12932)
 
     def test_exact_totals_and_complete_peer_edge_inclusion_are_preserved(self) -> None:
@@ -179,35 +177,45 @@ class ExhaustiveGraphBudgetTests(unittest.TestCase):
         context_package = package()
         composer.compose(context_package, base_input_tokens=5500)
         graph_coverage = manifest(composer)["provider_coverage"]["graph"]
+        product_coverage = manifest(composer)["provider_coverage"]
 
         self.assertEqual(graph_coverage["returned_node_count"], 255)
-        self.assertEqual(graph_coverage["included_node_count"], 255)
+        self.assertLess(graph_coverage["included_node_count"], 255)
         self.assertEqual(graph_coverage["returned_edge_count"], 272)
-        self.assertEqual(graph_coverage["included_edge_count"], 272)
+        self.assertEqual(graph_coverage["included_edge_count"], 0)
         self.assertTrue(graph_coverage["retrieval_complete"])
-        self.assertTrue(graph_coverage["serialized_context_complete_for_retrieved_subset"])
-        self.assertTrue(graph_coverage["model_input_graph_complete"])
-        self.assertTrue(graph_coverage["complete_for_user_request"])
-        self.assertIn('"subnet_groups"', composer.last_parts["graph"])
-        self.assertIn('"direction":"bidirectional"', composer.last_parts["graph"])
+        self.assertFalse(graph_coverage["serialized_context_complete_for_retrieved_subset"])
+        self.assertFalse(graph_coverage["model_input_graph_complete"])
+        self.assertFalse(graph_coverage["complete_for_user_request"])
+        self.assertIn('"omitted_peer_count"', composer.last_parts["graph"])
+        self.assertIn('"continuation_guidance"', composer.last_parts["graph"])
+        self.assertIn("[ASSET_PROFILE_FULL_MINIFIED_JSON", composer.last_parts["asset_profile"])
+        self.assertIn("[ASSET_DETECTION_FULL_MINIFIED_JSON", composer.last_parts["detection"])
+        self.assertTrue(product_coverage["asset_profile"]["payload_complete"])
+        self.assertTrue(product_coverage["asset_detection"]["payload_complete"])
 
-    def test_large_profile_and_detection_remain_as_explicit_compact_evidence(self) -> None:
+    def test_oversized_complete_product_payloads_fail_without_truncation(self) -> None:
         composer = ContextComposer(settings())
         composer.compose(package(large_products=True), base_input_tokens=5500)
         coverage = manifest(composer)["provider_coverage"]
         profile_entity = coverage["asset_profile"]["entities"][TARGET]
         detection_entity = coverage["asset_detection"]["entities"][TARGET]
 
-        self.assertIn("[ASSET_PROFILE_COMPACT_JSON", composer.last_parts["asset_profile"])
-        self.assertTrue(composer.last_parts["detection"])
-        self.assertEqual(profile_entity["representation"], "compact")
-        self.assertIn(detection_entity["representation"], {"full", "compact"})
+        self.assertEqual(composer.last_parts["asset_profile"], "")
+        self.assertEqual(composer.last_parts["detection"], "")
+        self.assertEqual(composer.last_parts["graph"], "")
+        self.assertEqual(profile_entity["representation"], "excluded")
+        self.assertEqual(detection_entity["representation"], "excluded")
         self.assertFalse(coverage["asset_profile"]["payload_complete"])
-        self.assertEqual(
-            coverage["asset_detection"]["payload_complete"],
-            detection_entity["representation"] == "full",
-        )
+        self.assertFalse(coverage["asset_detection"]["payload_complete"])
         self.assertTrue(profile_entity["source_payload_complete"])
+        self.assertFalse(profile_entity["projection_truncated"])
+        self.assertEqual(profile_entity["projection_omitted_count"], 0)
+        self.assertTrue(composer.required_context_missing)
+        self.assertEqual(
+            composer.required_context_missing_reason,
+            "required_product_payloads_exceed_context",
+        )
 
     def test_history_budget_drops_stale_assistant_report_before_user_context(self) -> None:
         stale_report = "STALE-PEER-LIST " * 4000
@@ -245,7 +253,11 @@ class ExhaustiveGraphBudgetTests(unittest.TestCase):
             fixed_tokens + approx_tokens(text) + 12288 + 2048,
             32768,
         )
-        self.assertTrue(coverage["model_input_graph_included"])
+        self.assertFalse(coverage["model_input_graph_included"])
+        self.assertEqual(
+            composer.required_context_missing_reason,
+            "required_product_payloads_exceed_context",
+        )
 
     def test_impossibly_small_budget_marks_required_graph_missing(self) -> None:
         composer = ContextComposer(
@@ -263,7 +275,7 @@ class ExhaustiveGraphBudgetTests(unittest.TestCase):
         self.assertEqual(composer.last_parts["graph"], "")
         self.assertFalse(graph_coverage["model_input_graph_included"])
         self.assertFalse(graph_coverage["complete_for_user_request"])
-        self.assertIn("Do not answer from previous assistant claims", text)
+        self.assertIn("Required complete Product evidence could not fit", text)
 
     def test_node_summary_and_direct_relationship_remain_on_existing_representation(self) -> None:
         graph = exhaustive_graph()
@@ -303,6 +315,8 @@ class ExhaustiveGraphBudgetTests(unittest.TestCase):
             CopilotContextPackage(entities=EntityResolver().resolve(TARGET), graph=direct)
         )
         self.assertIn('"direct_relationship"', composer.last_parts["graph"])
+        self.assertEqual(direct.context["model_context_token_cap"], 700)
+        self.assertLessEqual(direct.context["model_context_token_estimate"], 700)
 
     def test_calibrated_estimate_and_dynamic_output_reservation_are_bounded(self) -> None:
         estimator = TokenEstimator(deployment="gpt55", model="fixture", multiplier=1.35)

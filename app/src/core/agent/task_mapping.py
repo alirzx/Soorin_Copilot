@@ -21,6 +21,9 @@ MULTI_STEP_WORDING = re.compile(
 
 def task_spec_from_route(route: Any, request: str) -> TaskSpec:
     request_lower = request.lower()
+    entities = tuple(dict.fromkeys(getattr(route, "materialized_entities", ()) or ()))
+    if getattr(route, "scope", "none") == "multi_entity_comparison" and len(entities) != 2:
+        raise ValueError("comparison_requires_two_distinct_entities")
     capabilities: list[str] = []
     if getattr(route, "use_asset_profile", False):
         capabilities.append("asset.get_profile")
@@ -52,7 +55,7 @@ def task_spec_from_route(route: Any, request: str) -> TaskSpec:
         intent=str(getattr(route, "intent", "unclear")),
         scope=str(getattr(route, "scope", "none")),
         direction=str(getattr(route, "direction", "none")),
-        entities=tuple(getattr(route, "materialized_entities", ()) or ()),
+        entities=entities,
         required_capabilities=tuple(capabilities),
         workflow_mode="multi_step" if multi_step else "direct",
         semantic_decision_source=str(getattr(route, "decision_source", "unknown")),

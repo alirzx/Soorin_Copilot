@@ -104,6 +104,7 @@ class Settings:
     planner_enabled: bool
     planner_deployment: LLMDeploymentName
     planner_repair_enabled: bool
+    planner_system_prompt_path: str
     agent_max_supplemental_retrievals: int
     agent_max_capability_calls: int
     agent_max_entities: int
@@ -250,6 +251,8 @@ class Settings:
     evidence_snapshot_max_requests: int
     evidence_snapshot_max_total_bytes: int
     evidence_snapshot_max_bytes: int
+    llm_usage_reporting_enabled: bool
+    llm_usage_reporting_url: str
 
     def deployment(self, name: LLMDeploymentName) -> ArvanDeploymentConfig:
         """Build either deployment through the same typed configuration contract."""
@@ -404,6 +407,10 @@ def get_settings() -> Settings:
             _deployment_name("SOORIN_INTENT_ROUTER_DEPLOYMENT"),
         ),
         planner_repair_enabled=_bool("SOORIN_PLANNER_REPAIR_ENABLED", True),
+        planner_system_prompt_path=os.getenv(
+            "SOORIN_PLANNER_SYSTEM_PROMPT_PATH",
+            "app/prompts/planner_system_prompt.md",
+        ).strip(),
         agent_max_supplemental_retrievals=max(0, min(1, _int("SOORIN_AGENT_MAX_SUPPLEMENTAL_RETRIEVALS", 1))),
         agent_max_capability_calls=max(1, min(6, _int("SOORIN_AGENT_MAX_CAPABILITY_CALLS", 6))),
         agent_max_entities=max(1, min(2, _int("SOORIN_AGENT_MAX_ENTITIES", 2))),
@@ -600,6 +607,10 @@ def get_settings() -> Settings:
         evidence_snapshot_max_bytes=max(
             1024, _int("SOORIN_EVIDENCE_SNAPSHOT_MAX_BYTES", 5242880)
         ),
+        llm_usage_reporting_enabled=_bool("LLM_USAGE_REPORTING_ENABLED", True),
+        llm_usage_reporting_url=os.getenv(
+            "LLM_USAGE_REPORTING_URL", ""
+        ).strip(),
     )
     settings.validate_product_paths()
     settings.validate_observability_configuration()

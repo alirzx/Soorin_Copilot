@@ -61,6 +61,16 @@ class ToolResult:
     omitted_section_count: int = 0
     view_token_estimate: int = 0
     normalized_query_hash: str = ""
+    context_identity: str = ""
+    context_inclusion_reason: str | None = None
+    context_representation: str = "unreviewed"
+    context_token_estimate: int = 0
+    context_token_cap: int = 0
+    source_payload_complete: bool = False
+    projection_usable: bool = False
+    usable_fact_count: int = 0
+    projection_truncated: bool = False
+    projection_omitted_count: int = 0
 
 
 @dataclass(frozen=True)
@@ -132,6 +142,7 @@ class EvidencePack:
     time_scope: str = "current_request"
     plan_summary: tuple[dict[str, Any], ...] = ()
     provider_coverage: dict[str, str] = field(default_factory=dict)
+    result_coverage: dict[str, str] = field(default_factory=dict)
     graph_completeness: str = "not_requested"
     rag_citations: tuple[dict[str, Any], ...] = ()
     missing_evidence: tuple[str, ...] = ()
@@ -178,6 +189,15 @@ class CapabilitySpec:
     maximum_result_scope: int | None = None
     required_permissions: tuple[str, ...] = ("read",)
     concurrency_group: str = "default"
+    allowed_arguments: tuple[str, ...] = ()
+    allowed_views: tuple[str, ...] = ()
+    allowed_detail_levels: tuple[str, ...] = ()
+    allowed_purposes: tuple[str, ...] = ()
+    allowed_scopes: tuple[str, ...] = ()
+    allowed_depths: tuple[int, ...] = ()
+    dependencies: tuple[str, ...] = ()
+    reusable_locally: bool = False
+    parallelization: str = "independent_when_dependencies_allow"
 
 
 class InvestigationState(TypedDict, total=False):

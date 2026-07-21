@@ -15,6 +15,20 @@ from src.core.memory.routing_state import SessionRoutingState
 logger = logging.getLogger(__name__)
 IPV4_CANDIDATE_RE = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
 CIDR_CANDIDATE_RE = re.compile(r"(?<![0-9A-Fa-f:.])(?:[0-9A-Fa-f:.]+)/\d{1,3}(?!\d)")
+COMPARISON_REFERENCE_RE = re.compile(
+    r"\b(?:compare|contrast|relate|different\s+from|differs?\s+from|difference\s+between)\b"
+    r".{0,100}\b(?:it|this|that|the\s+(?:same|previous|current)\s+(?:ip|asset|host|node)|"
+    r"previous\s+(?:ip|asset|host|node))\b",
+    re.IGNORECASE,
+)
+COMPARATIVE_SIGNAL_RE = re.compile(
+    r"\b(?:compare|contrast|different|differs?|difference|versus|vs\.?|against|diverge|diverges|similar|same)\b",
+    re.IGNORECASE,
+)
+RECENT_REFERENCE_RE = re.compile(
+    r"\b(?:it|this|that|previous|prior|last|recent|same|asset|host|node|ip|one)\b",
+    re.IGNORECASE,
+)
 REFERENTIAL_ENTITY_PATTERNS: dict[str, re.Pattern[str]] = {
     "this_entity": re.compile(r"\b(?:this|that|the\s+selected|the\s+current)\s+(?:ip|asset|host|node)\b", re.IGNORECASE),
     "same_entity": re.compile(r"\b(?:the\s+)?(?:same|previous)\s+(?:ip|asset|host|node)\b", re.IGNORECASE),
@@ -137,6 +151,18 @@ def _extract_subnets(message: str) -> tuple[tuple[str, ...], str]:
     return tuple(networks), "".join(masked)
 
 
+def _extract_recent_entity_candidates(recent_messages: list[dict[str, str]] | None) -> tuple[str, ...]:
+    candidates: list[str] = []
+    for item in reversed(recent_messages or []):
+        text = item.get("content", "")
+        _subnets, host_text = _extract_subnets(text)
+        for candidate in IPV4_CANDIDATE_RE.findall(host_text):
+            ip = _valid_ipv4(candidate)
+            if ip and ip not in candidates:
+                candidates.append(ip)
+    return tuple(candidates[:2])
+
+
 class EntityResolver:
     """Resolve only IPv4 entities for the frozen baseline."""
 
@@ -164,6 +190,7 @@ class EntityResolver:
         ui_context: dict[str, Any] | None = None,
         routing_state: SessionRoutingState | None = None,
         *,
+        recent_messages: list[dict[str, str]] | None = None,
         request_id: str = "",
     ) -> EntityResolution:
         started = time.perf_counter()
@@ -192,8 +219,25 @@ class EntityResolver:
             ip for raw in (routing_state.active_entities if routing_state else ())
             if (ip := _valid_ipv4(raw))
         ]
+        if not active_ip and len(active_entities) == 1:
+            active_ip = active_entities[0]
+        elif active_ip and active_ip not in active_entities:
+            active_entities = [active_ip, *active_entities]
+        recent_entity_candidates = _extract_recent_entity_candidates(recent_messages)
         reference_detected, reference_type = self._detect_reference(message)
         pair_reference_detected, pair_reference_type = self._detect_pair_reference(message)
+        comparison_reference_detected = bool(COMPARISON_REFERENCE_RE.search(message or ""))
+        comparative_reference_signal = bool(
+            len(message_ips) == 1
+            and COMPARATIVE_SIGNAL_RE.search(message or "")
+            and (reference_detected or RECENT_REFERENCE_RE.search(message or "") or recent_entity_candidates or active_entities)
+        )
+        if comparison_reference_detected:
+            reference_detected = True
+            reference_type = "compare_with_reference"
+        elif comparative_reference_signal and (reference_detected or RECENT_REFERENCE_RE.search(message or "")):
+            reference_detected = True
+            reference_type = "compare_with_reference"
         reference_suppressed, suppression_reason = self._detect_reference_suppression(message)
         if reference_suppressed:
             reference_detected = False
@@ -203,15 +247,24 @@ class EntityResolver:
 
         if (
             len(message_ips) == 1
-            and reference_detected
-            and reference_type == "compare_with_reference"
-            and active_ip
-            and active_ip != message_ips[0]
+            and comparison_reference_detected
+            and (active_ip or recent_entity_candidates)
+            and next(
+                (
+                    ip
+                    for ip in [*active_entities, *recent_entity_candidates]
+                    if ip != message_ips[0]
+                ),
+                None,
+            )
             and not reference_suppressed
         ):
+            comparison_peer = next(
+                ip for ip in [*active_entities, *recent_entity_candidates] if ip != message_ips[0]
+            )
             entities = [
-                ResolvedEntity(type="ip", value=active_ip, source="conversation"),
                 ResolvedEntity(type="ip", value=message_ips[0], source="message"),
+                ResolvedEntity(type="ip", value=comparison_peer, source="conversation"),
             ]
             resolution = EntityResolution(
                 status="resolved",
@@ -223,6 +276,36 @@ class EntityResolver:
                 valid_entity_count=len(entities),
                 reference_detected=True,
                 reference_type=reference_type,
+                reference_suppressed=reference_suppressed,
+                suppression_reason=suppression_reason,
+            )
+        elif (
+            len(message_ips) == 1
+            and comparative_reference_signal
+            and not reference_suppressed
+            and (comparison_peer := next(
+                (
+                    ip
+                    for ip in [*active_entities, *recent_entity_candidates]
+                    if ip != message_ips[0]
+                ),
+                None,
+            ))
+        ):
+            entities = [
+                ResolvedEntity(type="ip", value=message_ips[0], source="message"),
+                ResolvedEntity(type="ip", value=comparison_peer, source="conversation"),
+            ]
+            resolution = EntityResolution(
+                status="resolved",
+                entities=entities,
+                primary_entity=None,
+                entity_mode="multiple",
+                candidate_count=len(entities),
+                explicit_candidate_count=len(explicit_candidates),
+                valid_entity_count=len(entities),
+                reference_detected=True,
+                reference_type="compare_with_reference",
                 reference_suppressed=reference_suppressed,
                 suppression_reason=suppression_reason,
             )

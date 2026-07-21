@@ -231,17 +231,19 @@ class TestPlanner:
         assert plan.planner_called
         assert llm.purposes == ["planner"]
 
-    def test_malformed_output_gets_only_one_repair(self):
+    def test_malformed_output_fails_after_one_planner_call(self):
         llm = self.FakeLLM([
             "not json",
             '{"goal":"check","target_entities":["192.0.2.10"],"steps":[],"stop_condition":"done"}',
         ])
         planner = BoundedPlanner(llm)
-        planner.plan(task("a", mode="multi_step"), (self.capability(),), request_id="r1")
-        assert planner.last_repair_used
-        assert llm.purposes == ["planner", "planner_repair"]
+        with pytest.raises(PlannerError) as captured:
+            planner.plan(task("a", mode="multi_step"), (self.capability(),), request_id="r1")
+        assert captured.value.code == "planner_schema_invalid"
+        assert not planner.last_repair_used
+        assert llm.purposes == ["planner"]
 
-    def test_extra_prose_triggers_repair_instead_of_accepting_nested_json(self):
+    def test_extra_prose_fails_without_second_planner_call(self):
         valid = (
             '{"goal":"check","target_entities":["192.0.2.10"],'
             '"steps":[{"step_id":"s1","capability":"a",'
@@ -251,14 +253,15 @@ class TestPlanner:
         )
         llm = self.FakeLLM([f"Planner result: {valid}", valid])
 
-        plan = BoundedPlanner(llm).plan(
-            task("a", mode="multi_step"),
-            (self.capability(),),
-            request_id="r1",
-        )
+        with pytest.raises(PlannerError) as captured:
+            BoundedPlanner(llm).plan(
+                task("a", mode="multi_step"),
+                (self.capability(),),
+                request_id="r1",
+            )
 
-        assert plan.steps[0].arguments["metadata"] == {"nested": True}
-        assert llm.purposes == ["planner", "planner_repair"]
+        assert captured.value.code == "planner_schema_invalid"
+        assert llm.purposes == ["planner"]
 
     def test_direct_task_never_calls_planner(self):
         llm = self.FakeLLM([])
@@ -486,7 +489,7 @@ class TestEvidenceAndReview:
         )
         assert serialization.completeness == "partial"
 
-    def test_multiple_product_views_reuse_one_request_scoped_fetch(self):
+    def test_complete_product_payload_does_not_request_supplemental_projection(self):
         calls = []
         settings = SimpleNamespace(
             detection_cache_enabled=False,
@@ -541,26 +544,14 @@ class TestEvidenceAndReview:
             detail_level="deep",
         )
         decision = EvidenceReviewer().review(deep_task, [first], allow_supplemental=True)
-        assert decision.supplemental_allowed
-        supplemental = PlanValidator(registry).validate(
-            compile_supplemental_plan(
-                deep_task,
-                decision.next_capability,
-                decision.next_arguments,
-                plan_id="p1",
-            )
-        )
-        second = CapabilityExecutor(registry).execute(
-            supplemental,
-            base_payload={"request_id": "r1", "session_id": "s1"},
-        )[0]
+        assert not decision.supplemental_allowed
+        assert decision.next_capability is None
         assert len(calls) == 1
-        assert first.provider_result is second.provider_result
-        assert first.raw_payload is second.raw_payload
         assert first.selected_views == ("overview", "identity_role")
-        assert second.selected_views == ("services_software", "security_posture", "evidence_deep")
-        assert first.view_payload != first.raw_payload
-        assert "must-not-appear" not in json.dumps(second.view_payload)
+        assert first.view_payload == first.raw_payload
+        assert "must-not-appear" in json.dumps(first.view_payload)
+        assert not first.projection_truncated
+        assert first.projection_omitted_count == 0
 
     def test_task_steps_are_recommendations_not_plan_security_limits(self):
         current = task("a")

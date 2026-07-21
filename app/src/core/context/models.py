@@ -244,6 +244,7 @@ class AssetProfileProviderResult:
 class CopilotContextPackage:
     entities: EntityResolution
     graph: GraphProviderResult | None = None
+    graphs: list[GraphProviderResult] = field(default_factory=list)
     detections: list[DetectionProviderResult] = field(default_factory=list)
     asset_profiles: list[AssetProfileProviderResult] = field(default_factory=list)
     knowledge: KnowledgeSearchResult | None = None
@@ -253,11 +254,15 @@ class CopilotContextPackage:
     @property
     def has_model_context(self) -> bool:
         return bool(
-            (self.graph and self.graph.status in {"available", "not_found"})
+            any(item.status in {"available", "not_found"} for item in self.graph_results)
             or any(item.status in {"available", "not_found"} for item in self.detections)
             or any(item.status in {"available", "not_found"} for item in self.asset_profiles)
             or bool(self.knowledge and self.knowledge.status in {"ok", "partial", "empty"})
         )
+
+    @property
+    def graph_results(self) -> list[GraphProviderResult]:
+        return self.graphs or ([self.graph] if self.graph else [])
 
     @property
     def detection(self) -> DetectionProviderResult | None:

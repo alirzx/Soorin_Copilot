@@ -6,7 +6,7 @@ import logging
 import ipaddress
 import time
 from typing import Any
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -75,30 +75,58 @@ class ProductApiClient:
             "Accept": "application/json",
         }
 
-    def get_json(self, endpoint_path: str, *, request_id: str = "") -> tuple[Any, int, float]:
-        """Fetch JSON from a product endpoint without logging sensitive data."""
+    def _resolve_url(self, endpoint_or_url: str) -> tuple[str, str]:
+        if endpoint_or_url.startswith(("http://", "https://")):
+            parsed = urlsplit(endpoint_or_url)
+            path = parsed.path or "/"
+            if parsed.query:
+                path = f"{path}?{parsed.query}"
+            return endpoint_or_url, path
+        endpoint_path = endpoint_or_url
         if not endpoint_path.startswith("/"):
             endpoint_path = f"/{endpoint_path}"
-        url = f"{self.base_url}{endpoint_path}"
+        return f"{self.base_url}{endpoint_path}", endpoint_path
 
-        logger.info("event=product_request_started request_id=%s endpoint_path=%s", request_id, endpoint_path)
+    def _request_json(
+        self,
+        method: str,
+        endpoint_or_url: str,
+        *,
+        request_id: str = "",
+        json_body: Any | None = None,
+        extra_headers: dict[str, str] | None = None,
+    ) -> tuple[Any, int, float]:
+        method = method.upper()
+        url, endpoint_path = self._resolve_url(endpoint_or_url)
+        logger.info(
+            "event=product_request_started request_id=%s method=%s endpoint_path=%s",
+            request_id,
+            method,
+            endpoint_path,
+        )
         started = time.perf_counter()
         response = None
         self.last_auth_retry_count = 0
         for attempt in range(2):
             try:
-                response = self.session.get(
-                    url,
-                    headers=self._headers(
-                        request_id=request_id,
-                        reason="retry_after_401" if attempt else "request",
-                    ),
-                    timeout=(self.connect_timeout, self.read_timeout),
+                headers = self._headers(
+                    request_id=request_id,
+                    reason="retry_after_401" if attempt else "request",
                 )
+                if extra_headers:
+                    headers.update(extra_headers)
+                request_kwargs: dict[str, Any] = {
+                    "headers": headers,
+                    "timeout": (self.connect_timeout, self.read_timeout),
+                }
+                if json_body is not None:
+                    request_kwargs["json"] = json_body
+                response = self.session.request(method, url, **request_kwargs)
             except requests.RequestException as exc:
                 logger.warning(
-                    "event=product_request_exception request_id=%s endpoint_path=%s error_type=%s",
+                    "event=product_request_exception request_id=%s method=%s endpoint_path=%s error_type=%s",
                     request_id,
+                    method,
                     endpoint_path,
                     type(exc).__name__,
                 )
@@ -109,11 +137,13 @@ class ProductApiClient:
 
             self.last_auth_retry_count = 1
             logger.info(
-                "event=product_auth_retry_after_401 request_id=%s reason=unauthorized status_code=%s token_age_seconds=%s retry_count=%s",
+                "event=product_auth_retry_after_401 request_id=%s reason=unauthorized status_code=%s token_age_seconds=%s retry_count=%s method=%s endpoint_path=%s",
                 request_id,
                 response.status_code,
                 self.auth_manager.token_age_seconds,
                 self.last_auth_retry_count,
+                method,
+                endpoint_path,
             )
             self.auth_manager.invalidate()
 
@@ -122,8 +152,9 @@ class ProductApiClient:
 
         elapsed = time.perf_counter() - started
         logger.info(
-            "event=product_response_received request_id=%s endpoint_path=%s status_code=%s elapsed_ms=%s auth_source=%s token_refreshed=%s auth_retry_count=%s",
+            "event=product_response_received request_id=%s method=%s endpoint_path=%s status_code=%s elapsed_ms=%s auth_source=%s token_refreshed=%s auth_retry_count=%s",
             request_id,
+            method,
             endpoint_path,
             response.status_code,
             int(elapsed * 1000),
@@ -147,6 +178,29 @@ class ProductApiClient:
             return response.json(), response.status_code, elapsed
         except ValueError as exc:
             raise ProductApiError("Product API response was not valid JSON.") from exc
+
+    def get_json(self, endpoint_path: str, *, request_id: str = "") -> tuple[Any, int, float]:
+        """Fetch JSON from a product endpoint without logging sensitive data."""
+        return self._request_json("GET", endpoint_path, request_id=request_id)
+
+    def post_json(
+        self,
+        endpoint_or_url: str,
+        payload: dict[str, Any],
+        *,
+        request_id: str = "",
+        idempotency_key: str = "",
+    ) -> tuple[Any, int, float]:
+        headers = {"Content-Type": "application/json"}
+        if idempotency_key:
+            headers["Idempotency-Key"] = idempotency_key
+        return self._request_json(
+            "POST",
+            endpoint_or_url,
+            request_id=request_id,
+            json_body=payload,
+            extra_headers=headers,
+        )
 
     def fetch_topology_unique_ip_pairs(self) -> ProductTopologyResponse:
         """Fetch currently supported topology unique communication pairs."""

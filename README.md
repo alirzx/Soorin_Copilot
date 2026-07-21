@@ -54,7 +54,7 @@ Four roles remain deliberately separate:
 - **Reviewer:** deterministically decides whether evidence is sufficient, limited, missing, or unsafe for synthesis.
 - **Synthesizer:** explains reviewed evidence; it does not select providers or mutate session state.
 
-Direct profile, detection, graph, pair/path, and knowledge requests compile deterministic plans and skip the Planner. Multi-step requests can use one Planner proposal and one schema-repair attempt only when `SOORIN_PLANNER_ENABLED=true`. The deployment remains configurable; GPT-5.5 is the currently recommended Planner deployment.
+Direct profile, detection, graph, pair/path, and knowledge requests compile deterministic plans and skip the Planner. Multi-step requests can use exactly one Planner proposal when `SOORIN_PLANNER_ENABLED=true`. Invalid proposals receive at most one deterministic mechanical repair before deterministic fallback; the Planner model is never called a second time. The deployment remains configurable; GPT-5.5 is the currently recommended Planner deployment. The tracked JSON-only retrieval prompt is `app/prompts/planner_system_prompt.md`.
 
 `CapabilityRegistry` is the only normal provider execution boundary. Independent Graph and Knowledge steps may overlap. Product Profile and Detection steps are serialized because they share one Product client/session. Tool outputs become canonical `ToolResult` records, including status, freshness, completeness, counts, limitations, citations, and the original typed provider result.
 
@@ -62,7 +62,11 @@ The first review evaluates retrieval sufficiency and may authorize one supplemen
 
 Workflow events use compact allowlisted metadata with request, trace, plan, and step IDs. System logs retain deployment, status, count, latency, cache, freshness, and completeness metadata without secrets, prompts, raw provider payloads, hidden reasoning, or full model responses.
 
-Phase 2.1 adds bounded Product evidence views, request-scoped one-fetch reuse, validated Knowledge deduplication, request-specific graph completeness, conservative deployment-aware token estimates, strict offline BGE loading, optional secure evidence snapshots, and an exact greeting/thanks fast path. Detection views are `overview`, `identity_role`, `anomaly_risk`, `behavior`, and `evidence_deep`; Profile views are `overview`, `identity_role`, `services_software`, `security_posture`, and `evidence_deep`. `TaskSpec.recommended_steps` describes semantic complexity only; `PlanValidator` and configured limits remain the security boundary.
+Phase 2.1 adds bounded deduplicated Product evidence views, request-scoped one-fetch reuse, validated Knowledge deduplication, request-specific graph completeness, conservative deployment-aware token estimates, strict offline BGE loading, optional secure evidence snapshots, and an exact greeting/thanks fast path. Product context is one ranked `projected` fact block per provider/entity; raw Product payloads remain internal. Detection views are `overview`, `identity_role`, `anomaly_risk`, `behavior`, and `evidence_deep`; Profile views are `overview`, `identity_role`, `services_software`, `security_posture`, and `evidence_deep`. `TaskSpec.recommended_steps` describes semantic complexity only; `PlanValidator` and configured limits remain the security boundary.
+
+Graph semantics are separate from safety budgets: the Router owns scope/direction/depth, retrieval applies named node/edge ceilings, and Context Composer applies independent serialization/token limits. `node_summary` is aggregate-only by default. Every Graph `ToolResult` has a capability/entity/scope identity, so summary, neighbors, relationship, comparison, and path results are reviewed independently and cannot be overwritten by provider name.
+
+Conversation continuity uses bounded in-process Working Memory plus Episodic Session Memory. A typed context key groups related turns by entities, topic family, relationship mode, and scope family. Explicit entity/pair or topic changes archive a deterministic compact episode and detach its raw messages; a prior summary can return only when its context key is relevant again.
 
 ## Repository Layout
 
@@ -195,7 +199,7 @@ SOORIN_PLANNER_ENABLED=true
 SOORIN_PLANNER_DEPLOYMENT=gpt55
 ```
 
-Execution remains capped at six capability calls, two resolved entities, graph depth two, four executor workers, and one supplemental retrieval. The Planner always has one proposal pass; the repair setting permits at most one schema-repair call.
+Execution remains capped at six capability calls, two resolved entities, graph depth two, four executor workers, and one supplemental retrieval. The Planner always has one proposal pass; the repair setting permits at most one deterministic mechanical repair, not another model call.
 
 ## Local Run
 

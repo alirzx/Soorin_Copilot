@@ -6,7 +6,12 @@ from dataclasses import replace
 from typing import Any
 
 from src.core.agent.contracts import EvidencePack, ExecutionPlan, ReviewDecision, TaskSpec, ToolResult
-from src.core.context.product_views import approved_views
+from src.core.agent.context_identity import identity_for_tool_result
+
+
+_NO_DEDICATED_ANOMALY_EVIDENCE = (
+    "No dedicated anomaly provider evidence is available; only bounded graph structural analysis is supplied."
+)
 
 
 class EvidenceReviewer:
@@ -96,36 +101,51 @@ class EvidenceReviewer:
                     f"{capability} was unavailable for this request." for capability in failed
                 ),
             )
-        if allow_supplemental and task.detail_level in {"detailed", "deep", "report"}:
-            for result in required:
-                provider = (
-                    "asset_profile"
-                    if result.source_capability == "asset.get_profile"
-                    else "detection"
-                    if result.source_capability == "asset.get_detection"
-                    else None
-                )
-                if not provider or not result.selected_views:
-                    continue
-                missing_views = [
-                    view for view in approved_views(provider) if view not in result.selected_views
+        for capability in ("asset.get_profile", "asset.get_detection"):
+            if capability not in task.required_capabilities:
+                continue
+            for entity in task.entities:
+                entity_results = [
+                    result
+                    for result in by_capability[capability]
+                    if entity in result.entities and result.status in {"ok", "partial"}
                 ]
-                if missing_views:
-                    return ReviewDecision(
-                        outcome="missing_required_evidence",
-                        reasons=("A bounded local Product evidence view can complete the deep request.",),
-                        missing_capabilities=(result.source_capability,),
-                        supplemental_allowed=True,
-                        next_capability=result.source_capability,
-                        next_arguments={
-                            "entities": list(result.entities),
-                            "views": missing_views,
-                            "detail": "deep",
-                            "max_context_tokens": 2000,
-                            "purpose": "supplemental_evidence",
-                        },
-                    )
+                if not entity_results:
+                    continue
+                usable = any(
+                    result.context_included
+                    and result.context_representation == "full_minified"
+                    and result.source_payload_complete
+                    and result.projection_usable
+                    and not result.projection_truncated
+                    and result.projection_omitted_count == 0
+                    for result in entity_results
+                )
+                if usable:
+                    continue
+                limitation = (
+                    f"{capability} retrieval succeeded for {entity}, but its complete minified payload "
+                    "was not available in model context."
+                )
+                return ReviewDecision(
+                    outcome="answer_with_limitations",
+                    reasons=(limitation,),
+                    missing_capabilities=(capability,),
+                    limitations=(limitation,),
+                )
         limitations: list[str] = []
+        dedicated_anomaly_evidence = any(
+            result.source_capability == "asset.get_detection"
+            and "anomaly_risk" in result.selected_views
+            and result.status in {"ok", "partial"}
+            and result.context_included
+            and result.context_representation == "full_minified"
+            and result.source_payload_complete
+            and result.projection_usable
+            and not result.projection_truncated
+            and result.projection_omitted_count == 0
+            for result in required
+        )
         for result in required:
             if result.status in {"partial", "empty", "not_found"}:
                 limitations.append(f"{result.source_capability} status is {result.status}.")
@@ -135,9 +155,45 @@ class EvidenceReviewer:
                 limitations.append(f"{result.source_capability} evidence is incomplete or truncated.")
             if not result.context_included:
                 limitations.append(f"{result.source_capability} evidence was not included in model context.")
+            if (
+                result.source_capability.startswith("graph.")
+                and result.context_included
+                and result.context_token_cap > 0
+                and result.context_token_estimate > result.context_token_cap
+            ):
+                limitations.append(
+                    f"{result.source_capability} model context exceeded its scope-specific token cap."
+                )
+            if result.source_capability.startswith("graph."):
+                graph_context = getattr(result.provider_result, "context", None)
+                graph_context = graph_context if isinstance(graph_context, dict) else {}
+                retrieved_nodes = int(graph_context.get("retrieved_node_count") or 0)
+                retrieved_edges = int(graph_context.get("retrieved_edge_count") or 0)
+                included_nodes = int(graph_context.get("included_node_count") or 0)
+                included_edges = int(graph_context.get("included_edge_count") or 0)
+                omitted_peers = int(graph_context.get("model_context_omitted_peer_count") or 0)
+                serialization_truncated = bool(
+                    graph_context.get("serialized_context_truncated", False)
+                )
+                if included_nodes > retrieved_nodes or included_edges > retrieved_edges:
+                    limitations.append(
+                        f"{result.source_capability} reported inconsistent retrieval and model-context counts."
+                    )
+                if omitted_peers > 0 and not serialization_truncated:
+                    limitations.append(
+                        f"{result.source_capability} reported omitted peers without truncation metadata."
+                    )
+                if serialization_truncated:
+                    limitations.append(
+                        f"{result.source_capability} model context contains a bounded subset of retrieved graph evidence."
+                    )
             if result.contradictions:
                 limitations.append(f"{result.source_capability} reported contradictions.")
-            limitations.extend(result.limitations)
+            limitations.extend(
+                item
+                for item in result.limitations
+                if not (dedicated_anomaly_evidence and item == _NO_DEDICATED_ANOMALY_EVIDENCE)
+            )
         if limitations:
             return ReviewDecision(
                 outcome="answer_with_limitations",
@@ -172,12 +228,28 @@ class EvidenceReviewer:
             if graph_results
             else "missing"
         )
+        dedicated_anomaly_evidence = any(
+            result.source_capability == "asset.get_detection"
+            and "anomaly_risk" in result.selected_views
+            and result.status in {"ok", "partial"}
+            and result.source_payload_complete
+            and result.projection_usable
+            for result in results
+        )
         return EvidencePack(
             task=task,
             tool_results=tuple(results),
             facts=tuple(fact for result in results for fact in result.facts),
             limitations=tuple(
-                dict.fromkeys(limitation for result in results for limitation in result.limitations)
+                dict.fromkeys(
+                    limitation
+                    for result in results
+                    for limitation in result.limitations
+                    if not (
+                        dedicated_anomaly_evidence
+                        and limitation == _NO_DEDICATED_ANOMALY_EVIDENCE
+                    )
+                )
             ),
             contradictions=tuple(
                 dict.fromkeys(item for result in results for item in result.contradictions)
@@ -197,6 +269,10 @@ class EvidenceReviewer:
                 for step in (plan.steps if plan else ())
             ),
             provider_coverage=coverage,
+            result_coverage={
+                result.context_identity or identity_for_tool_result(result): result.status
+                for result in results
+            },
             graph_completeness=graph_completeness,
             rag_citations=tuple(citation for result in results for citation in result.citations),
             missing_evidence=missing,

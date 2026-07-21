@@ -35,6 +35,7 @@ from src.core.llm.errors import LLMError
 from src.core.llm.providers.base import LLMProviderResult, LLMStreamEvent
 from src.core.llm.token_estimator import TokenEstimator
 from src.core.memory.routing_state import SessionRoutingState, SessionRoutingStateStore
+from src.core.memory.episodes import MemoryContextKey
 from src.core.memory.store import MemoryStore
 from src.core.copilot.trace import CopilotRequestTrace, render_human_copilot_trace
 from src.core.copilot.fallback_answer import build_evidence_fallback_answer
@@ -42,7 +43,7 @@ from src.core.graph.loader import get_graph_metadata
 from src.core.graph.refresh import get_refresh_status
 from src.core.product_client import ProductApiClient
 from src.core.rag.service import KnowledgeSearchService
-from src.core.observability import EvidenceSnapshotWriter
+from src.core.observability import EvidenceSnapshotWriter, ProductUsageReporter
 
 
 logger = logging.getLogger(__name__)
@@ -85,6 +86,9 @@ class CopilotService:
         llm_client: LLMClient,
         memory_store: MemoryStore,
         routing_state_store: SessionRoutingStateStore | None = None,
+        *,
+        product_client: ProductApiClient | None = None,
+        usage_reporter: ProductUsageReporter | None = None,
     ) -> None:
         self.settings = settings
         self.llm_client = llm_client
@@ -95,7 +99,9 @@ class CopilotService:
         self.fallback_router = DeterministicFallbackRouter()
         self.intent_router = SemanticIntentRouter(settings, llm_client)
         self.graph_provider = GraphContextProvider(settings)
-        product_client = ProductApiClient(settings)
+        product_client = product_client or ProductApiClient(settings)
+        self.product_client = product_client
+        self.usage_reporter = usage_reporter or ProductUsageReporter(settings, product_client)
         self.detection_provider = DetectionContextProvider(settings, product_client)
         self.asset_profile_provider = AssetProfileContextProvider(settings, product_client)
         self.knowledge_service = KnowledgeSearchService(settings)
@@ -121,6 +127,7 @@ class CopilotService:
         self.planner = BoundedPlanner(
             llm_client,
             repair_enabled=settings.planner_repair_enabled,
+            system_prompt_path=settings.planner_system_prompt_path,
         )
         self.evidence_reviewer = EvidenceReviewer()
         self._capability_provider_ids = self._current_capability_provider_ids()
@@ -220,7 +227,8 @@ class CopilotService:
             raw_top_level_key_count=sum(item.raw_top_level_key_count for item in results),
             raw_payload_present=all(item.raw_payload_present for item in results) if results else False,
             full_payload_fetched=all(item.full_payload_fetched for item in results) if results else False,
-            full_payload_included=False,
+            raw_payload_retained_internally=all(item.raw_payload_present for item in results) if results else False,
+            model_representation="projected",
             context_chars=0,
             context_approx_tokens=0,
             context_truncated=False,
@@ -302,17 +310,18 @@ class CopilotService:
             for item in fetched
         ]
         reasons = [reason for included, reason in inclusion if not included and reason]
-        if any(representation == "compact" for representation in representations):
-            reasons.append("route_aware_compaction")
         trace.put(
             section,
-            full_payload_included=bool(fetched)
-            and all(included for included, _ in inclusion)
-            and all(representation == "full" for representation in representations),
-            context_representation=", ".join(representations),
+            raw_payload_retained_internally=bool(fetched),
+            model_representation=", ".join(representations),
             context_chars=len(context_text),
             context_approx_tokens=approx_tokens(context_text),
-            context_truncated=bool(reasons),
+            source_payload_complete=bool(fetched) and all(item.full_payload_fetched for item in fetched),
+            projection_usable=bool(fetched) and all(item.full_payload_fetched for item in fetched),
+            projection_truncated=False,
+            projection_omitted_count=0,
+            context_truncated=False,
+            context_omitted=bool(reasons),
             context_truncation_reason=", ".join(dict.fromkeys(reasons)),
         )
 
@@ -327,6 +336,7 @@ class CopilotService:
         timeout_seconds: int,
         sink: Callable[[LLMStreamEvent], None],
         metrics: dict[str, Any],
+        trace_id: str = "",
     ) -> LLMProviderResult:
         """Collect one final-model stream while forwarding safe incremental events."""
         deployment = self.settings.deployment_for_purpose("chat")
@@ -351,6 +361,7 @@ class CopilotService:
                 top_p=top_p,
                 timeout_seconds=timeout_seconds,
                 purpose="chat",
+                trace_id=trace_id,
             ):
                 metrics["stream_chunk_count"] += 1
                 if event.type == "reasoning_delta" and event.text:
@@ -564,14 +575,28 @@ class CopilotService:
         ui_context: dict[str, Any] | None = None,
         request_id: str | None = None,
         stream_sink: Callable[[LLMStreamEvent], None] | None = None,
-    ) -> dict[str, Any]:
+        ) -> dict[str, Any]:
         resolved_request_id = request_id or uuid4().hex[:12]
+        workflow_trace_id = uuid4().hex[:16]
         trivial = self._trivial_response(message)
         if trivial is not None:
             session = (session_id or "").strip() or uuid4().hex
             if self.settings.chat_store_history:
-                self.memory_store.append(session, "user", message.strip())
-                self.memory_store.append(session, "assistant", trivial)
+                general_context = MemoryContextKey()
+                self.memory_store.prepare_for_model(
+                    session,
+                    self.settings,
+                    self.routing_state_store.get(session),
+                    context_key=general_context,
+                    request_id=resolved_request_id,
+                )
+                self.memory_store.record_turn(
+                    session,
+                    message.strip(),
+                    trivial,
+                    general_context,
+                    providers=("deterministic",),
+                )
             if stream_sink is not None:
                 stream_sink(LLMStreamEvent("answer_delta", text=trivial))
             logger.info(
@@ -587,20 +612,51 @@ class CopilotService:
                 "model": "trivial-message-fast-path",
                 "_warnings": [],
             }
-        return self.workflow.run(
-            message=message,
-            session_id=session_id,
-            ui_context=ui_context,
-            request_id=resolved_request_id,
-            stream_sink=stream_sink,
-            typed_executor=self._chat_phase2,
-            direct_executor=self._chat_direct,
-        )
+        usage_scope = self.usage_reporter.start_request(resolved_request_id, workflow_trace_id)
+        request_success = False
+        try:
+            result = self.workflow.run(
+                message=message,
+                session_id=session_id,
+                ui_context=ui_context,
+                request_id=resolved_request_id,
+                trace_id=workflow_trace_id,
+                stream_sink=stream_sink,
+                typed_executor=self._chat_phase2,
+                direct_executor=self._chat_direct,
+            )
+            request_success = True
+            return result
+        finally:
+            self.usage_reporter.finish_request(usage_scope, request_success=request_success)
 
     @staticmethod
     def _trivial_response(message: str) -> str | None:
         normalized = " ".join(message.strip().casefold().split())
         return TRIVIAL_RESPONSES.get(normalized)
+
+    @staticmethod
+    def _bounded_deterministic_response(
+        session: str,
+        answer: str,
+        *,
+        model: str,
+        warning: str,
+        stream_sink: Callable[[LLMStreamEvent], None] | None,
+        phase2_state: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        if stream_sink is not None:
+            stream_sink(LLMStreamEvent("answer_delta", text=answer))
+        response: dict[str, Any] = {
+            "session_id": session,
+            "answer": answer,
+            "provider": "deterministic",
+            "model": model,
+            "_warnings": [warning],
+        }
+        if phase2_state is not None:
+            response["_phase2_state"] = phase2_state
+        return response
 
     def _chat_direct(
         self,
@@ -665,7 +721,7 @@ class CopilotService:
             "ROUTING STATE",
             active_ip_before=routing_state.active_ip or "",
             active_entities_before=", ".join(routing_state.active_entities),
-            active_entity_count_before=len(routing_state.active_entities),
+            active_entity_count_before=len(routing_state.active_entities) or int(bool(routing_state.active_ip)),
             last_provider_before=routing_state.last_provider or "",
             last_providers_before=", ".join(routing_state.last_providers),
             previous_intent=routing_state.previous_intent or "",
@@ -682,10 +738,24 @@ class CopilotService:
             routing_state.active_ip or "",
             routing_state.last_provider or "",
         )
+        recent_messages_for_routing = (
+            self.memory_store.recent_for_routing(
+                session,
+                max(2, self.settings.conversation_recent_raw_messages),
+            )
+            if self.settings.chat_store_history
+            else []
+        )
         entity_started = time.perf_counter()
         events.emit("entity_resolution_started")
         try:
-            entities = self.entity_resolver.resolve(user_text, ui_context, routing_state, request_id=request_id)
+            entities = self.entity_resolver.resolve(
+                user_text,
+                ui_context,
+                routing_state,
+                recent_messages=recent_messages_for_routing,
+                request_id=request_id,
+            )
         except Exception as exc:
             events.emit(
                 "entity_resolution_failed",
@@ -718,7 +788,35 @@ class CopilotService:
             subnet_constraints=", ".join(entities.subnet_constraints),
             unsupported_constraints=", ".join(entities.unsupported_constraints),
         )
-        routing_context = build_routing_context(user_text, entities, routing_state, ui_context=ui_context)
+        if (
+            entities.reference_type == "compare_with_reference"
+            and entities.explicit_candidate_count == 1
+            and len({entity.value for entity in entities.entities}) != 2
+        ):
+            clarification = (
+                "Please provide the second IP address to compare, or first select/investigate "
+                "the previous asset."
+            )
+            events.emit(
+                "comparison_clarification_required",
+                entity_count=len(entities.entities),
+                planner_called=False,
+                safe_error_code="comparison_second_entity_required",
+            )
+            return self._bounded_deterministic_response(
+                session,
+                clarification,
+                model="comparison-entity-guard",
+                warning="comparison_second_entity_required",
+                stream_sink=stream_sink,
+            )
+        routing_context = build_routing_context(
+            user_text,
+            entities,
+            routing_state,
+            ui_context=ui_context,
+            recent_messages=recent_messages_for_routing,
+        )
         trace.put("ROUTER INPUT", **routing_context)
         router_started = time.perf_counter()
         events.emit("router_started", entity_count=len(entities.entities))
@@ -727,6 +825,8 @@ class CopilotService:
             entities,
             routing_state,
             ui_context=ui_context,
+            recent_messages=recent_messages_for_routing,
+            trace_id=trace_id,
             request_id=request_id,
         )
         if intent_decision.fallback_used:
@@ -792,6 +892,42 @@ class CopilotService:
                 }
             )
 
+        if len(set(route.materialized_entities)) > self.settings.agent_max_entities:
+            clarification = "Please provide no more than two IP addresses for this request."
+            events.emit(
+                "entity_clarification_required",
+                intent=route.intent,
+                entity_count=len(set(route.materialized_entities)),
+                planner_called=False,
+                safe_error_code="too_many_entities",
+            )
+            return self._bounded_deterministic_response(
+                session,
+                clarification,
+                model="entity-count-guard",
+                warning="too_many_entities",
+                stream_sink=stream_sink,
+            )
+
+        if (
+            route.scope == "multi_entity_comparison"
+            and len(set(route.materialized_entities)) != 2
+        ):
+            clarification = "Please provide exactly two distinct IP addresses for this comparison."
+            events.emit(
+                "comparison_clarification_required",
+                intent=route.intent,
+                entity_count=len(set(route.materialized_entities)),
+                planner_called=False,
+                safe_error_code="comparison_requires_two_distinct_entities",
+            )
+            return self._bounded_deterministic_response(
+                session,
+                clarification,
+                model="comparison-task-guard",
+                warning="comparison_requires_two_distinct_entities",
+                stream_sink=stream_sink,
+            )
         events.emit("task_validation_started", intent=route.intent, entity_count=len(route_entities.entities))
         try:
             task_spec = task_spec_from_route(route, user_text)
@@ -816,10 +952,15 @@ class CopilotService:
             complexity=task_spec.workflow_mode,
             planner_called=task_spec.workflow_mode == "multi_step" and self.settings.planner_enabled,
         )
+        memory_context_key = MemoryContextKey.from_task(task_spec)
 
         planner_called = False
         planner_fallback_used = False
         planner_latency_ms = 0
+        planner_plan_initially_valid = False
+        planner_repair_attempted = False
+        planner_repair_actions: tuple[str, ...] = ()
+        planner_repair_valid = False
         if task_spec.workflow_mode == "multi_step" and self.settings.planner_enabled:
             planner_called = True
             planner_started = time.perf_counter()
@@ -829,6 +970,7 @@ class CopilotService:
                     task_spec,
                     capability_registry.list(planner_visible=True),
                     request_id=request_id,
+                    trace_id=trace_id,
                     events=events,
                 )
                 planner_latency_ms = int((time.perf_counter() - planner_started) * 1000)
@@ -865,25 +1007,91 @@ class CopilotService:
         events.emit("plan_validation_started", plan_id=execution_plan.plan_id, tool_call_count=len(execution_plan.steps))
         try:
             execution_plan = plan_validator.validate(execution_plan)
+            planner_plan_initially_valid = True
         except PlanValidationError as exc:
             events.emit(
                 "plan_validation_rejected",
                 level=logging.WARNING,
                 plan_id=execution_plan.plan_id,
+                step_id=exc.step_id or "plan",
+                capability=exc.capability or "plan",
+                field=exc.field,
+                validation_rule=exc.validation_rule,
                 error_class=exc.code,
                 safe_error_code=exc.code,
             )
             if execution_plan.source != "llm":
-                raise
-            planner_fallback_used = True
-            execution_plan = plan_validator.validate(
-                replace(
+                safe_answer = (
+                    "I cannot safely execute this comparison because its deterministic plan "
+                    "did not pass validation. No provider calls were made."
+                )
+                events.emit(
+                    "workflow_safe_failure",
+                    plan_id=execution_plan.plan_id,
+                    reason="deterministic_plan_validation_failed",
+                    safe_error_code=exc.code,
+                )
+                return self._bounded_deterministic_response(
+                    session,
+                    safe_answer,
+                    model="plan-validation-guard",
+                    warning="plan_validation_failed",
+                    stream_sink=stream_sink,
+                    phase2_state={
+                        "task": task_spec,
+                        "tool_results": [],
+                        "planner_called": planner_called,
+                        "fallback_used": True,
+                    },
+                )
+            repaired_plan, planner_repair_actions = plan_validator.repair(execution_plan, exc)
+            planner_repair_attempted = bool(planner_repair_actions) and self.settings.planner_repair_enabled
+            if planner_repair_attempted:
+                try:
+                    execution_plan = plan_validator.validate(repaired_plan)
+                    planner_repair_valid = True
+                    events.emit(
+                        "planner_repair_completed",
+                        plan_id=execution_plan.plan_id,
+                        planner_called=True,
+                        reason=",".join(planner_repair_actions),
+                    )
+                except PlanValidationError:
+                    planner_repair_valid = False
+            if not planner_repair_valid:
+                planner_fallback_used = True
+                fallback_plan = replace(
                     compile_direct_plan(task_spec),
                     source="deterministic_fallback",
                     planner_called=True,
                 )
-            )
-            events.emit("planner_fallback_used", plan_id=execution_plan.plan_id, planner_called=True, fallback_used=True)
+                try:
+                    execution_plan = plan_validator.validate(fallback_plan)
+                except PlanValidationError as fallback_exc:
+                    safe_answer = (
+                        "I cannot safely execute this comparison because both the proposed and "
+                        "deterministic fallback plans failed validation. No provider calls were made."
+                    )
+                    events.emit(
+                        "workflow_safe_failure",
+                        plan_id=fallback_plan.plan_id,
+                        reason="fallback_plan_validation_failed",
+                        safe_error_code=fallback_exc.code,
+                    )
+                    return self._bounded_deterministic_response(
+                        session,
+                        safe_answer,
+                        model="plan-validation-guard",
+                        warning="plan_validation_failed",
+                        stream_sink=stream_sink,
+                        phase2_state={
+                            "task": task_spec,
+                            "tool_results": [],
+                            "planner_called": planner_called,
+                            "fallback_used": True,
+                        },
+                    )
+                events.emit("planner_fallback_used", plan_id=execution_plan.plan_id, planner_called=True, fallback_used=True)
         events.emit(
             "plan_validation_completed",
             plan_id=execution_plan.plan_id,
@@ -927,6 +1135,10 @@ class CopilotService:
             source=execution_plan.source,
             plan_id=execution_plan.plan_id,
             latency_ms=planner_latency_ms,
+            plan_initially_valid=planner_plan_initially_valid,
+            repair_attempted=planner_repair_attempted,
+            repair_actions=", ".join(planner_repair_actions),
+            repair_valid=planner_repair_valid,
             fallback_used=planner_fallback_used,
         )
         trace.put(
@@ -1408,7 +1620,13 @@ class CopilotService:
             chat_request.max_tokens,
         )
         conversation_snapshot = (
-            self.memory_store.prepare_for_model(session, self.settings, routing_state, request_id=request_id)
+            self.memory_store.prepare_for_model(
+                session,
+                self.settings,
+                routing_state,
+                context_key=memory_context_key,
+                request_id=request_id,
+            )
             if self.settings.chat_store_history
             else None
         )
@@ -1418,14 +1636,13 @@ class CopilotService:
         )
         history_message_count_before_budget = len(history)
         history_budget_tokens = history_tokens_before_budget
-        exhaustive_graph_request = bool(
-            route.use_graph
-            and (
-                route.scope == "full_neighbors"
-                or route.exhaustive_connections_requested
-            )
+        provider_context_requested = bool(
+            asset_profile_results
+            or detection_results
+            or context_package.graph_results
+            or knowledge_result
         )
-        if exhaustive_graph_request:
+        if provider_context_requested:
             input_capacity = max(
                 0,
                 int(
@@ -1438,13 +1655,35 @@ class CopilotService:
                 ),
             )
             fixed_tokens = approx_tokens(self.system_prompt) + approx_tokens(user_text)
-            compact_product_reserve = 384 * (
-                len(asset_profile_results) + len(detection_results)
+            product_reserve = sum(
+                approx_tokens(
+                    "\n".join(
+                        (
+                            f'[{tag} ip="{item.ip}"]',
+                            item.serialized_json,
+                            f'[/{tag}]',
+                        )
+                    )
+                )
+                for tag, results in (
+                    ("ASSET_PROFILE_FULL_MINIFIED_JSON", asset_profile_results),
+                    ("ASSET_DETECTION_FULL_MINIFIED_JSON", detection_results),
+                )
+                for item in results
+                if item.status in {"available", "not_found"} and item.serialized_json
+            )
+            graph_reserve = sum(
+                self.context_composer.graph_context_cap(item.context)
+                for item in context_package.graph_results
+            )
+            knowledge_reserve = (
+                self.settings.rag_max_context_tokens if knowledge_result else 0
             )
             desired_dynamic_reserve = min(
                 max(0, input_capacity - fixed_tokens),
-                max(0, self.settings.graph_max_context_tokens)
-                + compact_product_reserve
+                product_reserve
+                + graph_reserve
+                + knowledge_reserve
                 + 1024,
             )
             history_budget_tokens = max(
@@ -1457,9 +1696,12 @@ class CopilotService:
                 prefer_current_evidence=True,
             )
             logger.info(
-                "event=conversation_history_route_budgeted request_id=%s requested_scope=%s history_budget_tokens=%s history_tokens_before=%s history_tokens_after=%s messages_before=%s messages_after=%s assistant_messages_dropped=%s",
+                "event=conversation_history_provider_budgeted request_id=%s requested_scope=%s product_reserve_tokens=%s graph_reserve_tokens=%s knowledge_reserve_tokens=%s history_budget_tokens=%s history_tokens_before=%s history_tokens_after=%s messages_before=%s messages_after=%s assistant_messages_dropped=%s",
                 request_id,
                 route.scope,
+                product_reserve,
+                graph_reserve,
+                knowledge_reserve,
                 history_budget_tokens,
                 history_tokens_before_budget,
                 sum(approx_tokens(item.get("content", "")) for item in history),
@@ -1575,6 +1817,152 @@ class CopilotService:
             f"{dynamic_context}\n\n<SOORIN_REVIEWED_EVIDENCE_SUMMARY_JSON>\n"
             f"{reviewed_summary}\n</SOORIN_REVIEWED_EVIDENCE_SUMMARY_JSON>"
         ).strip()
+
+        def build_model_messages() -> list[dict[str, str]]:
+            prepared = [{"role": "system", "content": self.system_prompt}]
+            if dynamic_context:
+                prepared.append({"role": "system", "content": dynamic_context})
+            prepared.extend([*history, {"role": "user", "content": user_text}])
+            return prepared
+
+        token_guard_history_reduced = False
+        token_guard_recomposition_attempted = False
+        token_guard_output_reduced = False
+        messages = build_model_messages()
+        input_estimate = token_estimator.estimate_messages(messages)
+        token_budget = token_estimator.window_budget(
+            input_estimate.calibrated_tokens,
+            selected_output_reservation,
+            self.settings.llm_context_safety_margin_tokens,
+            self.settings.llm_context_window_tokens,
+        )
+        if not token_budget.fits and history:
+            history = []
+            token_guard_history_reduced = True
+            messages = build_model_messages()
+            input_estimate = token_estimator.estimate_messages(messages)
+            token_budget = token_estimator.window_budget(
+                input_estimate.calibrated_tokens,
+                selected_output_reservation,
+                self.settings.llm_context_safety_margin_tokens,
+                self.settings.llm_context_window_tokens,
+            )
+        if not token_budget.fits:
+            token_guard_recomposition_attempted = True
+            recomposition_base = token_estimator.estimate_text(
+                "\n".join((self.system_prompt, user_text))
+            ).calibrated_tokens + 512
+            dynamic_context = self.context_composer.compose(
+                context_package,
+                request_id=request_id,
+                base_input_tokens=recomposition_base,
+                reserved_output_tokens=selected_output_reservation,
+            )
+            profile_dynamic_context = self.context_composer.last_parts.get("asset_profile", "")
+            graph_dynamic_context = self.context_composer.last_parts.get("graph", "")
+            detection_dynamic_context = self.context_composer.last_parts.get("detection", "")
+            fusion_dynamic_context = self.context_composer.last_parts.get("fusion", "")
+            knowledge_dynamic_context = self.context_composer.last_parts.get("knowledge", "")
+            tool_results = apply_context_inclusion(tool_results, self.context_composer.last_inclusion)
+            evidence_pack = self.evidence_reviewer.build_pack(
+                task_spec,
+                tool_results,
+                plan=execution_plan,
+                request_id=request_id,
+                trace_id=trace_id,
+                supplemental_history=supplemental_history,
+            )
+            review_decision = self.evidence_reviewer.review(
+                task_spec,
+                tool_results,
+                allow_supplemental=False,
+            )
+            evidence_pack = self.evidence_reviewer.with_review(evidence_pack, review_decision)
+            reviewed_summary = json.dumps(
+                safe_review_summary(evidence_pack),
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+            dynamic_context = (
+                f"{dynamic_context}\n\n<SOORIN_REVIEWED_EVIDENCE_SUMMARY_JSON>\n"
+                f"{reviewed_summary}\n</SOORIN_REVIEWED_EVIDENCE_SUMMARY_JSON>"
+            ).strip()
+            messages = build_model_messages()
+            input_estimate = token_estimator.estimate_messages(messages)
+            token_budget = token_estimator.window_budget(
+                input_estimate.calibrated_tokens,
+                selected_output_reservation,
+                self.settings.llm_context_safety_margin_tokens,
+                self.settings.llm_context_window_tokens,
+            )
+        if not token_budget.fits:
+            available_output = (
+                self.settings.llm_context_window_tokens
+                - input_estimate.calibrated_tokens
+                - self.settings.llm_context_safety_margin_tokens
+            )
+            minimum_output = token_estimator.minimum_output_reservation(task_spec.detail_level)
+            if available_output >= minimum_output:
+                selected_output_reservation = min(selected_output_reservation, available_output)
+                token_guard_output_reduced = True
+                token_budget = token_estimator.window_budget(
+                    input_estimate.calibrated_tokens,
+                    selected_output_reservation,
+                    self.settings.llm_context_safety_margin_tokens,
+                    self.settings.llm_context_window_tokens,
+                )
+        token_guard_blocked = not token_budget.fits
+        if token_guard_recomposition_attempted:
+            self._update_product_inclusion_trace(
+                trace,
+                "ASSET PROFILE",
+                "asset_profile",
+                asset_profile_results,
+                profile_dynamic_context,
+            )
+            self._update_product_inclusion_trace(
+                trace,
+                "ASSET DETECTION",
+                "detection",
+                detection_results,
+                detection_dynamic_context,
+            )
+            trace.put("CAPABILITY STEPS", details=self._trace_capability_details(tool_results))
+            trace.put(
+                "CONTEXT",
+                asset_profile_tokens=approx_tokens(profile_dynamic_context),
+                detection_tokens=approx_tokens(detection_dynamic_context),
+                graph_tokens=approx_tokens(graph_dynamic_context),
+                knowledge_tokens=approx_tokens(knowledge_dynamic_context),
+                fusion_tokens=approx_tokens(fusion_dynamic_context),
+                dynamic_tokens=approx_tokens(dynamic_context),
+                context_inclusion=", ".join(
+                    f"{key}:{'included' if value[0] else 'omitted'}"
+                    for key, value in self.context_composer.last_inclusion.items()
+                ),
+            )
+            trace.put(
+                "REVIEW DECISION",
+                stage="post_recomposition",
+                outcome=review_decision.outcome,
+                reasons=", ".join(review_decision.reasons),
+                missing_capabilities=", ".join(review_decision.missing_capabilities),
+                supplemental_allowed=False,
+            )
+        logger.info(
+            "event=final_token_guard request_id=%s calibrated_input=%s output_reservation=%s configured_safety_margin=%s context_window=%s remaining_before_safety=%s remaining_usable_tokens=%s history_reduced=%s recomposition_attempted=%s output_reduced=%s provider_blocked=%s",
+            request_id,
+            input_estimate.calibrated_tokens,
+            selected_output_reservation,
+            self.settings.llm_context_safety_margin_tokens,
+            self.settings.llm_context_window_tokens,
+            token_budget.remaining_before_safety,
+            token_budget.remaining_usable_tokens,
+            token_guard_history_reduced,
+            token_guard_recomposition_attempted,
+            token_guard_output_reduced,
+            token_guard_blocked,
+        )
         try:
             self.snapshot_writer.write(
                 request_id,
@@ -1656,6 +2044,12 @@ class CopilotService:
             )
         trace.put(
             "GRAPH RETRIEVAL",
+            candidate_node_count=graph_context.get("candidate_node_count", 0) if isinstance(graph_context, dict) else 0,
+            retrieved_node_count=graph_context.get("retrieved_node_count", 0) if isinstance(graph_context, dict) else 0,
+            included_node_count=graph_context.get("included_node_count", 0) if isinstance(graph_context, dict) else 0,
+            candidate_edge_count=graph_context.get("candidate_edge_count", 0) if isinstance(graph_context, dict) else 0,
+            retrieved_edge_count=graph_context.get("retrieved_edge_count", 0) if isinstance(graph_context, dict) else 0,
+            included_edge_count=graph_context.get("included_edge_count", 0) if isinstance(graph_context, dict) else 0,
             inbound_context_included=graph_context.get("inbound_context_included", "") if isinstance(graph_context, dict) else "",
             outbound_context_included=graph_context.get("outbound_context_included", "") if isinstance(graph_context, dict) else "",
             bidirectional_context_included=graph_context.get("bidirectional_context_included", "") if isinstance(graph_context, dict) else "",
@@ -1670,6 +2064,9 @@ class CopilotService:
             complete_for_user_request=graph_context.get("complete_for_user_request", False) if isinstance(graph_context, dict) else False,
             context_chars=len(graph_dynamic_context),
             context_tokens_approx=approx_tokens(graph_dynamic_context),
+            model_context_token_estimate=graph_context.get("model_context_token_estimate", 0) if isinstance(graph_context, dict) else 0,
+            model_context_token_cap=graph_context.get("model_context_token_cap", 0) if isinstance(graph_context, dict) else 0,
+            model_context_omitted_peer_count=graph_context.get("model_context_omitted_peer_count", 0) if isinstance(graph_context, dict) else 0,
         )
 
         trace.put(
@@ -1682,7 +2079,13 @@ class CopilotService:
             conversation_tokens_after_compaction=conversation_snapshot.tokens_after_compaction if conversation_snapshot else 0,
             conversation_summary_updated=conversation_snapshot.summary_updated if conversation_snapshot else False,
             conversation_summary_error=conversation_snapshot.summary_error if conversation_snapshot else "",
-            route_aware_history_budget_applied=exhaustive_graph_request,
+            context_identity=conversation_snapshot.context_identity if conversation_snapshot else "",
+            episode_transition=conversation_snapshot.episode_transition if conversation_snapshot else False,
+            previous_episode_summary_included=(
+                conversation_snapshot.previous_episode_summary_included if conversation_snapshot else False
+            ),
+            retained_episode_count=conversation_snapshot.episode_count if conversation_snapshot else 0,
+            route_aware_history_budget_applied=provider_context_requested,
             history_budget_tokens=history_budget_tokens,
             history_message_count_before_budget=history_message_count_before_budget,
             history_message_count_after_budget=len(history),
@@ -1702,13 +2105,10 @@ class CopilotService:
         conversation_chars = sum(len(item.get("content", "")) for item in history) + len(user_text)
         total_chars = sum(len(item.get("content", "")) for item in messages)
         input_estimate = token_estimator.estimate_messages(messages)
-        remaining_safety = (
-            self.settings.llm_context_window_tokens
-            - input_estimate.calibrated_tokens
-            - selected_output_reservation
-        )
+        remaining_before_safety = token_budget.remaining_before_safety
+        remaining_usable_tokens = token_budget.remaining_usable_tokens
         logger.info(
-            "event=model_input_prepared request_id=%s deployment=%s provider=%s model=%s message_count=%s roles=%s system_chars=%s system_approx_tokens=%s asset_profile_dynamic_approx_tokens=%s detection_dynamic_approx_tokens=%s graph_dynamic_approx_tokens=%s knowledge_dynamic_approx_tokens=%s fusion_dynamic_approx_tokens=%s dynamic_context_chars=%s dynamic_context_approx_tokens=%s conversation_chars=%s conversation_approx_tokens=%s total_input_chars=%s raw_input_estimate=%s calibrated_input_estimate=%s estimate_multiplier=%s selected_output_reservation=%s remaining_safety_margin=%s",
+            "event=model_input_prepared request_id=%s deployment=%s provider=%s model=%s message_count=%s roles=%s system_chars=%s system_approx_tokens=%s asset_profile_dynamic_approx_tokens=%s detection_dynamic_approx_tokens=%s graph_dynamic_approx_tokens=%s knowledge_dynamic_approx_tokens=%s fusion_dynamic_approx_tokens=%s dynamic_context_chars=%s dynamic_context_approx_tokens=%s conversation_chars=%s conversation_approx_tokens=%s total_input_chars=%s raw_input_estimate=%s calibrated_input_estimate=%s estimate_multiplier=%s selected_output_reservation=%s configured_safety_margin=%s remaining_before_safety=%s remaining_usable_tokens=%s",
             request_id,
             chat_deployment.name,
             chat_deployment.provider_type,
@@ -1731,7 +2131,9 @@ class CopilotService:
             input_estimate.calibrated_tokens,
             input_estimate.multiplier,
             selected_output_reservation,
-            remaining_safety,
+            self.settings.llm_context_safety_margin_tokens,
+            remaining_before_safety,
+            remaining_usable_tokens,
         )
         trace.put(
             "MODEL INPUT",
@@ -1752,7 +2154,9 @@ class CopilotService:
             calibrated_total_tokens_approx=input_estimate.calibrated_tokens,
             estimate_multiplier=input_estimate.multiplier,
             selected_output_reservation=selected_output_reservation,
-            remaining_safety_margin=remaining_safety,
+            remaining_safety_margin=remaining_usable_tokens,
+            remaining_before_safety=remaining_before_safety,
+            remaining_usable_tokens=remaining_usable_tokens,
         )
         trace.put(
             "TOKEN BUDGET",
@@ -1761,7 +2165,13 @@ class CopilotService:
             multiplier=input_estimate.multiplier,
             selected_output_reservation=selected_output_reservation,
             llm_context_safety_margin_tokens=self.settings.llm_context_safety_margin_tokens,
-            remaining_safety_margin=remaining_safety,
+            remaining_safety_margin=remaining_usable_tokens,
+            remaining_before_safety=remaining_before_safety,
+            remaining_usable_tokens=remaining_usable_tokens,
+            hard_guard_passed=not token_guard_blocked,
+            history_reduced=token_guard_history_reduced,
+            recomposition_attempted=token_guard_recomposition_attempted,
+            output_reservation_reduced=token_guard_output_reduced,
         )
         logger.info(
             "event=conversation_request request_id=%s session_id=%s message_count=%s provider_message_count=%s user_preview=%r",
@@ -1804,7 +2214,28 @@ class CopilotService:
         if stream_sink is not None:
             events.emit("synthesis_stream_started", plan_id=execution_plan.plan_id)
         try:
-            if review_decision.outcome in {"safe_failure", "missing_required_evidence"}:
+            if token_guard_blocked:
+                safe_answer = (
+                    "I cannot safely generate this response because the bounded evidence context "
+                    "exceeds the model input window after deterministic compaction."
+                )
+                result = LLMProviderResult(
+                    text=safe_answer,
+                    provider="deterministic",
+                    model="token-window-guard",
+                    deployment="deterministic",
+                    finish_reason=None,
+                )
+                final_synthesis_status = "context_window_unsafe"
+                fallback_answer_used = True
+                response_warnings.append("model_context_window_unsafe")
+                if stream_sink is not None:
+                    stream_sink(LLMStreamEvent("answer_delta", text=safe_answer))
+                logger.error(
+                    "event=final_synthesis_skipped request_id=%s reason=token_window_invariant_failed provider_called=false",
+                    request_id,
+                )
+            elif review_decision.outcome in {"safe_failure", "missing_required_evidence"}:
                 missing = ", ".join(review_decision.missing_capabilities) or "the required current evidence"
                 safe_answer = (
                     "I cannot safely complete this investigation because "
@@ -1829,8 +2260,16 @@ class CopilotService:
                     reason="required_evidence_unavailable",
                 )
             elif self.context_composer.required_context_missing:
+                product_context_missing = (
+                    self.context_composer.required_context_missing_reason
+                    == "required_product_payloads_exceed_context"
+                )
                 safe_answer = (
-                    "I cannot safely analyze all requested connections because the current "
+                    "I cannot safely analyze the requested asset evidence because the complete "
+                    "Product payload could not fit within the model context budget and was not "
+                    "truncated."
+                    if product_context_missing
+                    else "I cannot safely analyze all requested connections because the current "
                     "graph evidence could not fit within the model context budget. No prior "
                     "assistant peer list was used as current evidence."
                 )
@@ -1843,12 +2282,18 @@ class CopilotService:
                 )
                 final_synthesis_status = "context_insufficient"
                 fallback_answer_used = True
-                response_warnings.append("graph_context_budget_insufficient")
+                response_warnings.append(
+                    "required_product_context_budget_insufficient"
+                    if product_context_missing
+                    else "graph_context_budget_insufficient"
+                )
                 if stream_sink is not None:
                     stream_sink(LLMStreamEvent("answer_delta", text=safe_answer))
                 logger.error(
-                    "event=final_synthesis_skipped request_id=%s reason=required_graph_context_missing stale_history_used=false",
+                    "event=final_synthesis_skipped request_id=%s reason=%s stale_history_used=false",
                     request_id,
+                    self.context_composer.required_context_missing_reason
+                    or "required_context_missing",
                 )
             elif stream_sink is not None:
                 result = self._stream_final_model(
@@ -1860,6 +2305,7 @@ class CopilotService:
                     timeout_seconds=chat_request.read_timeout_seconds,
                     sink=stream_sink,
                     metrics=stream_metrics,
+                    trace_id=trace_id,
                 )
             else:
                 result = self.llm_client.chat(
@@ -1870,6 +2316,7 @@ class CopilotService:
                     top_p=chat_request.top_p,
                     timeout_seconds=chat_request.read_timeout_seconds,
                     purpose="chat",
+                    trace_id=trace_id,
                 )
         except LLMError as exc:
             events.emit(
@@ -1970,7 +2417,7 @@ class CopilotService:
             else ""
         )
         logger.info(
-            "event=token_estimate_calibrated request_id=%s deployment=%s model=%s raw_estimate=%s multiplied_estimate=%s provider_prompt_usage=%s estimate_to_actual_ratio=%s selected_output_reservation=%s remaining_safety_margin=%s",
+            "event=token_estimate_calibrated request_id=%s deployment=%s model=%s raw_estimate=%s multiplied_estimate=%s provider_prompt_usage=%s estimate_to_actual_ratio=%s selected_output_reservation=%s configured_safety_margin=%s remaining_usable_tokens=%s",
             request_id,
             chat_deployment.name,
             chat_deployment.model,
@@ -1979,10 +2426,11 @@ class CopilotService:
             provider_prompt_tokens or "",
             estimate_to_actual_ratio,
             selected_output_reservation,
-            remaining_safety,
+            self.settings.llm_context_safety_margin_tokens,
+            remaining_usable_tokens,
         )
         completion_tokens = usage.get("completion_tokens", "")
-        output_tokens = usage.get("output_tokens", "")
+        output_tokens = usage.get("output_tokens", completion_tokens)
         answer_truncated = _answer_truncated(result.finish_reason, completion_tokens, requested_max_tokens)
         if answer_truncated:
             response_warnings.append("final_answer_truncated")
@@ -2044,8 +2492,20 @@ class CopilotService:
         )
 
         if self.settings.chat_store_history:
-            self.memory_store.append(session, "user", user_text)
-            self.memory_store.append(session, "assistant", result.text)
+            self.memory_store.record_turn(
+                session,
+                user_text,
+                result.text,
+                memory_context_key,
+                providers=tuple(
+                    dict.fromkeys(
+                        item.provider or item.source_capability.split(".", 1)[0]
+                        for item in tool_results
+                    )
+                ),
+                limitations=tuple(evidence_pack.limitations),
+                scope=task_spec.scope,
+            )
 
         updated_active_ip = routing_state.active_ip
         updated_active_entities = routing_state.active_entities
@@ -2069,7 +2529,7 @@ class CopilotService:
             last_resolved_entities = resolved_values
             if len(resolved_values) == 1 and route_entities.primary_entity:
                 updated_active_ip = resolved_values[0]
-                updated_active_entities = ()
+                updated_active_entities = resolved_values
                 if route_entities.primary_entity.source == "message":
                     update_reason = "explicit_message_entity"
                 elif route_entities.primary_entity.source == "ui":
@@ -2198,25 +2658,6 @@ class CopilotService:
             previous_requires_asset_profile_after=new_routing_state.previous_requires_asset_profile,
             update_reason=update_reason,
         )
-        if self.settings.chat_store_history:
-            try:
-                post_summary_updated = self.memory_store.compact_if_needed(
-                    session,
-                    self.settings,
-                    new_routing_state,
-                    route=route,
-                    graph_context=graph_context if isinstance(graph_context, dict) else {},
-                    request_id=request_id,
-                )
-                trace.put("MEMORY", conversation_summary_updated_after_response=post_summary_updated)
-            except Exception as exc:
-                logger.warning(
-                    "event=conversation_summary_failed request_id=%s session_id=%s error_type=%s",
-                    request_id,
-                    session,
-                    type(exc).__name__,
-                )
-                trace.put("MEMORY", conversation_summary_error=type(exc).__name__)
         trace.status = "ok"
         trace.total_latency_ms = int((time.perf_counter() - request_started) * 1000)
         trace.put(
