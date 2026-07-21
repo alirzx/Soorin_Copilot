@@ -36,6 +36,9 @@ class KnowledgeSearchService:
         self.embedder = embedder or HuggingFaceTextEmbedder(
             settings.rag_embedding_model,
             settings.rag_embedding_dimension,
+            local_files_only=settings.rag_embedding_local_files_only,
+            cache_dir=settings.rag_embedding_cache_dir,
+            revision=settings.rag_embedding_revision,
         )
         self.vector_store = vector_store
         if self.vector_store is None and settings.rag_enabled and settings.rag_backend == "qdrant":
@@ -147,11 +150,12 @@ class KnowledgeSearchService:
                 filters=filters,
             )
         except Exception as exc:
+            error_code = getattr(exc, "code", type(exc).__name__)
             logger.warning(
                 "event=knowledge_search_failed request_id=%s backend=%s error_type=%s",
                 request_id,
                 self.settings.rag_backend,
-                type(exc).__name__,
+                error_code,
             )
             return KnowledgeSearchResult(
                 status="unavailable",
@@ -160,7 +164,7 @@ class KnowledgeSearchService:
                 retrieved_at=_now(),
                 freshness="unknown",
                 limitations=("Knowledge retrieval failed.",),
-                error_classification=type(exc).__name__,
+                error_classification=error_code,
             )
 
         accepted: list[KnowledgeChunk] = []

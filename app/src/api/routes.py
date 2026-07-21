@@ -13,6 +13,7 @@ from fastapi import APIRouter
 from pydantic import BaseModel, Field, field_validator
 from starlette.responses import StreamingResponse
 
+from src.api.dependencies import get_product_api_client
 from src.config.settings import get_settings
 from src.core.copilot.service import CopilotService
 from src.core.context.models import approx_tokens, compact_preview
@@ -21,6 +22,7 @@ from src.core.llm.errors import LLMError
 from src.core.llm.providers.base import LLMStreamEvent
 from src.core.memory.routing_state import SessionRoutingStateStore
 from src.core.memory.store import MemoryStore
+from src.core.observability.llm_usage import ProductUsageReporter
 
 
 logger = logging.getLogger(__name__)
@@ -28,8 +30,17 @@ router = APIRouter()
 settings = get_settings()
 memory_store = MemoryStore(settings.conversation_max_messages)
 routing_state_store = SessionRoutingStateStore()
-llm_client = LLMClient(settings)
-copilot_service = CopilotService(settings, llm_client, memory_store, routing_state_store)
+product_client = get_product_api_client()
+usage_reporter = ProductUsageReporter(settings, product_client)
+llm_client = LLMClient(settings, usage_recorder=usage_reporter)
+copilot_service = CopilotService(
+    settings,
+    llm_client,
+    memory_store,
+    routing_state_store,
+    product_client=product_client,
+    usage_reporter=usage_reporter,
+)
 
 
 class ChatUIContext(BaseModel):

@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import logging
+import hashlib
+import re
+import threading
+from dataclasses import replace
 from datetime import datetime, timezone
-from typing import Any, Callable
+from typing import Any, Callable, Literal
 
 from pydantic import BaseModel, Field
 
@@ -15,6 +19,17 @@ from src.core.agent.contracts import (
     ToolResult,
 )
 from src.core.rag.models import KnowledgeSearchResult
+from src.core.context.product_views import (
+    MAX_PRODUCT_VIEW_TOKENS,
+    MIN_PRODUCT_VIEW_TOKENS,
+    ProductEvidenceView,
+    approved_views,
+    build_product_view,
+    normalize_purpose,
+)
+
+
+logger = logging.getLogger(__name__)
 
 
 class EntityInput(BaseModel):
@@ -22,6 +37,18 @@ class EntityInput(BaseModel):
     request_id: str = ""
     session_id: str = ""
     route: Any | None = None
+    scope: str | None = None
+    direction: str | None = None
+    depth: int | None = Field(default=None, ge=0, le=2)
+    relationship_mode: str | None = None
+    views: list[str] = Field(default_factory=list, max_length=5)
+    detail: Literal["brief", "standard", "deep"] = "standard"
+    max_context_tokens: int = Field(
+        default=3000,
+        ge=MIN_PRODUCT_VIEW_TOKENS,
+        le=MAX_PRODUCT_VIEW_TOKENS,
+    )
+    purpose: str = Field(default="", max_length=64, pattern=r"^[A-Za-z0-9_-]*$")
 
 
 class KnowledgeInput(BaseModel):
@@ -29,6 +56,8 @@ class KnowledgeInput(BaseModel):
     top_k: int | None = Field(default=None, ge=1, le=20)
     filters: dict[str, Any] | None = None
     request_id: str = ""
+    purpose: str = Field(default="general_reference", max_length=64, pattern=r"^[A-Za-z0-9_-]+$")
+    max_context_tokens: int = Field(default=3000, ge=1, le=8000)
 
 
 CapabilityHandler = Callable[[BaseModel], ToolResult]
@@ -79,39 +108,110 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def _provider_result(capability: str, entities: tuple[str, ...], result: Any) -> ToolResult:
-    status = str(getattr(result, "status", "unavailable"))
+def _provider_result(
+    capability: str,
+    entities: tuple[str, ...],
+    result: Any,
+    *,
+    evidence_view: ProductEvidenceView | None = None,
+) -> ToolResult:
+    provider_status = str(getattr(result, "status", "unavailable"))
+    status_map = {"available": "ok", "not_found": "not_found"}
+    status = status_map.get(provider_status, provider_status)
+    known_statuses = {"ok", "empty", "not_configured", "unavailable", "invalid", "partial", "not_found"}
+    invalid_provider_status = status not in known_statuses
+    if invalid_provider_status:
+        status = "invalid"
     payload = getattr(result, "raw_payload", None)
     if payload is None:
         payload = getattr(result, "context", None)
     limitations = tuple(getattr(result, "limitations", ()) or ())
+    if invalid_provider_status:
+        limitations = (*limitations, "Provider returned an unrecognized status.")
     complete = True
     if isinstance(payload, dict):
         retrieval_complete = bool(payload.get("retrieval_complete", True))
         serialization_complete = bool(
             payload.get("serialized_context_complete_for_retrieved_subset", True)
         )
-        request_complete = bool(payload.get("complete_for_user_request", retrieval_complete))
-        complete = retrieval_complete and serialization_complete and request_complete
+        if "complete_for_user_request" in payload:
+            request_complete = bool(payload["complete_for_user_request"])
+        elif "requested_scope_complete" in payload:
+            request_complete = bool(payload["requested_scope_complete"])
+        else:
+            request_complete = retrieval_complete
+        complete = request_complete and serialization_complete
         if capability.startswith("graph.") and not retrieval_complete:
-            limitations = (*limitations, "Graph retrieval was incomplete.")
+            limitations = (
+                *limitations,
+                "Broader graph retrieval was bounded; requested-scope completeness is reported separately."
+                if request_complete
+                else "Graph retrieval was incomplete for the requested scope.",
+            )
         if capability.startswith("graph.") and not serialization_complete:
             limitations = (*limitations, "Graph serialization was incomplete.")
+    total_count: int | None = 1 if payload is not None else 0
+    included_count: int | None = total_count
+    omitted_count: int | None = 0
+    if isinstance(payload, dict) and capability.startswith("graph."):
+        total_count = payload.get("candidate_node_count", payload.get("total_node_count"))
+        included_count = payload.get("retrieved_node_count", payload.get("returned_node_count"))
+        if isinstance(total_count, int) and isinstance(included_count, int):
+            omitted_count = max(0, total_count - included_count)
+        else:
+            omitted_count = None
+    stale = bool(getattr(result, "stale", False))
+    cache_hit = bool(getattr(result, "cache_hit", False))
+    completeness = (
+        "unknown"
+        if status not in {"ok", "empty", "not_found", "partial"}
+        else "partial"
+        if status == "partial" or not complete
+        else "complete"
+    )
+    safe_error_code = (
+        "invalid_provider_status"
+        if invalid_provider_status
+        else getattr(result, "error_type", None) or getattr(result, "error_reason", None)
+    )
+    fact_payload = evidence_view.payload if evidence_view else payload
     return ToolResult(
-        status=status if status in {"ok", "empty", "not_configured", "unavailable", "invalid", "partial", "not_found"} else "ok",  # type: ignore[arg-type]
+        status=status,  # type: ignore[arg-type]
         entities=entities,
         source_capability=capability,
         retrieved_at=_now(),
-        freshness="current" if status in {"available", "ok"} else "unknown",
-        completeness="complete" if complete else "partial",
-        facts=(EvidenceFact(capability, "Provider evidence payload", payload, entities[0] if len(entities) == 1 else None),)
-        if payload is not None
+        freshness="stale" if stale else "current" if status in {"ok", "not_found"} else "unknown",
+        completeness=completeness,  # type: ignore[arg-type]
+        facts=(EvidenceFact(capability, "Provider evidence payload", fact_payload, entities[0] if len(entities) == 1 else None),)
+        if fact_payload is not None
         else (),
         limitations=limitations,
-        total_count=1 if payload is not None else 0,
-        included_count=1 if payload is not None else 0,
+        total_count=total_count,
+        included_count=included_count,
+        omitted_count=omitted_count,
         truncated=not complete,
-        error_classification=getattr(result, "error_type", None) or getattr(result, "error_reason", None),
+        error_classification=safe_error_code,
+        safe_error_code=safe_error_code,
+        provider=str(getattr(result, "provider", "")),
+        valid_at=getattr(result, "fetched_at", None),
+        latency_ms=int(getattr(result, "latency_ms", 0) or 0),
+        cache_status="stale" if stale else "hit" if cache_hit else "miss",
+        evidence_type="graph_topology" if capability.startswith("graph.") else "operational_product",
+        raw_payload=payload,
+        provider_result=result,
+        selected_views=evidence_view.selected_views if evidence_view else (),
+        detail=evidence_view.detail if evidence_view else "standard",
+        purpose=evidence_view.purpose if evidence_view else "",
+        view_payload=evidence_view.payload if evidence_view else None,
+        payload_inventory=evidence_view.inventory.as_dict() if evidence_view else {},
+        included_paths=evidence_view.included_paths if evidence_view else (),
+        omitted_section_count=evidence_view.omitted_path_count if evidence_view else 0,
+        view_token_estimate=evidence_view.token_estimate if evidence_view else 0,
+        source_payload_complete=evidence_view.source_payload_complete if evidence_view else payload is not None,
+        projection_usable=evidence_view.projection_usable if evidence_view else payload is not None,
+        usable_fact_count=evidence_view.usable_fact_count if evidence_view else int(payload is not None),
+        projection_truncated=evidence_view.truncated if evidence_view else False,
+        projection_omitted_count=evidence_view.projection_omitted_count if evidence_view else 0,
     )
 
 
@@ -123,31 +223,101 @@ def build_capability_registry(
     knowledge_service: Any,
 ) -> CapabilityRegistry:
     registry = CapabilityRegistry()
+    product_fetches: dict[tuple[str, str, str], Any] = {}
+    product_fetch_lock = threading.Lock()
+
+    def fetch_product_once(provider: str, ip: str, request_id: str, session_id: str) -> Any:
+        key = (request_id, provider, ip)
+        with product_fetch_lock:
+            if key in product_fetches:
+                return product_fetches[key]
+            source = asset_profile_provider if provider == "asset_profile" else detection_provider
+            result = source.fetch(ip, request_id, session_id=session_id)
+            product_fetches[key] = result
+            if len(product_fetches) > 512:
+                product_fetches.pop(next(iter(product_fetches)))
+            return result
+
+    def product_result(capability: str, provider: str, payload: EntityInput) -> ToolResult:
+        ip = payload.entities[0]
+        result = fetch_product_once(provider, ip, payload.request_id, payload.session_id)
+        if getattr(result, "raw_payload", None) is None:
+            return _provider_result(capability, (ip,), result)
+        selected = tuple(payload.views) or ("overview",)
+        if any(view not in approved_views(provider) for view in selected):
+            raise ValueError("Product capability requested an unapproved evidence view.")
+        view = build_product_view(
+            result.raw_payload,
+            provider=provider,
+            views=selected,
+            detail=payload.detail,
+            max_context_tokens=payload.max_context_tokens,
+            purpose=normalize_purpose(payload.purpose, "general_assessment"),
+        )
+        logger.info(
+            "event=product_evidence_view_built request_id=%s provider=%s target_ip=%s views=%s detail=%s purpose=%s usable_fact_count=%s omitted_paths=0 view_tokens=%s raw_payload_retained_internally=true model_representation=full_minified",
+            payload.request_id,
+            provider,
+            ip,
+            ",".join(view.selected_views),
+            view.detail,
+            view.purpose,
+            view.usable_fact_count,
+            view.token_estimate,
+        )
+        return _provider_result(capability, (ip,), result, evidence_view=view)
 
     def profile(payload: EntityInput) -> ToolResult:
-        ip = payload.entities[0]
-        result = asset_profile_provider.fetch(ip, payload.request_id, session_id=payload.session_id)
-        return _provider_result("asset.get_profile", (ip,), result)
+        return product_result("asset.get_profile", "asset_profile", payload)
 
     def detection(payload: EntityInput) -> ToolResult:
-        ip = payload.entities[0]
-        result = detection_provider.fetch(ip, payload.request_id, session_id=payload.session_id)
-        return _provider_result("asset.get_detection", (ip,), result)
+        return product_result("asset.get_detection", "detection", payload)
 
     def graph(capability: str) -> CapabilityHandler:
         def run(payload: EntityInput) -> ToolResult:
-            target = getattr(payload.route, "target_entity", None)
-            result = graph_provider.provide(target, route=payload.route, request_id=payload.request_id)
+            route = payload.route
+            scope_defaults = {
+                "graph.get_summary": "node_summary",
+                "graph.get_neighbors": "one_hop",
+                "graph.get_relationship": "one_hop",
+                "graph.compare_assets": "multi_entity_comparison",
+                "graph.find_path": "path",
+            }
+            if route is not None:
+                requested_scope = payload.scope or scope_defaults[capability]
+                if capability == "graph.get_neighbors" and payload.scope is None and getattr(route, "scope", None) in {"one_hop", "full_neighbors", "two_hop"}:
+                    requested_scope = route.scope
+                route = replace(
+                    route,
+                    scope=requested_scope,
+                    direction=payload.direction or getattr(route, "direction", "both"),
+                    depth=payload.depth if payload.depth is not None else getattr(route, "depth", 0),
+                    relationship_mode=payload.relationship_mode or getattr(route, "relationship_mode", "none"),
+                )
+            target = getattr(route, "target_entity", None)
+            result = graph_provider.provide(target, route=route, request_id=payload.request_id)
             return _provider_result(capability, tuple(payload.entities), result)
 
         return run
 
     def knowledge(payload: KnowledgeInput) -> ToolResult:
+        normalized_query = re.sub(r"\s+", " ", payload.query.casefold().strip())
+        query_hash = hashlib.sha256(normalized_query.encode("utf-8")).hexdigest()[:16]
+        purpose = normalize_purpose(payload.purpose, "general_reference")
         result: KnowledgeSearchResult = knowledge_service.search(
             payload.query,
             top_k=payload.top_k,
             filters=payload.filters,
             request_id=payload.request_id,
+        )
+        logger.info(
+            "event=knowledge_capability_result request_id=%s purpose=%s normalized_query_hash=%s status=%s included=%s truncated=%s",
+            payload.request_id,
+            purpose,
+            query_hash,
+            result.status,
+            result.included_count,
+            result.truncated,
         )
         return ToolResult(
             status=result.status,
@@ -165,19 +335,71 @@ def build_capability_registry(
             included_count=result.included_count,
             truncated=result.truncated,
             error_classification=result.error_classification,
+            safe_error_code=result.error_classification,
+            provider=result.backend,
+            evidence_type="documentation",
+            citations=tuple(
+                {
+                    "chunk_id": citation.chunk_id,
+                    "relative_path": citation.relative_path,
+                    "section": citation.section,
+                    "title": citation.title,
+                }
+                for citation in result.citations
+            ),
+            omitted_count=max(0, (result.total_candidates or 0) - result.included_count)
+            if result.total_candidates is not None
+            else None,
+            raw_payload=result,
+            provider_result=result,
+            purpose=purpose,
+            normalized_query_hash=query_hash,
         )
 
     specs = (
-        ("asset.get_profile", EntityInput, (1, 1), profile),
-        ("asset.get_detection", EntityInput, (1, 1), detection),
-        ("graph.get_summary", EntityInput, (1, 1), graph("graph.get_summary")),
-        ("graph.get_neighbors", EntityInput, (1, 1), graph("graph.get_neighbors")),
-        ("graph.get_relationship", EntityInput, (2, 2), graph("graph.get_relationship")),
-        ("graph.compare_assets", EntityInput, (2, 2), graph("graph.compare_assets")),
-        ("graph.find_path", EntityInput, (2, 2), graph("graph.find_path")),
-        ("knowledge.search", KnowledgeInput, (0, 0), knowledge),
+        ("asset.get_profile", "Current Product asset profile evidence.", EntityInput, (1, 1), "operational_product", "product", 0, profile),
+        ("asset.get_detection", "Current Product asset-detection evidence.", EntityInput, (1, 1), "operational_product", "product", 0, detection),
+        ("graph.get_summary", "Observed topology summary for one asset.", EntityInput, (1, 1), "graph_topology", "graph", 0, graph("graph.get_summary")),
+        ("graph.get_neighbors", "Bounded observed neighbors for one asset.", EntityInput, (1, 1), "graph_topology", "graph", 2, graph("graph.get_neighbors")),
+        ("graph.get_relationship", "Observed direct relationship for two assets.", EntityInput, (2, 2), "graph_topology", "graph", 1, graph("graph.get_relationship")),
+        ("graph.compare_assets", "Bounded topology comparison for two assets.", EntityInput, (2, 2), "graph_topology", "graph", 1, graph("graph.compare_assets")),
+        ("graph.find_path", "Bounded observed graph path for two assets.", EntityInput, (2, 2), "graph_topology", "graph", 2, graph("graph.find_path")),
+        ("knowledge.search", "Approved SOC documentation retrieval.", KnowledgeInput, (0, 0), "documentation", "knowledge", 0, knowledge),
     )
-    for name, input_schema, cardinality, handler in specs:
+    for name, description, input_schema, cardinality, evidence_type, group, max_depth, handler in specs:
+        product_settings = getattr(asset_profile_provider, "settings", None)
+        knowledge_settings = getattr(knowledge_service, "settings", None)
+        graph_settings = getattr(graph_provider, "settings", None)
+        if group == "product":
+            timeout_seconds = float(getattr(product_settings, "product_read_timeout_seconds", 30))
+            maximum_result_scope = 1
+        elif group == "knowledge":
+            timeout_seconds = float(getattr(knowledge_settings, "rag_qdrant_timeout_seconds", 10))
+            maximum_result_scope = int(getattr(knowledge_settings, "rag_top_k", 5))
+        else:
+            timeout_seconds = min(30.0, float(getattr(graph_settings, "agent_request_timeout_seconds", 30)))
+            maximum_result_scope = int(getattr(graph_settings, "graph_full_neighbors_hard_max", 5000))
+        allowed_scopes = {
+            "graph.get_summary": ("node_summary",),
+            "graph.get_neighbors": ("one_hop", "two_hop", "full_neighbors"),
+            "graph.get_relationship": ("one_hop",),
+            "graph.compare_assets": ("multi_entity_comparison",),
+            "graph.find_path": ("path",),
+        }.get(name, ())
+        allowed_depths = {
+            "graph.get_summary": (0,),
+            "graph.get_neighbors": (1, 2),
+            "graph.get_relationship": (1,),
+            "graph.compare_assets": (1,),
+            "graph.find_path": (0,),
+        }.get(name, ())
+        planner_arguments = (
+            ("entities", "views", "detail", "max_context_tokens", "purpose")
+            if group == "product"
+            else ("entities",)
+            if group == "graph"
+            else ("query", "top_k", "filters", "purpose", "max_context_tokens")
+        )
         registry.register(
             CapabilitySpec(
                 name=name,
@@ -186,10 +408,42 @@ def build_capability_registry(
                 output_schema=ToolResult,
                 required_entity_cardinality=cardinality,
                 read_only=True,
-                timeout_seconds=30.0,
+                timeout_seconds=timeout_seconds,
                 retry_policy=RetryPolicy(max_retries=0),
                 planner_visible=True,
+                description=description,
+                evidence_type=evidence_type,
+                side_effect_class="read_only",
+                cache_policy="provider_managed",
+                freshness_policy="current_when_available" if group != "knowledge" else "indexed",
+                maximum_graph_depth=max_depth,
+                maximum_result_scope=maximum_result_scope,
+                required_permissions=("read",),
+                concurrency_group=group,
+                allowed_arguments=planner_arguments,
+                allowed_views=approved_views("asset_profile" if name == "asset.get_profile" else "detection")
+                if group == "product"
+                else (),
+                allowed_detail_levels=("brief", "standard", "deep") if group == "product" else (),
+                allowed_purposes=(
+                    "general_reference",
+                    "interpret_evidence",
+                    "recommended_response_actions",
+                    "response_actions",
+                    "investigation_procedure",
+                    "hardening_guidance",
+                ) if group == "knowledge" else (),
+                allowed_scopes=allowed_scopes,
+                allowed_depths=allowed_depths,
+                reusable_locally=group == "product",
+                parallelization="serialized_per_product" if group == "product" else "independent_when_dependencies_allow",
             ),
             handler,
         )
+    logger.info(
+        "event=capability_registry_initialized capability_count=%s planner_visible_count=%s read_only=true capabilities=%s",
+        len(registry.list()),
+        len(registry.list(planner_visible=True)),
+        ",".join(spec.name for spec in registry.list()),
+    )
     return registry

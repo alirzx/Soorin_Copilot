@@ -14,6 +14,8 @@ from unittest.mock import patch
 import networkx as nx
 
 from src.config.settings import get_settings
+from src.core.agent.contracts import EvidenceFact, ToolResult
+from src.core.agent.task_mapping import task_spec_from_route
 from src.core.context.composer import ContextComposer
 from src.core.context.entities import EntityResolver
 from src.core.context.intent import (
@@ -23,7 +25,14 @@ from src.core.context.intent import (
     _json_from_text,
     validate_router_payload,
 )
-from src.core.context.models import CopilotContextPackage, GraphProviderResult, ProviderProvenance, ResolvedEntity
+from src.core.context.models import (
+    AssetProfileProviderResult,
+    CopilotContextPackage,
+    DetectionProviderResult,
+    GraphProviderResult,
+    ProviderProvenance,
+    ResolvedEntity,
+)
 from src.core.context.providers.graph import GraphContextProvider
 from src.core.context.router import DeterministicFallbackRouter, normalize_intent_route
 from src.core.copilot.service import CopilotService
@@ -34,8 +43,9 @@ from src.core.graph.retrieval import GraphRetrievalSpec, retrieve_graph_context
 from src.core.graph.service import get_subnet
 from src.core.graph.visualization import _filter_graph_by_subnet, _inject_node_click_bridge, generate_pyvis_graph
 from src.core.llm.errors import LLMError
-from src.core.llm.providers.base import LLMProviderResult
+from src.core.llm.providers.base import LLMProviderResult, LLMStreamEvent
 from src.core.memory.routing_state import SessionRoutingState, SessionRoutingStateStore
+from src.core.memory.episodes import MemoryContextKey
 from src.core.memory.store import MemoryStore
 from src.core.product_client.schemas import ProductTopologyResponse, TopologyConnectionRecord
 from src.web.copilot_help import choose_help_ui_pattern, get_copilot_help_content
@@ -88,6 +98,8 @@ def make_settings(**overrides):
         "llm_provider": "fake",
         "intent_router_deployment": "glm",
         "chat_deployment": "glm",
+        "planner_enabled": False,
+        "planner_deployment": "glm",
         "glm_model": "fake",
         "copilot_human_trace_enabled": False,
         "intent_router_enabled": True,
@@ -132,6 +144,26 @@ class EntityAuthorityTests(unittest.TestCase):
             routing_state=SessionRoutingState(active_ip="192.168.30.115"),
         )
         self.assertEqual(result.primary_entity.source, "conversation")
+
+    def test_comparison_followup_materializes_explicit_then_active_entity(self) -> None:
+        state = SessionRoutingState(active_ip="192.168.21.142")
+        prompts = (
+            "How is 192.168.0.125 different from it?",
+            "How is 192.168.0.125 different from previous asset?",
+        )
+
+        for prompt in prompts:
+            with self.subTest(prompt=prompt):
+                result = self.resolver.resolve(prompt, routing_state=state)
+                self.assertEqual(
+                    [entity.value for entity in result.entities],
+                    ["192.168.0.125", "192.168.21.142"],
+                )
+                self.assertEqual(
+                    [entity.source for entity in result.entities],
+                    ["message", "conversation"],
+                )
+                self.assertEqual(result.reference_type, "compare_with_reference")
 
     def test_cidr_only_never_materializes_network_address_as_host(self) -> None:
         for cidr in ("192.168.21.0/24", "10.0.0.0/8", "172.16.0.0/16", "2001:db8::/32"):
@@ -241,7 +273,26 @@ class EntityAuthorityTests(unittest.TestCase):
         )
         self.assertEqual(result.status, "resolved")
         self.assertEqual(result.entity_mode, "multiple")
-        self.assertEqual([entity.value for entity in result.entities], ["192.168.30.115", "192.168.30.144"])
+        self.assertEqual([entity.value for entity in result.entities], ["192.168.30.144", "192.168.30.115"])
+
+    def test_comparison_reference_can_use_recent_turn_entity(self) -> None:
+        result = self.resolver.resolve(
+            "How does 192.168.0.125 diverge from the asset we just analyzed?",
+            recent_messages=[
+                {"role": "user", "content": "Tell me about 192.168.21.142."},
+                {"role": "assistant", "content": "192.168.21.142 was analyzed."},
+            ],
+        )
+        self.assertEqual(result.status, "resolved")
+        self.assertEqual(result.entity_mode, "multiple")
+        self.assertEqual(
+            [entity.value for entity in result.entities],
+            ["192.168.0.125", "192.168.21.142"],
+        )
+        self.assertEqual(
+            [entity.source for entity in result.entities],
+            ["message", "conversation"],
+        )
 
     def test_invalid_ip_candidate_is_not_resolved(self) -> None:
         result = self.resolver.resolve("Tell me about 999.999.999.999")
@@ -316,6 +367,42 @@ class RouterSchemaTests(unittest.TestCase):
             min_confidence=0.65,
         )
         self.assertEqual(decision.scope, "path")
+
+    def test_explicit_comparison_binding_keeps_conversation_second_entity(self) -> None:
+        message = "How is 192.168.0.125 different from previous asset?"
+        state = SessionRoutingState(active_ip="192.168.21.142")
+        entities = EntityResolver().resolve(message, routing_state=state)
+        decision = validate_router_payload(
+            self.payload(
+                intent="graph_relationships",
+                scope="multi_entity_comparison",
+                direction="both",
+                depth=1,
+                requires_multiple_entities=True,
+                entity_binding="explicit",
+                is_followup=True,
+            ),
+            entities,
+            min_confidence=0.65,
+            message=message,
+            routing_state=state,
+        )
+
+        self.assertEqual(
+            decision.materialized_entities,
+            ("192.168.0.125", "192.168.21.142"),
+        )
+        self.assertEqual(decision.scope, "multi_entity_comparison")
+        self.assertTrue(decision.requires_multiple_entities)
+
+    def test_comparison_task_spec_rejects_one_entity(self) -> None:
+        route = SimpleNamespace(
+            materialized_entities=("192.168.0.125",),
+            scope="multi_entity_comparison",
+        )
+
+        with self.assertRaisesRegex(ValueError, "comparison_requires_two_distinct_entities"):
+            task_spec_from_route(route, "Compare this asset with the previous asset.")
 
     def test_multi_entity_neighbors_is_normalized_to_comparison(self) -> None:
         decision = validate_router_payload(
@@ -1687,7 +1774,8 @@ class GraphRetrievalTests(unittest.TestCase):
         self.assertEqual(result.context["inbound_context_included"], 0)
         self.assertEqual(result.context["outbound_context_included"], 0)
         self.assertEqual(result.context["bidirectional_context_included"], 0)
-        self.assertIn('"serialized_nodes":1', text)
+        self.assertIn('"representation":"node_summary"', text)
+        self.assertNotIn('"top_peers"', text)
 
     def test_single_node_zero_edge_context_preserves_counter_invariants(self) -> None:
         context = {
@@ -1821,7 +1909,7 @@ class GraphRetrievalTests(unittest.TestCase):
         self.assertEqual(result.context["inbound_context_included"], 33)
         self.assertFalse(result.context["context_truncated"])
         self.assertIn('"complete_for_user_request":true', text)
-        self.assertIn('"returned":33', text)
+        self.assertIn('"inbound":33', text)
 
     def test_directional_context_counts_use_actual_included_directions(self) -> None:
         graph = nx.DiGraph()
@@ -1891,7 +1979,8 @@ class GraphRetrievalTests(unittest.TestCase):
         self.assertLess(result.context["outbound_context_included"], result.context["outbound_retrieved"])
         self.assertFalse(result.context["retrieval_truncated"])
         self.assertTrue(result.context["context_truncated"])
-        self.assertIn('"returned":120', text)
+        self.assertIn('"retrieved_peer_count":120', text)
+        self.assertIn('"omitted_peer_count":101', text)
         self.assertIn('"serialized_context_truncated":true', text)
 
     def test_two_hop_edge_only_truncation_reports_edge_limit(self) -> None:
@@ -1964,7 +2053,7 @@ class GraphRetrievalTests(unittest.TestCase):
         )
 
         self.assertEqual(context["included_node_count"], 5)
-        self.assertEqual(context["included_edge_count"], 5)
+        self.assertEqual(context["included_edge_count"], 0)
         self.assertFalse(context["context_truncated"])
         self.assertIsNone(context["context_truncation_reason"])
 
@@ -1997,8 +2086,7 @@ class GraphRetrievalTests(unittest.TestCase):
         self.assertLessEqual(context["included_edge_count"], context["retrieved_edge_count"])
         self.assertLessEqual(context["retrieved_edge_count"], context["candidate_edge_count"])
         self.assertTrue(context["context_truncated"])
-        self.assertIn("graph_context_node_limit", context["context_truncation_reasons"])
-        self.assertIn("graph_context_edge_limit", context["context_truncation_reasons"])
+        self.assertEqual(context["context_truncation_reasons"], ["one_hop_peer_top_k"])
 
     def test_edges_with_excluded_endpoint_are_not_counted_as_included(self) -> None:
         context = {
@@ -2023,8 +2111,8 @@ class GraphRetrievalTests(unittest.TestCase):
         )
 
         self.assertEqual(context["included_node_count"], 2)
-        self.assertEqual(context["included_edge_count"], 1)
-        self.assertEqual(context["context_truncation_reasons"], ["graph_context_node_limit"])
+        self.assertEqual(context["included_edge_count"], 0)
+        self.assertEqual(context["context_truncation_reasons"], ["one_hop_peer_top_k"])
 
     def test_no_truncation_below_limits(self) -> None:
         graph = nx.DiGraph()
@@ -2279,17 +2367,18 @@ class GraphCompletenessContractTests(unittest.TestCase):
         replace_active_graph(graph, {"active_graph_source": "test"})
         return graph
 
-    def test_node_summary_keeps_20_node_cap_but_satisfies_summary_scope(self) -> None:
+    def test_node_summary_is_aggregate_only_without_peer_cap(self) -> None:
         self.graph_with_inbound(30)
         context = retrieve_graph_context(
             GraphRetrievalSpec(scope="node_summary", direction="both", depth=0, entities=[self.entity]),
             make_settings(graph_one_hop_max_nodes=500),
         )
         self.assertEqual(context["requested_scope"], "node_summary")
-        self.assertLessEqual(context["returned_node_count"], 20)
-        self.assertFalse(context["retrieval_complete"])
-        self.assertTrue(context["retrieval_truncated"])
-        self.assertEqual(context["retrieval_truncation_reason"], "node_limit:20")
+        self.assertEqual(context["returned_node_count"], 1)
+        self.assertEqual(context["returned_edge_count"], 0)
+        self.assertTrue(context["retrieval_complete"])
+        self.assertFalse(context["retrieval_truncated"])
+        self.assertIsNone(context["retrieval_truncation_reason"])
         self.assertTrue(context["requested_scope_complete"])
         self.assertTrue(context["complete_for_user_request"])
 
@@ -2345,7 +2434,8 @@ class GraphCompletenessContractTests(unittest.TestCase):
             route=GraphRetrievalTests.route(self, "node_summary", "both", 0, [self.entity]),
         )
         text = ContextComposer(settings).compose(CopilotContextPackage(entities=EntityResolver().resolve(self.target), graph=result))
-        self.assertIn('"inbound":{"peers":[],"returned":5,"total":5}', text)
+        self.assertIn('"inbound_total":5', text)
+        self.assertNotIn('"top_peers"', text)
         self.assertEqual(result.context["context_node_count"], 1)
         self.assertEqual(result.context["context_edge_count"], 0)
 
@@ -2371,7 +2461,250 @@ class GraphCompletenessContractTests(unittest.TestCase):
         text = ContextComposer(settings).compose(CopilotContextPackage(entities=EntityResolver().resolve(f"{self.target} {other.value}"), graph=result))
         self.assertIn(f'"entities":{{"{self.target}"', text)
         self.assertIn(f'"{other.value}":', text)
-        self.assertIn('"comparison":{', text)
+        self.assertIn('"peer_comparison":{', text)
+        self.assertIn('"representation":"comparison_summary"', text)
+
+
+class ComparisonFollowupRegressionTests(unittest.TestCase):
+    EXPLICIT_IP = "192.168.0.125"
+    ACTIVE_IP = "192.168.21.142"
+
+    class RecordingExecutor:
+        def __init__(self) -> None:
+            self.plans = []
+
+        def execute(self, plan, **kwargs):
+            del kwargs
+            self.plans.append(plan)
+            results = []
+            for step in plan.steps:
+                entities = tuple(step.arguments.get("entities") or ())
+                is_product = step.capability in {"asset.get_profile", "asset.get_detection"}
+                results.append(
+                    ToolResult(
+                        status="ok",
+                        entities=entities,
+                        source_capability=step.capability,
+                        retrieved_at="fixture",
+                        freshness="current",
+                        completeness="complete",
+                        facts=(EvidenceFact(step.capability, "fixture", {"ok": True}),),
+                        step_id=step.id,
+                        context_included=True,
+                        context_representation="full_minified" if is_product else "included",
+                        source_payload_complete=is_product,
+                        projection_usable=is_product,
+                        usable_fact_count=1,
+                    )
+                )
+            return results
+
+    class InvalidPlanStreamingLLM:
+        def __init__(self, route_json: str, plan_json: str) -> None:
+            self.route_json = route_json
+            self.plan_json = plan_json
+            self.chat_purposes = []
+            self.stream_purposes = []
+
+        def chat(self, messages, **kwargs):
+            del messages
+            purpose = kwargs.get("purpose")
+            self.chat_purposes.append(purpose)
+            return fake_result(self.route_json if purpose == "intent_router" else self.plan_json)
+
+        def stream_chat(self, messages, **kwargs):
+            del messages
+            self.stream_purposes.append(kwargs.get("purpose"))
+            yield LLMStreamEvent("answer_delta", text="Comparison completed.")
+            yield LLMStreamEvent(
+                "done",
+                data={
+                    "provider": "fake",
+                    "model": "fake",
+                    "deployment": "glm",
+                    "finish_reason": "stop",
+                    "usage": {},
+                    "latency_ms": 1,
+                    "status_code": 200,
+                    "stream_terminated": True,
+                },
+            )
+
+    def test_missing_active_comparison_returns_clarification_before_planner(self) -> None:
+        llm = FakeLLMClient([])
+        service = CopilotService(
+            make_settings(planner_enabled=True),
+            llm,
+            MemoryStore(10),
+            SessionRoutingStateStore(),
+        )
+
+        events = list(
+            service.chat_stream(
+                f"How is {self.EXPLICIT_IP} different from previous asset?",
+                "comparison-missing-active",
+                request_id="comparison-missing-active",
+            )
+        )
+
+        self.assertEqual([event.type for event in events], ["answer_delta", "done"])
+        self.assertIn("second IP address", events[0].text)
+        self.assertEqual(llm.calls, [])
+
+    def test_three_entity_comparison_clarifies_before_planner(self) -> None:
+        route_json = (
+            '{"intent":"graph_relationships","scope":"multi_entity_comparison",'
+            '"direction":"both","depth":1,"requires_graph":true,'
+            '"requires_detection":false,"requires_asset_profile":false,'
+            '"entity_binding":"explicit","requires_multiple_entities":true,'
+            '"is_followup":false,"classification_confidence":0.95,'
+            '"reason":"too many entities"}'
+        )
+        llm = FakeLLMClient([fake_result(route_json)])
+        service = CopilotService(
+            make_settings(planner_enabled=True, intent_router_retry_enabled=False),
+            llm,
+            MemoryStore(10),
+            SessionRoutingStateStore(),
+        )
+
+        events = list(
+            service.chat_stream(
+                "Compare 192.168.1.1 192.168.1.2 192.168.1.3",
+                "too-many",
+                request_id="too-many",
+            )
+        )
+
+        self.assertEqual([event.type for event in events], ["answer_delta", "done"])
+        self.assertIn("no more than two IP", events[0].text)
+        self.assertEqual(len(llm.calls), 1)
+
+    def test_comparison_uses_recent_raw_turn_when_active_state_is_missing(self) -> None:
+        route_json = (
+            '{"intent":"graph_relationships","scope":"multi_entity_comparison",'
+            '"direction":"both","depth":1,"requires_graph":true,'
+            '"requires_detection":false,"requires_asset_profile":false,'
+            '"entity_binding":"explicit","requires_multiple_entities":true,'
+            '"is_followup":true,"classification_confidence":0.95,'
+            '"reason":"compare explicit asset with recent asset"}'
+        )
+        llm = FakeLLMClient([fake_result(route_json), fake_result("comparison answer")])
+        memory = MemoryStore(10)
+        memory.append("recent-comparison", "user", "Tell me about 192.168.21.142.")
+        memory.append("recent-comparison", "assistant", "192.168.21.142 was analyzed.")
+        service = CopilotService(settings := make_settings(), llm, memory, SessionRoutingStateStore())
+        captured_routes = []
+
+        def fake_graph_provider(entity, **kwargs):
+            del entity
+            captured_routes.append(kwargs["route"])
+            return GraphProviderResult(
+                provider="graph",
+                status="available",
+                context={
+                    "target_ips": [self.EXPLICIT_IP, self.ACTIVE_IP],
+                    "target_ip": self.EXPLICIT_IP,
+                    "node_found": True,
+                    "scope": "multi_entity_comparison",
+                    "direction": "both",
+                    "depth": 1,
+                    "relationship_mode": "compare",
+                    "entities": [self.EXPLICIT_IP, self.ACTIVE_IP],
+                    "entity_a": {"ip": self.EXPLICIT_IP, "present": True},
+                    "entity_b": {"ip": self.ACTIVE_IP, "present": True},
+                    "direct_relationship": {"relationship_status": "unknown"},
+                    "degree_comparison": {},
+                    "subnet_comparison": {},
+                    "nodes": [],
+                    "edges": [],
+                },
+                provenance=ProviderProvenance(source="observed_communication_graph", status="available"),
+            )
+
+        service.graph_provider.provide = fake_graph_provider  # type: ignore[method-assign]
+        service.chat(
+            f"How does {self.EXPLICIT_IP} diverge from the previous asset?",
+            "recent-comparison",
+            request_id="recent-comparison",
+        )
+
+        self.assertEqual(settings.intent_router_enabled, True)
+        self.assertEqual(captured_routes[0].scope, "multi_entity_comparison")
+        self.assertEqual(captured_routes[0].materialized_entities, (self.EXPLICIT_IP, self.ACTIVE_IP))
+        router_context = llm.calls[0]["messages"][1]["content"]
+        self.assertIn(self.ACTIVE_IP, router_context)
+        self.assertIn("recent_turns", router_context)
+
+    def test_invalid_llm_plan_uses_validated_comparison_fallback_without_stream_error(self) -> None:
+        route_json = (
+            '{"intent":"graph_relationships","scope":"multi_entity_comparison",'
+            '"direction":"both","depth":1,"requires_graph":true,'
+            '"requires_detection":true,"requires_asset_profile":true,'
+            '"entity_binding":"explicit","requires_multiple_entities":true,'
+            '"is_followup":true,"classification_confidence":0.95,'
+            '"reason":"compare explicit asset with active asset"}'
+        )
+        invalid_plan_json = (
+            '{"goal":"compare assets","target_entities":["192.168.0.125","192.168.21.142"],'
+            '"steps":[{"step_id":"graph-only","capability":"graph.compare_assets",'
+            '"arguments":{"entities":["192.168.0.125","192.168.21.142"],'
+            '"scope":"multi_entity_comparison","direction":"both","depth":1,'
+            '"relationship_mode":"compare"},"depends_on":[],"required":true,'
+            '"expected_evidence":"graph_topology"}],'
+            '"stop_condition":"required_evidence_collected"}'
+        )
+        llm = self.InvalidPlanStreamingLLM(route_json, invalid_plan_json)
+        state_store = SessionRoutingStateStore()
+        state_store.set(
+            "comparison-fallback",
+            SessionRoutingState(active_ip=self.ACTIVE_IP),
+        )
+        service = CopilotService(
+            make_settings(planner_enabled=True, planner_repair_enabled=True),
+            llm,
+            MemoryStore(10),
+            state_store,
+        )
+        recording_executor = self.RecordingExecutor()
+        service._capability_runtime_snapshot = lambda: (  # type: ignore[method-assign]
+            service.capability_registry,
+            service.plan_validator,
+            recording_executor,
+        )
+
+        events = list(
+            service.chat_stream(
+                f"How is {self.EXPLICIT_IP} different from it?",
+                "comparison-fallback",
+                request_id="comparison-fallback",
+            )
+        )
+
+        self.assertNotIn("error", [event.type for event in events])
+        self.assertEqual("".join(event.text for event in events if event.type == "answer_delta"), "Comparison completed.")
+        self.assertEqual(llm.chat_purposes, ["intent_router", "planner"])
+        self.assertEqual(llm.stream_purposes, ["chat"])
+        self.assertEqual(len(recording_executor.plans), 1)
+
+        fallback = recording_executor.plans[0]
+        expected_entities = (self.EXPLICIT_IP, self.ACTIVE_IP)
+        self.assertTrue(fallback.validated)
+        self.assertEqual(fallback.source, "deterministic_fallback")
+        self.assertEqual(fallback.task.entities, expected_entities)
+        self.assertEqual(
+            {step.capability for step in fallback.steps},
+            set(fallback.task.required_capabilities),
+        )
+        for capability in ("asset.get_profile", "asset.get_detection"):
+            steps = [step for step in fallback.steps if step.capability == capability]
+            self.assertEqual(len(steps), 2)
+            self.assertEqual(
+                {tuple(step.arguments["entities"]) for step in steps},
+                {(self.EXPLICIT_IP,), (self.ACTIVE_IP,)},
+            )
+        graph_step = next(step for step in fallback.steps if step.capability == "graph.compare_assets")
+        self.assertEqual(tuple(graph_step.arguments["entities"]), expected_entities)
 
 
 class ServiceAndTraceTests(unittest.TestCase):
@@ -2391,7 +2724,30 @@ class ServiceAndTraceTests(unittest.TestCase):
         service.chat("Tell me about 192.168.30.115", "s1", request_id="r1")
         state = state_store.get("s1")
         self.assertEqual(state.active_ip, "192.168.30.115")
+        self.assertEqual(state.active_entities, ("192.168.30.115",))
+        self.assertEqual(state.active_entity_count, 1)
         self.assertEqual(state.previous_scope, "node_summary")
+
+    def test_successful_response_stores_latest_raw_user_and_assistant_turn(self) -> None:
+        settings = make_settings()
+        router_json = '{"intent":"asset_investigation","scope":"node_summary","direction":"both","depth":0,"requires_graph":true,"requires_detection":false,"requires_asset_profile":false,"requires_multiple_entities":false,"is_followup":false,"classification_confidence":0.9,"reason":"asset"}'
+        memory = MemoryStore(10)
+        service = CopilotService(settings, FakeLLMClient([fake_result(router_json), fake_result("asset answer")]), memory, SessionRoutingStateStore())
+        service.graph_provider.provide = lambda entity, **kwargs: GraphProviderResult(  # type: ignore[method-assign]
+            provider="graph",
+            status="available",
+            target_entity=entity,
+            context={"target_ip": entity.value, "node_found": True, "scope": kwargs["route"].scope, "direction": "both", "depth": 0},
+            provenance=ProviderProvenance(source="observed_communication_graph", status="available"),
+        )
+
+        service.chat("Tell me about 192.168.21.142.", "raw-turn", request_id="raw-turn")
+
+        history = memory.get("raw-turn")
+        self.assertEqual(history[-2:], [
+            {"role": "user", "content": "Tell me about 192.168.21.142."},
+            {"role": "assistant", "content": "asset answer"},
+        ])
 
     def test_single_asset_summary_and_possessive_followups_use_graph_and_state(self) -> None:
         settings = make_settings()
@@ -2464,7 +2820,8 @@ class ServiceAndTraceTests(unittest.TestCase):
 
         state = state_store.get("single")
         self.assertEqual(state.active_ip, "192.168.21.1")
-        self.assertEqual(state.active_entities, ())
+        self.assertEqual(state.active_entities, ("192.168.21.1",))
+        self.assertEqual(state.active_entity_count, 1)
         self.assertEqual(state.last_provider, "graph")
         self.assertEqual(state.previous_intent, "asset_investigation")
         self.assertEqual(state.previous_scope, "node_summary")
@@ -2519,7 +2876,8 @@ class ServiceAndTraceTests(unittest.TestCase):
         service.chat("Tell me about 192.168.30.115", "s", request_id="r-single")
         state = state_store.get("s")
         self.assertEqual(state.active_ip, "192.168.30.115")
-        self.assertEqual(state.active_entities, ())
+        self.assertEqual(state.active_entities, ("192.168.30.115",))
+        self.assertEqual(state.active_entity_count, 1)
 
     def test_general_and_unclear_turns_preserve_active_pair_state(self) -> None:
         settings = make_settings()
@@ -2595,7 +2953,8 @@ class ServiceAndTraceTests(unittest.TestCase):
         service.chat("Tell me about 192.168.21.2.", "single", request_id="r-new-single")
         state = state_store.get("single")
         self.assertEqual(state.active_ip, "192.168.21.2")
-        self.assertEqual(state.active_entities, ())
+        self.assertEqual(state.active_entities, ("192.168.21.2",))
+        self.assertEqual(state.active_entity_count, 1)
 
     def test_explicit_broad_comparison_executes_comparison_route_and_stores_pair(self) -> None:
         settings = make_settings()
@@ -2663,6 +3022,8 @@ class ServiceAndTraceTests(unittest.TestCase):
         answer_call_messages = llm.calls[1]["messages"]
         serialized = "\n".join(message["content"] for message in answer_call_messages)
         self.assertIn("[SOORIN CONVERSATION SUMMARY]", serialized)
+        self.assertIn("recent question", serialized)
+        self.assertIn("recent short answer", serialized)
         self.assertNotIn(long_old_answer, serialized)
 
     def test_compaction_preserves_pair_and_them_followup_uses_pair(self) -> None:
@@ -2737,6 +3098,55 @@ class ServiceAndTraceTests(unittest.TestCase):
         self.assertFalse(second.summary_updated)
         self.assertTrue(second.summary_present)
 
+    def test_compaction_preserves_latest_completed_raw_turn_even_with_small_recent_setting(self) -> None:
+        settings = make_settings(conversation_summary_trigger_tokens=20, conversation_recent_raw_messages=1)
+        memory = MemoryStore(20)
+        memory.append("s", "user", "old " * 100)
+        memory.append("s", "assistant", "answer " * 100)
+        memory.append("s", "user", "latest user about 192.168.21.142")
+        memory.append("s", "assistant", "latest assistant answer")
+
+        snapshot = memory.prepare_for_model("s", settings, SessionRoutingState(active_ip="192.168.21.142"))
+
+        self.assertTrue(snapshot.summary_updated)
+        self.assertEqual(
+            memory.get("s")[-2:],
+            [
+                {"role": "user", "content": "latest user about 192.168.21.142"},
+                {"role": "assistant", "content": "latest assistant answer"},
+            ],
+        )
+        self.assertEqual(snapshot.messages[-2:], memory.get("s")[-2:])
+
+    def test_episode_transition_keeps_latest_turn_for_routing_but_not_model_context(self) -> None:
+        settings = make_settings(conversation_summary_enabled=True, conversation_recent_raw_messages=2)
+        memory = MemoryStore(20)
+        asset_context = MemoryContextKey(("192.168.21.142",), "asset_investigation", "none", "topology")
+        general_context = MemoryContextKey((), "general", "none", "none")
+        memory.prepare_for_model("s", settings, SessionRoutingState(), context_key=asset_context)
+        memory.record_turn("s", "Tell me about 192.168.21.142.", "asset-only-answer", asset_context)
+
+        snapshot = memory.prepare_for_model("s", settings, SessionRoutingState(), context_key=general_context)
+
+        self.assertTrue(snapshot.episode_transition)
+        self.assertNotIn("asset-only-answer", "\n".join(item["content"] for item in snapshot.messages))
+        routing_recent = memory.recent_for_routing("s", 2)
+        self.assertIn("asset-only-answer", "\n".join(item["content"] for item in routing_recent))
+
+    def test_general_topic_detachment_excludes_asset_raw_history_from_model_context(self) -> None:
+        settings = make_settings(conversation_summary_enabled=True, conversation_recent_raw_messages=2)
+        memory = MemoryStore(20)
+        asset_context = MemoryContextKey(("192.168.21.142",), "asset_investigation", "none", "topology")
+        general_context = MemoryContextKey((), "general", "none", "none")
+        memory.prepare_for_model("detached", settings, SessionRoutingState(), context_key=asset_context)
+        memory.record_turn("detached", "Analyze 192.168.21.142.", "asset raw answer", asset_context)
+
+        snapshot = memory.prepare_for_model("detached", settings, SessionRoutingState(), context_key=general_context)
+
+        rendered = "\n".join(item["content"] for item in snapshot.messages)
+        self.assertNotIn("Analyze 192.168.21.142", rendered)
+        self.assertNotIn("asset raw answer", rendered)
+
     def test_trace_renders_router_and_retrieval_sections(self) -> None:
         trace = CopilotRequestTrace("r", "s", "m")
         trace.put("ROUTER INPUT", resolved_entity_count=1)
@@ -2744,8 +3154,8 @@ class ServiceAndTraceTests(unittest.TestCase):
         with self.assertLogs("src.core.copilot.trace", level="INFO") as logs:
             render_human_copilot_trace(trace)
         text = "\n".join(logs.output)
-        self.assertIn("== ROUTER INPUT ==", text)
-        self.assertIn("== GRAPH RETRIEVAL ==", text)
+        self.assertIn("ROUTER INPUT", text)
+        self.assertIn("GRAPH RETRIEVAL", text)
 
 
 if __name__ == "__main__":

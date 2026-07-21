@@ -8,7 +8,7 @@ from urllib.parse import urlsplit
 
 
 LLMDeploymentName = Literal["glm", "gpt55"]
-LLMPurpose = Literal["intent_router", "intent_router_repair", "chat"]
+LLMPurpose = Literal["intent_router", "intent_router_repair", "planner", "planner_repair", "chat"]
 VALID_LLM_DEPLOYMENTS: tuple[LLMDeploymentName, ...] = ("glm", "gpt55")
 
 
@@ -72,12 +72,12 @@ class ArvanDeploymentConfig:
 
     def request_config(self, purpose: str) -> LLMRequestConfig:
         """Resolve purpose-specific limits while enforcing the deployment maximum."""
-        if purpose == "intent_router":
+        if purpose in {"intent_router", "planner"}:
             requested_max_tokens = self.router_max_tokens
             timeout_seconds = self.router_read_timeout_seconds
             temperature = self.router_temperature
             top_p = self.router_top_p
-        elif purpose == "intent_router_repair":
+        elif purpose in {"intent_router_repair", "planner_repair"}:
             requested_max_tokens = self.router_repair_max_tokens
             timeout_seconds = self.router_read_timeout_seconds
             temperature = self.router_temperature

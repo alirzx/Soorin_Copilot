@@ -31,6 +31,26 @@ class GraphRetrievalSpec:
     exhaustive_connections_requested: bool = False
 
 
+@dataclass(frozen=True)
+class GraphRetrievalPolicy:
+    """Named deterministic safety budgets, separate from semantic scope."""
+
+    node_summary_representative_peer_limit: int = 0
+    one_hop_max_nodes: int = 100
+    one_hop_max_edges: int = 200
+    two_hop_max_nodes: int = 150
+    two_hop_max_edges: int = 300
+
+    @classmethod
+    def from_settings(cls, settings: Settings) -> "GraphRetrievalPolicy":
+        return cls(
+            one_hop_max_nodes=min(settings.graph_one_hop_max_nodes, cls.one_hop_max_nodes),
+            one_hop_max_edges=min(settings.graph_max_edges, cls.one_hop_max_edges),
+            two_hop_max_nodes=min(settings.graph_two_hop_max_nodes, cls.two_hop_max_nodes),
+            two_hop_max_edges=min(settings.graph_max_edges, cls.two_hop_max_edges),
+        )
+
+
 def _apply_completeness_contract(
     result: dict[str, object],
     spec: GraphRetrievalSpec,
@@ -75,6 +95,10 @@ def _empty_result(spec: GraphRetrievalSpec, target_ip: str, *, node_found: bool)
         "bidirectional_retrieved": 0,
         "bidirectional_returned": 0,
         "bidirectional_context_included": 0,
+        "degree": 0,
+        "in_degree": 0,
+        "out_degree": 0,
+        "importance": None,
         "candidate_node_count": 0,
         "retrieved_node_count": 0,
         "returned_node_count": 0,
@@ -173,15 +197,19 @@ def _neighbor_context(graph: nx.DiGraph, spec: GraphRetrievalSpec, settings: Set
     all_candidate_nodes = [target, *sorted(set([*inbound, *outbound]).difference({target}))]
     candidate_edges = [_edge_dict(src, target, graph) for src in inbound] + [_edge_dict(target, dst, graph) for dst in outbound]
 
+    policy = GraphRetrievalPolicy.from_settings(settings)
     if spec.scope == "node_summary":
-        node_limit = min(settings.graph_one_hop_max_nodes, 20)
-        edge_limit = min(settings.graph_max_edges, 40)
+        # Summary scope is aggregate-only. Neighbor identities belong to one-hop scopes.
+        all_candidate_nodes = [target]
+        candidate_edges = []
+        node_limit = 1 + policy.node_summary_representative_peer_limit
+        edge_limit = 0
     elif spec.scope == "full_neighbors":
         node_limit = settings.graph_full_neighbors_hard_max
         edge_limit = settings.graph_max_edges
     else:
-        node_limit = settings.graph_one_hop_max_nodes
-        edge_limit = settings.graph_max_edges
+        node_limit = policy.one_hop_max_nodes
+        edge_limit = policy.one_hop_max_edges
 
     retrieved_nodes, node_truncated = _truncate_nodes(all_candidate_nodes, node_limit)
     retrieved_node_set = set(retrieved_nodes)
@@ -218,6 +246,10 @@ def _neighbor_context(graph: nx.DiGraph, spec: GraphRetrievalSpec, settings: Set
         "bidirectional_retrieved": bidirectional_retrieved,
         "bidirectional_returned": bidirectional_retrieved,
         "bidirectional_context_included": 0,
+        "degree": int(graph.degree(target)),
+        "in_degree": int(graph.in_degree(target)),
+        "out_degree": int(graph.out_degree(target)),
+        "importance": graph.nodes[target].get("centrality", graph.nodes[target].get("importance")),
         "candidate_node_count": len(all_candidate_nodes),
         "retrieved_node_count": len(retrieved_nodes),
         "returned_node_count": len(retrieved_nodes),
@@ -238,10 +270,11 @@ def _neighbor_context(graph: nx.DiGraph, spec: GraphRetrievalSpec, settings: Set
             for node in retrieved_nodes
         ],
         "edges": retrieved_edges,
-        "top_inbound_peers": inbound[: min(20, len(inbound))],
-        "top_outbound_peers": outbound[: min(20, len(outbound))],
-        "bidirectional_peers": bidirectional[: min(20, len(bidirectional))],
-        "subnets_reached": sorted({get_subnet(peer) for peer in outbound}),
+        "top_inbound_peers": [],
+        "top_outbound_peers": [],
+        "bidirectional_peers": [],
+        "subnet_distribution": sorted({get_subnet(peer) for peer in {*inbound_all, *outbound_all}}),
+        "subnets_reached": sorted({get_subnet(peer) for peer in outbound_all}),
         "retrieval_truncated": retrieval_truncated,
         "retrieval_truncation_reasons": retrieval_reasons,
         "retrieval_truncation_reason": retrieval_reason,
@@ -263,6 +296,7 @@ def _two_hop_context(graph: nx.DiGraph, spec: GraphRetrievalSpec, settings: Sett
     candidate_edge_keys: set[tuple[str, str]] = set()
     eligible_edge_count = 0
 
+    policy = GraphRetrievalPolicy.from_settings(settings)
     while queue:
         node, hop = queue.popleft()
         if hop >= 2:
@@ -279,13 +313,13 @@ def _two_hop_context(graph: nx.DiGraph, spec: GraphRetrievalSpec, settings: Sett
             candidate_edge_keys.add(edge_key)
             peer = dst if src == node else src
             candidate_nodes.add(peer)
-            if peer not in seen and len(seen) < settings.graph_two_hop_max_nodes:
+            if peer not in seen and len(seen) < policy.two_hop_max_nodes:
                 seen.add(peer)
                 hops[peer] = hop + 1
                 queue.append((peer, hop + 1))
             if src in seen and dst in seen:
                 eligible_edge_count += 1
-                if len(edges) < settings.graph_max_edges:
+                if len(edges) < policy.two_hop_max_edges:
                     edges.append(_edge_dict(src, dst, graph))
 
     inbound_all = sorted(graph.predecessors(target))
@@ -294,10 +328,10 @@ def _two_hop_context(graph: nx.DiGraph, spec: GraphRetrievalSpec, settings: Sett
     retrieval_reasons = []
     candidate_node_count = len(candidate_nodes)
     candidate_edge_count = len(candidate_edge_keys)
-    if candidate_node_count > settings.graph_two_hop_max_nodes:
-        retrieval_reasons.append(_reason("node_limit", settings.graph_two_hop_max_nodes, candidate_node_count, len(seen)))
-    if eligible_edge_count > settings.graph_max_edges:
-        retrieval_reasons.append(_reason("edge_limit", settings.graph_max_edges, eligible_edge_count, len(edges)))
+    if candidate_node_count > policy.two_hop_max_nodes:
+        retrieval_reasons.append(_reason("node_limit", policy.two_hop_max_nodes, candidate_node_count, len(seen)))
+    if eligible_edge_count > policy.two_hop_max_edges:
+        retrieval_reasons.append(_reason("edge_limit", policy.two_hop_max_edges, eligible_edge_count, len(edges)))
     retrieval_truncated = bool(retrieval_reasons)
     retrieval_reason = _reason_string(retrieval_reasons)
 

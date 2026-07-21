@@ -3,6 +3,19 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import ipaddress
+
+
+def _valid_ipv4(value: str | None) -> str | None:
+    if not value:
+        return None
+    try:
+        ip = ipaddress.ip_address(str(value).strip())
+    except ValueError:
+        return None
+    if ip.version != 4:
+        return None
+    return str(ip)
 
 
 @dataclass(frozen=True)
@@ -20,6 +33,30 @@ class SessionRoutingState:
     previous_depth: int | None = None
     previous_requires_detection: bool = False
     previous_requires_asset_profile: bool = False
+    last_plan_id: str | None = None
+    last_review_outcome: str | None = None
+    last_evidence_ids: tuple[str, ...] = ()
+    last_capability_statuses: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        active_entities = tuple(
+            dict.fromkeys(
+                ip
+                for raw in self.active_entities
+                if (ip := _valid_ipv4(raw))
+            )
+        )[:2]
+        active_ip = _valid_ipv4(self.active_ip)
+        if active_ip and not active_entities:
+            active_entities = (active_ip,)
+        elif not active_ip and len(active_entities) == 1:
+            active_ip = active_entities[0]
+        object.__setattr__(self, "active_ip", active_ip)
+        object.__setattr__(self, "active_entities", active_entities)
+
+    @property
+    def active_entity_count(self) -> int:
+        return len(self.active_entities)
 
 
 class SessionRoutingStateStore:

@@ -281,6 +281,39 @@ def provider_done(*, usage: dict[str, Any] | None = None) -> LLMStreamEvent:
 
 
 class CopilotServiceStreamingTests(unittest.TestCase):
+    def test_exact_greeting_bypasses_router_planner_providers_and_final_model(self) -> None:
+        llm = FakeStreamingLLM([])
+        memory = MemoryStore(10)
+        service = CopilotService(service_settings(), llm, memory)  # type: ignore[arg-type]
+
+        result = service.chat("hey", "fast-session", request_id="fast-request")
+
+        self.assertEqual(result["provider"], "deterministic")
+        self.assertEqual(llm.chat_calls, [])
+        self.assertEqual(llm.stream_calls, [])
+        self.assertEqual(memory.get("fast-session")[0]["content"], "hey")
+        self.assertIsNone(service.routing_state_store.get("fast-session").active_ip)
+
+    def test_streamed_thanks_preserves_contract_without_llm(self) -> None:
+        llm = FakeStreamingLLM([])
+        service = CopilotService(service_settings(), llm, MemoryStore(10))  # type: ignore[arg-type]
+
+        events = list(service.chat_stream("thank you", "thanks-session", request_id="thanks-request"))
+
+        self.assertEqual([event.type for event in events], ["answer_delta", "done"])
+        self.assertEqual(events[-1].data["provider"], "deterministic")
+        self.assertEqual(llm.chat_calls, [])
+        self.assertEqual(llm.stream_calls, [])
+
+    def test_greeting_prefixed_substantive_request_uses_normal_workflow(self) -> None:
+        llm = FakeStreamingLLM([], fallback_text="normal")
+        service = CopilotService(service_settings(), llm, MemoryStore(10))  # type: ignore[arg-type]
+
+        result = service.chat("hey, explain phishing", "normal-session", request_id="normal-request")
+
+        self.assertEqual(result["answer"], "normal")
+        self.assertEqual([call["purpose"] for call in llm.chat_calls], ["intent_router", "chat"])
+
     def test_router_is_non_streaming_and_final_answer_is_stored_once(self) -> None:
         llm = FakeStreamingLLM(
             [
