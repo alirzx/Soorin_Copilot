@@ -19,15 +19,15 @@ High-priority findings:
 
 | Priority | Finding | Summary |
 | --- | --- | --- |
-| P0 | Graph comparison direct relationship can be misread | `graph.compare_assets` fetches direct relationship and serializes it as `direct_relationship`, but also reports `serialized_edge_records=0`. The model may treat zero serialized edge records as no direct communication. |
+| P0 | Graph comparison direct relationship protected | `graph.compare_assets` serializes an explicit protected `direct_relationship` fact block before optional comparison details. Optional neighborhood edge records remain omitted by policy, but this no longer represents direct-relationship truth. |
 | P1 | Product full-payload false-negative likely happens after composition | Product providers fetch complete JSON and composer includes full minified JSON when it fits. False-negative reviewer messages are most likely from inclusion identity/bookkeeping mismatch or stale pre-compose ToolResult review state. |
 | P1 | `completed_with_limitations` is over-broad | Normal provider caveats, bounded graph serialization, and Top-K Knowledge limitations all flow into reviewer limitations and can downgrade otherwise usable answers. |
-| P3 | Knowledge provider label leak is prompt-driven | The active system prompt explicitly instructs `From Soorin Knowledge Base:`. This is not caused by Qdrant, citations, or context tags. |
+| P3 | Knowledge provider label leak removed from prompt | The active system prompt now asks for natural attribution and forbids exposing internal provider/tool/context/storage names. |
 | P3 | Human trace can still conflate fetched, included, and omitted evidence | Trace is much richer now, but several counts are summaries, not proof of exact final-message content. |
 
 Profile and Detection are fully included in the model context only when their full minified JSON sections fit the dynamic context budget. They are intentionally not projected or summarized for the model; the selected evidence views remain ToolResult metadata and validation inventory.
 
-Graph evidence is scope-specific and intentionally compacted. Summary, relationship, path, and bounded neighbors preserve their required facts. Comparison preserves direct relationship booleans/status but does not serialize actual edge records, which is the highest-risk ambiguity.
+Graph evidence is scope-specific and intentionally compacted. Summary, relationship, path, and bounded neighbors preserve their required facts. Comparison preserves a protected direct relationship fact block independently from optional neighborhood edge-record serialization.
 
 Knowledge/RAG chunks reach the model as bounded JSON including chunk text and citation metadata. The internal label leak comes from the final system prompt, not the RAG context block.
 
@@ -375,17 +375,17 @@ Final context:
 | Data | Model-visible |
 | --- | --- |
 | entity summaries | yes |
-| direct relationship booleans/status | yes: `direct_relationship` |
+| direct relationship protected fact | yes: `direct_relationship` |
 | degree differences | yes |
 | centrality availability/limitation | yes |
 | subnet differences | yes, top-k |
 | shared/distinct peers | top-k only |
 | retrieved node/edge record counts | yes |
-| actual edge records | no, `serialized_edge_records=0` |
+| actual neighborhood edge records | no, `neighborhood_edge_records_serialized=0` |
 
-This is the likely loss point for the observed contradiction. The direct relationship itself is not lost from `GraphProviderResult` or the comparison JSON; it is preserved as booleans/status. However, actual edge records are intentionally omitted and the serializer reports `serialized_edge_records=0` and `omitted_edge_records=raw_edges`. A synthesis model can read that as "no direct communication" unless it prioritizes `direct_relationship` over `serialization.serialized_edge_records`.
+The direct relationship itself is not lost from `GraphProviderResult` or the comparison JSON. It is serialized as a compact protected fact with `source`, `target`, `forward_edge`, `reverse_edge`, normalized `status`, original `relationship_status`, and `preserved=true`.
 
-The direct relationship is currently not independently protected from neighborhood/top-k semantics in presentation. It is fetched independently, but serialized beside a zero-edge policy. The minimal correction should make comparison serialization explicitly distinguish "direct relationship fact preserved" from "edge record list omitted by policy."
+Neighborhood edge records remain intentionally omitted in comparison summaries to preserve graph budgets. Serialization metadata distinguishes `direct_relationship_preserved=true` from `neighborhood_edge_records_serialized=0` and `neighborhood_edge_records_omitted=<raw_edges>`, so zero optional edge records cannot be interpreted as no direct relationship.
 
 ### 7.5 Path
 
@@ -445,9 +445,9 @@ Final context:
 
 `_compose_knowledge()` serializes status, query, backend, retrieval time, freshness, total candidates, retrieved chunk count, retrieval truncation, limitations, grounding rule, included chunk count, per-chunk text, score, title, section, category, source version, and path metadata. It includes chunks until `rag_max_context_tokens` or remaining global budget is exhausted.
 
-Label leak:
+Label hygiene:
 
-The phrase `From Soorin Knowledge Base:` is explicitly instructed in `app/prompts/system_prompt.md`. The backend context tag is `SOORIN_KNOWLEDGE_CONTEXT_JSON` and is internal, but the prompt asks the final model to use a user-visible attribution label.
+The backend context tag is `SOORIN_KNOWLEDGE_CONTEXT_JSON` and remains internal. The prompt now asks the final model to attribute retrieved knowledge naturally when attribution is useful, without exposing internal provider, tool, context, storage, routing, or prompt names.
 
 ## 9. Direct vs Planner vs Fallback Behavior
 
@@ -492,7 +492,7 @@ Divergence risks:
 | `graph.get_summary` | single node summary | NetworkX graph | `GraphProviderResult.context` | aggregate-only | graph context as raw payload | `GraphAnalysisResult` counts | yes | `SOORIN_GRAPH_CONTEXT_JSON` node_summary | yes if graph budget fits | subnet top-k only | verified |
 | `graph.get_neighbors` | one-hop/full/two-hop | NetworkX graph | retrieved nodes/edges/totals | ranked peers | graph context as raw payload | `GraphAnalysisResult` counts | yes | neighborhood summary | yes if graph budget fits | peer/edge serialization top-k | verified |
 | `graph.get_relationship` | pair/direct relation | NetworkX edge checks | booleans + edge metadata | direct relationship | graph context as raw payload | direct relationship bool | yes | direct_relationship JSON | yes if graph budget fits | low | verified |
-| `graph.compare_assets` | pair comparison | NetworkX summaries + direct check | comparison dict | top-k comparison summary | graph context as raw payload | direct relationship bool | yes | comparison_summary JSON | yes but edge records omitted | high ambiguity | suspect |
+| `graph.compare_assets` | pair comparison | NetworkX summaries + direct check | comparison dict | top-k comparison summary | graph context as raw payload | protected direct relationship fact | yes | comparison_summary JSON | yes; optional neighborhood edge records omitted | optional detail truncation only | verified conditionally |
 | `graph.find_path` | pair/path | NetworkX shortest path | path nodes/edges | selected path | graph context as raw payload | graph counts | yes | selected_path JSON | yes if graph budget fits | path length cap | verified |
 | `knowledge.search` | Knowledge-required route | Qdrant search hits | `KnowledgeSearchResult` | score + safety filter | chunks/citations | none, generic result | yes | `SOORIN_KNOWLEDGE_CONTEXT_JSON` | yes if remaining budget fits | Top-K + token budget | verified conditionally |
 
@@ -532,7 +532,7 @@ Graph-specific priority:
 
 | Claim | Status |
 | --- | --- |
-| direct relationship outranks graph neighbors | yes in direct relationship mode; ambiguous in comparison mode because direct fact is a field while edge records are omitted |
+| direct relationship outranks graph neighbors | yes in direct relationship mode and comparison mode; comparison direct truth is protected independently from optional neighborhood edge records |
 | path facts outrank optional peers | yes, path has dedicated serializer |
 | required evidence outranks supplemental context | mostly yes through required capabilities and review, but Product-first allocation can still exclude required Graph after large Product |
 
@@ -561,19 +561,19 @@ The final synthesis model does not see raw provider result objects, ToolResult d
 
 ## 14. Observed Defects and Likely Root Causes
 
-### 14.1 Graph comparison loses direct relationship
+### 14.1 Graph comparison direct relationship protection
 
-Severity: P0 functional correctness. Size: small to medium.
+Status: patched P0 functional correctness issue.
 
-User-visible impact: a risk/comparison answer can say there is no direct communication even when `graph.compare_assets` fetched a direct relationship.
+User-visible impact before patch: a risk/comparison answer could say there was no direct communication even when `graph.compare_assets` fetched a direct relationship.
 
-Likely exact loss point:
+Exact patch point:
 
 | File | Function | Condition |
 | --- | --- | --- |
-| `app/src/core/context/composer.py` | `_compose_comparison_graph()` | Payload includes `direct_relationship`, but reports `serialization.serialized_edge_records=0` and omits actual edge records. |
+| `app/src/core/context/composer.py` | `_compose_comparison_graph()` | Payload includes a protected `direct_relationship` block and separates optional neighborhood edge-record omission metadata. |
 
-The direct relationship is not lost in retrieval:
+The direct relationship is not lost in retrieval or final context:
 
 | Stage | Direct relationship preserved? |
 | --- | --- |
@@ -583,15 +583,15 @@ The direct relationship is not lost in retrieval:
 | `ToolResult.raw_payload/provider_result` | yes |
 | `GraphAnalysisResult.direct_relationship` | yes |
 | `EvidencePack` | yes through ToolResult |
-| `SOORIN_GRAPH_CONTEXT_JSON` | partly: booleans/status yes, edge records no |
+| `SOORIN_GRAPH_CONTEXT_JSON` | yes: protected booleans/status plus `preserved=true`; optional neighborhood edge records may still be omitted |
 
 Minimal correction:
 
 | Aspect | Recommendation |
 | --- | --- |
 | Patch scope | `ContextComposer._compose_comparison_graph()` |
-| Change | Add an explicit `direct_relationship_evidence` block with source/target, booleans, status, and optional direct edge metadata independent of peer/edge serialization policy. Rename serialization wording to clarify "neighborhood edge records omitted." |
-| Regression test | comparison context with direct edge must assert final JSON says relationship exists even when serialized neighborhood edges are zero. |
+| Change | Add an explicit `direct_relationship` block with source/target, booleans, normalized status, original relationship status, and `preserved=true` independent of peer/edge serialization policy. Rename serialization wording to clarify "neighborhood edge records omitted." |
+| Regression test | comparison context with direct, absent, and bidirectional edge states asserts final JSON relationship truth even when serialized neighborhood edges are zero. |
 | Risk | low if block is compact and budget-stable |
 
 ### 14.2 Profile context false-negative
@@ -663,21 +663,17 @@ Secondary trace concerns:
 | selected-step count logged as `result_count=0` in specialist select node | specialist subgraph event summary |
 | specialist capability count vs plan-step count | parent `dispatch_specialists()` record naming |
 
-### 14.5 Internal Knowledge provider label leakage
+### 14.5 Internal Knowledge provider label hygiene
 
-Severity: P3 presentation/hygiene. Size: small.
+Status: patched P3 presentation/hygiene issue.
 
-Likely cause: `app/prompts/system_prompt.md` explicitly instructs:
-
-```text
-From Soorin Knowledge Base:
-```
+Previous cause: `app/prompts/system_prompt.md` explicitly instructed a fixed internal-facing attribution label.
 
 Ranked correction options:
 
 | Rank | Option | Safety | Architectural fit |
 | --- | --- | --- | --- |
-| 1 | prompt clarification: cite naturally without fixed label | high | best |
+| 1 | prompt clarification: cite naturally without fixed label | high | implemented |
 | 2 | change Knowledge context heading label | medium | internal block names are useful for grounding |
 | 3 | response post-processing | low | brittle and can alter valid user text |
 
@@ -690,7 +686,7 @@ Ranked correction options:
 | Node summary | peer identities and edges | model may expect peers if route should have been neighbors |
 | Neighbors | all but top/ranked peers; often edge records | user may ask "all" but hard caps still apply |
 | Relationship | little; at most two edge records | low |
-| Comparison | raw subgraph and edge records | direct relationship ambiguity due zero serialized edge records |
+| Comparison | raw subgraph and edge records | direct relationship protected; optional neighborhood edge records omitted by policy |
 | Path | paths over max length truncated | path can be mistaken for routed network path despite warnings |
 | Knowledge | chunks beyond Top-K, below threshold, unsafe, or over token budget | model may overuse docs if operational evidence is thin |
 
@@ -698,11 +694,11 @@ Ranked correction options:
 
 | Priority | Fix | Files/functions | Patch size | Can combine? |
 | --- | --- | --- | --- | --- |
-| P0 | Make comparison direct relationship impossible to confuse with omitted edge records | `app/src/core/context/composer.py::_compose_comparison_graph` | small | yes, with tests |
+| P0 | Keep comparison direct relationship impossible to confuse with omitted edge records | `app/src/core/context/composer.py::_compose_comparison_graph` | small | yes, with tests |
 | P1 | Harden Product inclusion bookkeeping and reviewer false-negative tests | `app/src/core/agent/evidence.py::apply_context_inclusion`, `app/src/core/agent/reviewer.py` | small | yes |
 | P1 | Split material limitations from caveats | `app/src/core/agent/reviewer.py` | medium | separate PR preferred |
 | P2 | Clean trace duplicate/label issues | `app/src/core/copilot/trace.py`, specialist event summaries | small | can combine with observability-only patch |
-| P3 | Remove fixed "From Soorin Knowledge Base" prompt label | `app/prompts/system_prompt.md` | small | separate prompt-only patch |
+| P3 | Keep fixed Knowledge label removed from final prompt | `app/prompts/system_prompt.md` | small | yes, with prompt hygiene test |
 
 ## 17. Recommended Tests and Production Gates
 
