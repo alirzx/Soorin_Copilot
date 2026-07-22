@@ -1,4 +1,4 @@
-"""Compact Streamlit help for asking Soorin Copilot questions."""
+"""Compact Streamlit help for asking Soorin Cyber Copilot questions."""
 
 from __future__ import annotations
 
@@ -26,178 +26,202 @@ class CopilotHelpContent:
 
 
 def get_copilot_help_content() -> CopilotHelpContent:
-    """Return user-facing help derived from the current router behavior."""
+    """Return help content for the current Copilot capabilities."""
     return CopilotHelpContent(
         authority=(
-            "Explicit IP in your prompt has the highest priority.",
-            "If no IP is typed, Copilot uses the selected graph node.",
-            "If neither is present, Copilot may use the previous active asset or pair for follow-ups.",
-            "If a selected graph node and a typed IP are different, the Explicit IP is used.",
-            "Clicking empty graph space clears the selected node.",
+            "An IP written in your prompt has the highest priority.",
+            "Two explicit IPs define the asset pair for comparison, relationship, or path questions.",
+            "If no IP is written, Copilot can use the selected topology asset.",
+            "Follow-up questions can use the previous active asset or asset pair.",
+            "A new general topic is handled separately from the previous asset investigation.",
+            "A typed IP overrides a different selected topology asset.",
         ),
         evidence=(
-            "Identification and classification questions may fetch live asset-detection evidence.",
-            "Connection, neighbor, comparison, and path questions fetch graph evidence.",
-            "Questions combining role, behavior, and topology may use graph and detection together.",
-            "General cybersecurity questions may use no live providers unless an asset is clearly referenced.",
+            "Asset Profile provides identity, hostname, operating system, role, services, and inventory evidence.",
+            "Detection provides classification, confidence, behavior, anomaly, and risk evidence.",
+            "Graph provides summaries, neighbors, direct relationships, comparisons, and observed paths.",
+            "Knowledge retrieval supports general cybersecurity concepts and investigation guidance.",
+            "Combined investigations can use Profile, Detection, Graph, and Knowledge evidence together.",
+            "Copilot selects evidence according to the question instead of fetching every source for every request.",
         ),
         examples=(
             PromptExampleGroup(
-                title="Identify an asset",
-                description=(
-                    "Use this for a short identity and baseline evidence summary."
-                ),
+                title="Summarize an asset",
+                description="Ask for a short or complete overview of one asset.",
                 examples=(
-                    "Briefly tell me about 192.168.21.1.",
-                    "What is this asset?",
-                    "Give me a short identity and evidence summary for this asset.",
+                    "Briefly summarize 192.168.0.149.",
+                    "Tell me about 192.168.0.125.",
+                    "Give me a short evidence summary for 192.168.0.149.",
+                    "Analyze 192.168.0.149 using all available asset evidence.",
                 ),
             ),
             PromptExampleGroup(
-                title="Get detailed evidence",
-                description=(
-                    "Use detection-specific wording for richer available "
-                    "classification evidence."
-                ),
+                title="Check identity and role",
+                description="Use these prompts for Profile and classification evidence.",
                 examples=(
-                    "Show detailed detection evidence for 192.168.21.1.",
-                    (
-                        "List the matched rules and classification signals "
-                        "for 192.168.21.1."
-                    ),
-                    (
-                        "Show detection conflicts and missing identification "
-                        "evidence for this asset."
-                    ),
+                    "What is 192.168.0.149 and what role does it serve?",
+                    "Show the identity and profile evidence for 192.168.0.125.",
+                    "What operating system and services are observed on 192.168.0.149?",
+                    "Does the detected role of 192.168.0.149 match its profile?",
                 ),
             ),
             PromptExampleGroup(
-                title="Explore connections",
-                description=(
-                    "Use graph-specific wording for direct peers, complete "
-                    "direct-neighbor retrieval, or two-hop expansion."
-                ),
+                title="Review detections and risk",
+                description="Ask about classifications, anomalies, behavior, or security risk.",
                 examples=(
-                    "Show direct neighbors for 192.168.21.1.",
-                    "Show all inbound peers for 192.168.21.1.",
-                    "Show all outbound peers for 192.168.21.1.",
-                    "Show the two-hop neighborhood around 192.168.21.1.",
+                    "Show the detection evidence for 192.168.0.149.",
+                    "What anomalies are associated with 192.168.0.149?",
+                    "Explain the risk score and classification confidence for 192.168.0.149.",
+                    "List the main detection signals and conflicts for 192.168.0.149.",
                 ),
             ),
             PromptExampleGroup(
-                title="Combine identity and topology",
-                description=(
-                    "Use this to assess whether identification evidence "
-                    "agrees with network behavior."
-                ),
+                title="Explore network connections",
+                description="Ask for direct peers, traffic direction, or wider graph scope.",
                 examples=(
-                    (
-                        "Does the detected role of 192.168.21.1 agree "
-                        "with its topology?"
-                    ),
-                    (
-                        "Analyze the identity and connection behavior "
-                        "of 192.168.21.1."
-                    ),
+                    "Show the direct neighbors of 192.168.0.149.",
+                    "Show all inbound peers for 192.168.0.125.",
+                    "Show all outbound peers for 192.168.0.149.",
+                    "Show the two-hop neighborhood around 192.168.0.149.",
                 ),
             ),
             PromptExampleGroup(
-                title="Compare assets",
-                description=(
-                    "Write exactly two IPs for the most reliable comparison "
-                    "or relationship result."
-                ),
+                title="Compare two assets",
+                description="Write exactly two IPs and state what should be compared.",
                 examples=(
+                    "Compare 192.168.0.149 and 192.168.0.125.",
                     (
-                        "Are 192.168.21.1 and 192.168.21.2 "
-                        "directly connected?"
+                        "Compare 192.168.0.149 and 192.168.0.125. "
+                        "State their direct relationship first, then give three differences."
                     ),
                     (
-                        "Compare 192.168.21.1 and 192.168.21.2, "
-                        "including shared and unique peers."
-                    ),
-                    (
-                        "Which of 192.168.21.1 and 192.168.21.2 "
+                        "Which of 192.168.0.149 and 192.168.0.125 "
                         "has broader outbound reach?"
                     ),
+                    (
+                        "Compare the roles, detections, and network behavior of "
+                        "192.168.0.149 and 192.168.0.125."
+                    ),
                 ),
             ),
             PromptExampleGroup(
-                title="Find a path",
-                description=(
-                    "Graph paths represent observed relationships, not proof "
-                    "of physical packet routing."
-                ),
+                title="Check a direct relationship",
+                description="Ask whether one asset directly communicates with another.",
                 examples=(
                     (
-                        "Find the shortest graph path between "
-                        "192.168.21.1 and 192.168.21.2."
+                        "What is the direct relationship between "
+                        "192.168.0.149 and 192.168.0.125?"
                     ),
                     (
-                        "Show the relationship path from "
-                        "192.168.21.1 to 192.168.21.2."
+                        "Does 192.168.0.149 communicate directly with "
+                        "192.168.0.125?"
+                    ),
+                    (
+                        "State the observed direction between "
+                        "192.168.0.149 and 192.168.0.125."
+                    ),
+                    (
+                        "Is the relationship between 192.168.0.149 and "
+                        "192.168.0.125 one-way or bidirectional?"
                     ),
                 ),
             ),
             PromptExampleGroup(
-                title="Ask general questions",
-                description=(
-                    "General knowledge questions do not require a selected asset."
-                ),
+                title="Assess risk between assets",
+                description="Combine relationship, Profile, and Detection evidence.",
                 examples=(
-                    "What is lateral movement?",
                     (
-                        "Explain the difference between inbound "
-                        "and outbound peers."
+                        "Does 192.168.0.149 create a security risk for "
+                        "192.168.0.125?"
+                    ),
+                    (
+                        "Assess the security risk from 192.168.0.149 to "
+                        "192.168.0.125. State the direct relationship first."
+                    ),
+                    (
+                        "Is there evidence of suspicious activity from "
+                        "192.168.0.149 toward 192.168.0.125?"
+                    ),
+                    (
+                        "Compare the detections and relationship of "
+                        "192.168.0.149 and 192.168.0.125."
                     ),
                 ),
             ),
-                        
             PromptExampleGroup(
-                title="Use follow-ups",
-                description=(
-                    'References such as "it" use the active asset. '
-                    'References such as "them" require an active pair.'
+                title="Find an observed path",
+                description="Ask for an ordered relationship path between two assets.",
+                examples=(
+                    (
+                        "Find the shortest graph path from "
+                        "192.168.0.149 to 192.168.0.125."
+                    ),
+                    (
+                        "Show the observed relationship path between "
+                        "192.168.0.149 and 192.168.0.125."
+                    ),
+                    (
+                        "How many graph hops separate "
+                        "192.168.0.149 and 192.168.0.125?"
+                    ),
+                    (
+                        "List the assets on the path from "
+                        "192.168.0.149 to 192.168.0.125."
+                    ),
                 ),
+            ),
+            PromptExampleGroup(
+                title="Run a combined investigation",
+                description="Ask Copilot to combine multiple evidence sources.",
+                examples=(
+                    "Analyze 192.168.0.149 using Profile, Detection, and Graph evidence.",
+                    (
+                        "Does the detected role of 192.168.0.149 agree "
+                        "with its network behavior?"
+                    ),
+                    (
+                        "Investigate the identity, risk, and connections "
+                        "of 192.168.0.149."
+                    ),
+                    (
+                        "Explain the most important security concerns for "
+                        "192.168.0.149 and recommend next checks."
+                    ),
+                ),
+            ),
+            PromptExampleGroup(
+                title="Ask cybersecurity questions",
+                description="General questions do not require a selected asset.",
+                examples=(
+                    "What is Kerberos? Answer in one sentence.",
+                    "Explain lateral movement in simple terms.",
+                    "What is the difference between LDAP and Kerberos?",
+                    "What does password spraying mean in a SOC investigation?",
+                ),
+            ),
+            PromptExampleGroup(
+                title="Use follow-up questions",
+                description="Use short references after establishing an active asset or pair.",
                 examples=(
                     "Tell me more about it.",
-                    "Show its outbound connections.",
-                    "Show more detection evidence about it.",
-                    "Compare them.",
-                    (
-                        "Find the path between them after comparing "
-                        "two explicit IPs."
-                    ),
+                    "Show its detection evidence.",
+                    "Show its outbound neighbors.",
+                    "Compare them again, focusing on risk.",
+                    "Find the path between them.",
                 ),
             ),
-
-
         ),
         tips=(
-            "Write the IP explicitly when precision matters.",
-            'Use "short" or "brief" for a concise response.',
-            (
-                'Use "detailed detection evidence", "matched rules", '
-                '"classification signals", "conflicts", or "missing evidence" '
-                "for richer identification context."
-            ),
-            'Use "direct neighbors" or "one-hop" for immediate peers.',
-            (
-                'Use "all inbound peers" or "all outbound peers" for '
-                "complete direct-neighbor retrieval within configured limits."
-            ),
-            (
-                'Use "two-hop neighborhood" for neighbors-of-neighbors.'
-            ),
-            (
-                "Write exactly two IPs for the most reliable comparison "
-                "or path request."
-            ),
-            (
-                "A graph path is an observed relationship path, not "
-                "necessarily a physical network-routing path."
-            ),
-            "Click empty graph space to clear the selected asset.",
+            "Write the IP explicitly when accuracy matters.",
+            "Write exactly two IPs for comparison, relationship, risk, or path questions.",
+            'Use "brief" or "short" when you want a concise answer.',
+            'Use "detailed" or "all available evidence" for a broader investigation.',
+            'Use "inbound", "outbound", or "both directions" for connection questions.',
+            'Ask Copilot to "state the direct relationship first" when comparing two assets.',
+            "Use detection wording for classifications, anomalies, risk, and behavior.",
+            "Use graph wording for neighbors, relationships, comparisons, and paths.",
+            "Use follow-up words such as “it” after one asset and “them” after an asset pair.",
+            "Click empty graph space to clear the selected topology asset.",
         ),
     )
 
@@ -208,16 +232,16 @@ def choose_help_ui_pattern(st_module: Any) -> str:
 
 
 def render_copilot_help_content() -> None:
-    """Render the compact help body inside the current Streamlit container."""
+    """Render the help body inside the current Streamlit container."""
     import streamlit as st
 
     content = get_copilot_help_content()
 
-    st.markdown("#### How Copilot chooses the asset")
+    st.markdown("#### How Copilot selects assets")
     for item in content.authority:
         st.markdown(f"- {item}")
 
-    st.markdown("#### What evidence Copilot can fetch")
+    st.markdown("#### Evidence Copilot can use")
     for item in content.evidence:
         st.markdown(f"- {item}")
 
