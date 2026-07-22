@@ -46,6 +46,7 @@ class MemoryStore:
         self._history: dict[str, list[dict[str, str]]] = {}
         self._latest_completed_turns: dict[str, list[dict[str, str]]] = {}
         self._summaries: dict[str, dict[str, Any]] = {}
+        self._recorded_request_ids: dict[str, set[str]] = {}
         self.repository = repository or InMemoryMemoryRepository()
 
     def get(self, session_id: str) -> list[dict[str, str]]:
@@ -68,10 +69,20 @@ class MemoryStore:
         providers: tuple[str, ...] = (),
         limitations: tuple[str, ...] = (),
         scope: str = "none",
+        request_id: str = "",
     ) -> None:
         """Record one bounded turn without storing provider payloads or prompts."""
         if self.max_messages == 0:
             return
+        if request_id:
+            recorded = self._recorded_request_ids.setdefault(session_id, set())
+            if request_id in recorded:
+                logger.info(
+                    "event=memory_turn_skipped request_id=%s session_id=%s reason=idempotent_replay",
+                    request_id,
+                    session_id,
+                )
+                return
         working = self.repository.get_working(session_id)
         if working is None or working.context_key != context_key:
             working = WorkingMemory(
@@ -91,6 +102,8 @@ class MemoryStore:
         working.last_scope = scope
         working.limitations = tuple(dict.fromkeys(compact_preview(item, limit=200) for item in limitations))[:8]
         self.repository.set_working(working)
+        if request_id:
+            recorded.add(request_id)
 
     @staticmethod
     def fit_messages_to_budget(

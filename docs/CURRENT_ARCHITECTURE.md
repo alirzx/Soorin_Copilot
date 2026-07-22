@@ -23,10 +23,10 @@ Soorin Copilot follows these implementation rules:
 sequenceDiagram
     participant UI as Streamlit UI
     participant API as FastAPI
-    participant Service as CopilotService
+    participant Service as CopilotService facade
+    participant Workflow as Durable LangGraph
     participant Entity as EntityResolver
     participant Router as SemanticIntentRouter
-    participant Workflow as BoundedCopilotWorkflow
     participant Planner as Bounded Planner
     participant Executor as Capability Executor
     participant Reviewer as Evidence Reviewer
@@ -36,23 +36,22 @@ sequenceDiagram
 
     UI->>API: POST /chat or /chat/stream
     API->>Service: message, session_id, optional ui_context
-    Service->>Workflow: dispatch one bounded executor callback
-    Workflow->>Service: invoke Phase 2 executor exactly once
-    Service->>Entity: resolve explicit/UI/session entities
-    Service->>Router: classify with GLM/GPT deployment
-    Router->>Service: JSON route decision
-    Service->>Service: validate, normalize, fallback if needed
-    Service->>Planner: multi-step only; one structured proposal
-    Service->>Service: deterministic plan validation
-    Service->>Executor: validated registered read-only plan
+    Service->>Workflow: invoke request with runtime dependencies
+    Workflow->>Entity: resolve explicit/UI/session entities
+    Workflow->>Router: classify with GLM/GPT deployment
+    Router->>Workflow: JSON route decision
+    Workflow->>Workflow: validate and normalize task
+    Workflow->>Planner: multi-step only; one structured proposal
+    Workflow->>Workflow: deterministic plan validation/fallback
+    Workflow->>Executor: validated registered read-only plan
     Executor->>Providers: dependency-aware bounded execution
     Providers->>Executor: canonical ToolResults with raw provider objects preserved
     Executor->>Reviewer: canonical EvidencePack
     Reviewer->>Executor: at most one approved supplemental retrieval
-    Reviewer->>Service: sufficient, limitations, missing evidence, or safe failure
-    Service->>Composer: bounded model context
-    Composer->>Service: tagged dynamic context
-    Service->>LLM: final chat request or stream
+    Reviewer->>Workflow: sufficient, limitations, missing evidence, or safe failure
+    Workflow->>Composer: bounded model context
+    Composer->>Workflow: tagged dynamic context
+    Workflow->>LLM: final chat request or stream
     LLM->>API: answer deltas or answer text
     API->>UI: envelope or UTF-8 SSE
 ```
@@ -204,11 +203,11 @@ Important normalization rules:
 
 Deterministic fallback is present but intentionally secondary. Its operational provider logging currently covers graph, detection, and asset profile; semantic routes can also select knowledge.
 
-## 8. Active Bounded Investigation Workflow
+## 8. Durable Bounded Investigation Workflow
 
 Implemented in `app/src/core/agent`.
 
-Current status: Phase 2 typed execution is the normal request path. `_chat_direct` is a compatibility alias that delegates to `_chat_phase2`; it is not an independent legacy implementation and must not be described as a fallback.
+Current status: Phase 3 typed LangGraph execution is the normal request path. `CopilotService` is a facade and no longer contains the former `_chat_phase2` workflow controller.
 
 Contracts:
 
@@ -235,22 +234,27 @@ Capability registry entries:
 - `graph.find_path`
 - `knowledge.search`
 
-Active workflow:
+Active graph nodes:
 
 ```text
-Entity resolution
--> semantic routing
--> validated TaskSpec
--> deterministic direct plan OR one bounded Planner pass
--> deterministic PlanValidator
--> dependency-aware CapabilityExecutor
--> canonical ToolResults
--> canonical EvidencePack
--> deterministic EvidenceReviewer
--> at most one supplemental capability call
--> reviewed context composition
--> final synthesis or deterministic safe failure
--> deterministic state update
+resolve_entities
+-> route
+-> validate_task
+-> build_direct_plan OR build_plan
+-> validate_plan
+-> build_fallback_plan when required
+-> dispatch_specialists
+   -> Asset Investigation Specialist for validated asset.* steps
+   -> Graph Analysis Specialist for validated graph.* steps
+   -> generic execution for validated non-specialist steps
+-> join_specialist_results in parent-plan order
+-> build_evidence
+-> review_retrieval
+-> supplemental_retrieval at most once
+-> compose_context
+-> review_context
+-> synthesize
+-> update_memory
 ```
 
 - Direct tasks use `compile_direct_plan`; the Planner is skipped.
@@ -258,31 +262,47 @@ Entity resolution
 - Planner output is a proposal. It cannot execute tools, invent entities, introduce URLs, change permissions, or mutate state.
 - Planner receives one model call only. A rejected plan may receive one deterministic mechanical repair for known structural defects; malformed model output falls back safely without another Planner call.
 - Planner failure or plan rejection falls back explicitly to a deterministic plan when one is safe.
+- Router failure with exactly two deterministically resolved entities preserves explicit comparison, direct-relationship, or path meaning before prior-route continuity. Normal comparison fallback includes per-entity Profile and Detection plus `graph.compare_assets`; direct relationships and paths remain graph-specific.
 - `PlanValidator` enforces known/planner-visible/read-only capabilities, entity authority, cardinality, argument schemas, dependency references, DAG structure, duplicate-call rejection, six-call maximum, two-entity maximum, and graph depth two.
 - `CapabilityExecutor` runs independent steps concurrently with a maximum of four workers by default. Profile and Detection are serialized because they share a Product client/session; Graph and Knowledge can overlap safely.
+- Asset and Graph Specialists are typed bounded LangGraph subgraphs. They receive only validated parent-plan steps, delegate execution to the same registry/executor, add no LLM calls, cannot mutate task/entity authority or memory, and return checkpoint-safe summaries. Parent review and synthesis remain authoritative.
 - Provider exceptions become safe typed failures; successful and partial results are preserved.
-- LangGraph remains bounded at recursion limit 12 and carries the actual Phase 2 task, plan, results, pack, review, and final response through workflow state. It is currently a dispatch/state shell: detailed entity, routing, planning, execution, context, synthesis, and state-update mechanics remain in `CopilotService._chat_phase2`.
-- LangGraph and the deterministic compatibility runner each choose and invoke exactly one executor callback. They do not run typed and compatibility callbacks together.
-- When LangGraph is unavailable, the deterministic compatibility runner executes the same `_chat_phase2` implementation. This is runtime compatibility, not a separate legacy request path.
+- LangGraph is bounded at recursion limit 32. Conditional edges express direct/planner selection, clarification/safe failure, deterministic plan fallback, one supplemental retrieval, context review, and terminal memory update.
+- Runtime clients, locks, streams, and secrets are supplied through LangGraph runtime context and are never persisted in `InvestigationState`.
+- The deterministic compatibility runner uses the same node contract when LangGraph is unavailable. The historical callback adapter exists only for focused backward-compatible tests.
 - There is no unrestricted tool loop or autonomous action path.
 
-### Active call graph and ownership
+Terminal status is evidence-driven. `completed` means every required validated capability and final synthesis succeeded without material fallback or truncation. `completed_with_limitations` is reserved for material provider/evidence gaps, truncation, deterministic synthesis fallback, or recovered plan fallback and carries bounded `limitation_reasons`. Clarification, partial failure, failure, and cancellation remain distinct terminal outcomes.
+
+### Checkpoint and recovery model
+
+The official LangGraph SQLite saver is configured by:
+
+- `SOORIN_LANGGRAPH_CHECKPOINT_ENABLED`
+- `SOORIN_LANGGRAPH_CHECKPOINT_PATH`
+
+The default path is `data/runtime/langgraph-checkpoints.sqlite3`, under the ignored runtime data tree. Its directory and database are restricted to `0700` and `0600`. The volume is operationally sensitive because checkpoints can contain bounded evidence state and must receive the same backup/access controls as other private runtime data. The workflow maps `thread_id` to `request_id`; `session_id` and `trace_id` remain persisted correlation fields, and the Soorin checkpoint namespace is retained as metadata. This prevents one request from being resumed merely because it shares a session with another request.
+
+Node outputs and completion records are checkpointed after each graph step. Node wrappers emit `langgraph_checkpoint_requested`; `langgraph_checkpoint_saved status=saved` is emitted only after the official saver returns a readable checkpoint. Persistence failures emit `langgraph_checkpoint_failed` without serializing checkpoint content. A terminal checkpoint is returned without rerunning provider calls, synthesis, memory update, or usage reporting. The internal `resume` method continues a non-terminal request from its latest checkpoint. Clarification can use an opt-in official LangGraph interrupt/resume path; the public chat route keeps the Phase 2.1 immediate clarification response.
+
+Nodes reuse checkpointed outputs after resume. Plan validation, EvidencePack construction, and retrieval review are the only repeatable graph stages, and only for their bounded fallback/supplemental second pass. Memory writes accept `request_id` and suppress duplicate completed turns. Product and LLM adapters retain their existing bounded retry behavior; the workflow adds at most one retry only for an explicitly classified `RetryableWorkflowError`.
+
+The checkpoint abstraction owns the saver and connection, allowing a future PostgreSQL saver without changing node contracts. SQLite checkpointing is workflow persistence only; it is unrelated to the removed LLM-usage database.
+
+### Service responsibilities after refactor
 
 ```text
-BoundedCopilotWorkflow.run
--> exactly one selected callback
--> CopilotService._chat_phase2
-   -> EntityResolver
-   -> SemanticIntentRouter and deterministic normalization/fallback
-   -> task_spec_from_route
-   -> compile_direct_plan OR BoundedPlanner
-   -> PlanValidator
-   -> CapabilityExecutor and CapabilityRegistry
-   -> EvidencePack construction and EvidenceReviewer
-   -> optional validated supplemental plan
-   -> ContextComposer and final context review
-   -> final LLM synthesis OR deterministic safe failure
-   -> one conversation/routing-state update
+CopilotService
+-> request/session/trace preparation
+-> request-scoped runtime dependency construction
+-> BoundedCopilotWorkflow invocation
+-> SSE stream forwarding and response adaptation
+-> top-level safe error translation and usage-report lifecycle
+
+BoundedCopilotWorkflow
+-> explicit nodes and conditional edges listed above
+-> checkpoint/recovery/interrupt boundaries
+-> workflow and node observability
 ```
 
 The service contains no legacy direct provider loop. Normal Profile, Detection, Graph, and Knowledge calls occur only through registered capability handlers. The service consumes provider results only after they have been converted to `ToolResult` and associated with the EvidencePack.
@@ -342,7 +362,7 @@ Arguments are never replaced after validation. Duplicate equivalent calls are re
 - `SOORIN_AGENT_EXECUTOR_MAX_CONCURRENCY` (hard-capped at 4)
 - `SOORIN_AGENT_REQUEST_TIMEOUT_SECONDS`
 
-`SOORIN_PLANNER_ENABLED` defaults to `false`. One Planner proposal is an architectural fixed bound rather than a misleading configurable planning-pass value. Enable Planner testing explicitly with `SOORIN_PLANNER_ENABLED=true` and `SOORIN_PLANNER_DEPLOYMENT=gpt55`.
+`SOORIN_PLANNER_ENABLED` defaults to `false`. One Planner proposal is an architectural fixed bound rather than a misleading configurable planning-pass value. Enable Planner testing explicitly with `SOORIN_PLANNER_ENABLED=true` and `SOORIN_PLANNER_DEPLOYMENT=glm`.
 
 ## 9. Evidence Reviewer
 
@@ -584,6 +604,21 @@ Each successful service request constructs one new `SessionRoutingState` and cal
 
 ## 16. Phase 2.1 Observability
 
+Phase 3 adds node lifecycle events on the same allowlisted logging path:
+
+- `langgraph_node_started`
+- `langgraph_node_completed`
+- `langgraph_node_failed`
+- `langgraph_node_retried`
+- `langgraph_node_skipped`
+- `langgraph_checkpoint_requested`
+- `langgraph_checkpoint_saved`
+- `langgraph_checkpoint_failed`
+- specialist start/completion/failure/skip and specialist-node lifecycle events
+- workflow start, resume, interrupt, completion, partial, and failure events
+
+The detailed human workflow trace is adapted from final `InvestigationState`. It includes request/entity authority, routing, task/plan, `LANGGRAPH WORKFLOW`, `SPECIALISTS`, capability execution, evidence coverage, context/token budget, memory transition, bounded LLM-call counts, final status, and limitation reasons. It never renders prompts, model responses, credentials, or evidence payloads.
+
 Machine workflow events use compact allowlisted metadata with request, trace, session, plan, and step identifiers and support console or JSON formatting. They never contain complete prompts, full model responses, raw Product JSON, credentials, headers, or hidden reasoning.
 
 Recorded timings include router, Planner, validation, per-capability, initial execution wall time, EvidencePack construction, review, supplemental retrieval, first streamed answer token, synthesis, and total request latency.
@@ -712,32 +747,32 @@ Implemented:
 
 Partial or structural:
 
-- LangGraph dispatches and carries the typed Phase 2 runtime state, while detailed provider/context/synthesis mechanics remain methods on `CopilotService`; further node-level extraction is possible without changing contracts.
-- LangGraph nodes currently mark and carry workflow stages; the detailed phase mechanics remain in the single `_chat_phase2` service executor.
 - RAG has service and indexer support, but no dedicated public API endpoint and no automatic index build.
+- Specialist findings are deterministic evidence-availability summaries; cross-domain interpretation remains with the parent reviewer and final synthesizer.
 
 Deferred or not implemented:
 
 - LLM evidence reviewer.
-- Neo4j, Cypher, text-to-Cypher, Graph Data Science.
+- Neo4j, GraphStore migration, Cypher, text-to-Cypher, Graph Data Science.
+- GraphRAG and bulk graph enrichment.
 - MCP.
 - SIEM/Splunk integrations.
 - Alert actions.
 - Report-generation endpoints.
 - Long-term durable memory.
-- Database-backed checkpoints.
+- Durable cross-process episodic conversation memory.
 - Human approval workflows.
 - Automatic remediation.
 - Microsoft Global or DRIFT GraphRAG.
 
-## 22. Remaining Risks and Phase 3 Entry Point
+## 22. Remaining Risks and Next Step
 
 Remaining risks:
 
-- `CopilotService._chat_phase2` remains large and owns most detailed orchestration. Future extraction should move verified stages into dedicated LangGraph nodes without changing the contracts or provider boundary.
+- SQLite checkpoints contain bounded request evidence and require private runtime-volume controls; they are not conversation memory, billing, analytics, or Product cache storage.
 - Synchronous provider calls cannot be killed after a Python future timeout; transport-native timeouts must remain correctly configured.
 - Planner mode is offline-tested with fakes but requires deliberate manual parity testing before broad enablement.
 - Conversation and routing state are process-local and do not coordinate concurrent workers.
 - RAG availability and freshness depend on an externally maintained Qdrant collection; the application does not index at startup.
 
-The safest Phase 3 entry point is to preserve the current `TaskSpec`, `ExecutionPlan`, `CapabilityRegistry`, `ToolResult`, `EvidencePack`, and Reviewer contracts while extracting service stages into real LangGraph nodes. Neo4j can then be introduced behind the existing graph capability boundary with bounded parameterized read-only queries. Planner expansion, Cypher generation, additional integrations, and side-effecting actions should remain deferred until node-level parity, evidence evaluation, and durable state design are verified.
+The safest next step is offline acceptance and operational parity testing of the stabilized parent/specialist workflow before adding any new capability. A future Neo4j implementation should remain behind the existing graph capability boundary with bounded parameterized read-only queries. GraphRAG, Planner expansion, MCP/vendor tools, bulk enrichment, and side-effecting actions remain deferred.

@@ -11,12 +11,14 @@ For the full audited design, implementation status, and known limitations, see [
 ```mermaid
 flowchart TD
     UI[Streamlit UI] --> API[FastAPI API]
-    API --> Service[CopilotService]
-    Service --> Entity[Deterministic entity resolver]
+    API --> Service[CopilotService facade]
+    Service --> Workflow[Durable bounded LangGraph]
+    Workflow --> Entity[Deterministic entity resolver]
     Entity --> Router[Semantic LLM router]
     Router --> Validate[Deterministic validation and normalization]
     Validate --> Plan[Direct compiler or bounded Planner]
-    Plan --> Executor[Validated capability executor]
+    Plan --> Specialists[Bounded asset and graph specialists]
+    Specialists --> Executor[Validated capability executor]
     Executor --> Providers[Registered evidence capabilities]
     Providers --> Graph[NetworkX graph artifacts]
     Providers --> Product[Product API profile and detection]
@@ -28,9 +30,9 @@ flowchart TD
     API --> UI
 ```
 
-## Phase 2 Workflow
+## Phase 3 Workflow
 
-The active request path is:
+The active request path is an explicit typed LangGraph `StateGraph`:
 
 ```text
 Entity Resolver
@@ -38,7 +40,8 @@ Entity Resolver
 -> TaskSpec
 -> deterministic direct compiler OR bounded Planner
 -> PlanValidator
--> CapabilityExecutor
+-> bounded Asset and Graph specialist subgraphs
+-> CapabilityExecutor plus generic capability execution
 -> ToolResults and EvidencePack
 -> deterministic Evidence Reviewer
 -> optional one validated supplemental retrieval
@@ -47,14 +50,36 @@ Entity Resolver
 -> one routing-state update
 ```
 
-Four roles remain deliberately separate:
+The graph has separate nodes for resolution, routing, task validation, direct or
+planned plan construction, plan validation/fallback, specialist dispatch/join,
+evidence construction and review, one optional supplemental retrieval, context
+composition/review, synthesis, and memory update. `CopilotService` prepares the
+request, injects runtime dependencies, forwards SSE events, adapts the response,
+and translates top-level errors; it no longer controls workflow sequencing.
+
+Durable checkpoints use the official LangGraph SQLite saver when enabled:
+
+```env
+SOORIN_LANGGRAPH_CHECKPOINT_ENABLED=true
+SOORIN_LANGGRAPH_CHECKPOINT_PATH=data/runtime/langgraph-checkpoints.sqlite3
+```
+
+Each request uses its own `thread_id=request_id`. Session and trace IDs remain
+correlation data, so a later request in the same session cannot accidentally
+resume an earlier request. Terminal checkpoints are returned without repeating
+synthesis or memory writes. The internal workflow API can resume a non-terminal
+checkpoint and supports an opt-in LangGraph clarification interrupt.
+
+Six roles remain deliberately separate:
 
 - **Planner:** proposes a structured plan only for multi-step investigations. It cannot execute tools or change entity authority.
 - **Executor:** runs only validated, registered, read-only capability steps under call, depth, entity, concurrency, and timeout bounds.
+- **Asset Specialist:** runs validated Profile/Detection steps and returns typed evidence-availability metadata without an LLM call.
+- **Graph Specialist:** runs validated Graph steps and preserves scope, direction, depth, counts, completeness, and truncation without an LLM call.
 - **Reviewer:** deterministically decides whether evidence is sufficient, limited, missing, or unsafe for synthesis.
 - **Synthesizer:** explains reviewed evidence; it does not select providers or mutate session state.
 
-Direct profile, detection, graph, pair/path, and knowledge requests compile deterministic plans and skip the Planner. Multi-step requests can use exactly one Planner proposal when `SOORIN_PLANNER_ENABLED=true`. Invalid proposals receive at most one deterministic mechanical repair before deterministic fallback; the Planner model is never called a second time. The deployment remains configurable; GPT-5.5 is the currently recommended Planner deployment. The tracked JSON-only retrieval prompt is `app/prompts/planner_system_prompt.md`.
+Direct profile, detection, graph, pair/path, and knowledge requests compile deterministic plans and skip the Planner. Multi-step requests can use exactly one Planner proposal when `SOORIN_PLANNER_ENABLED=true`. Invalid proposals receive at most one deterministic mechanical repair before deterministic fallback; the Planner model is never called a second time. The recommended deployment split is GPT for routing and GLM for planning and final synthesis. Specialists add zero LLM calls. The tracked JSON-only retrieval prompt is `app/prompts/planner_system_prompt.md`.
 
 `CapabilityRegistry` is the only normal provider execution boundary. Independent Graph and Knowledge steps may overlap. Product Profile and Detection steps are serialized because they share one Product client/session. Tool outputs become canonical `ToolResult` records, including status, freshness, completeness, counts, limitations, citations, and the original typed provider result.
 
@@ -78,7 +103,7 @@ app/
   src/config/                Environment-backed settings and LLM deployments
   src/core/agent/            Typed agent contracts, registry, reviewer, bounded workflow
   src/core/context/          Entity resolution, routing, provider context, composition
-  src/core/copilot/          Main request orchestration service
+  src/core/copilot/          API/runtime facade and final stream transport
   src/core/graph/            NetworkX graph build, storage, refresh, retrieval, visualization
   src/core/llm/              Provider-neutral LLM client and Arvan adapter
   src/core/memory/           In-memory conversation and routing state
@@ -132,9 +157,9 @@ SOORIN_API_BASE_URL=http://127.0.0.1:6998
 STREAMLIT_SERVER_PORT=8503
 
 SOORIN_INTENT_ROUTER_DEPLOYMENT=gpt55
-SOORIN_CHAT_DEPLOYMENT=gpt55
+SOORIN_CHAT_DEPLOYMENT=glm
 SOORIN_PLANNER_ENABLED=false
-SOORIN_PLANNER_DEPLOYMENT=gpt55
+SOORIN_PLANNER_DEPLOYMENT=glm
 SOORIN_AGENT_MAX_CAPABILITY_CALLS=6
 SOORIN_AGENT_MAX_SUPPLEMENTAL_RETRIEVALS=1
 SOORIN_AGENT_EXECUTOR_MAX_CONCURRENCY=4
@@ -196,7 +221,7 @@ SOORIN_PLANNER_ENABLED=false
 ```env
 # Explicit Phase 2 Planner test mode
 SOORIN_PLANNER_ENABLED=true
-SOORIN_PLANNER_DEPLOYMENT=gpt55
+SOORIN_PLANNER_DEPLOYMENT=glm
 ```
 
 Execution remains capped at six capability calls, two resolved entities, graph depth two, four executor workers, and one supplemental retrieval. The Planner always has one proposal pass; the repair setting permits at most one deterministic mechanical repair, not another model call.
@@ -350,8 +375,10 @@ PYTHONPATH=app python -m compileall -q app
 - RAG is optional and documentation-oriented. It is not source of truth for current assets, detections, graph edges, alerts, risk values, or peer lists.
 - Direct requests use deterministic plans and never pay Planner overhead. Multi-step investigations may use one structured Planner pass, but every plan is deterministically validated and limited to six registered read-only calls, two entities, graph depth two, and one reviewer-approved supplemental retrieval.
 - The active synthesis path consumes a reviewed canonical EvidencePack. Provider failures, omissions, freshness, truncation, graph coverage, and RAG citations remain explicit.
-- LangGraph currently provides bounded dispatch, typed state transport, stage visibility, and recursion control; detailed orchestration remains in `CopilotService`.
+- LangGraph owns the bounded request lifecycle, conditional branches, checkpoint state, and recovery boundaries.
+- Terminal `completed` means all required plan capabilities and synthesis succeeded without a material limitation; `completed_with_limitations` carries bounded `limitation_reasons`.
+- Asset and Graph specialist subgraphs are deterministic dispatch boundaries. Parent plan validation, budgets, evidence review, synthesis, and memory remain authoritative.
 - Already-running synchronous provider calls cannot be forcibly terminated after an executor timeout; provider-native timeouts remain the primary transport bound.
-- Neo4j, SIEM actions, MCP, remediation, durable checkpoints, and long-term memory are deferred.
+- Neo4j/GraphStore migration, GraphRAG, bulk enrichment, SIEM actions, MCP/vendor tools, remediation, and durable cross-process episodic memory are deferred.
 - Conversation and routing state are in-memory per process.
 - Streaming preserves Unicode over SSE; clients should parse UTF-8 SSE events instead of re-decoding text manually.

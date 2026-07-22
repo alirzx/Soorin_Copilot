@@ -2685,25 +2685,27 @@ class ComparisonFollowupRegressionTests(unittest.TestCase):
         self.assertEqual("".join(event.text for event in events if event.type == "answer_delta"), "Comparison completed.")
         self.assertEqual(llm.chat_purposes, ["intent_router", "planner"])
         self.assertEqual(llm.stream_purposes, ["chat"])
-        self.assertEqual(len(recording_executor.plans), 1)
+        self.assertEqual(len(recording_executor.plans), 2)
 
-        fallback = recording_executor.plans[0]
+        fallback_plans = recording_executor.plans
+        fallback = fallback_plans[0]
         expected_entities = (self.EXPLICIT_IP, self.ACTIVE_IP)
-        self.assertTrue(fallback.validated)
-        self.assertEqual(fallback.source, "deterministic_fallback")
-        self.assertEqual(fallback.task.entities, expected_entities)
+        self.assertTrue(all(plan.validated for plan in fallback_plans))
+        self.assertTrue(all(plan.source == "deterministic_fallback" for plan in fallback_plans))
+        self.assertTrue(all(plan.task.entities == expected_entities for plan in fallback_plans))
+        fallback_steps = [step for plan in fallback_plans for step in plan.steps]
         self.assertEqual(
-            {step.capability for step in fallback.steps},
-            set(fallback.task.required_capabilities),
+            {step.capability for step in fallback_steps},
+            {"asset.get_profile", "asset.get_detection", "graph.compare_assets"},
         )
         for capability in ("asset.get_profile", "asset.get_detection"):
-            steps = [step for step in fallback.steps if step.capability == capability]
+            steps = [step for step in fallback_steps if step.capability == capability]
             self.assertEqual(len(steps), 2)
             self.assertEqual(
                 {tuple(step.arguments["entities"]) for step in steps},
                 {(self.EXPLICIT_IP,), (self.ACTIVE_IP,)},
             )
-        graph_step = next(step for step in fallback.steps if step.capability == "graph.compare_assets")
+        graph_step = next(step for step in fallback_steps if step.capability == "graph.compare_assets")
         self.assertEqual(tuple(graph_step.arguments["entities"]), expected_entities)
 
 

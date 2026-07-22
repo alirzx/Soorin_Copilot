@@ -111,6 +111,8 @@ class Settings:
     agent_max_graph_depth: int
     agent_executor_max_concurrency: int
     agent_request_timeout_seconds: float
+    langgraph_checkpoint_enabled: bool
+    langgraph_checkpoint_path: str
     glm_base_url: str
     glm_chat_path: str
     glm_model: str
@@ -376,6 +378,12 @@ class Settings:
                 "SOORIN_EVIDENCE_SNAPSHOT_MODE must be none, metadata, summary, or redacted."
             )
 
+    def validate_langgraph_configuration(self) -> None:
+        if self.langgraph_checkpoint_enabled and not self.langgraph_checkpoint_path:
+            raise ValueError(
+                "SOORIN_LANGGRAPH_CHECKPOINT_PATH is required when checkpointing is enabled."
+            )
+
 
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:
@@ -417,6 +425,11 @@ def get_settings() -> Settings:
         agent_max_graph_depth=max(0, min(2, _int("SOORIN_AGENT_MAX_GRAPH_DEPTH", 2))),
         agent_executor_max_concurrency=max(1, min(4, _int("SOORIN_AGENT_EXECUTOR_MAX_CONCURRENCY", 4))),
         agent_request_timeout_seconds=max(1.0, _float("SOORIN_AGENT_REQUEST_TIMEOUT_SECONDS", 120.0)),
+        langgraph_checkpoint_enabled=_bool("SOORIN_LANGGRAPH_CHECKPOINT_ENABLED", True),
+        langgraph_checkpoint_path=os.getenv(
+            "SOORIN_LANGGRAPH_CHECKPOINT_PATH",
+            "data/runtime/langgraph-checkpoints.sqlite3",
+        ).strip(),
         glm_base_url=os.getenv("SOORIN_LLM_GLM_BASE_URL", "").strip().rstrip("/"),
         glm_chat_path=os.getenv("SOORIN_LLM_GLM_CHAT_PATH", "/chat/completions").strip(),
         glm_model=os.getenv("SOORIN_LLM_GLM_MODEL", "GLM-5.2").strip(),
@@ -614,6 +627,7 @@ def get_settings() -> Settings:
     )
     settings.validate_product_paths()
     settings.validate_observability_configuration()
+    settings.validate_langgraph_configuration()
     logger.info(
         "event=settings_loaded env_file_path=%s env_file_loaded=%s router_deployment=%s chat_deployment=%s product_base_url_configured=%s product_token_present=%s product_hwid_present=%s product_username_present=%s product_password_present=%s product_captcha_bypass_present=%s rag_enabled=%s rag_backend=%s rag_source_configured=%s rag_qdrant_mode=%s rag_qdrant_configured=%s",
         ENV_PATH,

@@ -8,7 +8,7 @@ from fastapi import FastAPI
 
 from src.api.dependencies import get_graph_refresh_service as get_api_graph_refresh_service
 from src.api.graph_routes import router as graph_router
-from src.api.routes import router
+from src.api.routes import copilot_service, router
 from src.config.settings import get_settings
 from src.core.graph.refresh import set_graph_refresh_service
 
@@ -61,6 +61,7 @@ def create_app() -> FastAPI:
         refresh_service = get_api_graph_refresh_service()
         refresh_service.stop_background()
         set_graph_refresh_service(None)
+        copilot_service.workflow.close()
         logger.info("event=application_shutdown")
 
     return app

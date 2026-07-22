@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Literal, TypedDict
+from typing import Annotated, Any, Literal, TypedDict
+import operator
 
 
 ToolStatus = Literal["ok", "empty", "not_configured", "unavailable", "invalid", "partial", "not_found"]
@@ -12,6 +13,15 @@ ReviewOutcome = Literal["sufficient", "answer_with_limitations", "missing_requir
 WorkflowMode = Literal["direct", "multi_step"]
 StepRequirement = Literal["required", "optional"]
 PlanSource = Literal["deterministic", "llm", "deterministic_fallback"]
+WorkflowStatus = Literal[
+    "running",
+    "completed",
+    "completed_with_limitations",
+    "clarification_required",
+    "partial_failure",
+    "failed",
+    "cancelled",
+]
 
 
 @dataclass(frozen=True)
@@ -163,6 +173,42 @@ class ReviewDecision:
     next_arguments: dict[str, Any] | None = None
 
 
+SpecialistStatus = Literal["completed", "completed_with_limitations", "skipped", "failed"]
+
+
+@dataclass(frozen=True)
+class AssetInvestigationResult:
+    entities: tuple[str, ...]
+    executed_capabilities: tuple[str, ...]
+    result_statuses: tuple[tuple[str, str], ...]
+    identity_role_fact_count: int = 0
+    service_software_fact_count: int = 0
+    risk_behavior_fact_count: int = 0
+    role_consistency_indicators: tuple[str, ...] = ()
+    conflicts: tuple[str, ...] = ()
+    missing_evidence: tuple[str, ...] = ()
+    freshness: tuple[str, ...] = ()
+    truncated: bool = False
+    status: SpecialistStatus = "skipped"
+
+
+@dataclass(frozen=True)
+class GraphAnalysisResult:
+    entities: tuple[str, ...]
+    executed_capabilities: tuple[str, ...]
+    result_statuses: tuple[tuple[str, str], ...]
+    scope: str = "none"
+    direction: str = "none"
+    depth: int = 0
+    candidate_count: int = 0
+    retrieved_count: int = 0
+    complete_for_request: bool = False
+    direct_relationship: bool | None = None
+    missing_evidence: tuple[str, ...] = ()
+    truncated: bool = False
+    status: SpecialistStatus = "skipped"
+
+
 @dataclass(frozen=True)
 class RetryPolicy:
     max_retries: int = 0
@@ -205,17 +251,56 @@ class InvestigationState(TypedDict, total=False):
     trace_id: str
     session_id: str
     message: str
+    original_message: str
     ui_context: dict[str, Any] | None
+    streaming: bool
+    workflow_id: str
+    thread_id: str
+    checkpoint_namespace: str
+    started_at: str
+    updated_at: str
+    completed_at: str
+    workflow_status: WorkflowStatus
+    terminal: bool
+    resumed: bool
+    resolved_entities: Any
+    active_entity_state: Any
+    recent_messages: list[dict[str, str]]
+    routing_result: Any
+    plan_validation_result: dict[str, Any]
+    capability_results: list[ToolResult]
+    supplemental_retrieval_state: dict[str, Any]
+    composed_context: str
+    model_messages: list[dict[str, str]]
+    conversation_snapshot: Any
+    memory_context_key: Any
+    synthesis_request: dict[str, Any]
+    context_review: dict[str, Any]
+    synthesis_result: dict[str, Any]
+    memory_update_result: dict[str, Any]
+    retry_counters: dict[str, int]
+    failure_metadata: dict[str, Any]
+    limitation_reasons: list[str]
+    next_edge: str
+    clarification: dict[str, Any]
+    node_records: Annotated[list[dict[str, Any]], operator.add]
+    completed_nodes: Annotated[list[str], operator.add]
     task: TaskSpec
     execution_plan: ExecutionPlan
     tool_results: list[ToolResult]
+    asset_specialist_result: AssetInvestigationResult
+    graph_specialist_result: GraphAnalysisResult
+    specialist_tool_results: list[ToolResult]
+    generic_tool_results: list[ToolResult]
+    specialist_records: list[dict[str, Any]]
     evidence_pack: EvidencePack
     review_decision: ReviewDecision
     supplemental_retrieval_count: int
     planner_called: bool
     fallback_used: bool
+    routing_fallback_used: bool
     workflow_mode: WorkflowMode
     iteration_count: int
-    errors: list[str]
-    stages: list[str]
+    errors: Annotated[list[str], operator.add]
+    stages: Annotated[list[str], operator.add]
     final_response: dict[str, Any]
