@@ -139,3 +139,8 @@ data/qdrant-local/*.tar
 compose.env.*
 !compose.env.example
 *.tar
+
+
+#local doc files
+copilot_tmp_notes_docs/
+copilot_tmp_response_test/
