@@ -475,7 +475,11 @@ class CopilotService:
                 "model": "trivial-message-fast-path",
                 "_warnings": [],
             }
-        usage_scope = self.usage_reporter.start_request(resolved_request_id, workflow_trace_id)
+        usage_scope = self.usage_reporter.start_request(
+            resolved_request_id,
+            workflow_trace_id,
+            resolved_session_id,
+        )
         request_success = False
         try:
             result = self.workflow.run(
@@ -491,6 +495,11 @@ class CopilotService:
             return result
         finally:
             self.usage_reporter.finish_request(usage_scope, request_success=request_success)
+
+    def close(self) -> None:
+        """Release owned local resources during application shutdown."""
+        self.knowledge_service.close()
+        self.workflow.close()
 
     @staticmethod
     def _trivial_response(message: str) -> str | None:

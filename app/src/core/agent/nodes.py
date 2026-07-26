@@ -359,7 +359,19 @@ class CopilotWorkflowNodes:
             generic_capabilities = tuple(dict.fromkeys(step.capability for step in generic_steps))
             generic_plan = replace(
                 plan,
-                task=replace(plan.task, required_capabilities=generic_capabilities),
+                task=replace(
+                    plan.task,
+                    required_capabilities=tuple(
+                        capability
+                        for capability in generic_capabilities
+                        if capability in plan.task.required_capabilities
+                    ),
+                    optional_capabilities=tuple(
+                        capability
+                        for capability in generic_capabilities
+                        if capability in plan.task.optional_capabilities
+                    ),
+                ),
                 steps=tuple(
                     replace(step, depends_on=tuple(item for item in step.depends_on if item in generic_ids))
                     for step in generic_steps
@@ -643,16 +655,6 @@ class CopilotWorkflowNodes:
             warning.append("model_context_window_unsafe")
             status = "partial_failure"
             limitation_reasons.append("model_context_window_unsafe")
-        elif review.outcome in {"safe_failure", "missing_required_evidence"}:
-            missing = ", ".join(review.missing_capabilities) or "the required current evidence"
-            result = self._deterministic(
-                f"I cannot safely complete this investigation because {missing} is unavailable. "
-                "No unsupported conclusion was generated.",
-                "evidence-review-guard",
-            )
-            warning.append("required_evidence_unavailable")
-            status = "completed_with_limitations"
-            limitation_reasons.extend(review.reasons or ("missing_required_evidence",))
         elif context_review.get("required_context_missing"):
             result = self._deterministic(
                 "I cannot safely analyze all requested evidence because the required current "
@@ -663,6 +665,11 @@ class CopilotWorkflowNodes:
             status = "completed_with_limitations"
             limitation_reasons.append("required_context_budget_insufficient")
         else:
+            if review.outcome in {"safe_failure", "missing_required_evidence"}:
+                warning.append("required_evidence_unavailable")
+                limitation_reasons.extend(
+                    review.reasons or ("missing_required_evidence",)
+                )
             request = state["synthesis_request"]
             try:
                 if self.stream_sink is not None:
@@ -699,7 +706,11 @@ class CopilotWorkflowNodes:
                         purpose="chat",
                         trace_id=state["trace_id"],
                     )
-                if review.outcome == "answer_with_limitations":
+                if review.outcome in {
+                    "answer_with_limitations",
+                    "safe_failure",
+                    "missing_required_evidence",
+                }:
                     status = "completed_with_limitations"
                     limitation_reasons.extend(review.reasons or review.limitations)
                 else:

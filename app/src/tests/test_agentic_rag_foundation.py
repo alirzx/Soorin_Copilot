@@ -264,7 +264,7 @@ class QdrantAdapterTests(unittest.TestCase):
 
     def test_unavailable_qdrant_is_classified_without_leaking_configuration(self) -> None:
         def unavailable(name):
-            raise TimeoutError("offline")
+            raise TimeoutError("offline at /private/qdrant token=do-not-log")
 
         store = QdrantVectorStore(
             url="http://qdrant.invalid:6333",
@@ -276,7 +276,46 @@ class QdrantAdapterTests(unittest.TestCase):
         with self.assertLogs("src.core.rag.qdrant_store", level="WARNING") as captured:
             health = store.health()
         self.assertEqual(health.status, "unavailable")
-        self.assertNotIn("do-not-log", " ".join(captured.output))
+        output = " ".join(captured.output)
+        self.assertNotIn("do-not-log", output)
+        self.assertNotIn("/private/qdrant", output)
+        self.assertIn("error_reason=", output)
+        self.assertIn("storage_path_kind=remote_url", output)
+
+    def test_local_unnamed_vector_search_reuses_and_closes_client(self) -> None:
+        from qdrant_client.http import models
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = QdrantVectorStore(
+                mode="local",
+                path=directory,
+                collection="fixture",
+                dimension=3,
+            )
+            first_client = store._get_client()
+            first_client.create_collection(
+                collection_name="fixture",
+                vectors_config=models.VectorParams(
+                    size=3,
+                    distance=models.Distance.COSINE,
+                ),
+            )
+            first_client.upsert(
+                collection_name="fixture",
+                points=[
+                    models.PointStruct(
+                        id=1,
+                        vector=[1.0, 0.0, 0.0],
+                        payload={"title": "Kerberos"},
+                    )
+                ],
+                wait=True,
+            )
+            hits = store.search([1.0, 0.0, 0.0], top_k=1)
+            self.assertIs(store._get_client(), first_client)
+            self.assertEqual(hits[0].payload["title"], "Kerberos")
+            store.close()
+            self.assertIsNone(store._client)
 
     def test_filters_and_batched_upserts_are_forwarded(self) -> None:
         calls = {"search": [], "upsert": []}
@@ -412,11 +451,33 @@ class RoutingWorkflowAndReviewerTests(unittest.TestCase):
         self.assertTrue(route.use_knowledge)
         self.assertFalse(route.use_graph)
         self.assertEqual(task.entities, ())
-        self.assertEqual(task.required_capabilities, ("knowledge.search",))
+        self.assertEqual(task.required_capabilities, ())
+        self.assertEqual(task.optional_capabilities, ("knowledge.search",))
         self.assertEqual(task.semantic_decision_source, "semantic_router")
         plan = compile_direct_plan(task)
         self.assertFalse(plan.validated)
         self.assertEqual(plan.max_iterations, 1)
+        self.assertEqual(plan.steps[0].requirement, "optional")
+
+    def test_explicit_indexed_source_request_requires_knowledge(self) -> None:
+        route = SimpleNamespace(
+            materialized_entities=(),
+            scope="none",
+            direction="none",
+            intent="general_knowledge",
+            use_asset_profile=False,
+            use_detection=False,
+            use_graph=False,
+            use_knowledge=True,
+            decision_source="semantic_router",
+        )
+        task = task_spec_from_route(
+            route,
+            "According to the indexed NIST document, what does it say about Kerberos?",
+        )
+        self.assertEqual(task.required_capabilities, ("knowledge.search",))
+        self.assertEqual(task.optional_capabilities, ())
+        self.assertEqual(compile_direct_plan(task).steps[0].requirement, "required")
 
     def test_direct_workflow_calls_executor_once_and_preserves_response(self) -> None:
         calls = []
@@ -472,6 +533,12 @@ class RoutingWorkflowAndReviewerTests(unittest.TestCase):
         self.assertEqual(reviewer.review(task, [partial]).outcome, "answer_with_limitations")
         self.assertEqual(reviewer.review(task, []).outcome, "missing_required_evidence")
         self.assertEqual(reviewer.review(task, [unavailable]).outcome, "safe_failure")
+        optional_task = replace(
+            task,
+            required_capabilities=(),
+            optional_capabilities=("knowledge.search",),
+        )
+        self.assertEqual(reviewer.review(optional_task, [unavailable]).outcome, "sufficient")
         missing_entity_task = replace(
             task,
             required_capabilities=("graph.get_summary",),
@@ -530,6 +597,19 @@ class KnowledgeContextTests(unittest.TestCase):
         self.assertTrue(coverage["model_input_knowledge_included"])
         self.assertLessEqual(coverage["included_chunk_count"], 3)
         self.assertIn("operational providers outrank", composer.last_parts["knowledge"])
+
+
+class PromptKnowledgePolicyTests(unittest.TestCase):
+    def test_prompts_preserve_optional_knowledge_and_operational_authority(self) -> None:
+        system = Path("app/prompts/system_prompt.md").read_text(encoding="utf-8")
+        router = Path("app/prompts/intent_router_system_prompt.md").read_text(encoding="utf-8")
+        planner = Path("app/prompts/planner_system_prompt.md").read_text(encoding="utf-8")
+        self.assertIn("Retrieved Knowledge is supplemental context", system)
+        self.assertIn("Do not refuse solely because retrieval failed", system)
+        self.assertIn("supplemental by default", router)
+        self.assertIn("does not decide whether synthesis may continue", router)
+        self.assertIn("Mark `knowledge.search` optional by default", planner)
+        self.assertIn("model knowledge cannot substitute for current environment facts", planner)
 
 
 if __name__ == "__main__":

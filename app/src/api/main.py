@@ -61,7 +61,7 @@ def create_app() -> FastAPI:
         refresh_service = get_api_graph_refresh_service()
         refresh_service.stop_background()
         set_graph_refresh_service(None)
-        copilot_service.workflow.close()
+        copilot_service.close()
         logger.info("event=application_shutdown")
 
     return app

@@ -66,7 +66,7 @@ class PlanValidator:
         if any(entity not in plan.task.entities for entity in plan.target_entities):
             raise PlanValidationError("entity_authority_violation", "Plan attempted to introduce an unresolved target entity.")
         if not plan.steps:
-            if plan.task.required_capabilities:
+            if plan.task.required_capabilities or plan.task.optional_capabilities:
                 raise PlanValidationError("plan_steps_missing", "Plan contains no execution steps.")
             return replace(plan, validated=True, maximum_allowed_calls=self.max_calls)
         if len(plan.steps) > min(self.max_calls, plan.maximum_allowed_calls):
@@ -234,7 +234,20 @@ class PlanValidator:
             if signature in signatures:
                 raise PlanValidationError("duplicate_capability_call", "Plan contains duplicate equivalent capability calls.")
             signatures.add(signature)
-            normalized.append(replace(step, arguments=arguments))
+            requirement = (
+                "required"
+                if step.capability in plan.task.required_capabilities
+                else "optional"
+                if step.capability in plan.task.optional_capabilities
+                else step.requirement
+            )
+            normalized.append(
+                replace(
+                    step,
+                    arguments=arguments,
+                    requirement=requirement,
+                )
+            )
 
         self._validate_dag(normalized)
         planned_capabilities = {step.capability for step in normalized}
@@ -243,6 +256,12 @@ class PlanValidator:
             raise PlanValidationError(
                 "required_capability_missing",
                 "Plan omitted a capability required by the validated TaskSpec.",
+            )
+        missing_optional = set(plan.task.optional_capabilities) - planned_capabilities
+        if missing_optional:
+            raise PlanValidationError(
+                "optional_capability_missing",
+                "Plan omitted an optional enrichment requested by the validated TaskSpec.",
             )
         return replace(
             plan,

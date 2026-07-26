@@ -91,6 +91,7 @@ class TaskSpec:
     direction: str
     entities: tuple[str, ...]
     required_capabilities: tuple[str, ...]
+    optional_capabilities: tuple[str, ...] = ()
     workflow_mode: WorkflowMode = "direct"
     semantic_decision_source: str = "unknown"
     requires_multiple_entities: bool = False
@@ -256,7 +257,6 @@ class InvestigationState(TypedDict, total=False):
     streaming: bool
     workflow_id: str
     thread_id: str
-    checkpoint_namespace: str
     started_at: str
     updated_at: str
     completed_at: str

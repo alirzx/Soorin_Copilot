@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 from src.config.settings import Settings
@@ -33,6 +34,15 @@ class KnowledgeSearchService:
         vector_store: VectorStore | None = None,
     ) -> None:
         self.settings = settings
+        logger.info(
+            "event=rag_collection_selected enabled=%s backend=%s mode=%s collection=%s embedding_model=%s dimension=%s",
+            settings.rag_enabled,
+            settings.rag_backend,
+            settings.rag_qdrant_mode,
+            settings.rag_collection,
+            settings.rag_embedding_model,
+            settings.rag_embedding_dimension,
+        )
         self.embedder = embedder or HuggingFaceTextEmbedder(
             settings.rag_embedding_model,
             settings.rag_embedding_dimension,
@@ -54,6 +64,7 @@ class KnowledgeSearchService:
                 api_key=settings.rag_qdrant_api_key,
                 timeout_seconds=settings.rag_qdrant_timeout_seconds,
                 batch_size=settings.rag_upsert_batch_size,
+                embedding_model=settings.rag_embedding_model,
             )
 
     def search(
@@ -126,7 +137,10 @@ class KnowledgeSearchService:
                 backend=health.backend,
                 retrieved_at=started_at,
                 freshness="unknown",
-                limitations=("Knowledge vector store is unavailable.",),
+                limitations=(
+                    "Knowledge vector store is unavailable"
+                    + (f": {health.error_reason}" if health.error_reason else "."),
+                ),
                 error_classification=health.error_classification or health.status,
             )
         embedder_health = self.embedder.health()
@@ -152,10 +166,26 @@ class KnowledgeSearchService:
         except Exception as exc:
             error_code = getattr(exc, "code", type(exc).__name__)
             logger.warning(
-                "event=knowledge_search_failed request_id=%s backend=%s error_type=%s",
+                "event=knowledge_search_failed request_id=%s backend=%s mode=%s "
+                "collection=%s embedding_model=%s storage_path_kind=%s "
+                "error_type=%s error_reason=%s",
                 request_id,
                 self.settings.rag_backend,
+                self.settings.rag_qdrant_mode,
+                self.settings.rag_collection,
+                self.settings.rag_embedding_model,
+                (
+                    "remote_url"
+                    if self.settings.rag_qdrant_mode == "server"
+                    else "absolute_local"
+                    if self.settings.rag_qdrant_path
+                    and Path(self.settings.rag_qdrant_path).expanduser().is_absolute()
+                    else "relative_local"
+                    if self.settings.rag_qdrant_path
+                    else "not_configured"
+                ),
                 error_code,
+                QdrantVectorStore.safe_error_reason(exc),
             )
             return KnowledgeSearchResult(
                 status="unavailable",
@@ -212,6 +242,11 @@ class KnowledgeSearchService:
             included_count=len(accepted),
             truncated=len(hits) >= requested_k,
         )
+
+    def close(self) -> None:
+        close = getattr(self.vector_store, "close", None)
+        if callable(close):
+            close()
 
     @staticmethod
     def _chunk_from_hit(hit: VectorSearchHit) -> KnowledgeChunk:

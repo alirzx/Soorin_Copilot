@@ -131,7 +131,19 @@ class BoundedSpecialistSubgraph:
         capabilities = tuple(dict.fromkeys(step.capability for step in bounded_steps))
         subplan = replace(
             plan,
-            task=replace(plan.task, required_capabilities=capabilities),
+            task=replace(
+                plan.task,
+                required_capabilities=tuple(
+                    capability
+                    for capability in capabilities
+                    if capability in plan.task.required_capabilities
+                ),
+                optional_capabilities=tuple(
+                    capability
+                    for capability in capabilities
+                    if capability in plan.task.optional_capabilities
+                ),
+            ),
             steps=bounded_steps,
             maximum_allowed_calls=min(plan.maximum_allowed_calls, len(bounded_steps)),
             validated=True,

@@ -68,6 +68,7 @@ def build_index(
         api_key=settings.rag_qdrant_api_key,
         timeout_seconds=settings.rag_qdrant_timeout_seconds,
         batch_size=settings.rag_upsert_batch_size,
+        embedding_model=settings.rag_embedding_model,
     )
     store.ensure_collection()
     vectors = active_embedder.embed_documents([chunk.text for chunk in chunks])

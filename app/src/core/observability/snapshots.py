@@ -50,6 +50,14 @@ class EvidenceSnapshotWriter:
             "status": "disabled" if not self.enabled else "not_written",
             "mode": self.mode,
         }
+        if self.enabled and self.mode != "none" and self.root.exists():
+            if self.root.is_symlink():
+                logger.warning(
+                    "event=evidence_snapshot_prune_failed path_kind=snapshot_root "
+                    "error_class=SymlinkRoot safe_error_code=snapshot_prune_failed"
+                )
+            else:
+                self._prune(current=None)
 
     def write(self, request_id: str, artifacts: dict[str, Any]) -> Path | None:
         if not self.enabled or self.mode == "none":
@@ -72,7 +80,7 @@ class EvidenceSnapshotWriter:
                     indent=2,
                     default=_json_default,
                 ).encode("utf-8")
-                if total + len(encoded) > self.max_bytes:
+                if len(encoded) > self.max_bytes or total + len(encoded) > self.max_bytes:
                     logger.warning(
                         "event=evidence_snapshot_bounded request_id=%s mode=%s max_bytes=%s",
                         safe_request_id,
@@ -146,10 +154,16 @@ class EvidenceSnapshotWriter:
     def _prepare_directories(self, request_dir: Path) -> None:
         date_dir = request_dir.parent
         self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
+        if self.root.is_symlink():
+            raise OSError("Evidence snapshot root must not be a symlink.")
         os.chmod(self.root, 0o700)
         date_dir.mkdir(exist_ok=True, mode=0o700)
+        if date_dir.is_symlink():
+            raise OSError("Evidence snapshot date directory must not be a symlink.")
         os.chmod(date_dir, 0o700)
         request_dir.mkdir(exist_ok=True, mode=0o700)
+        if request_dir.is_symlink():
+            raise OSError("Evidence snapshot request directory must not be a symlink.")
         os.chmod(request_dir, 0o700)
 
     @staticmethod
@@ -167,7 +181,7 @@ class EvidenceSnapshotWriter:
             if os.path.exists(temporary):
                 os.unlink(temporary)
 
-    def _prune(self, *, current: Path) -> None:
+    def _prune(self, *, current: Path | None) -> None:
         removed_requests = 0
         freed_bytes = 0
         try:
@@ -175,7 +189,7 @@ class EvidenceSnapshotWriter:
                 request_dirs = self._request_directories()
                 cutoff = time.time() - self.ttl_hours * 3600
                 for path in list(request_dirs):
-                    if path == current:
+                    if current is not None and path == current:
                         continue
                     if path.stat().st_mtime < cutoff:
                         freed_bytes += _directory_size(path)
@@ -185,7 +199,10 @@ class EvidenceSnapshotWriter:
 
                 request_dirs.sort(key=lambda item: item.stat().st_mtime)
                 while len(request_dirs) > self.max_requests:
-                    victim = next((path for path in request_dirs if path != current), None)
+                    victim = next(
+                        (path for path in request_dirs if current is None or path != current),
+                        None,
+                    )
                     if victim is None:
                         break
                     freed_bytes += _directory_size(victim)
@@ -195,7 +212,10 @@ class EvidenceSnapshotWriter:
 
                 total_bytes = sum(_directory_size(path) for path in request_dirs)
                 while total_bytes > self.max_total_bytes:
-                    victim = next((path for path in request_dirs if path != current), None)
+                    victim = next(
+                        (path for path in request_dirs if current is None or path != current),
+                        None,
+                    )
                     if victim is None:
                         break
                     size = _directory_size(victim)
@@ -224,16 +244,16 @@ class EvidenceSnapshotWriter:
         return [
             request_dir
             for date_dir in self.root.iterdir()
-            if date_dir.is_dir()
+            if date_dir.is_dir() and not date_dir.is_symlink()
             for request_dir in date_dir.iterdir()
-            if request_dir.is_dir()
+            if request_dir.is_dir() and not request_dir.is_symlink()
         ]
 
     def _remove_empty_date_directories(self) -> None:
         if not self.root.exists():
             return
         for date_dir in self.root.iterdir():
-            if date_dir.is_dir() and not any(date_dir.iterdir()):
+            if date_dir.is_dir() and not date_dir.is_symlink() and not any(date_dir.iterdir()):
                 date_dir.rmdir()
 
 
@@ -298,6 +318,7 @@ def _summary_artifact(name: str, value: Any) -> Any:
             "direction",
             "entities",
             "required_capabilities",
+            "optional_capabilities",
             "workflow_mode",
             "recommended_steps",
             "detail_level",
