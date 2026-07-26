@@ -67,6 +67,10 @@ script/router_e2e_results/
 data/
 data/runtime/evidence/
 data/runtime/logs/
+*.sqlite3
+*.sqlite3-shm
+*.sqlite3-wal
+data/runtime/langgraph-checkpoints*
 
 # ============================================================
 # Local graph/generated data

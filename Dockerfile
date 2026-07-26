@@ -5,21 +5,25 @@ FROM python:${PYTHON_VERSION}-slim AS builder
 ENV PIP_DISABLE_PIP_VERSION_CHECK=1 \
     PIP_NO_CACHE_DIR=1 \
     PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1
+    PYTHONUNBUFFERED=1 \
+    VIRTUAL_ENV=/opt/venv \
+    PATH=/opt/venv/bin:$PATH
 
 WORKDIR /build
 
 RUN apt-get update \
-    && apt-get install --no-install-recommends -y \
-        build-essential \
-    && rm -rf /var/lib/apt/lists/*
+    && apt-get install --no-install-recommends -y build-essential \
+    && rm -rf /var/lib/apt/lists/* \
+    && python -m venv /opt/venv
 
-COPY requirements.txt .
+COPY requirements-torch-cpu.txt requirements.txt ./
 
 RUN python -m pip install --upgrade pip setuptools wheel \
-    && python -m pip wheel \
-        --wheel-dir /build/wheels \
-        -r requirements.txt
+    && python -m pip install -r requirements-torch-cpu.txt \
+    && python -m pip install -r requirements.txt \
+    && python -m pip check \
+    && python -c 'import torch; assert torch.version.cuda is None; assert "+cpu" in torch.__version__' \
+    && python -c 'import importlib.metadata as m; bad=[d.metadata["Name"] for d in m.distributions() if (d.metadata.get("Name") or "").lower().startswith(("nvidia-", "cuda-"))]; assert not bad, bad'
 
 
 FROM python:${PYTHON_VERSION}-slim AS runtime
@@ -29,9 +33,9 @@ ARG APP_GID=10001
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    PIP_DISABLE_PIP_VERSION_CHECK=1 \
-    PIP_NO_CACHE_DIR=1 \
     PYTHONPATH=/workspace/app \
+    VIRTUAL_ENV=/opt/venv \
+    PATH=/opt/venv/bin:$PATH \
     SOORIN_HOST=0.0.0.0 \
     SOORIN_PORT=6998 \
     HF_HOME=/home/soorin/.cache/huggingface \
@@ -46,41 +50,30 @@ RUN groupadd --gid "${APP_GID}" soorin \
         --gid "${APP_GID}" \
         --create-home \
         --shell /usr/sbin/nologin \
-        soorin
-
-# libgomp1 is commonly required by CPU Torch runtimes.
-RUN apt-get update \
-    && apt-get install --no-install-recommends -y \
-        libgomp1 \
+        soorin \
+    && apt-get update \
+    && apt-get install --no-install-recommends -y libgomp1 \
     && rm -rf /var/lib/apt/lists/*
 
-COPY --from=builder /build/wheels /tmp/wheels
-COPY requirements.txt /tmp/requirements.txt
-
-RUN python -m pip install \
-        --no-index \
-        --find-links=/tmp/wheels \
-        -r /tmp/requirements.txt \
-    && rm -rf /tmp/wheels /tmp/requirements.txt
-
+COPY --from=builder /opt/venv /opt/venv
 COPY --chown=soorin:soorin app ./app
 COPY --chown=soorin:soorin lib ./lib
-COPY --chown=soorin:soorin script ./script
-
-# Keep the approved SOC corpus available for index rebuilding.
-COPY --chown=soorin:soorin docs ./docs
 
 RUN mkdir -p \
         /workspace/data/raw \
         /workspace/data/processed \
+        /workspace/data/runtime/logs \
+        /workspace/data/runtime/evidence \
         /workspace/data/qdrant-local \
+        /workspace/docs \
         /home/soorin/.cache/huggingface \
     && chown -R soorin:soorin \
         /workspace/data \
+        /workspace/docs \
         /home/soorin
 
 USER soorin
 
 EXPOSE 6998 8501
 
-CMD ["python", "-m", "uvicorn", "src.api.main:app", "--host", "0.0.0.0", "--port", "6998"]
+CMD ["python", "app/run.py", "--api"]

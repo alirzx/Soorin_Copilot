@@ -1,9 +1,8 @@
-"""Durable bounded LangGraph workflow for Soorin Copilot investigations."""
+"""Bounded LangGraph workflow for Soorin Copilot investigations."""
 
 from __future__ import annotations
 
 import logging
-import sqlite3
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -11,7 +10,6 @@ from datetime import datetime, timezone
 from typing import Any, Protocol
 from uuid import uuid4
 
-from src.core.agent.checkpoints import WorkflowCheckpointManager
 from src.core.agent.contracts import InvestigationState, TaskSpec
 from src.core.agent.events import WorkflowEventContext, WorkflowEventLogger
 
@@ -120,7 +118,6 @@ class BoundedCopilotWorkflow:
     """Compile the full request lifecycle as explicit bounded LangGraph nodes."""
 
     recursion_limit = 32
-    checkpoint_namespace = "soorin-copilot-v1"
     required_nodes = (
         "resolve_entities",
         "route",
@@ -143,18 +140,8 @@ class BoundedCopilotWorkflow:
         "safe_failure",
     )
 
-    def __init__(
-        self,
-        settings: Any | None = None,
-        *,
-        checkpoint_saver: Any | None = None,
-    ) -> None:
+    def __init__(self, settings: Any | None = None) -> None:
         self.settings = settings
-        self.checkpoints = (
-            WorkflowCheckpointManager(settings, saver=checkpoint_saver)
-            if settings is not None or checkpoint_saver is not None
-            else None
-        )
         try:
             from langgraph.graph import END, START, StateGraph
         except ModuleNotFoundError:
@@ -170,11 +157,9 @@ class BoundedCopilotWorkflow:
             self.runtime = "langgraph"
             self.graph = self._compile_graph()
         logger.info(
-            "event=langgraph_initialized runtime=%s bounded=true recursion_limit=%s "
-            "checkpoint_backend=%s",
+            "event=langgraph_initialized runtime=%s bounded=true recursion_limit=%s persistence=none",
             self.runtime,
             self.recursion_limit,
-            self.checkpoints.backend if self.checkpoints else "disabled",
         )
 
     @staticmethod
@@ -310,17 +295,6 @@ class BoundedCopilotWorkflow:
                 output_summary=output_summary,
                 resumed=bool(state.get("resumed")),
             )
-            if self.checkpoints and self.checkpoints.saver is not None:
-                events.emit(
-                    "langgraph_checkpoint_requested",
-                    workflow_id=state.get("workflow_id"),
-                    thread_id=state.get("thread_id"),
-                    checkpoint_id=f"{state.get('request_id')}:{name}:{attempt}",
-                    node=name,
-                    attempt=attempt,
-                    status="requested",
-                    backend=self.checkpoints.backend,
-                )
             return update
 
         execute.__name__ = name
@@ -453,10 +427,7 @@ class BoundedCopilotWorkflow:
         graph.add_edge("update_memory", self._end)
         graph.add_edge("clarification", self._end)
         graph.add_edge("safe_failure", self._end)
-        return graph.compile(
-            checkpointer=self.checkpoints.saver if self.checkpoints else None,
-            name="soorin_bounded_investigation",
-        )
+        return graph.compile(name="soorin_bounded_investigation")
 
     def _clarification_interrupt(self, state: InvestigationState, runtime: Any) -> dict[str, Any]:
         if not runtime.context.interrupt_on_clarification:
@@ -560,7 +531,6 @@ class BoundedCopilotWorkflow:
             "streaming": stream_sink is not None,
             "workflow_id": workflow_id,
             "thread_id": request_id,
-            "checkpoint_namespace": self.checkpoint_namespace,
             "started_at": _now(),
             "updated_at": _now(),
             "workflow_status": "running",
@@ -592,24 +562,6 @@ class BoundedCopilotWorkflow:
             node_runtime = _CompatibilityRuntime(selected_executor, stream_sink)
 
         config = self._config(request_id)
-        prior = self._checkpoint_values(config)
-        if (
-            prior
-            and prior.get("request_id") == request_id
-            and prior.get("terminal")
-            and isinstance(prior.get("final_response"), dict)
-        ):
-            self._events(prior).emit(
-                "langgraph_node_skipped",
-                workflow_id=prior.get("workflow_id"),
-                thread_id=request_id,
-                node="workflow",
-                status=prior.get("workflow_status"),
-                resumed=True,
-                reason="terminal_checkpoint",
-            )
-            return dict(prior["final_response"])
-
         events = self._events(initial)
         events.emit(
             "langgraph_workflow_started",
@@ -621,29 +573,11 @@ class BoundedCopilotWorkflow:
         if self.graph is None or self._state_graph_type is None:
             final = self._run_deterministic(initial, node_runtime)
         else:
-            try:
-                final = self.graph.invoke(
-                    initial,
-                    config=config,
-                    context=WorkflowRunContext(node_runtime, interrupt_on_clarification),
-                )
-            except Exception as exc:
-                if (
-                    self.checkpoints
-                    and self.checkpoints.saver is not None
-                    and self._is_checkpoint_failure(exc)
-                ):
-                    events.emit(
-                        "langgraph_checkpoint_failed",
-                        level=logging.ERROR,
-                        workflow_id=workflow_id,
-                        thread_id=request_id,
-                        backend=self.checkpoints.backend,
-                        status="failed",
-                        error_type=type(exc).__name__,
-                    )
-                raise
-            self._emit_checkpoint_saved(final, config)
+            final = self.graph.invoke(
+                initial,
+                config=config,
+                context=WorkflowRunContext(node_runtime, interrupt_on_clarification),
+            )
         response = final.get("final_response")
         if not isinstance(response, dict):
             if interrupt_on_clarification and final.get("workflow_status") == "clarification_required":
@@ -671,114 +605,8 @@ class BoundedCopilotWorkflow:
         self._render_workflow_trace(final)
         return response
 
-    def resume(
-        self,
-        request_id: str,
-        *,
-        node_runtime: WorkflowNodeRuntime,
-        resume_value: Any | None = None,
-    ) -> dict[str, Any]:
-        """Resume one non-terminal request from its latest durable checkpoint."""
-        if self.graph is None or not self.checkpoints or self.checkpoints.saver is None:
-            raise RuntimeError("Durable workflow recovery is not configured.")
-        config = self._config(request_id)
-        prior = self._checkpoint_values(config)
-        if not prior or prior.get("request_id") != request_id:
-            raise KeyError("No checkpoint exists for the requested workflow.")
-        if prior.get("terminal"):
-            response = prior.get("final_response")
-            if isinstance(response, dict):
-                return dict(response)
-            raise RuntimeError("Terminal checkpoint has no final response.")
-        events = self._events(prior)
-        events.emit(
-            "langgraph_workflow_resumed",
-            workflow_id=prior.get("workflow_id"),
-            thread_id=request_id,
-            status=prior.get("workflow_status", "running"),
-            resumed=True,
-        )
-        graph_input: Any = None
-        if resume_value is not None:
-            from langgraph.types import Command
-
-            graph_input = Command(resume=resume_value)
-            events.emit(
-                "langgraph_interrupt_resumed",
-                workflow_id=prior.get("workflow_id"),
-                thread_id=request_id,
-                status="running",
-                resumed=True,
-            )
-        final = self.graph.invoke(
-            graph_input,
-            config=config,
-            context=WorkflowRunContext(node_runtime, resume_value is not None),
-        )
-        self._emit_checkpoint_saved(final, config)
-        response = final.get("final_response")
-        if not isinstance(response, dict):
-            raise RuntimeError("Resumed workflow did not produce a final response.")
-        return response
-
     def _config(self, request_id: str) -> dict[str, Any]:
-        return {
-            "recursion_limit": self.recursion_limit,
-            "configurable": {
-                "thread_id": request_id,
-                # Root graphs use LangGraph's empty checkpoint namespace. The
-                # Soorin namespace remains explicit metadata for future subgraphs.
-                "checkpoint_ns": "",
-                "soorin_checkpoint_namespace": self.checkpoint_namespace,
-            },
-        }
-
-    def _checkpoint_values(self, config: dict[str, Any]) -> InvestigationState | None:
-        if self.graph is None or not self.checkpoints or self.checkpoints.saver is None:
-            return None
-        try:
-            snapshot = self.graph.get_state(config)
-        except Exception:
-            return None
-        values = getattr(snapshot, "values", None)
-        return values if isinstance(values, dict) and values else None
-
-    def _emit_checkpoint_saved(self, state: InvestigationState, config: dict[str, Any]) -> None:
-        if not self.checkpoints or self.checkpoints.saver is None or self.graph is None:
-            return
-        events = self._events(state)
-        try:
-            snapshot = self.graph.get_state(config)
-            snapshot_config = getattr(snapshot, "config", {}) or {}
-            configurable = snapshot_config.get("configurable", {})
-            checkpoint_id = configurable.get("checkpoint_id") or state.get("request_id")
-        except Exception as exc:
-            events.emit(
-                "langgraph_checkpoint_failed",
-                level=logging.ERROR,
-                workflow_id=state.get("workflow_id"),
-                thread_id=state.get("thread_id"),
-                backend=self.checkpoints.backend,
-                status="failed",
-                error_type=type(exc).__name__,
-            )
-            return
-        events.emit(
-            "langgraph_checkpoint_saved",
-            workflow_id=state.get("workflow_id"),
-            thread_id=state.get("thread_id"),
-            checkpoint_id=checkpoint_id,
-            node=(state.get("completed_nodes") or ["workflow"])[-1],
-            attempt=1,
-            status="saved",
-            backend=self.checkpoints.backend,
-        )
-
-    @staticmethod
-    def _is_checkpoint_failure(exc: Exception) -> bool:
-        module = type(exc).__module__.casefold()
-        name = type(exc).__name__.casefold()
-        return isinstance(exc, sqlite3.Error) or "checkpoint" in module or "checkpoint" in name
+        return {"recursion_limit": self.recursion_limit}
 
     def _render_workflow_trace(self, state: InvestigationState) -> None:
         if not self.settings or not getattr(self.settings, "copilot_human_trace_enabled", False):
@@ -834,5 +662,4 @@ class BoundedCopilotWorkflow:
         return tuple(self.graph.get_graph().nodes)
 
     def close(self) -> None:
-        if self.checkpoints:
-            self.checkpoints.close()
+        """Keep the service lifecycle hook stable; no persistent resource is owned."""

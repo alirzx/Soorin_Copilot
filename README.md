@@ -61,7 +61,7 @@ flowchart LR
 - `app/src/core/graph`: product topology fetching, graph building/loading/querying, retrieval, and visualization helpers.
 - `app/src/core/rag`: knowledge/RAG contracts, embedding abstraction, Qdrant vector store, retrieval, citations, and safety.
 - `app/src/core/llm`: provider-neutral LLM client and Arvan-compatible deployments.
-- `app/src/core/memory`: session history, routing state, summaries, and checkpoint-aware memory.
+- `app/src/core/memory`: process-local session history, routing state, and bounded summaries.
 - `app/src/core/observability`: logging, tracing, usage recording, and evidence snapshots.
 
 ## Quick Start
@@ -102,11 +102,13 @@ The application reads `app/.env` first, then environment variables. Compose-leve
 Important configuration groups:
 
 - API/UI: `API_HOST`, `API_PORT`, `SOORIN_API_BASE_URL`, `STREAMLIT_SERVER_PORT`
-- LLM: router and chat deployments, Arvan base URLs, models, API keys, timeouts, token limits
+- LLM: Kimi router/chat, GLM Planner, retained GPT compatibility, provider-neutral gateway settings, timeouts, and token limits
 - Product API: base URL, topology/profile/detection/login paths, token or login credentials, HWID
 - Graph: artifact paths, refresh policy, retrieval caps, UI limits, context budgets
 - RAG: enable flag, source root, Qdrant mode/server/local path, collection, BGE embedding model/dimension
-- Memory and observability: history limits, trace detail, usage storage, evidence snapshots
+- Memory and observability: history limits, trace detail, request-local usage reporting, and evidence snapshots
+
+This release has no LangGraph checkpoint persistence. Workflow execution remains bounded and active, while conversation/routing memory remains process-local.
 
 Secrets such as API keys, product credentials, and Qdrant API keys must remain in local environment files or deployment secret stores.
 
@@ -143,7 +145,7 @@ make test
 Run local focused Python checks when working in the virtual environment:
 
 ```bash
-PYTHONPATH=app .venv/bin/python -m pytest -q app/src/tests
+PYTHONPATH=app .venv/bin/python -m unittest discover -s app/src/tests -p 'test_*.py' -v
 ```
 
 Use offline tests for routing, graph, RAG, context budgeting, evidence contracts, and streaming. Do not call live Product, LLM, Qdrant, FastAPI, Streamlit, Docker, or indexing flows from unit tests.

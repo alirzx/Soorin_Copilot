@@ -30,6 +30,15 @@ compose.env.*
 # Generated and runtime data
 data/
 copilot_test_results/
+copilot_tmp_notes_docs/
+copilot_tmp_response_test/
+data/runtime/
+data/qdrant-local/
+data/raw/*.snapshot.*.json
+data/processed/*.snapshot.*.pkl
+*.sqlite3
+*.sqlite3-shm
+*.sqlite3-wal
 
 # Local model caches
 .cache/

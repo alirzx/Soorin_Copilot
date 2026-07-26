@@ -216,7 +216,7 @@ Streamlit UI  ──>  FastAPI API  ──>  CopilotService Facade  ──>  Lan
                                     │
                               Context Composer (budget-aware)
                                     │
-                              Final LLM Synthesis (Arvan GLM/GPT)
+                              Final LLM Synthesis (configured Kimi/GLM/GPT)
                                     │
                               Memory Update
 ```
@@ -253,7 +253,7 @@ Streamlit UI  ──>  FastAPI API  ──>  CopilotService Facade  ──>  Lan
 | File | Purpose |
 |---|---|
 | `settings.py` | All configuration from `app/.env` + environment variables, validated at startup |
-| `llm_deployments.py` | Two named Arvan-compatible deployments: `glm` (GLM-5.2) and `gpt55` (GPT-5.5) |
+| `llm_deployments.py` | OpenAI-compatible deployments: `kimi`, `glm`, and retained `gpt55` |
 
 **Major configuration groups:**
 
@@ -271,7 +271,7 @@ This is the brain of the system — a 13-node bounded LangGraph workflow.
 
 | File | Symbol | Role |
 |---|---|---|
-| `workflow.py` | `BoundedCopilotWorkflow` | Durable LangGraph lifecycle with conditional edges |
+| `workflow.py` | `BoundedCopilotWorkflow` | Bounded no-checkpointer LangGraph lifecycle with conditional edges |
 | `nodes.py` | `CopilotWorkflowNodes` | All 13 node implementations (request-scoped) |
 | `contracts.py` | `InvestigationState`, `TaskSpec`, `ExecutionPlan`, `ToolResult`, `EvidenceFact`, `EvidencePack`, `ReviewDecision`, `CapabilitySpec` | Typed contracts |
 | `planner.py` | `BoundedPlanner` | Optional LLM-based multi-step planner |
@@ -281,7 +281,6 @@ This is the brain of the system — a 13-node bounded LangGraph workflow.
 | `reviewer.py` | `EvidenceReviewer` | Two-stage deterministic review (retrieval + context) |
 | `evidence.py` | `EvidencePack` builder, `apply_context_inclusion` | Evidence packaging and composer integration |
 | `task_mapping.py` | Task mapping | Route decision to TaskSpec translation |
-| `checkpoints.py` | SQLite checkpoint saver | Durable recovery per `request_id` |
 | `events.py` | Event types | Typed lifecycle events for observability |
 | `context_identity.py` | Context identity | Identity keys for evidence tracking |
 | `specialists/` | Asset Investigation Specialist, Graph Analysis Specialist | Typed bounded LangGraph subgraphs (zero-LLM) |
@@ -325,7 +324,7 @@ resolve_entities -> route -> validate_task -> build_direct_plan OR build_plan
 | File | Purpose |
 |---|---|
 | `entities.py` | Deterministic IPv4 entity extraction with authority order |
-| `intent.py` | Semantic LLM router (GLM/GPT deployment) |
+| `intent.py` | Semantic LLM router (configured Kimi/GLM/GPT deployment) |
 | `router.py` | Deterministic fallback router (regex-based, after LLM failure) |
 | `composer.py` | Context composition with provider coverage, budgets, and limitations |
 | `product_views.py` | Product evidence view selection and inventory |
@@ -419,8 +418,9 @@ deterministic entity extraction -> semantic LLM router -> strict schema validati
 
 | Alias | Default Model | Purpose |
 |---|---|---|
-| `glm` | GLM-5.2 | Chat synthesis (default) |
-| `gpt55` | GPT-5.5 | Intent router (default) |
+| `kimi` | kimi-k3 | Intent router and chat synthesis (default) |
+| `glm` | GLM-5.2 | Planner (default when enabled) |
+| `gpt55` | GPT-5.5 | Retained configurable compatibility deployment |
 
 Both use OpenAI-compatible `messages` format, `Authorization: <scheme> <key>`, and extract `choices[0].message.content`.
 
@@ -600,7 +600,7 @@ Both use OpenAI-compatible `messages` format, `Authorization: <scheme> <key>`, a
 | **Evidence traceability** | Full lineage from provider fetch → ToolResult → EvidencePack → Context → Model |
 | **Budget awareness** | Token-level context budgeting with Product-first priority, safety margins, and hard guards |
 | **Two-stage review** | Retrieval review + context review prevent unsafe synthesis |
-| **Checkpoint/recovery** | SQLite-based durable checkpoints per request with resume capability |
+| **Bounded execution** | LangGraph runs without checkpoint persistence; state and memory remain process-local |
 | **Observability** | Human trace + machine events, evidence snapshots, structured logging |
 | **Clean separation** | CopilotService (facade) → Workflow (orchestration) → Nodes (implementation) |
 | **Specialist pattern** | Domain-specific bounded subgraphs without additional LLM calls |

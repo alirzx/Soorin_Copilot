@@ -1583,28 +1583,30 @@ class CopilotHelpContentTests(unittest.TestCase):
         content = get_copilot_help_content()
         authority = " ".join(content.authority)
         evidence = " ".join(content.evidence)
+        tips = " ".join(content.tips)
 
-        self.assertIn("Explicit IP", authority)
-        self.assertIn("selected graph node", authority)
+        self.assertIn("IP written in your prompt", authority)
+        self.assertIn("selected topology asset", authority)
         self.assertIn("previous active asset", authority)
-        self.assertIn("Clicking empty graph space clears", authority)
-        self.assertIn("asset-detection evidence", evidence)
-        self.assertIn("graph evidence", evidence)
-        self.assertIn("General cybersecurity questions", evidence)
+        self.assertIn("Click empty graph space", tips)
+        self.assertIn("Detection provides", evidence)
+        self.assertIn("Graph provides", evidence)
+        self.assertIn("Knowledge retrieval", evidence)
 
     def test_help_examples_cover_current_route_shapes(self) -> None:
         content = get_copilot_help_content()
         groups = {group.title: group for group in content.examples}
 
         for title in (
-            "Identify an asset",
-            "Get detailed evidence",
-            "Explore connections",
-            "Combine identity and topology",
-            "Compare assets",
-            "Find a path",
-            "Ask general questions",
-            "Use follow-ups",
+            "Summarize an asset",
+            "Check identity and role",
+            "Review detections and risk",
+            "Explore network connections",
+            "Run a combined investigation",
+            "Compare two assets",
+            "Find an observed path",
+            "Ask cybersecurity questions",
+            "Use follow-up questions",
         ):
             self.assertIn(title, groups)
 
@@ -1612,7 +1614,7 @@ class CopilotHelpContentTests(unittest.TestCase):
         self.assertIn("Show all inbound peers", examples)
         self.assertIn("Show all outbound peers", examples)
         self.assertIn("two-hop neighborhood", examples)
-        self.assertIn("directly connected", examples)
+        self.assertIn("communicate directly", examples)
         self.assertIn("shortest graph path", examples)
         self.assertIn("Tell me more about it", examples)
         self.assertIn("Compare them", examples)

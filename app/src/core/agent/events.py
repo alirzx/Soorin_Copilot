@@ -20,7 +20,7 @@ SAFE_EVENT_FIELDS = {
     "path_kind", "file_count", "removed_requests", "freed_bytes", "mode",
     "max_bytes", "backup_count",
     "field", "validation_rule",
-    "workflow_id", "thread_id", "checkpoint_id", "node", "attempt",
+    "workflow_id", "thread_id", "node", "attempt",
     "started_at", "input_summary", "output_summary", "next_edge",
     "error_type", "retryable", "resumed",
     "backend", "specialist", "subgraph_node", "capability_count",

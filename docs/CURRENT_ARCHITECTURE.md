@@ -24,7 +24,7 @@ sequenceDiagram
     participant UI as Streamlit UI
     participant API as FastAPI
     participant Service as CopilotService facade
-    participant Workflow as Durable LangGraph
+    participant Workflow as Bounded LangGraph
     participant Entity as EntityResolver
     participant Router as SemanticIntentRouter
     participant Planner as Bounded Planner
@@ -38,7 +38,7 @@ sequenceDiagram
     API->>Service: message, session_id, optional ui_context
     Service->>Workflow: invoke request with runtime dependencies
     Workflow->>Entity: resolve explicit/UI/session entities
-    Workflow->>Router: classify with GLM/GPT deployment
+    Workflow->>Router: classify with configured Kimi/GLM/GPT deployment
     Router->>Workflow: JSON route decision
     Workflow->>Workflow: validate and normalize task
     Workflow->>Planner: multi-step only; one structured proposal
@@ -112,12 +112,13 @@ Validation currently enforces:
 
 Implemented in `app/src/config/llm_deployments.py`, `app/src/core/llm/client.py`, and `app/src/core/llm/providers/arvan.py`.
 
-The system supports two named Arvan-compatible deployments:
+The system supports three named OpenAI-compatible deployments through the existing adapter:
 
+- `kimi`, default model label `kimi-k3`.
 - `glm`, default model label `GLM-5.2`.
 - `gpt55`, default model label `GPT-5.5`.
 
-`SOORIN_INTENT_ROUTER_DEPLOYMENT` selects the semantic router model. `SOORIN_CHAT_DEPLOYMENT` selects the final synthesis model. Both aliases use the same typed `ArvanDeploymentConfig` contract.
+`SOORIN_INTENT_ROUTER_DEPLOYMENT` selects the semantic router model, `SOORIN_CHAT_DEPLOYMENT` selects final synthesis, and `SOORIN_PLANNER_DEPLOYMENT` selects the optional Planner. Release defaults are Kimi for routing/synthesis and GLM for planning; GPT remains configurable but inactive. All aliases use the same typed `ArvanDeploymentConfig` contract.
 
 The provider:
 
@@ -265,7 +266,7 @@ resolve_entities
 - Router failure with exactly two deterministically resolved entities preserves explicit comparison, direct-relationship, or path meaning before prior-route continuity. Normal comparison fallback includes per-entity Profile and Detection plus `graph.compare_assets`; direct relationships and paths remain graph-specific.
 - `PlanValidator` enforces known/planner-visible/read-only capabilities, entity authority, cardinality, argument schemas, dependency references, DAG structure, duplicate-call rejection, six-call maximum, two-entity maximum, and graph depth two.
 - `CapabilityExecutor` runs independent steps concurrently with a maximum of four workers by default. Profile and Detection are serialized because they share a Product client/session; Graph and Knowledge can overlap safely.
-- Asset and Graph Specialists are typed bounded LangGraph subgraphs. They receive only validated parent-plan steps, delegate execution to the same registry/executor, add no LLM calls, cannot mutate task/entity authority or memory, and return checkpoint-safe summaries. Parent review and synthesis remain authoritative.
+- Asset and Graph Specialists are typed bounded LangGraph subgraphs. They receive only validated parent-plan steps, delegate execution to the same registry/executor, add no LLM calls, cannot mutate task/entity authority or memory, and return compact serializable summaries. Parent review and synthesis remain authoritative.
 - Provider exceptions become safe typed failures; successful and partial results are preserved.
 - LangGraph is bounded at recursion limit 32. Conditional edges express direct/planner selection, clarification/safe failure, deterministic plan fallback, one supplemental retrieval, context review, and terminal memory update.
 - Runtime clients, locks, streams, and secrets are supplied through LangGraph runtime context and are never persisted in `InvestigationState`.
@@ -274,20 +275,9 @@ resolve_entities
 
 Terminal status is evidence-driven. `completed` means every required validated capability and final synthesis succeeded without material fallback or truncation. `completed_with_limitations` is reserved for material provider/evidence gaps, truncation, deterministic synthesis fallback, or recovered plan fallback and carries bounded `limitation_reasons`. Clarification, partial failure, failure, and cancellation remain distinct terminal outcomes.
 
-### Checkpoint and recovery model
+### Workflow persistence model
 
-The official LangGraph SQLite saver is configured by:
-
-- `SOORIN_LANGGRAPH_CHECKPOINT_ENABLED`
-- `SOORIN_LANGGRAPH_CHECKPOINT_PATH`
-
-The default path is `data/runtime/langgraph-checkpoints.sqlite3`, under the ignored runtime data tree. Its directory and database are restricted to `0700` and `0600`. The volume is operationally sensitive because checkpoints can contain bounded evidence state and must receive the same backup/access controls as other private runtime data. The workflow maps `thread_id` to `request_id`; `session_id` and `trace_id` remain persisted correlation fields, and the Soorin checkpoint namespace is retained as metadata. This prevents one request from being resumed merely because it shares a session with another request.
-
-Node outputs and completion records are checkpointed after each graph step. Node wrappers emit `langgraph_checkpoint_requested`; `langgraph_checkpoint_saved status=saved` is emitted only after the official saver returns a readable checkpoint. Persistence failures emit `langgraph_checkpoint_failed` without serializing checkpoint content. A terminal checkpoint is returned without rerunning provider calls, synthesis, memory update, or usage reporting. The internal `resume` method continues a non-terminal request from its latest checkpoint. Clarification can use an opt-in official LangGraph interrupt/resume path; the public chat route keeps the Phase 2.1 immediate clarification response.
-
-Nodes reuse checkpointed outputs after resume. Plan validation, EvidencePack construction, and retrieval review are the only repeatable graph stages, and only for their bounded fallback/supplemental second pass. Memory writes accept `request_id` and suppress duplicate completed turns. Product and LLM adapters retain their existing bounded retry behavior; the workflow adds at most one retry only for an explicitly classified `RetryableWorkflowError`.
-
-The checkpoint abstraction owns the saver and connection, allowing a future PostgreSQL saver without changing node contracts. SQLite checkpointing is workflow persistence only; it is unrelated to the removed LLM-usage database.
+This release compiles LangGraph without a checkpointer and provides no SQLite or alternate checkpoint persistence. Request execution remains bounded, all workflow nodes and conditional edges remain active, and memory update remains exactly once per completed request. Conversation and routing state are process-local; interrupted requests cannot resume after a process restart. Durable checkpointing is a future architecture option, not a runtime feature of this release.
 
 ### Service responsibilities after refactor
 
@@ -301,7 +291,7 @@ CopilotService
 
 BoundedCopilotWorkflow
 -> explicit nodes and conditional edges listed above
--> checkpoint/recovery/interrupt boundaries
+-> bounded request lifecycle and safe terminal boundaries
 -> workflow and node observability
 ```
 
@@ -611,11 +601,8 @@ Phase 3 adds node lifecycle events on the same allowlisted logging path:
 - `langgraph_node_failed`
 - `langgraph_node_retried`
 - `langgraph_node_skipped`
-- `langgraph_checkpoint_requested`
-- `langgraph_checkpoint_saved`
-- `langgraph_checkpoint_failed`
 - specialist start/completion/failure/skip and specialist-node lifecycle events
-- workflow start, resume, interrupt, completion, partial, and failure events
+- workflow start, completion, partial, and failure events
 
 The detailed human workflow trace is adapted from final `InvestigationState`. It includes request/entity authority, routing, task/plan, `LANGGRAPH WORKFLOW`, `SPECIALISTS`, capability execution, evidence coverage, context/token budget, memory transition, bounded LLM-call counts, final status, and limitation reasons. It never renders prompts, model responses, credentials, or evidence payloads.
 
@@ -679,8 +666,8 @@ Local launcher:
 
 Docker:
 
-- `Dockerfile` builds wheels in a builder stage and runs as non-root `soorin`.
-- Runtime copies `app`, `lib`, `script`, and `docs`.
+- `Dockerfile` installs CPU-only Torch and application dependencies into `/opt/venv` in a builder stage, verifies no CUDA/NVIDIA packages, and runs as non-root `soorin`.
+- Runtime copies only `/opt/venv`, `app`, and `lib`; local data, secrets, caches, wheels, and checkpoint files are excluded.
 - Runtime exposes `6998` and `8501`.
 - `compose.yaml` defines `api` and `ui` services.
 - API uses `python app/run.py --api`.
@@ -728,7 +715,7 @@ Implemented:
 
 - FastAPI chat and graph APIs.
 - Streamlit workspace with topology UI and streaming chat.
-- Provider-neutral LLM client with Arvan deployments for GLM/GPT aliases.
+- Provider-neutral LLM client with OpenAI-compatible Kimi/GLM/GPT deployment aliases.
 - Semantic LLM router with deterministic validation and fallback.
 - Deterministic IPv4 entity authority.
 - Product auth/client for topology, detection, profile, and login.
@@ -769,7 +756,7 @@ Deferred or not implemented:
 
 Remaining risks:
 
-- SQLite checkpoints contain bounded request evidence and require private runtime-volume controls; they are not conversation memory, billing, analytics, or Product cache storage.
+- There is no durable workflow checkpointing; in-flight work cannot resume after a process restart.
 - Synchronous provider calls cannot be killed after a Python future timeout; transport-native timeouts must remain correctly configured.
 - Planner mode is offline-tested with fakes but requires deliberate manual parity testing before broad enablement.
 - Conversation and routing state are process-local and do not coordinate concurrent workers.

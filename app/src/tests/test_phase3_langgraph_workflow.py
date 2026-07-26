@@ -1,14 +1,10 @@
-"""Focused offline tests for the Phase 3 durable LangGraph workflow."""
+"""Focused offline tests for the bounded no-checkpointer LangGraph workflow."""
 
 from __future__ import annotations
 
 import logging
 from threading import Thread
-from types import SimpleNamespace
 from typing import Any
-
-from langgraph.checkpoint.memory import InMemorySaver
-from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
 
 from src.core.agent.contracts import (
     EvidencePack,
@@ -215,6 +211,19 @@ class ClarificationRuntime(FakeNodeRuntime):
             }
         return {"resolved_entities": {"entities": ["192.0.2.10", "192.0.2.11"]}}
 
+    def clarification_response(self, state: InvestigationState) -> dict[str, Any]:
+        self._call("clarification_response")
+        return {
+            "final_response": {
+                "session_id": state["session_id"],
+                "answer": "Which second asset should be compared?",
+                "provider": "deterministic",
+                "model": "clarification",
+            },
+            "terminal": True,
+            "workflow_status": "clarification_required",
+        }
+
 
 def run_workflow(workflow: BoundedCopilotWorkflow, runtime: FakeNodeRuntime, request_id: str = "r1") -> dict[str, Any]:
     return workflow.run(
@@ -228,7 +237,7 @@ def run_workflow(workflow: BoundedCopilotWorkflow, runtime: FakeNodeRuntime, req
 
 
 def test_graph_contains_required_nodes_and_conditional_routes() -> None:
-    workflow = BoundedCopilotWorkflow(checkpoint_saver=InMemorySaver())
+    workflow = BoundedCopilotWorkflow()
     names = set(workflow.graph_node_names())
     assert set(workflow.required_nodes) <= names
     graph = workflow.graph.get_graph()
@@ -245,7 +254,7 @@ def test_graph_contains_required_nodes_and_conditional_routes() -> None:
 
 def test_direct_request_skips_planner_and_updates_memory_once() -> None:
     runtime = FakeNodeRuntime(mode="direct")
-    result = run_workflow(BoundedCopilotWorkflow(checkpoint_saver=InMemorySaver()), runtime)
+    result = run_workflow(BoundedCopilotWorkflow(), runtime)
     assert result["answer"] == "ok"
     assert "build_direct_plan" in runtime.calls
     assert "build_plan" not in runtime.calls
@@ -254,14 +263,14 @@ def test_direct_request_skips_planner_and_updates_memory_once() -> None:
 
 def test_planner_request_is_validated_before_execution() -> None:
     runtime = FakeNodeRuntime(mode="planner")
-    run_workflow(BoundedCopilotWorkflow(checkpoint_saver=InMemorySaver()), runtime)
+    run_workflow(BoundedCopilotWorkflow(), runtime)
     assert runtime.calls.index("build_plan") < runtime.calls.index("validate_plan")
     assert runtime.calls.index("validate_plan") < runtime.calls.index("dispatch_specialists")
 
 
 def test_invalid_plan_uses_one_validated_deterministic_fallback() -> None:
     runtime = FakeNodeRuntime(mode="planner", invalid_plan_once=True)
-    run_workflow(BoundedCopilotWorkflow(checkpoint_saver=InMemorySaver()), runtime)
+    run_workflow(BoundedCopilotWorkflow(), runtime)
     assert runtime.calls.count("build_fallback_plan") == 1
     assert runtime.calls.count("validate_plan") == 2
     assert runtime.calls.count("dispatch_specialists") == 1
@@ -269,92 +278,60 @@ def test_invalid_plan_uses_one_validated_deterministic_fallback() -> None:
 
 def test_supplemental_retrieval_is_bounded_to_one_round() -> None:
     runtime = FakeNodeRuntime(supplemental=True)
-    run_workflow(BoundedCopilotWorkflow(checkpoint_saver=InMemorySaver()), runtime)
+    run_workflow(BoundedCopilotWorkflow(), runtime)
     assert runtime.calls.count("supplemental_retrieval") == 1
     assert runtime.review_calls == 2
 
 
-def test_terminal_checkpoint_does_not_repeat_synthesis_or_memory_update() -> None:
+def test_one_workflow_run_synthesizes_and_updates_memory_once() -> None:
     runtime = FakeNodeRuntime()
-    workflow = BoundedCopilotWorkflow(checkpoint_saver=InMemorySaver())
-    first = run_workflow(workflow, runtime, "terminal")
-    second = run_workflow(workflow, runtime, "terminal")
-    assert first == second
+    result = run_workflow(BoundedCopilotWorkflow(), runtime, "single-run")
+    assert result["answer"] == "ok"
     assert runtime.synthesis_calls == 1
     assert runtime.memory_writes == 1
 
 
-def test_sqlite_checkpoint_survives_workflow_reconstruction(tmp_path: Any) -> None:
-    settings = SimpleNamespace(
-        langgraph_checkpoint_enabled=True,
-        langgraph_checkpoint_path=str(tmp_path / "checkpoints.sqlite3"),
-        copilot_human_trace_enabled=False,
-    )
-    first_runtime = FakeNodeRuntime()
-    first = BoundedCopilotWorkflow(settings)
-    expected = run_workflow(first, first_runtime, "restart")
-    assert (tmp_path / "checkpoints.sqlite3").stat().st_mode & 0o777 == 0o600
-    first.close()
-
-    second_runtime = FakeNodeRuntime()
-    second = BoundedCopilotWorkflow(settings)
-    restored = run_workflow(second, second_runtime, "restart")
-    second.close()
-
-    assert restored == expected
-    assert second_runtime.calls == []
+def test_workflow_creates_no_sqlite_wal_or_shm_files(tmp_path: Any, monkeypatch: Any) -> None:
+    monkeypatch.chdir(tmp_path)
+    runtime = FakeNodeRuntime()
+    run_workflow(BoundedCopilotWorkflow(), runtime, "no-persistence")
+    assert not list(tmp_path.rglob("*.sqlite3"))
+    assert not list(tmp_path.rglob("*.sqlite3-wal"))
+    assert not list(tmp_path.rglob("*.sqlite3-shm"))
 
 
-def test_clarification_interrupt_resumes_without_repeating_completed_downstream_nodes() -> None:
-    workflow = BoundedCopilotWorkflow(checkpoint_saver=InMemorySaver())
+def test_clarification_responds_without_persistent_resume_state() -> None:
+    workflow = BoundedCopilotWorkflow()
     runtime = ClarificationRuntime()
-    interrupted = workflow.run(
+    response = workflow.run(
         message="Compare 192.0.2.10 with it",
         session_id="interrupt-session",
         ui_context=None,
         request_id="interrupt",
         trace_id="trace-interrupt",
         node_runtime=runtime,
-        interrupt_on_clarification=True,
     )
-    assert interrupted["_interrupt"] is True
+    assert response["answer"] == "Which second asset should be compared?"
     assert runtime.synthesis_calls == 0
-
-    resumed = workflow.resume(
-        "interrupt",
-        node_runtime=runtime,
-        resume_value="192.0.2.11",
-    )
-    assert resumed["answer"] == "ok"
-    assert runtime.calls.count("resolve_entities") == 2
-    assert runtime.synthesis_calls == 1
-    assert runtime.memory_writes == 1
 
 
 def test_transient_node_failure_retries_once_and_logs(caplog: Any) -> None:
     runtime = FakeNodeRuntime(retry_route_once=True)
     with caplog.at_level(logging.INFO, logger="src.core.agent.workflow"):
-        run_workflow(BoundedCopilotWorkflow(checkpoint_saver=InMemorySaver()), runtime, "retry")
+        run_workflow(BoundedCopilotWorkflow(), runtime, "retry")
     assert runtime.calls.count("route") == 2
     assert "event=langgraph_node_retried" in caplog.text
 
 
-def test_persisted_state_serializes_without_runtime_dependencies() -> None:
-    saver = InMemorySaver()
-    workflow = BoundedCopilotWorkflow(checkpoint_saver=saver)
-    runtime = FakeNodeRuntime()
-    run_workflow(workflow, runtime, "serialize")
-    state = workflow.graph.get_state(workflow._config("serialize")).values
-    assert "runtime" not in state
-    assert all("FakeNodeRuntime" not in repr(value) for value in state.values())
-    serializer = JsonPlusSerializer()
-    payload = serializer.dumps_typed(state)
-    restored = serializer.loads_typed(payload)
-    assert restored["request_id"] == "serialize"
+def test_graph_compiles_without_a_checkpointer() -> None:
+    workflow = BoundedCopilotWorkflow()
+    assert workflow.graph is not None
+    assert "checkpointer" not in workflow._config("no-checkpointer")
+    assert getattr(workflow.graph, "checkpointer", None) is None
 
 
 def test_concurrent_requests_keep_state_and_results_isolated() -> None:
-    workflow = BoundedCopilotWorkflow(checkpoint_saver=InMemorySaver())
+    workflow = BoundedCopilotWorkflow()
     runtimes = {name: FakeNodeRuntime() for name in ("a", "b")}
     results: dict[str, dict[str, Any]] = {}
 
@@ -373,14 +350,11 @@ def test_concurrent_requests_keep_state_and_results_isolated() -> None:
 
 def test_every_executed_node_emits_start_completion_and_trace_record(caplog: Any) -> None:
     runtime = FakeNodeRuntime()
-    workflow = BoundedCopilotWorkflow(checkpoint_saver=InMemorySaver())
+    workflow = BoundedCopilotWorkflow()
     with caplog.at_level(logging.INFO, logger="src.core.agent.workflow"):
         run_workflow(workflow, runtime, "logs")
     for node in runtime.calls:
         assert f"event=langgraph_node_started" in caplog.text
         assert f"node={node}" in caplog.text
     assert "event=langgraph_node_completed" in caplog.text
-    assert "event=langgraph_checkpoint_requested" in caplog.text
-    assert "status=requested" in caplog.text
-    assert "event=langgraph_checkpoint_saved" in caplog.text
-    assert "status=saved" in caplog.text
+    assert "langgraph_checkpoint" not in caplog.text

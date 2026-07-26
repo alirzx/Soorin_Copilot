@@ -16,7 +16,7 @@ QDRANT_VOLUME := soorin-copilot_copilot-qdrant
 
 .PHONY: \
 	help build build-no-cache seed-qdrant \
-	up down restart logs ps health test config export
+	up down restart logs ps health test config inspect-image export
 
 help:
 	@echo "Available targets:"
@@ -31,6 +31,7 @@ help:
 	@echo "  make health           Check API, OpenAPI and UI"
 	@echo "  make test             Run tests inside the image"
 	@echo "  make config           Validate Compose configuration"
+	@echo "  make inspect-image    Verify local image CPU/runtime contracts"
 	@echo "  make export           Export image and checksum"
 
 build:
@@ -92,6 +93,10 @@ test:
 config:
 	$(COMPOSE) config --quiet
 	@echo "Compose configuration is valid."
+
+inspect-image:
+	docker image inspect $(IMAGE) --format '{{.Config.User}} {{.Config.WorkingDir}}'
+	docker run --rm --entrypoint python $(IMAGE) -c 'import torch; assert torch.version.cuda is None; assert "+cpu" in torch.__version__; print(torch.__version__)'
 
 export:
 	docker save \

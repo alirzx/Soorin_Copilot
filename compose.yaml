@@ -63,7 +63,7 @@ services:
       - ${SOORIN_RAG_SOURCE_HOST_PATH}:/workspace/docs:ro
       - ${SOORIN_HF_CACHE_HOST_PATH}:/home/soorin/.cache/huggingface:ro
 
-    restart: unless-stopped
+    restart: "${SOORIN_RESTART_POLICY:-unless-stopped}"
     init: true
     stop_grace_period: 60s
 
@@ -142,7 +142,7 @@ services:
       api:
         condition: service_healthy
 
-    restart: unless-stopped
+    restart: "${SOORIN_RESTART_POLICY:-unless-stopped}"
     init: true
     stop_grace_period: 20s
 

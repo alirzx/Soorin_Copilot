@@ -72,10 +72,12 @@ def _optional_float(name: str) -> float | None:
 
 def _choice(name: str, default: str, choices: set[str]) -> str:
     value = (os.getenv(name) or default).split(" #", 1)[0].strip().lower()
-    return value if value in choices else default
+    if value not in choices:
+        raise ValueError(f"{name} must be one of: {', '.join(sorted(choices))}.")
+    return value
 
 
-def _deployment_name(name: str, default: LLMDeploymentName = "glm") -> LLMDeploymentName:
+def _deployment_name(name: str, default: LLMDeploymentName = "kimi") -> LLMDeploymentName:
     value = (os.getenv(name) or default).strip().lower()
     if value not in VALID_LLM_DEPLOYMENTS:
         valid = ", ".join(VALID_LLM_DEPLOYMENTS)
@@ -111,8 +113,24 @@ class Settings:
     agent_max_graph_depth: int
     agent_executor_max_concurrency: int
     agent_request_timeout_seconds: float
-    langgraph_checkpoint_enabled: bool
-    langgraph_checkpoint_path: str
+    kimi_base_url: str
+    kimi_chat_path: str
+    kimi_model: str
+    kimi_api_key: str
+    kimi_auth_scheme: str
+    kimi_connect_timeout_seconds: int
+    kimi_router_timeout_seconds: int
+    kimi_chat_timeout_seconds: int
+    kimi_max_tokens: int
+    kimi_router_max_tokens: int
+    kimi_router_retry_max_tokens: int
+    kimi_chat_max_tokens: int
+    kimi_router_temperature: float | None
+    kimi_router_top_p: float | None
+    kimi_chat_temperature: float | None
+    kimi_chat_top_p: float | None
+    kimi_supports_temperature: bool
+    kimi_supports_top_p: bool
     glm_base_url: str
     glm_chat_path: str
     glm_model: str
@@ -239,6 +257,8 @@ class Settings:
     graph_refresh_max_consecutive_failures: int
     graph_refresh_keep_raw_snapshots: int
     graph_refresh_keep_processed_snapshots: int
+    graph_snapshot_ttl_hours: int
+    graph_optional_exports_enabled: bool
     graph_refresh_lock_timeout_seconds: int
     graph_refresh_min_nodes: int
     graph_refresh_min_edges: int
@@ -257,7 +277,30 @@ class Settings:
     llm_usage_reporting_url: str
 
     def deployment(self, name: LLMDeploymentName) -> ArvanDeploymentConfig:
-        """Build either deployment through the same typed configuration contract."""
+        """Build any named OpenAI-compatible deployment through one contract."""
+        if name == "kimi":
+            return ArvanDeploymentConfig(
+                name="kimi",
+                base_url=self.kimi_base_url,
+                chat_path=self.kimi_chat_path,
+                model=self.kimi_model,
+                api_key=self.kimi_api_key,
+                auth_scheme=self.kimi_auth_scheme,
+                connect_timeout_seconds=self.kimi_connect_timeout_seconds,
+                maximum_completion_tokens=self.kimi_max_tokens,
+                router_read_timeout_seconds=self.kimi_router_timeout_seconds,
+                router_max_tokens=self.kimi_router_max_tokens,
+                router_repair_max_tokens=self.kimi_router_retry_max_tokens,
+                chat_read_timeout_seconds=self.kimi_chat_timeout_seconds,
+                chat_max_tokens=self.kimi_chat_max_tokens,
+                router_temperature=self.kimi_router_temperature,
+                router_top_p=self.kimi_router_top_p,
+                chat_temperature=self.kimi_chat_temperature,
+                chat_top_p=self.kimi_chat_top_p,
+                supports_temperature=self.kimi_supports_temperature,
+                supports_top_p=self.kimi_supports_top_p,
+                provider_type=self.llm_provider,
+            )
         if name == "glm":
             return ArvanDeploymentConfig(
                 name="glm",
@@ -279,6 +322,7 @@ class Settings:
                 chat_top_p=self.glm_chat_top_p,
                 supports_temperature=self.glm_supports_temperature,
                 supports_top_p=self.glm_supports_top_p,
+                provider_type=self.llm_provider,
             )
         if name == "gpt55":
             return ArvanDeploymentConfig(
@@ -301,6 +345,7 @@ class Settings:
                 chat_top_p=self.gpt55_chat_top_p,
                 supports_temperature=self.gpt55_supports_temperature,
                 supports_top_p=self.gpt55_supports_top_p,
+                provider_type=self.llm_provider,
             )
         valid = ", ".join(VALID_LLM_DEPLOYMENTS)
         raise ValueError(f"Invalid LLM deployment alias. Valid aliases: {valid}")
@@ -367,6 +412,13 @@ class Settings:
                 )
 
     def validate_observability_configuration(self) -> None:
+        valid_levels = {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}
+        if self.log_level.upper() not in valid_levels:
+            raise ValueError("LOG_LEVEL must be DEBUG, INFO, WARNING, ERROR, or CRITICAL.")
+        if self.log_file_level.upper() not in valid_levels:
+            raise ValueError(
+                "SOORIN_LOG_FILE_LEVEL must be DEBUG, INFO, WARNING, ERROR, or CRITICAL."
+            )
         if self.log_format not in {"console", "json"}:
             raise ValueError("SOORIN_LOG_FORMAT must be console or json.")
         if self.log_color not in {"auto", "always", "never"}:
@@ -377,13 +429,6 @@ class Settings:
             raise ValueError(
                 "SOORIN_EVIDENCE_SNAPSHOT_MODE must be none, metadata, summary, or redacted."
             )
-
-    def validate_langgraph_configuration(self) -> None:
-        if self.langgraph_checkpoint_enabled and not self.langgraph_checkpoint_path:
-            raise ValueError(
-                "SOORIN_LANGGRAPH_CHECKPOINT_PATH is required when checkpointing is enabled."
-            )
-
 
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:
@@ -410,10 +455,7 @@ def get_settings() -> Settings:
         intent_router_deployment=_deployment_name("SOORIN_INTENT_ROUTER_DEPLOYMENT"),
         chat_deployment=_deployment_name("SOORIN_CHAT_DEPLOYMENT"),
         planner_enabled=_bool("SOORIN_PLANNER_ENABLED", False),
-        planner_deployment=_deployment_name(
-            "SOORIN_PLANNER_DEPLOYMENT",
-            _deployment_name("SOORIN_INTENT_ROUTER_DEPLOYMENT"),
-        ),
+        planner_deployment=_deployment_name("SOORIN_PLANNER_DEPLOYMENT", "glm"),
         planner_repair_enabled=_bool("SOORIN_PLANNER_REPAIR_ENABLED", True),
         planner_system_prompt_path=os.getenv(
             "SOORIN_PLANNER_SYSTEM_PROMPT_PATH",
@@ -425,11 +467,24 @@ def get_settings() -> Settings:
         agent_max_graph_depth=max(0, min(2, _int("SOORIN_AGENT_MAX_GRAPH_DEPTH", 2))),
         agent_executor_max_concurrency=max(1, min(4, _int("SOORIN_AGENT_EXECUTOR_MAX_CONCURRENCY", 4))),
         agent_request_timeout_seconds=max(1.0, _float("SOORIN_AGENT_REQUEST_TIMEOUT_SECONDS", 120.0)),
-        langgraph_checkpoint_enabled=_bool("SOORIN_LANGGRAPH_CHECKPOINT_ENABLED", True),
-        langgraph_checkpoint_path=os.getenv(
-            "SOORIN_LANGGRAPH_CHECKPOINT_PATH",
-            "data/runtime/langgraph-checkpoints.sqlite3",
-        ).strip(),
+        kimi_base_url=os.getenv("SOORIN_LLM_KIMI_BASE_URL", "").strip().rstrip("/"),
+        kimi_chat_path=os.getenv("SOORIN_LLM_KIMI_CHAT_PATH", "/chat/completions").strip(),
+        kimi_model=os.getenv("SOORIN_LLM_KIMI_MODEL", "kimi-k3").strip(),
+        kimi_api_key=os.getenv("SOORIN_LLM_KIMI_API_KEY", "").strip(),
+        kimi_auth_scheme=os.getenv("SOORIN_LLM_KIMI_AUTH_SCHEME", "apikey").strip(),
+        kimi_connect_timeout_seconds=_int("SOORIN_LLM_KIMI_CONNECT_TIMEOUT_SECONDS", 8),
+        kimi_router_timeout_seconds=_int("SOORIN_LLM_KIMI_ROUTER_TIMEOUT_SECONDS", 30),
+        kimi_chat_timeout_seconds=_int("SOORIN_LLM_KIMI_CHAT_TIMEOUT_SECONDS", 360),
+        kimi_max_tokens=_int("SOORIN_LLM_KIMI_MAX_TOKENS", 12288),
+        kimi_router_max_tokens=_int("SOORIN_LLM_KIMI_ROUTER_MAX_TOKENS", 924),
+        kimi_router_retry_max_tokens=_int("SOORIN_LLM_KIMI_ROUTER_RETRY_MAX_TOKENS", 1284),
+        kimi_chat_max_tokens=_int("SOORIN_LLM_KIMI_CHAT_MAX_TOKENS", 12288),
+        kimi_router_temperature=_optional_float("SOORIN_LLM_KIMI_ROUTER_TEMPERATURE"),
+        kimi_router_top_p=_optional_float("SOORIN_LLM_KIMI_ROUTER_TOP_P"),
+        kimi_chat_temperature=_optional_float("SOORIN_LLM_KIMI_CHAT_TEMPERATURE"),
+        kimi_chat_top_p=_optional_float("SOORIN_LLM_KIMI_CHAT_TOP_P"),
+        kimi_supports_temperature=_bool("SOORIN_LLM_KIMI_SUPPORTS_TEMPERATURE", False),
+        kimi_supports_top_p=_bool("SOORIN_LLM_KIMI_SUPPORTS_TOP_P", False),
         glm_base_url=os.getenv("SOORIN_LLM_GLM_BASE_URL", "").strip().rstrip("/"),
         glm_chat_path=os.getenv("SOORIN_LLM_GLM_CHAT_PATH", "/chat/completions").strip(),
         glm_model=os.getenv("SOORIN_LLM_GLM_MODEL", "GLM-5.2").strip(),
@@ -589,6 +644,8 @@ def get_settings() -> Settings:
         graph_refresh_max_consecutive_failures=_int("SOORIN_GRAPH_REFRESH_MAX_CONSECUTIVE_FAILURES", 5),
         graph_refresh_keep_raw_snapshots=_int("SOORIN_GRAPH_REFRESH_KEEP_RAW_SNAPSHOTS", 5),
         graph_refresh_keep_processed_snapshots=_int("SOORIN_GRAPH_REFRESH_KEEP_PROCESSED_SNAPSHOTS", 3),
+        graph_snapshot_ttl_hours=max(0, _int("SOORIN_GRAPH_SNAPSHOT_TTL_HOURS", 72)),
+        graph_optional_exports_enabled=_bool("SOORIN_GRAPH_OPTIONAL_EXPORTS_ENABLED", False),
         graph_refresh_lock_timeout_seconds=_int("SOORIN_GRAPH_REFRESH_LOCK_TIMEOUT_SECONDS", 60),
         graph_refresh_min_nodes=_int("SOORIN_GRAPH_REFRESH_MIN_NODES", 1),
         graph_refresh_min_edges=_int("SOORIN_GRAPH_REFRESH_MIN_EDGES", 0),
@@ -596,7 +653,7 @@ def get_settings() -> Settings:
         graph_refresh_max_edge_drop_ratio=_float("SOORIN_GRAPH_REFRESH_MAX_EDGE_DROP_RATIO", 0.90),
         copilot_human_trace_enabled=_bool(
             "SOORIN_HUMAN_TRACE_ENABLED",
-            _bool("SOORIN_COPILOT_HUMAN_TRACE_ENABLED", True),
+            _bool("SOORIN_COPILOT_HUMAN_TRACE_ENABLED", False),
         ),
         copilot_human_trace_detail=_choice(
             "SOORIN_HUMAN_TRACE_DETAIL", "detailed", {"summary", "detailed"}
@@ -620,14 +677,13 @@ def get_settings() -> Settings:
         evidence_snapshot_max_bytes=max(
             1024, _int("SOORIN_EVIDENCE_SNAPSHOT_MAX_BYTES", 5242880)
         ),
-        llm_usage_reporting_enabled=_bool("LLM_USAGE_REPORTING_ENABLED", True),
+        llm_usage_reporting_enabled=_bool("LLM_USAGE_REPORTING_ENABLED", False),
         llm_usage_reporting_url=os.getenv(
             "LLM_USAGE_REPORTING_URL", ""
         ).strip(),
     )
     settings.validate_product_paths()
     settings.validate_observability_configuration()
-    settings.validate_langgraph_configuration()
     logger.info(
         "event=settings_loaded env_file_path=%s env_file_loaded=%s router_deployment=%s chat_deployment=%s product_base_url_configured=%s product_token_present=%s product_hwid_present=%s product_username_present=%s product_password_present=%s product_captcha_bypass_present=%s rag_enabled=%s rag_backend=%s rag_source_configured=%s rag_qdrant_mode=%s rag_qdrant_configured=%s",
         ENV_PATH,
