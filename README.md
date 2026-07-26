@@ -75,9 +75,14 @@ cp compose.env.example compose.env
 
 Edit `app/.env` and `compose.env` locally. Do not commit secrets.
 
-Build and start:
+Create the configured data and Hugging Face cache directories before using
+Compose. The data root must already contain the Graph artifacts and embedded
+Qdrant metadata; Compose deliberately does not create or seed these paths.
+
+Validate the deployment inputs, then build and start:
 
 ```bash
+make preflight
 make build
 make up
 ```
@@ -98,6 +103,18 @@ make down
 ## Configuration Overview
 
 The application reads `app/.env` first, then environment variables. Compose-level host bindings and image settings live in `compose.env`.
+
+`app/.env` owns application behavior and credentials. Its Graph and local
+Qdrant paths stay repository-relative for native execution. `compose.env` owns
+only host deployment values: image tag, restart policy, bind addresses, ports,
+UID/GID, the host data root, and the host Hugging Face cache root. Compose maps
+the data root to `/workspace/data` read/write for API and read-only for UI, and
+maps the model cache read-only into `/home/soorin/.cache/huggingface`.
+
+Normal retrieval reads Qdrant only; the original SOC corpus is needed only by
+the separate indexing maintenance flow and is not mounted into runtime
+containers. The preloaded image policy uses `pull_policy: never`, so a remote
+server must import the exported image before `make up`.
 
 Important configuration groups:
 

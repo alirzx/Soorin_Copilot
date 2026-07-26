@@ -65,11 +65,9 @@ RUN mkdir -p \
         /workspace/data/runtime/logs \
         /workspace/data/runtime/evidence \
         /workspace/data/qdrant-local \
-        /workspace/docs \
         /home/soorin/.cache/huggingface \
     && chown -R soorin:soorin \
         /workspace/data \
-        /workspace/docs \
         /home/soorin
 
 USER soorin

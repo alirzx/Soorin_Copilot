@@ -62,6 +62,33 @@ class EnvironmentAndRuntimeContractsTests(unittest.TestCase):
         keys = [value for kind, value in example_schema if kind == "key"]
         self.assertEqual(len(keys), len(set(keys)))
 
+    def test_private_and_example_compose_env_have_identical_structure(self) -> None:
+        private_schema = _env_schema(ROOT / "compose.env")
+        example_schema = _env_schema(ROOT / "compose.env.example")
+        self.assertEqual(private_schema, example_schema)
+
+    def test_compose_uses_fail_fast_host_binds_and_isolates_ui_secrets(self) -> None:
+        compose = (ROOT / "compose.yaml").read_text(encoding="utf-8")
+        api, ui = compose.split("  ui:", 1)
+        self.assertIn("SOORIN_DATA_HOST_PATH", api)
+        self.assertIn("SOORIN_HF_CACHE_HOST_PATH", api)
+        self.assertIn("create_host_path: false", api)
+        self.assertIn("read_only: false", api)
+        self.assertIn("SOORIN_DATA_HOST_PATH", ui)
+        self.assertIn("create_host_path: false", ui)
+        self.assertIn("read_only: true", ui)
+        self.assertNotIn("env_file:", ui)
+        self.assertNotIn("SOORIN_RAG_SOURCE_HOST_PATH", compose)
+        self.assertNotIn("copilot-qdrant", compose)
+        self.assertNotIn("copilot-data", compose)
+
+    def test_makefile_has_preflight_without_obsolete_volume_seeding(self) -> None:
+        makefile = (ROOT / "Makefile").read_text(encoding="utf-8")
+        self.assertIn("preflight:", makefile)
+        self.assertIn("test-local:", makefile)
+        self.assertIn("inspect-size:", makefile)
+        self.assertNotIn("seed-qdrant", makefile)
+
     def test_checkpoint_runtime_is_absent_from_source_config_and_dependencies(self) -> None:
         workflow = (ROOT / "app/src/core/agent/workflow.py").read_text(encoding="utf-8")
         settings = (ROOT / "app/src/config/settings.py").read_text(encoding="utf-8")

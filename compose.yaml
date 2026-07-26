@@ -37,7 +37,7 @@ services:
       SOORIN_PORT: "6998"
 
       # Container paths override host-local paths from app/.env.
-      SOORIN_RAG_SOURCE_ROOT: /workspace/docs
+      SOORIN_RAG_SOURCE_ROOT: ""
       SOORIN_RAG_QDRANT_MODE: local
       SOORIN_RAG_QDRANT_PATH: /workspace/data/qdrant-local
       SOORIN_RAG_EMBEDDING_LOCAL_FILES_ONLY: "true"
@@ -53,15 +53,18 @@ services:
       - "${SOORIN_API_BIND_IP:-127.0.0.1}:${SOORIN_API_PORT:-6998}:6998"
 
     volumes:
-      # Graph, topology and other shared runtime data.
-      - copilot-data:/workspace/data
-
-      # Embedded Qdrant storage. API is the only owner.
-      - copilot-qdrant:/workspace/data/qdrant-local
-
-      # External SOC corpus and pre-populated model cache are read-only.
-      - ${SOORIN_RAG_SOURCE_HOST_PATH}:/workspace/docs:ro
-      - ${SOORIN_HF_CACHE_HOST_PATH}:/home/soorin/.cache/huggingface:ro
+      - type: bind
+        source: ${SOORIN_DATA_HOST_PATH:?SOORIN_DATA_HOST_PATH is required}
+        target: /workspace/data
+        read_only: false
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${SOORIN_HF_CACHE_HOST_PATH:?SOORIN_HF_CACHE_HOST_PATH is required}
+        target: /home/soorin/.cache/huggingface
+        read_only: true
+        bind:
+          create_host_path: false
 
     restart: "${SOORIN_RESTART_POLICY:-unless-stopped}"
     init: true
@@ -116,9 +119,6 @@ services:
       - --server.headless=true
       - --browser.gatherUsageStats=false
 
-    env_file:
-      - ./app/.env
-
     environment:
       PYTHONPATH: /workspace/app
 
@@ -135,8 +135,12 @@ services:
       - "${SOORIN_UI_BIND_IP:-127.0.0.1}:${SOORIN_UI_PORT:-8503}:8501"
 
     volumes:
-      # UI can read topology data but cannot modify it.
-      - copilot-data:/workspace/data:ro
+      - type: bind
+        source: ${SOORIN_DATA_HOST_PATH:?SOORIN_DATA_HOST_PATH is required}
+        target: /workspace/data
+        read_only: true
+        bind:
+          create_host_path: false
 
     depends_on:
       api:
@@ -181,7 +185,3 @@ services:
 networks:
   copilot-network:
     driver: bridge
-
-volumes:
-  copilot-data:
-  copilot-qdrant:

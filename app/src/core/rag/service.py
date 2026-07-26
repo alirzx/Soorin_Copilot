@@ -107,17 +107,6 @@ class KnowledgeSearchService:
                 limitations=("Configured knowledge backend is unsupported.",),
                 error_classification="unsupported_backend",
             )
-        if not self.settings.rag_source_root:
-            return KnowledgeSearchResult(
-                status="not_configured",
-                query=normalized_query,
-                backend=self.settings.rag_backend,
-                retrieved_at=started_at,
-                freshness="unknown",
-                limitations=("SOC knowledge source root is not configured.",),
-                error_classification="source_root_missing",
-            )
-
         if self.vector_store is None:
             return KnowledgeSearchResult(
                 status="not_configured",

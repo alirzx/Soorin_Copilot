@@ -674,11 +674,13 @@ Docker:
 - UI uses `python -m streamlit run app/app_st.py --server.port=8501`.
 - Host port defaults are API `6998` and UI `8503`.
 - Volumes:
-  - `copilot-data` for graph/runtime data.
-  - `copilot-qdrant` for local Qdrant path.
-  - Host SOC corpus and Hugging Face cache bind-mounted read-only into the API only.
+  - One pre-existing host data root is bind-mounted at `/workspace/data`; API access is read/write and UI access is read-only.
+  - The host Hugging Face cache is bind-mounted read-only into the API only.
+  - Long bind syntax uses `create_host_path: false`, so missing or mistyped host paths fail instead of creating empty storage.
 
-Local `app/.env` keeps host-local paths. Compose overrides the corpus root, local Qdrant path, and Hugging Face cache path for the API container. Host bind sources are configured in untracked `compose.env`; the UI does not receive RAG source or model-cache mounts.
+Local `app/.env` keeps repository-relative Graph and local Qdrant paths. Compose overrides only container-specific Qdrant, cache, log, and evidence paths. Host bind sources, image tag, restart policy, UID/GID, ports, and bind addresses are configured in untracked `compose.env`. The UI does not receive `app/.env`, the original source corpus, model cache, or backend credentials.
+
+Normal retrieval reads indexed Qdrant payloads and does not open original corpus files. `SOORIN_RAG_SOURCE_ROOT` is therefore an indexing-maintenance input, and the source corpus is not mounted during normal API/UI operation. Embedded Qdrant is opened only by the API process.
 
 Compose currently does not define a separate Qdrant server container. Use local Qdrant mode for embedded file-backed Qdrant storage, or configure an external Qdrant server URL.
 
