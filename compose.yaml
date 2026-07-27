@@ -41,7 +41,7 @@ services:
       SOORIN_RAG_QDRANT_MODE: local
       SOORIN_RAG_QDRANT_PATH: /workspace/data/qdrant-local
       SOORIN_RAG_EMBEDDING_LOCAL_FILES_ONLY: "true"
-      SOORIN_RAG_EMBEDDING_CACHE_DIR: /home/soorin/.cache/huggingface
+      SOORIN_RAG_EMBEDDING_CACHE_DIR: /home/soorin/.cache/huggingface/hub
       SOORIN_LOG_FILE_PATH: /workspace/data/runtime/logs/soorin-copilot.log
       SOORIN_EVIDENCE_SNAPSHOT_ROOT: /workspace/data/runtime/evidence
       HF_HOME: /home/soorin/.cache/huggingface
