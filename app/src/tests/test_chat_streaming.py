@@ -68,6 +68,7 @@ def deployment() -> ArvanDeploymentConfig:
         chat_top_p=0.9,
         supports_temperature=True,
         supports_top_p=True,
+        provider_type="arvan",
     )
 
 

@@ -18,17 +18,24 @@ MULTI_STEP_WORDING = re.compile(
     re.IGNORECASE,
 )
 
+SOURCE_SPECIFIC_KNOWLEDGE = re.compile(
+    r"\b(?:according\s+to|quote|cite|use\s+only|what\s+does)\b.*"
+    r"\b(?:indexed|uploaded|knowledge[\s-]*base|document|source|nist|mitre)\b",
+    re.IGNORECASE,
+)
+
 
 def task_spec_from_route(route: Any, request: str) -> TaskSpec:
     request_lower = request.lower()
     entities = tuple(dict.fromkeys(getattr(route, "materialized_entities", ()) or ()))
     if getattr(route, "scope", "none") == "multi_entity_comparison" and len(entities) != 2:
         raise ValueError("comparison_requires_two_distinct_entities")
-    capabilities: list[str] = []
+    required_capabilities: list[str] = []
+    optional_capabilities: list[str] = []
     if getattr(route, "use_asset_profile", False):
-        capabilities.append("asset.get_profile")
+        required_capabilities.append("asset.get_profile")
     if getattr(route, "use_detection", False):
-        capabilities.append("asset.get_detection")
+        required_capabilities.append("asset.get_detection")
     if getattr(route, "use_graph", False):
         scope = getattr(route, "scope", "none")
         graph_capability = {
@@ -41,9 +48,15 @@ def task_spec_from_route(route: Any, request: str) -> TaskSpec:
             "multi_entity_comparison": "graph.compare_assets",
             "path": "graph.find_path",
         }.get(scope, "graph.get_summary")
-        capabilities.append(graph_capability)
+        required_capabilities.append(graph_capability)
     if getattr(route, "use_knowledge", False):
-        capabilities.append("knowledge.search")
+        target = (
+            required_capabilities
+            if SOURCE_SPECIFIC_KNOWLEDGE.search(request)
+            else optional_capabilities
+        )
+        target.append("knowledge.search")
+    capabilities = (*required_capabilities, *optional_capabilities)
     signals = set(getattr(route, "matched_signals", ()) or ())
     multi_step = (
         len(capabilities) >= 3
@@ -56,7 +69,8 @@ def task_spec_from_route(route: Any, request: str) -> TaskSpec:
         scope=str(getattr(route, "scope", "none")),
         direction=str(getattr(route, "direction", "none")),
         entities=entities,
-        required_capabilities=tuple(capabilities),
+        required_capabilities=tuple(required_capabilities),
+        optional_capabilities=tuple(optional_capabilities),
         workflow_mode="multi_step" if multi_step else "direct",
         semantic_decision_source=str(getattr(route, "decision_source", "unknown")),
         requires_multiple_entities=bool(getattr(route, "requires_multiple_entities", False)),
@@ -77,7 +91,13 @@ def task_spec_from_route(route: Any, request: str) -> TaskSpec:
 def compile_direct_plan(task: TaskSpec, *, plan_id: str | None = None) -> ExecutionPlan:
     """Compile a deterministic plan for a validated direct semantic task."""
     steps: list[PlanStep] = []
-    for capability in task.required_capabilities:
+    capabilities = (*task.required_capabilities, *task.optional_capabilities)
+    for capability in capabilities:
+        requirement = (
+            "required"
+            if capability in task.required_capabilities
+            else "optional"
+        )
         if capability in {"asset.get_profile", "asset.get_detection"}:
             targets = task.entities[:2]
             provider = "asset_profile" if capability == "asset.get_profile" else "detection"
@@ -102,6 +122,7 @@ def compile_direct_plan(task: TaskSpec, *, plan_id: str | None = None) -> Execut
                             "max_context_tokens": 5000 if detail == "deep" else 3000,
                             "purpose": purpose,
                         },
+                        requirement=requirement,
                         expected_evidence_type="operational_product",
                     )
                 )
@@ -115,6 +136,7 @@ def compile_direct_plan(task: TaskSpec, *, plan_id: str | None = None) -> Execut
                         "purpose": "interpret_evidence",
                         "max_context_tokens": 3000,
                     },
+                    requirement=requirement,
                     expected_evidence_type="documentation",
                 )
             )
@@ -130,6 +152,7 @@ def compile_direct_plan(task: TaskSpec, *, plan_id: str | None = None) -> Execut
                         "depth": task.graph_depth,
                         "relationship_mode": task.relationship_mode,
                     },
+                    requirement=requirement,
                     expected_evidence_type="graph_topology",
                 )
             )
@@ -159,6 +182,7 @@ def compile_supplemental_plan(
     supplemental_task = replace(
         task,
         required_capabilities=(capability,),
+        optional_capabilities=(),
         recommended_steps=1,
     )
     evidence_type = (

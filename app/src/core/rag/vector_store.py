@@ -19,6 +19,7 @@ class VectorStoreHealth:
     dimension: int | None = None
     distance: str | None = None
     error_classification: str | None = None
+    error_reason: str | None = None
 
 
 @dataclass(frozen=True)

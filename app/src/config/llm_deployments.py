@@ -7,9 +7,9 @@ from typing import Any, Literal
 from urllib.parse import urlsplit
 
 
-LLMDeploymentName = Literal["glm", "gpt55"]
+LLMDeploymentName = Literal["kimi", "glm", "gpt55"]
 LLMPurpose = Literal["intent_router", "intent_router_repair", "planner", "planner_repair", "chat"]
-VALID_LLM_DEPLOYMENTS: tuple[LLMDeploymentName, ...] = ("glm", "gpt55")
+VALID_LLM_DEPLOYMENTS: tuple[LLMDeploymentName, ...] = ("kimi", "glm", "gpt55")
 
 
 def normalize_chat_endpoint(base_url: str, chat_path: str) -> str:
@@ -37,7 +37,7 @@ class LLMRequestConfig:
 
 @dataclass(frozen=True)
 class ArvanDeploymentConfig:
-    """One named deployment served through Arvan chat completions."""
+    """One named deployment served through an OpenAI-compatible gateway."""
 
     name: LLMDeploymentName
     base_url: str
@@ -58,8 +58,8 @@ class ArvanDeploymentConfig:
     chat_top_p: float | None
     supports_temperature: bool
     supports_top_p: bool
+    provider_type: str
     request_options: tuple[tuple[str, Any], ...] = ()
-    provider_type: str = "arvan"
 
     @property
     def endpoint(self) -> str:

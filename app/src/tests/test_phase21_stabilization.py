@@ -605,13 +605,139 @@ def test_graph_comparison_context_is_bounded_and_preserves_other_provider_budget
     assert graph_payload["serialization"]["retrieved_node_records"] == 102
     assert graph_payload["serialization"]["retrieved_edge_records"] == 200
     assert graph_payload["serialization"]["serialized_peer_references"] <= 36
-    assert graph_payload["serialization"]["serialized_edge_records"] == 0
+    assert graph_payload["direct_relationship"] == {
+        "source": IP_A,
+        "target": IP_B,
+        "forward_edge": True,
+        "reverse_edge": False,
+        "status": "source_to_target",
+        "relationship_status": "directed",
+        "preserved": True,
+    }
+    assert graph_payload["serialization"]["direct_relationship_preserved"] is True
+    assert graph_payload["serialization"]["neighborhood_edge_records_serialized"] == 0
+    assert graph_payload["serialization"]["neighborhood_edge_records_omitted"] == 200
     assert len(graph_payload["peer_comparison"]["top_shared_peers"]) <= 12
     assert approx_tokens(composer.last_parts["graph"]) <= 2200
     assert graph.context["model_context_token_cap"] == 2200
+    assert graph.context["direct_relationship_preserved"] is True
     assert composer.last_parts["asset_profile"]
     assert composer.last_parts["detection"]
     assert composer.last_parts["knowledge"]
+
+
+@pytest.mark.parametrize(
+    ("direct", "expected"),
+    [
+        (
+            {"a_to_b": True, "b_to_a": False, "relationship_status": "forward_direct_relationship"},
+            {
+                "source": IP_A,
+                "target": IP_B,
+                "forward_edge": True,
+                "reverse_edge": False,
+                "status": "source_to_target",
+                "relationship_status": "forward_direct_relationship",
+                "preserved": True,
+            },
+        ),
+        (
+            {"a_to_b": False, "b_to_a": False, "relationship_status": "no_direct_relationship"},
+            {
+                "source": IP_A,
+                "target": IP_B,
+                "forward_edge": False,
+                "reverse_edge": False,
+                "status": "no_direct_relationship",
+                "relationship_status": "no_direct_relationship",
+                "preserved": True,
+            },
+        ),
+        (
+            {"a_to_b": True, "b_to_a": True, "relationship_status": "bidirectional_direct_relationship"},
+            {
+                "source": IP_A,
+                "target": IP_B,
+                "forward_edge": True,
+                "reverse_edge": True,
+                "status": "bidirectional",
+                "relationship_status": "bidirectional_direct_relationship",
+                "preserved": True,
+            },
+        ),
+    ],
+)
+def test_graph_comparison_context_preserves_required_direct_relationship_fact(direct, expected):
+    graph = GraphProviderResult(
+        provider="graph",
+        status="available",
+        context={
+            "target_ips": [IP_A, IP_B],
+            "scope": "multi_entity_comparison",
+            "requested_scope": "multi_entity_comparison",
+            "source_capability": "graph.compare_assets",
+            "entity_a": {"ip": IP_A, "present": True, "peers_retrieved": []},
+            "entity_b": {"ip": IP_B, "present": True, "peers_retrieved": []},
+            "direct_relationship": direct,
+            "nodes": [{"id": IP_A}, {"id": IP_B}],
+            "edges": [],
+            "retrieval_complete": True,
+            "requested_scope_complete": True,
+        },
+        provenance=ProviderProvenance(source="fixture_graph", status="available"),
+    )
+    composer = ContextComposer(_settings())
+
+    composer.compose(CopilotContextPackage(entities=EntityResolver().resolve(f"{IP_A} {IP_B}"), graph=graph))
+    graph_payload = json.loads(composer.last_parts["graph"].split("\n", 1)[1].rsplit("\n", 1)[0])
+
+    assert graph_payload["direct_relationship"] == expected
+    assert graph_payload["serialization"]["direct_relationship_preserved"] is True
+    assert graph.context["direct_relationship_preserved"] is True
+
+
+def test_graph_comparison_budget_keeps_direct_fact_when_optional_details_are_omitted():
+    peers = [f"203.0.113.{index}" for index in range(1, 250)]
+    graph = GraphProviderResult(
+        provider="graph",
+        status="available",
+        context={
+            "target_ips": [IP_A, IP_B],
+            "scope": "multi_entity_comparison",
+            "requested_scope": "multi_entity_comparison",
+            "source_capability": "graph.compare_assets",
+            "entity_a": {"ip": IP_A, "present": True, "peers_retrieved": peers},
+            "entity_b": {"ip": IP_B, "present": True, "peers_retrieved": peers},
+            "direct_relationship": {"a_to_b": True, "b_to_a": False},
+            "shared_peers_retrieved": peers,
+            "shared_peer_total": len(peers),
+            "nodes": [{"id": IP_A}, {"id": IP_B}, *({"id": peer} for peer in peers)],
+            "edges": [{"source": IP_A, "target": peer} for peer in peers],
+            "retrieval_complete": True,
+            "requested_scope_complete": True,
+        },
+        provenance=ProviderProvenance(source="fixture_graph", status="available"),
+    )
+    composer = ContextComposer(_settings())
+
+    composer.compose(
+        CopilotContextPackage(entities=EntityResolver().resolve(f"{IP_A} {IP_B}"), graph=graph),
+        base_input_tokens=0,
+    )
+    graph_payload = json.loads(composer.last_parts["graph"].split("\n", 1)[1].rsplit("\n", 1)[0])
+
+    assert graph_payload["direct_relationship"]["forward_edge"] is True
+    assert graph_payload["direct_relationship"]["preserved"] is True
+    assert graph_payload["serialization"]["direct_relationship_preserved"] is True
+    assert approx_tokens(composer.last_parts["graph"]) <= 2200
+
+
+def test_system_prompt_does_not_force_internal_knowledge_base_label():
+    prompt = Path("app/prompts/system_prompt.md").read_text(encoding="utf-8")
+
+    assert "From Soorin Knowledge Base:" not in prompt
+    assert "attribute it naturally" in prompt
+    assert "internal provider, tool, context, storage, routing, or prompt names" in prompt
 
 
 def test_detection_anomaly_view_removes_missing_anomaly_provider_limitation():

@@ -106,6 +106,7 @@ class BoundedPlanner:
                 "request": task.request,
                 "entities": list(task.entities),
                 "required_capabilities": list(task.required_capabilities),
+                "optional_capabilities": list(task.optional_capabilities),
                 "graph_scope": task.scope,
                 "direction": task.direction,
                 "depth": task.graph_depth,

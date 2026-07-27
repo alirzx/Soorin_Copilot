@@ -35,7 +35,11 @@ OUTBOUND_WORDS = re.compile(r"\b(?:outbound|outgoing|destinations?|reaches|sends
 PATH_WORDS = re.compile(r"\b(?:path|shortest\s+path|route|reachability|chain|intermediate)\b", re.IGNORECASE)
 RELATIONSHIP_WORDS = re.compile(r"\b(?:directly\s+connected|adjacent|relationship|edge\s+between)\b", re.IGNORECASE)
 DIRECT_RELATIONSHIP_WORDS = re.compile(r"\b(?:directly\s+connected|direct\s+connection|adjacent|edge\s+between|a\s*->\s*b|b\s*->\s*a)\b", re.IGNORECASE)
-COMPARISON_WORDS = re.compile(r"\b(?:compare|comparison|both\s+assets|both\s+ips|positions?|shared\s+peers?|common\s+peers?|relationship)\b", re.IGNORECASE)
+COMPARISON_WORDS = re.compile(
+    r"\b(?:compare|comparison|different|difference|differences|versus|vs\.?|"
+    r"both\s+assets|both\s+ips|positions?|shared\s+peers?|common\s+peers?)\b",
+    re.IGNORECASE,
+)
 TWO_HOP_WORDS = re.compile(
     r"\b(?:two[-\s]hops?|2\s+hops?|neighbors?\s+of\s+neighbors?|second[-\s]degree(?:\s+connections?|\s+impact)?|"
     r"indirect\s+connections?|surrounding\s+network|expand\s+the\s+network|connections?\s+through\s+(?:its\s+|direct\s+)?neighbors?)\b",
@@ -145,11 +149,19 @@ class DeterministicFallbackRouter:
         elif entity_count == 2 and PATH_WORDS.search(message or ""):
             intent, scope, direction, depth = "graph_path", "path", "both", 0
             use_graph, reason, signal_group = True, "fallback_path", "graph_path"
-        elif entity_count == 2 and graph_signal:
-            direct = bool(DIRECT_RELATIONSHIP_WORDS.search(message or ""))
+        elif entity_count == 2 and (
+            DIRECT_RELATIONSHIP_WORDS.search(message or "")
+            or RELATIONSHIP_WORDS.search(message or "")
+        ):
             intent = "graph_relationships"
-            scope, direction, depth = ("one_hop", "both", 1) if direct else ("multi_entity_comparison", "both", 1)
-            use_graph, reason, signal_group = True, "fallback_relationship" if direct else "fallback_comparison", "graph_relationship"
+            scope, direction, depth = "one_hop", "both", 1
+            use_graph, reason, signal_group = True, "fallback_relationship", "graph_relationship"
+        elif entity_count == 2 and (COMPARISON_WORDS.search(message or "") or graph_signal):
+            intent, scope, direction, depth = "graph_relationships", "multi_entity_comparison", "both", 1
+            use_graph, reason, signal_group = True, "fallback_comparison", "graph_comparison"
+            if COMPARISON_WORDS.search(message or ""):
+                use_detection = True
+                use_asset_profile = True
         elif entity_count == 2 and (profile_signal or detection_signal or comprehensive_signal):
             intent, scope, direction, depth = "asset_investigation", "none", "none", 0
             reason, signal_group = "fallback_multi_asset_product_evidence", "multi_asset_product_evidence"

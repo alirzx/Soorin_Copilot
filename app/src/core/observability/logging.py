@@ -15,12 +15,21 @@ from typing import Any
 
 
 _ANSI_ESCAPE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+_SENSITIVE_LOG_VALUE = re.compile(
+    r"(?i)\b(authorization|api[_-]?key|access[_-]?token|password|captcha(?:_bypass)?|"
+    r"secret|x-hwid)\s*[:=]\s*(?:\"[^\"]*\"|'[^']*'|"
+    r"(?:bearer|apikey|basic)\s+[^\s,;]+|[^\s,;]+)"
+)
 _STANDARD_FORMAT = "%(asctime)s %(levelname)s %(name)s %(message)s"
+
+
+def _redact_text(value: str) -> str:
+    return _SENSITIVE_LOG_VALUE.sub(lambda match: f"{match.group(1)}=[REDACTED]", value)
 
 
 class JsonLogFormatter(logging.Formatter):
     def format(self, record: logging.LogRecord) -> str:
-        message = record.getMessage()
+        message = _redact_text(record.getMessage())
         payload = {
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "level": record.levelname,
@@ -36,7 +45,12 @@ class JsonLogFormatter(logging.Formatter):
         return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
 
 
-class AnsiStrippingFormatter(logging.Formatter):
+class RedactingFormatter(logging.Formatter):
+    def format(self, record: logging.LogRecord) -> str:
+        return _redact_text(super().format(record))
+
+
+class AnsiStrippingFormatter(RedactingFormatter):
     """Keep file output plain even when the terminal human trace is colored."""
 
     def format(self, record: logging.LogRecord) -> str:
@@ -112,7 +126,7 @@ def configure_application_logging(
         terminal.setFormatter(JsonLogFormatter())
         terminal.addFilter(_JsonTerminalFilter())
     else:
-        terminal.setFormatter(logging.Formatter(_STANDARD_FORMAT))
+        terminal.setFormatter(RedactingFormatter(_STANDARD_FORMAT))
     target.addHandler(terminal)
 
     if bool(getattr(settings, "log_file_enabled", True)):

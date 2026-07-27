@@ -22,10 +22,12 @@ def make_settings(**overrides: Any):
     values = {
         "llm_provider": "arvan",
         "llm_enabled": True,
-        "intent_router_deployment": "glm",
-        "chat_deployment": "glm",
+        "intent_router_deployment": "kimi",
+        "chat_deployment": "kimi",
         "planner_enabled": True,
-        "planner_deployment": "gpt55",
+        "planner_deployment": "glm",
+        "kimi_base_url": "http://kimi.example.invalid",
+        "kimi_api_key": "kimi-key",
         "glm_base_url": "http://glm.example.invalid",
         "glm_api_key": "glm-key",
         "gpt55_base_url": "http://gpt.example.invalid",
@@ -103,7 +105,7 @@ class FakeRoutingProvider:
                     }
                 ),
                 provider="arvan",
-                model="GPT-5.5",
+                model="kimi-k3",
                 usage={"input_tokens": 2000, "output_tokens": 95, "total_tokens": 2095},
                 latency_ms=6004,
                 status_code=200,
@@ -112,7 +114,7 @@ class FakeRoutingProvider:
             return LLMProviderResult(
                 text='{"plan_id":"p1","steps":[]}',
                 provider="arvan",
-                model="GPT-5.5",
+                model="GLM-5.2",
                 usage={"input_tokens": 3000, "output_tokens": 100, "total_tokens": 3100},
                 latency_ms=5100,
                 status_code=200,
@@ -120,7 +122,7 @@ class FakeRoutingProvider:
         return LLMProviderResult(
             text="final answer",
             provider="arvan",
-            model="GLM-5.2",
+            model="kimi-k3",
             usage={"input_tokens": 6792, "output_tokens": 961, "total_tokens": 7753},
             latency_ms=4200,
             status_code=200,
@@ -133,7 +135,8 @@ class FakeRoutingProvider:
             type="done",
             data={
                 "provider": "arvan",
-                "model": "GLM-5.2",
+                "model": "kimi-k3",
+                "deployment": "kimi",
                 "usage": {"input_tokens": 6792, "output_tokens": 961, "total_tokens": 7753},
                 "latency_ms": 4200,
                 "status_code": 200,
@@ -151,8 +154,26 @@ class FakePlannerProvider(FakeRoutingProvider):
 
 
 class UsageReportingTests(unittest.TestCase):
+    @staticmethod
+    def assert_payload_contract(payload: dict[str, Any]) -> None:
+        assert set(payload) == {"inputTokens", "outputTokens", "models"}
+        for model in payload["models"]:
+            assert set(model) == {
+                "purpose",
+                "model",
+                "inputTokens",
+                "outputTokens",
+            }
+        assert payload["inputTokens"] == sum(
+            model["inputTokens"] for model in payload["models"]
+        )
+        assert payload["outputTokens"] == sum(
+            model["outputTokens"] for model in payload["models"]
+        )
+
     def build_client(self, reporter: ProductUsageReporter, provider: Any, **overrides: Any) -> LLMClient:
         client = LLMClient(make_settings(**overrides), usage_recorder=reporter)
+        client.providers["kimi"] = provider  # type: ignore[assignment]
         client.providers["glm"] = provider  # type: ignore[assignment]
         client.providers["gpt55"] = provider  # type: ignore[assignment]
         client.provider = provider  # type: ignore[assignment]
@@ -163,7 +184,7 @@ class UsageReportingTests(unittest.TestCase):
         reporter = ProductUsageReporter(make_settings(), product_client)  # type: ignore[arg-type]
         provider = FakeRoutingProvider()
         client = self.build_client(reporter, provider)
-        scope = reporter.start_request("req-1", "trace-1")
+        scope = reporter.start_request("req-1", "trace-1", "session-1")
         try:
             client.chat([{"role": "user", "content": "route"}], request_id="req-1", trace_id="trace-1", purpose="intent_router")
             client.chat([{"role": "user", "content": "plan"}], request_id="req-1", trace_id="trace-1", purpose="planner")
@@ -173,14 +194,36 @@ class UsageReportingTests(unittest.TestCase):
 
         self.assertEqual(len(product_client.calls), 1)
         payload = product_client.calls[0]["payload"]
-        self.assertEqual(payload["request_id"], "req-1")
-        self.assertEqual(payload["trace_id"], "trace-1")
-        self.assertEqual(payload["status"], "success")
-        self.assertEqual(payload["call_count"], 3)
-        self.assertEqual(payload["input_tokens"], 11792)
-        self.assertEqual(payload["output_tokens"], 1156)
-        self.assertEqual(payload["total_tokens"], 12948)
-        self.assertEqual([call["purpose"] for call in payload["calls"]], ["intent_router", "planner", "chat"])
+        self.assert_payload_contract(payload)
+        self.assertEqual(
+            payload,
+            {
+                "inputTokens": 11792,
+                "outputTokens": 1156,
+                "models": [
+                    {
+                        "purpose": "router",
+                        "model": "kimi-k3",
+                        "inputTokens": 2000,
+                        "outputTokens": 95,
+                    },
+                    {
+                        "purpose": "planner",
+                        "model": "GLM-5.2",
+                        "inputTokens": 3000,
+                        "outputTokens": 100,
+                    },
+                    {
+                        "purpose": "chat",
+                        "model": "kimi-k3",
+                        "inputTokens": 6792,
+                        "outputTokens": 961,
+                    },
+                ],
+            },
+        )
+        self.assertEqual(product_client.calls[0]["request_id"], "req-1")
+        self.assertEqual(product_client.calls[0]["idempotency_key"], "req-1")
 
     def test_reporting_disabled_sends_nothing(self) -> None:
         product_client = FakeProductClient()
@@ -200,7 +243,43 @@ class UsageReportingTests(unittest.TestCase):
         reporter.finish_request(scope, request_success=True)
         self.assertEqual(product_client.calls, [])
 
-    def test_partial_execution_reports_partial(self) -> None:
+    def test_streaming_chat_completion_is_included_once(self) -> None:
+        product_client = FakeProductClient()
+        reporter = ProductUsageReporter(make_settings(), product_client)  # type: ignore[arg-type]
+        client = self.build_client(reporter, FakeRoutingProvider())
+        scope = reporter.start_request("req-stream", "trace-stream", "session-stream")
+        try:
+            events = list(
+                client.stream_chat(
+                    [{"role": "user", "content": "answer"}],
+                    request_id="req-stream",
+                    trace_id="trace-stream",
+                    purpose="chat",
+                )
+            )
+        finally:
+            reporter.finish_request(scope, request_success=True)
+
+        self.assertEqual(events[-1].type, "done")
+        payload = product_client.calls[0]["payload"]
+        self.assert_payload_contract(payload)
+        self.assertEqual(
+            payload,
+            {
+                "inputTokens": 6792,
+                "outputTokens": 961,
+                "models": [
+                    {
+                        "purpose": "chat",
+                        "model": "kimi-k3",
+                        "inputTokens": 6792,
+                        "outputTokens": 961,
+                    }
+                ],
+            },
+        )
+
+    def test_partial_execution_reports_available_usage_without_status(self) -> None:
         product_client = FakeProductClient()
         reporter = ProductUsageReporter(make_settings(), product_client)  # type: ignore[arg-type]
         provider = FakePlannerProvider()
@@ -213,10 +292,18 @@ class UsageReportingTests(unittest.TestCase):
         finally:
             reporter.finish_request(scope, request_success=False)
 
-        self.assertEqual(product_client.calls[0]["payload"]["status"], "partial")
-        self.assertEqual(product_client.calls[0]["payload"]["call_count"], 2)
+        payload = product_client.calls[0]["payload"]
+        self.assert_payload_contract(payload)
+        self.assertNotIn("status", payload)
+        self.assertEqual(payload["inputTokens"], 2000)
+        self.assertEqual(payload["outputTokens"], 95)
+        failed_planner = next(
+            model for model in payload["models"] if model["purpose"] == "planner"
+        )
+        self.assertEqual(failed_planner["inputTokens"], 0)
+        self.assertEqual(failed_planner["outputTokens"], 0)
 
-    def test_one_retry_occurs_after_reporting_failure(self) -> None:
+    def test_reporting_failure_makes_one_nonfatal_product_call(self) -> None:
         product_client = FakeProductClient(failures=1)
         reporter = ProductUsageReporter(make_settings(), product_client)  # type: ignore[arg-type]
         scope = reporter.start_request("req-retry", "trace-retry")
@@ -232,7 +319,121 @@ class UsageReportingTests(unittest.TestCase):
             )
         )
         reporter.finish_request(scope, request_success=True)
-        self.assertEqual(len(product_client.calls), 2)
+        self.assertEqual(len(product_client.calls), 1)
+
+    def test_duplicate_call_id_and_duplicate_finish_are_suppressed(self) -> None:
+        product_client = FakeProductClient()
+        reporter = ProductUsageReporter(make_settings(), product_client)  # type: ignore[arg-type]
+        scope = reporter.start_request("req-once", "trace-once", "session-once")
+        call = LLMUsageCall.from_usage(
+            request_id="req-once",
+            call_id="req-once:chat:kimi:stream",
+            trace_id="trace-once",
+            provider="arvan",
+            deployment="kimi",
+            model="kimi-k3",
+            purpose="chat",
+            usage={"input_tokens": 4, "output_tokens": 2, "total_tokens": 6},
+            http_status=200,
+            finish_reason="stop",
+        )
+        reporter.record(call)
+        reporter.record(call)
+        reporter.finish_request(scope, request_success=True)
+        reporter.finish_request(scope, request_success=True)
+
+        self.assertEqual(len(product_client.calls), 1)
+        payload = product_client.calls[0]["payload"]
+        self.assert_payload_contract(payload)
+        self.assertEqual(
+            payload,
+            {
+                "inputTokens": 4,
+                "outputTokens": 2,
+                "models": [
+                    {
+                        "purpose": "chat",
+                        "model": "kimi-k3",
+                        "inputTokens": 4,
+                        "outputTokens": 2,
+                    }
+                ],
+            },
+        )
+
+    def test_repeated_calls_aggregate_by_purpose_and_model(self) -> None:
+        product_client = FakeProductClient()
+        reporter = ProductUsageReporter(make_settings(), product_client)  # type: ignore[arg-type]
+        scope = reporter.start_request("req-aggregate", "trace-aggregate")
+        for call_id, input_tokens, output_tokens in (
+            ("router-1", 10, 2),
+            ("router-2", 15, 3),
+        ):
+            reporter.record(
+                LLMUsageCall.from_usage(
+                    request_id="req-aggregate",
+                    call_id=call_id,
+                    trace_id="trace-aggregate",
+                    provider="arvan",
+                    deployment="kimi",
+                    model="kimi-k3",
+                    purpose="intent_router",
+                    usage={
+                        "input_tokens": input_tokens,
+                        "output_tokens": output_tokens,
+                    },
+                )
+            )
+        reporter.finish_request(scope, request_success=True)
+
+        payload = product_client.calls[0]["payload"]
+        self.assert_payload_contract(payload)
+        self.assertEqual(
+            payload,
+            {
+                "inputTokens": 25,
+                "outputTokens": 5,
+                "models": [
+                    {
+                        "purpose": "router",
+                        "model": "kimi-k3",
+                        "inputTokens": 25,
+                        "outputTokens": 5,
+                    }
+                ],
+            },
+        )
+
+    def test_planner_is_absent_when_it_did_not_run(self) -> None:
+        product_client = FakeProductClient()
+        reporter = ProductUsageReporter(make_settings(), product_client)  # type: ignore[arg-type]
+        scope = reporter.start_request("req-no-planner", "trace-no-planner")
+        reporter.record(
+            LLMUsageCall.from_usage(
+                request_id="req-no-planner",
+                call_id="router",
+                model="kimi-k3",
+                purpose="intent_router",
+                usage={"input_tokens": 7, "output_tokens": 1},
+            )
+        )
+        reporter.record(
+            LLMUsageCall.from_usage(
+                request_id="req-no-planner",
+                call_id="chat",
+                model="kimi-k3",
+                purpose="chat",
+                usage={"input_tokens": 11, "output_tokens": 4},
+            )
+        )
+        reporter.finish_request(scope, request_success=True)
+
+        payload = product_client.calls[0]["payload"]
+        self.assert_payload_contract(payload)
+        self.assertEqual(
+            [model["purpose"] for model in payload["models"]],
+            ["router", "chat"],
+        )
 
     def test_requests_remain_isolated_under_concurrency(self) -> None:
         product_client = FakeProductClient()
@@ -263,9 +464,15 @@ class UsageReportingTests(unittest.TestCase):
         second.join()
 
         self.assertEqual(len(product_client.calls), 2)
-        payloads = {item["payload"]["request_id"]: item["payload"] for item in product_client.calls}
-        self.assertEqual(payloads["req-a"]["input_tokens"], 10)
-        self.assertEqual(payloads["req-b"]["input_tokens"], 20)
+        payloads = {item["request_id"]: item["payload"] for item in product_client.calls}
+        self.assert_payload_contract(payloads["req-a"])
+        self.assert_payload_contract(payloads["req-b"])
+        self.assertEqual(payloads["req-a"]["inputTokens"], 10)
+        self.assertEqual(payloads["req-b"]["inputTokens"], 20)
+        self.assertEqual(
+            {item["idempotency_key"] for item in product_client.calls},
+            {"req-a", "req-b"},
+        )
 
     def test_payload_omits_prompts_and_responses_and_state_is_cleared(self) -> None:
         product_client = FakeProductClient()
@@ -286,7 +493,59 @@ class UsageReportingTests(unittest.TestCase):
 
         payload_text = json.dumps(product_client.calls[0]["payload"], ensure_ascii=False)
         self.assertNotIn("super secret prompt", payload_text)
+        self.assert_payload_contract(product_client.calls[0]["payload"])
         self.assertIsNone(usage_module._CURRENT_COLLECTOR.get())
+
+    def test_failed_call_without_usage_does_not_fabricate_tokens(self) -> None:
+        product_client = FakeProductClient()
+        reporter = ProductUsageReporter(make_settings(), product_client)  # type: ignore[arg-type]
+        scope = reporter.start_request("req-failed-zero", "trace-failed-zero")
+        reporter.record(
+            LLMUsageCall.from_usage(
+                request_id="req-failed-zero",
+                call_id="failed-chat",
+                model="kimi-k3",
+                purpose="chat",
+                usage=None,
+                status="failed",
+            )
+        )
+        reporter.finish_request(scope, request_success=False)
+
+        payload = product_client.calls[0]["payload"]
+        self.assert_payload_contract(payload)
+        self.assertEqual(
+            payload,
+            {
+                "inputTokens": 0,
+                "outputTokens": 0,
+                "models": [
+                    {
+                        "purpose": "chat",
+                        "model": "kimi-k3",
+                        "inputTokens": 0,
+                        "outputTokens": 0,
+                    }
+                ],
+            },
+        )
+
+    def test_request_without_llm_calls_reports_empty_exact_body(self) -> None:
+        product_client = FakeProductClient()
+        reporter = ProductUsageReporter(make_settings(), product_client)  # type: ignore[arg-type]
+        scope = reporter.start_request("req-empty", "trace-empty")
+
+        reporter.finish_request(scope, request_success=True)
+
+        self.assertEqual(len(product_client.calls), 1)
+        self.assertEqual(
+            product_client.calls[0]["payload"],
+            {
+                "inputTokens": 0,
+                "outputTokens": 0,
+                "models": [],
+            },
+        )
 
     def test_final_reporting_failure_does_not_fail_user_request(self) -> None:
         settings = make_settings()
@@ -306,7 +565,7 @@ class UsageReportingTests(unittest.TestCase):
 
         self.assertEqual(result["answer"], "final answer")
         self.assertEqual(result["provider"], "arvan")
-        self.assertEqual(len(product_client.calls), 2)
+        self.assertEqual(len(product_client.calls), 1)
 
 
 if __name__ == "__main__":

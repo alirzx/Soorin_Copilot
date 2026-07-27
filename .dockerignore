@@ -1,11 +1,12 @@
 # Git
 .git
 .gitmodules
+.github
 
 # Python environments
-.venv
-venv
-env
+.venv/
+venv/
+env/
 
 # Python caches
 __pycache__
@@ -18,18 +19,26 @@ __pycache__
 htmlcov
 
 # Local secrets
+.env
+.env.*
 app/.env
 app/.env.*
 compose.env
 compose.env.*
 
 # Keep safe examples available
+!.env.example
 !app/.env.example
 !compose.env.example
 
 # Generated and runtime data
 data/
 copilot_test_results/
+copilot_tmp_notes_docs/
+copilot_tmp_response_test/
+*.sqlite3
+*.sqlite3-shm
+*.sqlite3-wal
 
 # Local model caches
 .cache/
@@ -44,11 +53,21 @@ copilot_test_results/
 *.log
 *.tmp
 *.swp
+*.swo
 *~
 
 # IDE files
-.vscode
-.idea
+.vscode/
+.idea/
 
-# Temporary Dockerfiles
+# Certificates, private keys, local agents, and temporary Dockerfiles
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+.codex/
+.agent/
+.agents/
+.mimocode/
 Dockerfile.rebase

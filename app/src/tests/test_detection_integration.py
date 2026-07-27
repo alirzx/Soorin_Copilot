@@ -32,6 +32,7 @@ from src.core.memory.routing_state import SessionRoutingState
 from src.core.memory.store import MemoryStore
 from src.core.product_client.errors import ProductApiError
 from src.core.product_client.schemas import ProductAssetResponse
+from src.core.rag.models import KnowledgeChunk, KnowledgeSearchResult
 
 
 def make_settings(**overrides: Any):
@@ -140,6 +141,56 @@ class FakeLLMClient:
         if isinstance(response, Exception):
             raise response
         return response
+
+
+class FakeKnowledgeService:
+    def __init__(self, configured_settings: Any, status: str) -> None:
+        self.settings = configured_settings
+        self.status = status
+        self.calls = 0
+
+    def search(self, query: str, **kwargs: Any) -> KnowledgeSearchResult:
+        del kwargs
+        self.calls += 1
+        chunks = (
+            (
+                KnowledgeChunk(
+                    chunk_id="kerberos-1",
+                    document_id="protocols",
+                    text="Kerberos uses ticket-based authentication.",
+                    score=0.91,
+                    relative_path="Protocols/Kerberos.md",
+                    title="Kerberos",
+                    indexed_at="now",
+                ),
+            )
+            if self.status == "ok"
+            else ()
+        )
+        return KnowledgeSearchResult(
+            status=self.status,  # type: ignore[arg-type]
+            query=query,
+            backend="qdrant",
+            retrieved_at="now",
+            freshness="indexed" if chunks else "unknown",
+            chunks=chunks,
+            citations=tuple(chunk.citation() for chunk in chunks),
+            limitations=(
+                ("Knowledge retrieval was unavailable.",)
+                if self.status == "unavailable"
+                else ()
+            ),
+            total_candidates=len(chunks),
+            included_count=len(chunks),
+            error_classification=(
+                "fixture_unavailable"
+                if self.status == "unavailable"
+                else None
+            ),
+        )
+
+    def close(self) -> None:
+        return None
 
 
 def llm_result(text: str) -> LLMProviderResult:
@@ -583,6 +634,26 @@ class CopilotProductOrchestrationTests(unittest.TestCase):
             }
         )
 
+    @staticmethod
+    def knowledge_route_json() -> str:
+        return json.dumps(
+            {
+                "intent": "general_knowledge",
+                "scope": "none",
+                "direction": "none",
+                "depth": 0,
+                "requires_graph": False,
+                "requires_detection": False,
+                "requires_asset_profile": False,
+                "requires_knowledge": True,
+                "entity_binding": "none",
+                "requires_multiple_entities": False,
+                "is_followup": False,
+                "classification_confidence": 0.98,
+                "reason": "general concept",
+            }
+        )
+
     def service(self, route_json: str):
         llm = FakeLLMClient([llm_result(route_json), llm_result("grounded answer")])
         service = CopilotService(make_settings(), llm, MemoryStore(max_messages=4))
@@ -712,9 +783,14 @@ class CopilotProductOrchestrationTests(unittest.TestCase):
         self.assertIn("Complete Asset Profile JSON was retrieved", response["answer"])
         self.assertIn("final_synthesis_fallback_used", response["_warnings"])
 
-    def test_unusable_required_evidence_returns_deterministic_safe_failure(self) -> None:
+    def test_unusable_required_evidence_still_reaches_bounded_synthesis(self) -> None:
         route = self.single_route_json(graph=False, detection=True, profile=True)
-        llm = FakeLLMClient([llm_result(route), LLMError("failed", reason="provider_http_error")])
+        llm = FakeLLMClient(
+            [
+                llm_result(route),
+                llm_result("Environment evidence is unavailable; verify the asset providers."),
+            ]
+        )
         service = CopilotService(make_settings(), llm, MemoryStore(max_messages=4))
         service.detection_provider = FakeProductContextProvider(
             {"192.0.2.10": detection_result("192.0.2.10", status="unavailable")}
@@ -724,9 +800,78 @@ class CopilotProductOrchestrationTests(unittest.TestCase):
         )  # type: ignore[assignment]
 
         response = service.chat("Analyze 192.0.2.10.", request_id="req-no-evidence")
-        self.assertEqual(response["provider"], "deterministic")
-        self.assertIn("cannot safely complete", response["answer"])
+        self.assertEqual(response["provider"], "fake")
+        self.assertIn("evidence is unavailable", response["answer"])
         self.assertIn("required_evidence_unavailable", response["_warnings"])
+        self.assertEqual(len(llm.calls), 2)
+
+    def test_general_knowledge_rag_unavailable_still_calls_synthesis(self) -> None:
+        route = self.knowledge_route_json()
+        llm = FakeLLMClient([llm_result(route), llm_result("Kerberos is a ticket-based authentication protocol.")])
+        configured = make_settings(rag_enabled=True)
+        service = CopilotService(configured, llm, MemoryStore(max_messages=4))
+        knowledge = FakeKnowledgeService(configured, "unavailable")
+        service.knowledge_service = knowledge  # type: ignore[assignment]
+
+        response = service.chat("What is Kerberos?", request_id="req-knowledge-unavailable")
+
+        self.assertEqual(response["answer"], "Kerberos is a ticket-based authentication protocol.")
+        self.assertNotIn("cannot safely complete", response["answer"])
+        self.assertIn("knowledge_evidence_unavailable", response["_warnings"])
+        self.assertEqual(knowledge.calls, 1)
+        self.assertEqual(len(llm.calls), 2)
+
+    def test_general_knowledge_rag_available_or_empty_still_calls_synthesis(self) -> None:
+        for rag_status in ("ok", "empty"):
+            with self.subTest(rag_status=rag_status):
+                llm = FakeLLMClient(
+                    [
+                        llm_result(self.knowledge_route_json()),
+                        llm_result("Kerberos is a ticket-based authentication protocol."),
+                    ]
+                )
+                configured = make_settings(rag_enabled=True)
+                service = CopilotService(configured, llm, MemoryStore(max_messages=4))
+                knowledge = FakeKnowledgeService(configured, rag_status)
+                service.knowledge_service = knowledge  # type: ignore[assignment]
+
+                response = service.chat(
+                    "What is Kerberos?",
+                    request_id=f"req-knowledge-{rag_status}",
+                )
+
+                self.assertEqual(response["provider"], "fake")
+                self.assertEqual(knowledge.calls, 1)
+                self.assertEqual(len(llm.calls), 2)
+                model_context = "\n".join(
+                    message["content"] for message in llm.calls[-1]["messages"]
+                )
+                if rag_status == "ok":
+                    self.assertIn("Kerberos uses ticket-based authentication.", model_context)
+
+    def test_explicit_indexed_source_unavailable_calls_synthesis_with_limitations(self) -> None:
+        llm = FakeLLMClient(
+            [
+                llm_result(self.knowledge_route_json()),
+                llm_result(
+                    "The indexed NIST source could not be verified; generally, Kerberos uses tickets."
+                ),
+            ]
+        )
+        configured = make_settings(rag_enabled=True)
+        service = CopilotService(configured, llm, MemoryStore(max_messages=4))
+        knowledge = FakeKnowledgeService(configured, "unavailable")
+        service.knowledge_service = knowledge  # type: ignore[assignment]
+
+        response = service.chat(
+            "According to the indexed NIST document, explain Kerberos.",
+            request_id="req-indexed-source-unavailable",
+        )
+
+        self.assertIn("could not be verified", response["answer"])
+        self.assertIn("required_evidence_unavailable", response["_warnings"])
+        self.assertEqual(knowledge.calls, 1)
+        self.assertEqual(len(llm.calls), 2)
 
     def test_final_synthesis_keeps_configured_chat_timeout_and_token_budget(self) -> None:
         route = self.single_route_json(graph=False, detection=True, profile=False)

@@ -234,20 +234,26 @@ with st.sidebar:
     else:
         st.caption("Selected topology target: none")
 
-st.title("Soorin Copilot")
-st.caption("Asset Intelligence Investigation Workspace")
+
+st.title("Soorin Cyber Copilot")
+st.caption("Evidence-Grounded SOC/NOC Investigation Workspace")
 
 left_col, right_col = st.columns([0.42, 0.58], gap="large")
 
 with left_col:
-    st.title("Soorin Cyber Copilot")
+    st.subheader("Investigate Assets with Trusted Evidence")
     st.write(
-        "A baseline cybersecurity copilot for general Q&A. "
-        "Asset, RAG, and graph context will be added later."
+        "Analyze asset identity, detections, network behavior, relationships, "
+        "paths, and cybersecurity knowledge using current Soorin evidence."
     )
+
     selected_ip = st.session_state.get(SELECTED_COPILOT_IP_KEY)
-    st.caption(f"Selected topology target: {selected_ip or 'none'}")
-    st.caption("Graph context is used only on relevant graph or follow-up questions.")
+
+    st.caption(f"Selected topology asset: {selected_ip or 'none'}")
+    st.caption(
+        "The agents automatically selects relevant Profile, Detection, Graph, "
+        "and Knowledge tools for each question."
+    )
 
     for item in st.session_state.messages:
         with st.chat_message(item["role"]):

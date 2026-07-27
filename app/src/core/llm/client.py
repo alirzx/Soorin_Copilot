@@ -139,11 +139,13 @@ class LLMClient:
                     call_id=call_id,
                     trace_id=trace_id,
                     provider=deployment.provider_type,
+                    deployment=deployment.name,
                     model=deployment.model,
                     purpose=purpose,
                     usage={},
                     latency_ms=attempt_latency_ms,
                     status="error",
+                    http_status=exc.details.get("status_code"),
                 )
                 retryable = bool(exc.details.get("retryable", False))
                 error_type = str(exc.details.get("error_type") or exc.reason)
@@ -217,11 +219,14 @@ class LLMClient:
                 call_id=call_id,
                 trace_id=trace_id,
                 provider=result.provider,
+                deployment=result.deployment or deployment.name,
                 model=result.model,
                 purpose=purpose,
                 usage=result.usage,
                 latency_ms=result.latency_ms,
                 status="success",
+                http_status=result.status_code,
+                finish_reason=result.finish_reason,
             )
             return result
 
@@ -290,24 +295,29 @@ class LLMClient:
                         call_id=call_id,
                         trace_id=trace_id,
                         provider=str(data.get("provider") or deployment.provider_type),
+                        deployment=str(data.get("deployment") or deployment.name),
                         model=str(data.get("model") or deployment.model),
                         purpose=purpose,
                         usage=data.get("usage") if isinstance(data.get("usage"), dict) else {},
                         latency_ms=int(data.get("latency_ms") or (time.perf_counter() - started) * 1000),
                         status="success",
+                        http_status=data.get("status_code"),
+                        finish_reason=str(data.get("finish_reason") or "") or None,
                     )
                 yield event
-        except LLMError:
+        except LLMError as exc:
             self._record_usage(
                 request_id=request_id,
                 call_id=call_id,
                 trace_id=trace_id,
                 provider=deployment.provider_type,
+                deployment=deployment.name,
                 model=deployment.model,
                 purpose=purpose,
                 usage={},
                 latency_ms=int((time.perf_counter() - started) * 1000),
                 status="error",
+                http_status=exc.details.get("status_code"),
             )
             raise
 
@@ -323,11 +333,14 @@ class LLMClient:
         call_id: str,
         trace_id: str,
         provider: str,
+        deployment: str,
         model: str,
         purpose: str,
         usage: dict[str, object] | None,
         latency_ms: int,
         status: str,
+        http_status: object = None,
+        finish_reason: str | None = None,
     ) -> None:
         if self.usage_recorder is None:
             return
@@ -337,11 +350,14 @@ class LLMClient:
                 call_id=call_id,
                 trace_id=trace_id,
                 provider=provider,
+                deployment=deployment,
                 model=model,
                 purpose=purpose,
                 usage=usage,
                 latency_ms=latency_ms,
                 status=status,
+                http_status=http_status if isinstance(http_status, int) else None,
+                finish_reason=finish_reason,
             )
         )
 
@@ -366,7 +382,7 @@ class LLMClient:
         )
         return {
             "enabled": self.settings.llm_enabled,
-            "ready": bool(router["ready"] and chat["ready"]),
+            "ready": bool(router["ready"] and planner["ready"] and chat["ready"]),
             "provider": chat["provider"],
             "model": chat["model"],
             "deployment": chat["deployment"],

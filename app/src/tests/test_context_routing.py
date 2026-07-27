@@ -1583,28 +1583,30 @@ class CopilotHelpContentTests(unittest.TestCase):
         content = get_copilot_help_content()
         authority = " ".join(content.authority)
         evidence = " ".join(content.evidence)
+        tips = " ".join(content.tips)
 
-        self.assertIn("Explicit IP", authority)
-        self.assertIn("selected graph node", authority)
+        self.assertIn("IP written in your prompt", authority)
+        self.assertIn("selected topology asset", authority)
         self.assertIn("previous active asset", authority)
-        self.assertIn("Clicking empty graph space clears", authority)
-        self.assertIn("asset-detection evidence", evidence)
-        self.assertIn("graph evidence", evidence)
-        self.assertIn("General cybersecurity questions", evidence)
+        self.assertIn("Click empty graph space", tips)
+        self.assertIn("Detection provides", evidence)
+        self.assertIn("Graph provides", evidence)
+        self.assertIn("Knowledge retrieval", evidence)
 
     def test_help_examples_cover_current_route_shapes(self) -> None:
         content = get_copilot_help_content()
         groups = {group.title: group for group in content.examples}
 
         for title in (
-            "Identify an asset",
-            "Get detailed evidence",
-            "Explore connections",
-            "Combine identity and topology",
-            "Compare assets",
-            "Find a path",
-            "Ask general questions",
-            "Use follow-ups",
+            "Summarize an asset",
+            "Check identity and role",
+            "Review detections and risk",
+            "Explore network connections",
+            "Run a combined investigation",
+            "Compare two assets",
+            "Find an observed path",
+            "Ask cybersecurity questions",
+            "Use follow-up questions",
         ):
             self.assertIn(title, groups)
 
@@ -1612,7 +1614,7 @@ class CopilotHelpContentTests(unittest.TestCase):
         self.assertIn("Show all inbound peers", examples)
         self.assertIn("Show all outbound peers", examples)
         self.assertIn("two-hop neighborhood", examples)
-        self.assertIn("directly connected", examples)
+        self.assertIn("communicate directly", examples)
         self.assertIn("shortest graph path", examples)
         self.assertIn("Tell me more about it", examples)
         self.assertIn("Compare them", examples)
@@ -2685,25 +2687,27 @@ class ComparisonFollowupRegressionTests(unittest.TestCase):
         self.assertEqual("".join(event.text for event in events if event.type == "answer_delta"), "Comparison completed.")
         self.assertEqual(llm.chat_purposes, ["intent_router", "planner"])
         self.assertEqual(llm.stream_purposes, ["chat"])
-        self.assertEqual(len(recording_executor.plans), 1)
+        self.assertEqual(len(recording_executor.plans), 2)
 
-        fallback = recording_executor.plans[0]
+        fallback_plans = recording_executor.plans
+        fallback = fallback_plans[0]
         expected_entities = (self.EXPLICIT_IP, self.ACTIVE_IP)
-        self.assertTrue(fallback.validated)
-        self.assertEqual(fallback.source, "deterministic_fallback")
-        self.assertEqual(fallback.task.entities, expected_entities)
+        self.assertTrue(all(plan.validated for plan in fallback_plans))
+        self.assertTrue(all(plan.source == "deterministic_fallback" for plan in fallback_plans))
+        self.assertTrue(all(plan.task.entities == expected_entities for plan in fallback_plans))
+        fallback_steps = [step for plan in fallback_plans for step in plan.steps]
         self.assertEqual(
-            {step.capability for step in fallback.steps},
-            set(fallback.task.required_capabilities),
+            {step.capability for step in fallback_steps},
+            {"asset.get_profile", "asset.get_detection", "graph.compare_assets"},
         )
         for capability in ("asset.get_profile", "asset.get_detection"):
-            steps = [step for step in fallback.steps if step.capability == capability]
+            steps = [step for step in fallback_steps if step.capability == capability]
             self.assertEqual(len(steps), 2)
             self.assertEqual(
                 {tuple(step.arguments["entities"]) for step in steps},
                 {(self.EXPLICIT_IP,), (self.ACTIVE_IP,)},
             )
-        graph_step = next(step for step in fallback.steps if step.capability == "graph.compare_assets")
+        graph_step = next(step for step in fallback_steps if step.capability == "graph.compare_assets")
         self.assertEqual(tuple(graph_step.arguments["entities"]), expected_entities)
 
 

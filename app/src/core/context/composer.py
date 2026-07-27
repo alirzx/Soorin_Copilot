@@ -1185,6 +1185,11 @@ class ContextComposer:
         b_distinct = tuple(item for item in b_peers if item not in a_peer_set)
         raw_nodes = len(context.get("nodes") or ())
         raw_edges = len(context.get("edges") or ())
+        direct_relationship = self._comparison_direct_relationship_block(
+            context,
+            entity_a_ip,
+            entity_b_ip,
+        )
 
         def entity_summary(source: dict[str, Any], top_k: int) -> dict[str, Any]:
             subnets = [str(item) for item in source.get("subnets", ()) if item]
@@ -1200,7 +1205,7 @@ class ContextComposer:
                 "top_subnets": subnets[:top_k],
             }
 
-        def build(top_k: int) -> tuple[str, dict[str, Any], set[str]]:
+        def build(top_k: int, *, include_optional: bool = True) -> tuple[str, dict[str, Any], set[str]]:
             top_shared = list(shared[:top_k])
             top_a_distinct = list(a_distinct[:top_k])
             top_b_distinct = list(b_distinct[:top_k])
@@ -1238,38 +1243,15 @@ class ContextComposer:
                 "target_ips": [entity_a_ip, entity_b_ip],
                 "requested_scope": context.get("requested_scope", context.get("scope", "multi_entity_comparison")),
                 "coverage": coverage,
+                "direct_relationship": direct_relationship,
                 "entities": {
                     entity_a_ip: entity_summary(entity_a, top_k),
                     entity_b_ip: entity_summary(entity_b, top_k),
                 },
-                "direct_relationship": context.get("direct_relationship", {}),
-                "peer_comparison": {
-                    "shared_peer_count": context.get("shared_peer_total", 0),
-                    "shared_peer_retrieved_count": len(shared),
-                    "shared_peer_omitted_from_model": max(0, len(shared) - len(top_shared)),
-                    "top_shared_peers": top_shared,
-                    "entity_a_distinct_peer_count": context.get("entity_a_unique_peer_total", 0),
-                    "entity_a_distinct_peer_retrieved_count": len(a_distinct),
-                    "entity_a_distinct_peer_omitted_from_model": max(
-                        0, len(a_distinct) - len(top_a_distinct)
-                    ),
-                    "top_entity_a_distinct_peers": top_a_distinct,
-                    "entity_b_distinct_peer_count": context.get("entity_b_unique_peer_total", 0),
-                    "entity_b_distinct_peer_retrieved_count": len(b_distinct),
-                    "entity_b_distinct_peer_omitted_from_model": max(
-                        0, len(b_distinct) - len(top_b_distinct)
-                    ),
-                    "top_entity_b_distinct_peers": top_b_distinct,
-                },
-                "degree_differences": context.get("degree_comparison", {}),
-                "centrality_differences": context.get(
-                    "centrality_comparison",
-                    {"available": False, "limitation": "Centrality was not calculated for this comparison."},
-                ),
-                "subnet_distribution_differences": subnet_differences,
                 "serialization": {
                     "policy": "comparison_summary_top_k",
                     "top_k": top_k,
+                    "direct_relationship_preserved": True,
                     "retrieved_node_records": raw_nodes,
                     "retrieved_edge_records": raw_edges,
                     "serialized_peer_references": len(referenced_peers),
@@ -1278,12 +1260,48 @@ class ContextComposer:
                         len(shared) + len(a_distinct) + len(b_distinct) - len(referenced_peers),
                     ),
                     "omitted_node_records": max(0, raw_nodes - 2 - len(referenced_peers)),
+                    "neighborhood_edge_records_serialized": 0,
+                    "neighborhood_edge_records_omitted": raw_edges,
                     "serialized_edge_records": 0,
                     "omitted_edge_records": raw_edges,
                 },
                 "limitations": list(context.get("limitations") or graph.limitations or []),
                 "grounding_rules": GRAPH_GROUNDING_RULES,
             }
+            if include_optional:
+                payload.update(
+                    {
+                        "peer_comparison": {
+                            "shared_peer_count": context.get("shared_peer_total", 0),
+                            "shared_peer_retrieved_count": len(shared),
+                            "shared_peer_omitted_from_model": max(0, len(shared) - len(top_shared)),
+                            "top_shared_peers": top_shared,
+                            "entity_a_distinct_peer_count": context.get("entity_a_unique_peer_total", 0),
+                            "entity_a_distinct_peer_retrieved_count": len(a_distinct),
+                            "entity_a_distinct_peer_omitted_from_model": max(
+                                0, len(a_distinct) - len(top_a_distinct)
+                            ),
+                            "top_entity_a_distinct_peers": top_a_distinct,
+                            "entity_b_distinct_peer_count": context.get("entity_b_unique_peer_total", 0),
+                            "entity_b_distinct_peer_retrieved_count": len(b_distinct),
+                            "entity_b_distinct_peer_omitted_from_model": max(
+                                0, len(b_distinct) - len(top_b_distinct)
+                            ),
+                            "top_entity_b_distinct_peers": top_b_distinct,
+                        },
+                        "degree_differences": context.get("degree_comparison", {}),
+                        "centrality_differences": context.get(
+                            "centrality_comparison",
+                            {"available": False, "limitation": "Centrality was not calculated for this comparison."},
+                        ),
+                        "subnet_distribution_differences": subnet_differences,
+                    }
+                )
+            else:
+                payload["coverage"]["serialized_context_truncated"] = True
+                payload["coverage"]["serialized_context_truncation_reason"] = "comparison_optional_details_omitted"
+                payload["coverage"]["serialized_context_complete_for_retrieved_subset"] = False
+                payload["coverage"]["complete_for_user_request"] = False
             text = "[SOORIN_GRAPH_CONTEXT_JSON]\n" + json.dumps(
                 payload,
                 ensure_ascii=False,
@@ -1297,6 +1315,8 @@ class ContextComposer:
         while selected_top_k > 0 and approx_tokens(text) > token_budget:
             selected_top_k -= 1
             text, payload, referenced_peers = build(selected_top_k)
+        if approx_tokens(text) > token_budget:
+            text, payload, referenced_peers = build(0, include_optional=False)
         if approx_tokens(text) > token_budget:
             return ""
 
@@ -1316,6 +1336,11 @@ class ContextComposer:
                 "complete_for_user_request": payload["coverage"]["complete_for_user_request"],
                 "model_context_token_estimate": approx_tokens(text),
                 "model_context_token_cap": token_budget,
+                "direct_relationship_preserved": True,
+                "required_direct_relationship_preserved": True,
+                "required_graph_fact_count": 1,
+                "neighborhood_edge_records_serialized": payload["serialization"]["neighborhood_edge_records_serialized"],
+                "neighborhood_edge_records_omitted": payload["serialization"]["neighborhood_edge_records_omitted"],
                 "model_context_omitted_peer_count": max(
                     0,
                     int(context.get("shared_peer_total", 0))
@@ -1327,17 +1352,45 @@ class ContextComposer:
             }
         )
         logger.info(
-            "event=context_composer_graph_comparison request_id=%s raw_nodes=%s raw_edges=%s serialized_peer_references=%s serialized_edges=0 top_k=%s context_tokens=%s token_budget=%s truncated=%s",
+            "event=context_composer_graph_comparison request_id=%s raw_nodes=%s raw_edges=%s serialized_peer_references=%s direct_relationship_preserved=%s neighborhood_edges_serialized=0 top_k=%s context_tokens=%s token_budget=%s truncated=%s",
             request_id,
             raw_nodes,
             raw_edges,
             len(referenced_peers),
+            True,
             selected_top_k,
             approx_tokens(text),
             token_budget,
             serialized_truncated,
         )
         return text
+
+    @staticmethod
+    def _comparison_direct_relationship_block(
+        context: dict[str, Any],
+        source_ip: str,
+        target_ip: str,
+    ) -> dict[str, Any]:
+        direct = dict(context.get("direct_relationship") or {})
+        forward = bool(direct.get("a_to_b", direct.get("forward_edge", False)))
+        reverse = bool(direct.get("b_to_a", direct.get("reverse_edge", False)))
+        if forward and reverse:
+            status = "bidirectional"
+        elif forward:
+            status = "source_to_target"
+        elif reverse:
+            status = "target_to_source"
+        else:
+            status = "no_direct_relationship"
+        return {
+            "source": source_ip,
+            "target": target_ip,
+            "forward_edge": forward,
+            "reverse_edge": reverse,
+            "status": status,
+            "relationship_status": direct.get("relationship_status", status),
+            "preserved": True,
+        }
 
     def _compose_compact_graph(
         self,

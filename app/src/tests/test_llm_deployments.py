@@ -20,10 +20,13 @@ from src.core.llm.errors import LLMError
 from src.core.memory.routing_state import SessionRoutingState
 
 
+KIMI_BASE_URL = "https://kimi.example.invalid/v1"
 GLM_BASE_URL = "https://glm.example.invalid/v1"
 GPT_BASE_URL = "https://gpt.example.invalid/v1"
+KIMI_ENDPOINT = f"{KIMI_BASE_URL}/chat/completions"
 GLM_ENDPOINT = f"{GLM_BASE_URL}/chat/completions"
 GPT_ENDPOINT = f"{GPT_BASE_URL}/chat/completions"
+KIMI_KEY = "fixture-kimi-key"
 GLM_KEY = "fixture-glm-key"
 GPT_KEY = "fixture-gpt-key"
 
@@ -64,6 +67,20 @@ def isolated_settings(**overrides: str) -> Settings:
     environment = {
         "SOORIN_LLM_ENABLED": "true",
         "SOORIN_LLM_PROVIDER": "arvan",
+        "SOORIN_LLM_KIMI_BASE_URL": KIMI_BASE_URL,
+        "SOORIN_LLM_KIMI_CHAT_PATH": "/chat/completions",
+        "SOORIN_LLM_KIMI_MODEL": "kimi-k3",
+        "SOORIN_LLM_KIMI_API_KEY": KIMI_KEY,
+        "SOORIN_LLM_KIMI_AUTH_SCHEME": "apikey",
+        "SOORIN_LLM_KIMI_CONNECT_TIMEOUT_SECONDS": "8",
+        "SOORIN_LLM_KIMI_ROUTER_TIMEOUT_SECONDS": "30",
+        "SOORIN_LLM_KIMI_CHAT_TIMEOUT_SECONDS": "360",
+        "SOORIN_LLM_KIMI_MAX_TOKENS": "12288",
+        "SOORIN_LLM_KIMI_ROUTER_MAX_TOKENS": "924",
+        "SOORIN_LLM_KIMI_ROUTER_RETRY_MAX_TOKENS": "1284",
+        "SOORIN_LLM_KIMI_CHAT_MAX_TOKENS": "12288",
+        "SOORIN_LLM_KIMI_SUPPORTS_TEMPERATURE": "false",
+        "SOORIN_LLM_KIMI_SUPPORTS_TOP_P": "false",
         "SOORIN_LLM_GLM_BASE_URL": GLM_BASE_URL,
         "SOORIN_LLM_GLM_CHAT_PATH": "/chat/completions",
         "SOORIN_LLM_GLM_MODEL": "GLM-5.2",
@@ -125,14 +142,15 @@ class EndpointNormalizerTests(unittest.TestCase):
 
 
 class DeploymentConfigurationTests(unittest.TestCase):
-    def test_symmetric_environment_and_absent_selectors_default_to_glm(self) -> None:
-        settings = isolated_settings(SOORIN_LLM_GPT55_BASE_URL="", SOORIN_LLM_GPT55_API_KEY="")
+    def test_absent_selectors_default_router_and_chat_to_kimi_and_planner_to_glm(self) -> None:
+        settings = isolated_settings()
 
-        self.assertEqual(settings.intent_router_deployment, "glm")
-        self.assertEqual(settings.chat_deployment, "glm")
+        self.assertEqual(settings.intent_router_deployment, "kimi")
+        self.assertEqual(settings.chat_deployment, "kimi")
         self.assertFalse(settings.planner_enabled)
         self.assertEqual(settings.planner_deployment, "glm")
-        self.assertEqual(settings.deployment("glm").endpoint, GLM_ENDPOINT)
+        self.assertEqual(settings.deployment("kimi").endpoint, KIMI_ENDPOINT)
+        self.assertEqual(settings.deployment("kimi").model, "kimi-k3")
         self.assertEqual(settings.deployment("glm").model, "GLM-5.2")
 
     def test_both_selectors_can_use_gpt55(self) -> None:
@@ -173,11 +191,21 @@ class DeploymentConfigurationTests(unittest.TestCase):
         self.assertEqual(gpt.endpoint, normalize_chat_endpoint(gpt.base_url, gpt.chat_path))
 
     def test_invalid_alias_fails_with_safe_valid_alias_list(self) -> None:
-        with self.assertRaisesRegex(ValueError, r"Valid aliases: glm, gpt55") as raised:
+        with self.assertRaisesRegex(ValueError, r"Valid aliases: kimi, glm, gpt55") as raised:
             isolated_settings(SOORIN_CHAT_DEPLOYMENT="unknown-secret-value")
 
         self.assertNotIn(GLM_KEY, str(raised.exception))
         self.assertNotIn(GPT_KEY, str(raised.exception))
+        self.assertNotIn(KIMI_KEY, str(raised.exception))
+
+    def test_missing_selected_kimi_configuration_has_clear_readiness_and_validation(self) -> None:
+        settings = isolated_settings(SOORIN_LLM_KIMI_BASE_URL="")
+        health = LLMClient(settings).health()
+
+        self.assertFalse(health["ready"])
+        self.assertEqual(health["router"]["deployment"], "kimi")  # type: ignore[index]
+        with self.assertRaisesRegex(ValueError, "not configured for: kimi"):
+            settings.validate_selected_llm_deployments()
 
     def test_missing_selected_base_url_fails_during_startup_validation(self) -> None:
         settings = isolated_settings(
@@ -200,6 +228,8 @@ class DeploymentConfigurationTests(unittest.TestCase):
                 values[key.strip()] = value.strip()
 
         for name in (
+            "SOORIN_LLM_KIMI_BASE_URL",
+            "SOORIN_LLM_KIMI_API_KEY",
             "SOORIN_LLM_GLM_BASE_URL",
             "SOORIN_LLM_GLM_API_KEY",
             "SOORIN_LLM_GPT55_BASE_URL",
@@ -423,7 +453,11 @@ class DeploymentRequestTests(unittest.TestCase):
                 "reason": "fixture",
             }
         )
-        for deployment, expected_model in (("gpt55", "GPT-5.5"), ("glm", "GLM-5.2")):
+        for deployment, expected_model in (
+            ("kimi", "kimi-k3"),
+            ("gpt55", "GPT-5.5"),
+            ("glm", "GLM-5.2"),
+        ):
             with self.subTest(deployment=deployment):
                 post.reset_mock()
                 post.return_value = response(valid)
@@ -486,9 +520,9 @@ class UsageAndErrorCompatibilityTests(unittest.TestCase):
         for expected in (
             "event=llm_request_complete",
             "purpose=chat",
-            "deployment=glm",
+            "deployment=kimi",
             "provider=arvan",
-            "model=GLM-5.2",
+            "model=kimi-k3",
             "status_code=200",
             "latency_ms=",
             "finish_reason=stop",
@@ -510,7 +544,7 @@ class UsageAndErrorCompatibilityTests(unittest.TestCase):
                 with self.assertRaises(LLMError) as raised:
                     self.client.chat(self.messages, transient_retries=0)
                 self.assertEqual(raised.exception.details["status_code"], status_code)
-                self.assertEqual(raised.exception.details["deployment"], "glm")
+                self.assertEqual(raised.exception.details["deployment"], "kimi")
                 self.assertEqual(post.call_count, 1)
 
     @patch("src.core.llm.providers.arvan.requests.post")

@@ -142,6 +142,10 @@ Example:
 
 `requires_knowledge=true` retrieves approved SOC documentation and guidance.
 
+Knowledge retrieval is supplemental by default. `requires_knowledge=true` means retrieval should be attempted; it does not decide whether synthesis may continue if retrieval is empty or unavailable. Ordinary conceptual questions use Knowledge only, never Product, Detection, or Graph, and must remain detached from an old active asset unless the user clearly references it.
+
+Treat Knowledge as source-specific only when the user explicitly asks for an indexed or uploaded document, quotation, citation, or named knowledge-base source. Simple definitions such as “What is Kerberos?” are direct general-knowledge requests and do not require Planner.
+
 Knowledge is never authoritative for current asset identity, topology, detections, alerts, risk values, or peer lists. It explains and contextualizes operational evidence but must not override it.
 
 ## Graph scopes

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import uuid
 from collections.abc import Sequence
 from pathlib import Path
@@ -48,11 +49,13 @@ class QdrantVectorStore:
         batch_size: int = 64,
         mode: str = "server",
         path: str = "",
+        embedding_model: str = "",
         client: Any | None = None,
     ) -> None:
         self.mode = mode.strip().lower()
         self.url = url.strip().rstrip("/")
         self.path = path.strip()
+        self.embedding_model = embedding_model.strip()
         self.collection = collection.strip()
         self.dimension = int(dimension)
         self.distance = distance.strip().lower()
@@ -156,6 +159,26 @@ class QdrantVectorStore:
 
         return False
 
+    @staticmethod
+    def safe_error_reason(exc: Exception) -> str:
+        """Return a bounded diagnostic without paths, credentials, or payloads."""
+        message = " ".join(str(exc).split())
+        message = re.sub(
+            r"(?i)\b(?:api[_-]?key|token|authorization|password)\s*[=:]\s*\S+",
+            "[REDACTED]",
+            message,
+        )
+        message = re.sub(r"(?<![\w.])(?:~|/)[^\s,;:]+", "<path>", message)
+        return (message or type(exc).__name__)[:180]
+
+    @property
+    def storage_path_kind(self) -> str:
+        if self.mode == "server":
+            return "remote_url"
+        if not self.path:
+            return "not_configured"
+        return "absolute_local" if Path(self.path).expanduser().is_absolute() else "relative_local"
+
     def collection_info(self) -> VectorCollectionInfo | None:
         """Return normalized collection metadata.
 
@@ -229,10 +252,14 @@ class QdrantVectorStore:
 
             logger.warning(
                 "event=rag_vector_store_unavailable "
-                "backend=qdrant mode=%s collection=%s error_type=%s",
+                "backend=qdrant mode=%s collection=%s embedding_model=%s "
+                "storage_path_kind=%s error_type=%s error_reason=%s",
                 self.mode,
                 self.collection,
+                self.embedding_model or "not_configured",
+                self.storage_path_kind,
                 type(exc).__name__,
+                self.safe_error_reason(exc),
             )
 
             return VectorStoreHealth(
@@ -242,6 +269,7 @@ class QdrantVectorStore:
                 configured=True,
                 available=False,
                 error_classification=classification,
+                error_reason=self.safe_error_reason(exc),
             )
 
         if info is None:
@@ -268,6 +296,10 @@ class QdrantVectorStore:
                 distance=info.distance,
                 error_classification=(
                     "collection_vector_config_mismatch"
+                ),
+                error_reason=(
+                    "Configured embedding dimension or distance does not match "
+                    "the existing collection."
                 ),
             )
 

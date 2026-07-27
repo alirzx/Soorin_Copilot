@@ -23,10 +23,10 @@ Soorin Copilot follows these implementation rules:
 sequenceDiagram
     participant UI as Streamlit UI
     participant API as FastAPI
-    participant Service as CopilotService
+    participant Service as CopilotService facade
+    participant Workflow as Bounded LangGraph
     participant Entity as EntityResolver
     participant Router as SemanticIntentRouter
-    participant Workflow as BoundedCopilotWorkflow
     participant Planner as Bounded Planner
     participant Executor as Capability Executor
     participant Reviewer as Evidence Reviewer
@@ -36,23 +36,22 @@ sequenceDiagram
 
     UI->>API: POST /chat or /chat/stream
     API->>Service: message, session_id, optional ui_context
-    Service->>Workflow: dispatch one bounded executor callback
-    Workflow->>Service: invoke Phase 2 executor exactly once
-    Service->>Entity: resolve explicit/UI/session entities
-    Service->>Router: classify with GLM/GPT deployment
-    Router->>Service: JSON route decision
-    Service->>Service: validate, normalize, fallback if needed
-    Service->>Planner: multi-step only; one structured proposal
-    Service->>Service: deterministic plan validation
-    Service->>Executor: validated registered read-only plan
+    Service->>Workflow: invoke request with runtime dependencies
+    Workflow->>Entity: resolve explicit/UI/session entities
+    Workflow->>Router: classify with configured Kimi/GLM/GPT deployment
+    Router->>Workflow: JSON route decision
+    Workflow->>Workflow: validate and normalize task
+    Workflow->>Planner: multi-step only; one structured proposal
+    Workflow->>Workflow: deterministic plan validation/fallback
+    Workflow->>Executor: validated registered read-only plan
     Executor->>Providers: dependency-aware bounded execution
     Providers->>Executor: canonical ToolResults with raw provider objects preserved
     Executor->>Reviewer: canonical EvidencePack
     Reviewer->>Executor: at most one approved supplemental retrieval
-    Reviewer->>Service: sufficient, limitations, missing evidence, or safe failure
-    Service->>Composer: bounded model context
-    Composer->>Service: tagged dynamic context
-    Service->>LLM: final chat request or stream
+    Reviewer->>Workflow: sufficient, limitations, missing evidence, or safe failure
+    Workflow->>Composer: bounded model context
+    Composer->>Workflow: tagged dynamic context
+    Workflow->>LLM: final chat request or stream
     LLM->>API: answer deltas or answer text
     API->>UI: envelope or UTF-8 SSE
 ```
@@ -113,12 +112,13 @@ Validation currently enforces:
 
 Implemented in `app/src/config/llm_deployments.py`, `app/src/core/llm/client.py`, and `app/src/core/llm/providers/arvan.py`.
 
-The system supports two named Arvan-compatible deployments:
+The system supports three named OpenAI-compatible deployments through the existing adapter:
 
+- `kimi`, default model label `kimi-k3`.
 - `glm`, default model label `GLM-5.2`.
 - `gpt55`, default model label `GPT-5.5`.
 
-`SOORIN_INTENT_ROUTER_DEPLOYMENT` selects the semantic router model. `SOORIN_CHAT_DEPLOYMENT` selects the final synthesis model. Both aliases use the same typed `ArvanDeploymentConfig` contract.
+`SOORIN_INTENT_ROUTER_DEPLOYMENT` selects the semantic router model, `SOORIN_CHAT_DEPLOYMENT` selects final synthesis, and `SOORIN_PLANNER_DEPLOYMENT` selects the optional Planner. Release defaults are Kimi for routing/synthesis and GLM for planning; GPT remains configurable but inactive. All aliases use the same typed `ArvanDeploymentConfig` contract.
 
 The provider:
 
@@ -204,11 +204,11 @@ Important normalization rules:
 
 Deterministic fallback is present but intentionally secondary. Its operational provider logging currently covers graph, detection, and asset profile; semantic routes can also select knowledge.
 
-## 8. Active Bounded Investigation Workflow
+## 8. Durable Bounded Investigation Workflow
 
 Implemented in `app/src/core/agent`.
 
-Current status: Phase 2 typed execution is the normal request path. `_chat_direct` is a compatibility alias that delegates to `_chat_phase2`; it is not an independent legacy implementation and must not be described as a fallback.
+Current status: Phase 3 typed LangGraph execution is the normal request path. `CopilotService` is a facade and no longer contains the former `_chat_phase2` workflow controller.
 
 Contracts:
 
@@ -235,22 +235,27 @@ Capability registry entries:
 - `graph.find_path`
 - `knowledge.search`
 
-Active workflow:
+Active graph nodes:
 
 ```text
-Entity resolution
--> semantic routing
--> validated TaskSpec
--> deterministic direct plan OR one bounded Planner pass
--> deterministic PlanValidator
--> dependency-aware CapabilityExecutor
--> canonical ToolResults
--> canonical EvidencePack
--> deterministic EvidenceReviewer
--> at most one supplemental capability call
--> reviewed context composition
--> final synthesis or deterministic safe failure
--> deterministic state update
+resolve_entities
+-> route
+-> validate_task
+-> build_direct_plan OR build_plan
+-> validate_plan
+-> build_fallback_plan when required
+-> dispatch_specialists
+   -> Asset Investigation Specialist for validated asset.* steps
+   -> Graph Analysis Specialist for validated graph.* steps
+   -> generic execution for validated non-specialist steps
+-> join_specialist_results in parent-plan order
+-> build_evidence
+-> review_retrieval
+-> supplemental_retrieval at most once
+-> compose_context
+-> review_context
+-> synthesize
+-> update_memory
 ```
 
 - Direct tasks use `compile_direct_plan`; the Planner is skipped.
@@ -258,31 +263,36 @@ Entity resolution
 - Planner output is a proposal. It cannot execute tools, invent entities, introduce URLs, change permissions, or mutate state.
 - Planner receives one model call only. A rejected plan may receive one deterministic mechanical repair for known structural defects; malformed model output falls back safely without another Planner call.
 - Planner failure or plan rejection falls back explicitly to a deterministic plan when one is safe.
+- Router failure with exactly two deterministically resolved entities preserves explicit comparison, direct-relationship, or path meaning before prior-route continuity. Normal comparison fallback includes per-entity Profile and Detection plus `graph.compare_assets`; direct relationships and paths remain graph-specific.
 - `PlanValidator` enforces known/planner-visible/read-only capabilities, entity authority, cardinality, argument schemas, dependency references, DAG structure, duplicate-call rejection, six-call maximum, two-entity maximum, and graph depth two.
 - `CapabilityExecutor` runs independent steps concurrently with a maximum of four workers by default. Profile and Detection are serialized because they share a Product client/session; Graph and Knowledge can overlap safely.
+- Asset and Graph Specialists are typed bounded LangGraph subgraphs. They receive only validated parent-plan steps, delegate execution to the same registry/executor, add no LLM calls, cannot mutate task/entity authority or memory, and return compact serializable summaries. Parent review and synthesis remain authoritative.
 - Provider exceptions become safe typed failures; successful and partial results are preserved.
-- LangGraph remains bounded at recursion limit 12 and carries the actual Phase 2 task, plan, results, pack, review, and final response through workflow state. It is currently a dispatch/state shell: detailed entity, routing, planning, execution, context, synthesis, and state-update mechanics remain in `CopilotService._chat_phase2`.
-- LangGraph and the deterministic compatibility runner each choose and invoke exactly one executor callback. They do not run typed and compatibility callbacks together.
-- When LangGraph is unavailable, the deterministic compatibility runner executes the same `_chat_phase2` implementation. This is runtime compatibility, not a separate legacy request path.
+- LangGraph is bounded at recursion limit 32. Conditional edges express direct/planner selection, clarification/safe failure, deterministic plan fallback, one supplemental retrieval, context review, and terminal memory update.
+- Runtime clients, locks, streams, and secrets are supplied through LangGraph runtime context and are never persisted in `InvestigationState`.
+- The deterministic compatibility runner uses the same node contract when LangGraph is unavailable. The historical callback adapter exists only for focused backward-compatible tests.
 - There is no unrestricted tool loop or autonomous action path.
 
-### Active call graph and ownership
+Terminal status is evidence-driven. `completed` means every required validated capability and final synthesis succeeded without material fallback or truncation. `completed_with_limitations` is reserved for material provider/evidence gaps, truncation, deterministic synthesis fallback, or recovered plan fallback and carries bounded `limitation_reasons`. Clarification, partial failure, failure, and cancellation remain distinct terminal outcomes.
+
+### Workflow persistence model
+
+This release compiles LangGraph without a checkpointer and provides no SQLite or alternate checkpoint persistence. Request execution remains bounded, all workflow nodes and conditional edges remain active, and memory update remains exactly once per completed request. Conversation and routing state are process-local; interrupted requests cannot resume after a process restart. Durable checkpointing is a future architecture option, not a runtime feature of this release.
+
+### Service responsibilities after refactor
 
 ```text
-BoundedCopilotWorkflow.run
--> exactly one selected callback
--> CopilotService._chat_phase2
-   -> EntityResolver
-   -> SemanticIntentRouter and deterministic normalization/fallback
-   -> task_spec_from_route
-   -> compile_direct_plan OR BoundedPlanner
-   -> PlanValidator
-   -> CapabilityExecutor and CapabilityRegistry
-   -> EvidencePack construction and EvidenceReviewer
-   -> optional validated supplemental plan
-   -> ContextComposer and final context review
-   -> final LLM synthesis OR deterministic safe failure
-   -> one conversation/routing-state update
+CopilotService
+-> request/session/trace preparation
+-> request-scoped runtime dependency construction
+-> BoundedCopilotWorkflow invocation
+-> SSE stream forwarding and response adaptation
+-> top-level safe error translation and usage-report lifecycle
+
+BoundedCopilotWorkflow
+-> explicit nodes and conditional edges listed above
+-> bounded request lifecycle and safe terminal boundaries
+-> workflow and node observability
 ```
 
 The service contains no legacy direct provider loop. Normal Profile, Detection, Graph, and Knowledge calls occur only through registered capability handlers. The service consumes provider results only after they have been converted to `ToolResult` and associated with the EvidencePack.
@@ -342,7 +352,7 @@ Arguments are never replaced after validation. Duplicate equivalent calls are re
 - `SOORIN_AGENT_EXECUTOR_MAX_CONCURRENCY` (hard-capped at 4)
 - `SOORIN_AGENT_REQUEST_TIMEOUT_SECONDS`
 
-`SOORIN_PLANNER_ENABLED` defaults to `false`. One Planner proposal is an architectural fixed bound rather than a misleading configurable planning-pass value. Enable Planner testing explicitly with `SOORIN_PLANNER_ENABLED=true` and `SOORIN_PLANNER_DEPLOYMENT=gpt55`.
+`SOORIN_PLANNER_ENABLED` defaults to `false`. One Planner proposal is an architectural fixed bound rather than a misleading configurable planning-pass value. Enable Planner testing explicitly with `SOORIN_PLANNER_ENABLED=true` and `SOORIN_PLANNER_DEPLOYMENT=glm`.
 
 ## 9. Evidence Reviewer
 
@@ -374,7 +384,7 @@ There is no LLM evidence reviewer.
 
 Graph completeness is evaluated in authority order: `complete_for_user_request`, then `requested_scope_complete`, then `serialized_context_complete_for_retrieved_subset`, and only then general retrieval completeness. A complete `node_summary` remains complete when a broader neighborhood was bounded; that broader truncation is retained as an informational limitation.
 
-Graph scope, traversal, retrieval, and model serialization are separate contracts. `node_summary` serializes target identity and aggregate degree/direction/subnet/importance metadata without a hidden peer sample. One-hop and full-neighbor retrieval use their configured safety ceilings; two-hop uses its own node setting and a named code-level edge ceiling. Relationship and path are pair-specific. Comparison retains both summaries, shared/distinct peer totals, degree/subnet differences, and direct relationship evidence. Every result uses a capability/entity/scope identity; commutative comparison identities normalize entity order, while path/relationship order is preserved.
+Graph scope, traversal, retrieval, and model serialization are separate contracts. `node_summary` serializes target identity and aggregate degree/direction/subnet/importance metadata without a hidden peer sample. One-hop and full-neighbor retrieval use their configured safety ceilings; two-hop uses its own node setting and a named code-level edge ceiling. Relationship and path are pair-specific. Comparison retains both summaries, shared/distinct peer totals, degree/subnet differences, and a protected direct relationship fact block. Optional comparison peer and neighborhood edge details may be truncated or omitted by budget, but direct relationship truth is serialized independently before optional details. Every result uses a capability/entity/scope identity; commutative comparison identities normalize entity order, while path/relationship order is preserved.
 
 If all required evidence is unavailable, synthesis is skipped and the application returns a deterministic safe-failure explanation. If some valid evidence remains, the Reviewer allows synthesis with explicit limitations. A missing, not-yet-executed required capability may trigger one supplemental call; duplicate equivalent retrieval is rejected and a second supplemental call is impossible.
 
@@ -584,6 +594,18 @@ Each successful service request constructs one new `SessionRoutingState` and cal
 
 ## 16. Phase 2.1 Observability
 
+Phase 3 adds node lifecycle events on the same allowlisted logging path:
+
+- `langgraph_node_started`
+- `langgraph_node_completed`
+- `langgraph_node_failed`
+- `langgraph_node_retried`
+- `langgraph_node_skipped`
+- specialist start/completion/failure/skip and specialist-node lifecycle events
+- workflow start, completion, partial, and failure events
+
+The detailed human workflow trace is adapted from final `InvestigationState`. It includes request/entity authority, routing, task/plan, `LANGGRAPH WORKFLOW`, `SPECIALISTS`, capability execution, evidence coverage, context/token budget, memory transition, bounded LLM-call counts, final status, and limitation reasons. It never renders prompts, model responses, credentials, or evidence payloads.
+
 Machine workflow events use compact allowlisted metadata with request, trace, session, plan, and step identifiers and support console or JSON formatting. They never contain complete prompts, full model responses, raw Product JSON, credentials, headers, or hidden reasoning.
 
 Recorded timings include router, Planner, validation, per-capability, initial execution wall time, EvidencePack construction, review, supplemental retrieval, first streamed answer token, synthesis, and total request latency.
@@ -644,19 +666,21 @@ Local launcher:
 
 Docker:
 
-- `Dockerfile` builds wheels in a builder stage and runs as non-root `soorin`.
-- Runtime copies `app`, `lib`, `script`, and `docs`.
+- `Dockerfile` installs CPU-only Torch and application dependencies into `/opt/venv` in a builder stage, verifies no CUDA/NVIDIA packages, and runs as non-root `soorin`.
+- Runtime copies only `/opt/venv`, `app`, and `lib`; local data, secrets, caches, wheels, and checkpoint files are excluded.
 - Runtime exposes `6998` and `8501`.
 - `compose.yaml` defines `api` and `ui` services.
 - API uses `python app/run.py --api`.
 - UI uses `python -m streamlit run app/app_st.py --server.port=8501`.
 - Host port defaults are API `6998` and UI `8503`.
 - Volumes:
-  - `copilot-data` for graph/runtime data.
-  - `copilot-qdrant` for local Qdrant path.
-  - Host SOC corpus and Hugging Face cache bind-mounted read-only into the API only.
+  - One pre-existing host data root is bind-mounted at `/workspace/data`; API access is read/write and UI access is read-only.
+  - The host Hugging Face cache is bind-mounted read-only into the API only.
+  - Long bind syntax uses `create_host_path: false`, so missing or mistyped host paths fail instead of creating empty storage.
 
-Local `app/.env` keeps host-local paths. Compose overrides the corpus root, local Qdrant path, and Hugging Face cache path for the API container. Host bind sources are configured in untracked `compose.env`; the UI does not receive RAG source or model-cache mounts.
+Local `app/.env` keeps repository-relative Graph and local Qdrant paths. Compose overrides only container-specific Qdrant, cache, log, and evidence paths. Host bind sources, image tag, restart policy, UID/GID, ports, and bind addresses are configured in untracked `compose.env`. The UI does not receive `app/.env`, the original source corpus, model cache, or backend credentials.
+
+Normal retrieval reads indexed Qdrant payloads and does not open original corpus files. `SOORIN_RAG_SOURCE_ROOT` is therefore an indexing-maintenance input, and the source corpus is not mounted during normal API/UI operation. Embedded Qdrant is opened only by the API process.
 
 Compose currently does not define a separate Qdrant server container. Use local Qdrant mode for embedded file-backed Qdrant storage, or configure an external Qdrant server URL.
 
@@ -693,7 +717,7 @@ Implemented:
 
 - FastAPI chat and graph APIs.
 - Streamlit workspace with topology UI and streaming chat.
-- Provider-neutral LLM client with Arvan deployments for GLM/GPT aliases.
+- Provider-neutral LLM client with OpenAI-compatible Kimi/GLM/GPT deployment aliases.
 - Semantic LLM router with deterministic validation and fallback.
 - Deterministic IPv4 entity authority.
 - Product auth/client for topology, detection, profile, and login.
@@ -712,32 +736,32 @@ Implemented:
 
 Partial or structural:
 
-- LangGraph dispatches and carries the typed Phase 2 runtime state, while detailed provider/context/synthesis mechanics remain methods on `CopilotService`; further node-level extraction is possible without changing contracts.
-- LangGraph nodes currently mark and carry workflow stages; the detailed phase mechanics remain in the single `_chat_phase2` service executor.
 - RAG has service and indexer support, but no dedicated public API endpoint and no automatic index build.
+- Specialist findings are deterministic evidence-availability summaries; cross-domain interpretation remains with the parent reviewer and final synthesizer.
 
 Deferred or not implemented:
 
 - LLM evidence reviewer.
-- Neo4j, Cypher, text-to-Cypher, Graph Data Science.
+- Neo4j, GraphStore migration, Cypher, text-to-Cypher, Graph Data Science.
+- GraphRAG and bulk graph enrichment.
 - MCP.
 - SIEM/Splunk integrations.
 - Alert actions.
 - Report-generation endpoints.
 - Long-term durable memory.
-- Database-backed checkpoints.
+- Durable cross-process episodic conversation memory.
 - Human approval workflows.
 - Automatic remediation.
 - Microsoft Global or DRIFT GraphRAG.
 
-## 22. Remaining Risks and Phase 3 Entry Point
+## 22. Remaining Risks and Next Step
 
 Remaining risks:
 
-- `CopilotService._chat_phase2` remains large and owns most detailed orchestration. Future extraction should move verified stages into dedicated LangGraph nodes without changing the contracts or provider boundary.
+- There is no durable workflow checkpointing; in-flight work cannot resume after a process restart.
 - Synchronous provider calls cannot be killed after a Python future timeout; transport-native timeouts must remain correctly configured.
 - Planner mode is offline-tested with fakes but requires deliberate manual parity testing before broad enablement.
 - Conversation and routing state are process-local and do not coordinate concurrent workers.
 - RAG availability and freshness depend on an externally maintained Qdrant collection; the application does not index at startup.
 
-The safest Phase 3 entry point is to preserve the current `TaskSpec`, `ExecutionPlan`, `CapabilityRegistry`, `ToolResult`, `EvidencePack`, and Reviewer contracts while extracting service stages into real LangGraph nodes. Neo4j can then be introduced behind the existing graph capability boundary with bounded parameterized read-only queries. Planner expansion, Cypher generation, additional integrations, and side-effecting actions should remain deferred until node-level parity, evidence evaluation, and durable state design are verified.
+The safest next step is offline acceptance and operational parity testing of the stabilized parent/specialist workflow before adding any new capability. A future Neo4j implementation should remain behind the existing graph capability boundary with bounded parameterized read-only queries. GraphRAG, Planner expansion, MCP/vendor tools, bulk enrichment, and side-effecting actions remain deferred.

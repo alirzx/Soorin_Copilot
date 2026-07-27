@@ -227,7 +227,11 @@ class GraphRefreshService:
             )
 
             raw_path, pickle_path = self._write_required_artifacts(topology.raw_payload, graph, stats)
-            optional_failures = self._write_optional_exports(graph)
+            optional_failures = (
+                self._write_optional_exports(graph)
+                if self.settings.graph_optional_exports_enabled
+                else []
+            )
             if optional_failures:
                 logger.warning(
                     "event=graph_optional_exports_failed snapshot_version=%s failures=%s",
@@ -235,8 +239,18 @@ class GraphRefreshService:
                     ",".join(optional_failures),
                 )
             raw_snapshot_path, processed_snapshot_path = self._write_snapshots(topology.raw_payload, graph, snapshot_version)
-            self._prune_snapshots(resolve_path(self.settings.graph_raw_path), "*.snapshot.*.json", self.settings.graph_refresh_keep_raw_snapshots)
-            self._prune_snapshots(resolve_path(self.settings.graph_pickle_path), "*.snapshot.*.pkl", self.settings.graph_refresh_keep_processed_snapshots)
+            self._prune_snapshots(
+                resolve_path(self.settings.graph_raw_path),
+                "*.snapshot.*.json",
+                self.settings.graph_refresh_keep_raw_snapshots,
+                self.settings.graph_snapshot_ttl_hours,
+            )
+            self._prune_snapshots(
+                resolve_path(self.settings.graph_pickle_path),
+                "*.snapshot.*.pkl",
+                self.settings.graph_refresh_keep_processed_snapshots,
+                self.settings.graph_snapshot_ttl_hours,
+            )
 
             metadata = replace_active_graph(
                 graph,
@@ -411,13 +425,35 @@ class GraphRefreshService:
         return raw_snapshot, pickle_snapshot
 
     @staticmethod
-    def _prune_snapshots(anchor_path: Path, pattern: str, keep: int) -> None:
-        if keep <= 0:
-            return
-        snapshots = sorted(anchor_path.parent.glob(pattern), key=lambda path: path.stat().st_mtime, reverse=True)
-        for stale in snapshots[keep:]:
-            stale.unlink(missing_ok=True)
-            logger.info("event=graph_snapshot_pruned path=%s", stale)
+    def _prune_snapshots(
+        anchor_path: Path,
+        pattern: str,
+        keep: int,
+        ttl_hours: int,
+    ) -> None:
+        """Prune only regular snapshot files beside the configured active artifact."""
+        try:
+            snapshots = [
+                path
+                for path in anchor_path.parent.glob(pattern)
+                if path.is_file() and not path.is_symlink()
+            ]
+            snapshots.sort(key=lambda path: path.stat().st_mtime, reverse=True)
+            cutoff = time.time() - ttl_hours * 3600 if ttl_hours > 0 else None
+            retained = 0
+            for snapshot in snapshots:
+                expired = cutoff is not None and snapshot.stat().st_mtime < cutoff
+                over_count = keep <= 0 or retained >= keep
+                if expired or over_count:
+                    snapshot.unlink(missing_ok=True)
+                    logger.info("event=graph_snapshot_pruned path_kind=graph_snapshot")
+                else:
+                    retained += 1
+        except OSError as exc:
+            logger.warning(
+                "event=graph_snapshot_prune_failed path_kind=graph_snapshot error_type=%s",
+                type(exc).__name__,
+            )
 
     def _record_attempt(self) -> None:
         with self._status_lock:

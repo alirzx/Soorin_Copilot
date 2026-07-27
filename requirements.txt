@@ -18,8 +18,7 @@ pillow==12.3.0
 psutil==7.2.2
 
 # Bounded agent workflow and knowledge retrieval foundations
-langchain-core>=0.3.0,<2.0.0
-langgraph>=0.2.0,<2.0.0
-qdrant-client>=1.12.0,<2.0.0
-torch>=2.5.0,<3.0.0
-transformers>=4.45.0,<5.0.0
+langchain-core==1.5.1
+langgraph==1.2.9
+qdrant-client==1.18.0
+transformers==4.57.6

@@ -1,20 +1,13 @@
-# ============================================================
 # Python environments
-# ============================================================
-
 .venv/
 venv/
 env/
 ENV/
 
-# ============================================================
 # Python cache, tests, coverage, and build output
-# ============================================================
-
 __pycache__/
 *.py[cod]
 *$py.class
-
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
@@ -26,24 +19,22 @@ __pycache__/
 .coverage.*
 htmlcov/
 coverage.xml
-
 build/
 dist/
 *.egg-info/
 .eggs/
 wheels/
 
-# ============================================================
 # Secrets and local environment configuration
-# ============================================================
-
 .env
 .env.*
 !.env.example
-
 app/.env
 app/.env.*
 !app/.env.example
+compose.env
+compose.env.*
+!compose.env.example
 
 # Certificates and private keys
 *.pem
@@ -52,90 +43,45 @@ app/.env.*
 *.p12
 *.pfx
 
-# ============================================================
-# Local runtime and test output
-# ============================================================
-
+# Local runtime, data, exports, and test output
+data/
 copilot_test_results/
+copilot_tmp_notes_docs/
+copilot_tmp_response_test/
 logs/
 *.log
-
 tmp/
 temp/
 .cache/
 script/router_e2e_results/
-data/
-data/runtime/evidence/
-data/runtime/logs/
+*.sqlite3
+*.sqlite3-shm
+*.sqlite3-wal
+*.tar
+*.tar.gz
+*.tar.sha256
 
-# ============================================================
-# Local graph/generated data
-# ============================================================
-
-# Keep tracked project data unless these directories are generated.
-# Uncomment only when appropriate:
-# data/raw/
-# data/processed/
-# data/generated/
-# data/cache/
-
-# ============================================================
 # Docker local overrides
-# ============================================================
-
 compose.override.yaml
 compose.local.yaml
 docker-compose.override.yml
 docker-compose.local.yml
 
-# Root Compose environment file
-/.env
-
-# ============================================================
-# IDE and editor files
-# ============================================================
-
+# IDE, editor, OS, and local agent state
 .vscode/
 .idea/
 *.code-workspace
-
 *.swp
 *.swo
 *~
 .project
 .pydevproject
-
-# ============================================================
-# Operating-system files
-# ============================================================
-
 .DS_Store
 Thumbs.db
 desktop.ini
-
-# ============================================================
-# Local agent and Codex state
-# ============================================================
-
 .codex/
 .agent/
-.agents/
-.agents/skills
-
-# ============================================================
-# Miscellaneous local files
-# ============================================================
-
+.mimocode/
 *.bak
 *.tmp
 *.temp
-# Python virtual environments
-.venv/
-venv/
-compose.env
-
-data/qdrant-local/*.tar
-*.tar.gz
-compose.env.*
-!compose.env.example
-*.tar
