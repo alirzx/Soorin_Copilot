@@ -9,10 +9,11 @@ from collections.abc import Iterator
 from typing import Any
 from uuid import uuid4
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends
 from pydantic import BaseModel, Field, field_validator
 from starlette.responses import StreamingResponse
 
+from src.api.auth import verify_api_key
 from src.api.dependencies import get_product_api_client
 from src.api.schemas.chat import ChatResponse, HealthResponse, LLMHealthResponse
 from src.config.settings import get_settings
@@ -89,7 +90,9 @@ def health() -> HealthResponse:
 
 
 @router.get("/llm/health", response_model=LLMHealthResponse)
-def llm_health() -> dict[str, Any]:
+def llm_health(
+    _auth: None = Depends(verify_api_key),
+) -> dict[str, Any]:
     result = llm_client.health()
     logger.info(
         "event=http_llm_health ready=%s deployment=%s provider=%s model=%s",
@@ -102,7 +105,10 @@ def llm_health() -> dict[str, Any]:
 
 
 @router.post("/chat", response_model=ChatResponse)
-def chat(request: ChatRequest) -> dict[str, Any]:
+def chat(
+    request: ChatRequest,
+    _auth: None = Depends(verify_api_key),
+) -> dict[str, Any]:
     request_id = uuid4().hex[:12]
     started = time.perf_counter()
     selected_ip_present = bool(request.ui_context and request.ui_context.selected_ip)
@@ -198,7 +204,10 @@ def chat(request: ChatRequest) -> dict[str, Any]:
         }
     },
 )
-def chat_stream(request: ChatRequest) -> StreamingResponse:
+def chat_stream(
+    request: ChatRequest,
+    _auth: None = Depends(verify_api_key),
+) -> StreamingResponse:
     """Stream only final-model events while preserving the existing chat route."""
     request_id = uuid4().hex[:12]
     session_for_log = (request.session_id or "").strip()

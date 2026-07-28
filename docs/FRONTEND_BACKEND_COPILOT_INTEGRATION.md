@@ -37,8 +37,10 @@ Product browser
 Product Backend / BFF / API Gateway                 (must be implemented)
   |  authenticate user, authorize tenant/assets, correlate, rate-limit
   |  stream bytes without buffering
+  |  Bearer Authorization: SOORIN_COPILOT_API_KEY
   v
 Soorin Copilot API                                  (this repository)
+  |  validates static Bearer API key on every request except GET /health
   |-- Arvan-compatible Router / optional Planner / Chat deployments
   |-- Product login and bearer-token manager
   |-- Product profile endpoint
@@ -64,10 +66,17 @@ browser-visible localhost address.
 | Copilot -> Arvan | provider credentials and normalized messages | model output is routed through validation/review |
 | Copilot -> Graph/Qdrant | configured local or server data stores | snapshots may be stale, incomplete, or unavailable |
 
-**Current gap:** the Copilot public request has no user ID, tenant ID,
-organization ID, role, permission, or authorized-asset scope. FastAPI defines no
-authentication or CORS middleware. Therefore these endpoints must not be
-internet/browser exposed as an authorization boundary.
+**Authentication:** every Copilot endpoint except `GET /health` requires a
+static Bearer API key (`SOORIN_COPILOT_API_KEY`) sent as:
+
+```
+Authorization: Bearer <SOORIN_COPILOT_API_KEY>
+```
+
+Missing or invalid tokens return `401`. This is a service-to-service auth layer
+only. The Copilot request still carries no user ID, tenant ID, organization ID,
+role, permission, or authorized-asset scope. Therefore these endpoints must not
+be internet/browser exposed as an authorization boundary.
 
 ## 4. Frontend-to-backend-to-Copilot request flow
 
@@ -881,9 +890,103 @@ Qdrant local mode and in-process session memory constrain horizontal scaling.
 Do not point multiple writers at one embedded local Qdrant path, and do not
 assume conversation continuity across replicas.
 
-## 29. Current limitations
+## 29. Authentication configuration
 
-- no Copilot endpoint authentication or tenant/user authorization;
+### Configuration variable
+
+| Variable | Required | Default | Purpose |
+|---|---|---|---|
+| `SOORIN_COPILOT_API_KEY` | yes | (none) | Static Bearer API key for service-to-service auth |
+
+Set in `app/.env`:
+
+```ini
+SOORIN_COPILOT_API_KEY=your-generated-api-key
+```
+
+### Which endpoints are protected
+
+Every endpoint except `GET /health` requires the API key:
+
+| Protected | Endpoint |
+|---|---|
+| Yes | `GET /llm/health` |
+| Yes | `POST /chat` |
+| Yes | `POST /chat/stream` |
+| Yes | `GET /graph/status` |
+| Yes | `GET /graph/stats` |
+| Yes | `GET /graph/nodes/{ip}` |
+| Yes | `GET /graph/nodes/{ip}/neighbors` |
+| Yes | `GET /graph/nodes/{ip}/context` |
+| Yes | `GET /graph/path` |
+| **No** | **`GET /health`** |
+
+### HTTP responses
+
+| Condition | Status | Body |
+|---|---|---|
+| Missing `Authorization` header | `401` | `{"detail":"Missing Authorization header"}` |
+| Invalid or missing Bearer token | `401` | `{"detail":"Invalid Bearer token"}` |
+| Valid Bearer token | `200` | Normal response |
+
+### Development workflow
+
+```text
+# Generate an API key (one time)
+SOORIN_COPILOT_API_KEY=$(python3 -c "import secrets; print(secrets.token_urlsafe(32))")
+
+# Start the API
+SOORIN_COPILOT_API_KEY=$SOORIN_COPILOT_API_KEY python app/run.py --api
+
+# Test the key
+curl -H "Authorization: Bearer $SOORIN_COPILOT_API_KEY" http://127.0.0.1:6998/chat/stream
+```
+
+### Production workflow (Browser → Product Backend → Copilot)
+
+```text
+Browser
+  |  (Product login/session cookie)
+  v
+Product Backend / BFF / API Gateway
+  |  1. Authenticate user (Product session)
+  |  2. Authorize tenant/assets
+  |  3. Add Authorization header with Copilot API key
+  |  4. Proxy request to Copilot API
+  v
+Soorin Copilot API
+  |  Validates Bearer token against SOORIN_COPILOT_API_KEY
+  |  Rejects with 401 if missing or invalid
+  |  Proceeds with normal logic if valid
+```
+
+### Example Authorization header
+
+```http
+Authorization: Bearer abc123def456ghi789jkl012mno345pqr678stu901vwx
+```
+
+The Bearer token is the literal value of `SOORIN_COPILOT_API_KEY`. The Product
+Backend must keep this secret and never expose it to the browser.
+
+### OpenAPI / Swagger
+
+Protected endpoints expose an **Authorize** button in Swagger UI
+(`/docs`). Clicking it prompts for a Bearer token. All protected operations
+then include the `Authorization: Bearer <token>` header automatically.
+
+### Implementation notes
+
+- Uses FastAPI `HTTPBearer` security scheme with `Security()` dependency.
+- `GET /health` intentionally excluded — used by load balancers, healthchecks,
+  and monitoring without requiring the API key.
+- No user, tenant, or role scoping — this is a single shared static key.
+- The key is loaded from `app/.env` at settings initialization time.
+- Changing the key requires a service restart.
+
+## 30. Current limitations
+
+- no tenant/user authorization (static API key only);
 - session IDs are arbitrary, unbounded strings and are not identity scoped;
 - in-memory session/routing state does not survive restart or safely span replicas;
 - browser disconnect does not cancel upstream model/workflow execution;
@@ -900,7 +1003,7 @@ assume conversation continuity across replicas.
 - current Streamlit history display duplicates each stored message visually;
 - OpenAPI cannot generate the incremental stream parser.
 
-## 30. Required follow-up changes
+## 31. Required follow-up changes
 
 Before broad frontend release, Product and Copilot teams should decide and then
 implement, in priority order:
@@ -921,7 +1024,7 @@ implement, in priority order:
 No additional payload change is required to implement a basic authorized
 streaming chat page through the BFF.
 
-## 31. Frontend implementation checklist
+## 32. Frontend implementation checklist
 
 - [ ] Use Product BFF URL, never Copilot/Product internal provider URLs.
 - [ ] Create or obtain one authorized UUID per chat and reuse it.
@@ -938,7 +1041,7 @@ streaming chat page through the BFF.
 - [ ] Show Graph `returned/total` truncation and path semantics.
 - [ ] Persist final messages only under authenticated Product ownership.
 
-## 32. Backend implementation checklist
+## 33. Backend implementation checklist
 
 - [ ] Add authenticated Product proxy routes and private service discovery.
 - [ ] Validate body size, message policy, UUID, selected IP, and explicit IPs.
@@ -955,10 +1058,12 @@ streaming chat page through the BFF.
 - [ ] Prevent proxy recursion between `/api/copilot/*` and Product data APIs.
 - [ ] Plan sticky sessions or shared tenant-scoped memory before multiple replicas.
 
-## 33. QA acceptance checklist
+## 34. QA acceptance checklist
 
-- [ ] `/health` returns exact 200 JSON status.
-- [ ] `/llm/health` makes no model call and is access restricted by Product layer.
+- [ ] `/health` returns exact 200 JSON status without any Authorization header.
+- [ ] `/llm/health` returns 401 without Authorization header.
+- [ ] `/llm/health` returns 401 with invalid Bearer token.
+- [ ] `/llm/health` returns 200 with valid Bearer token.
 - [ ] `/chat` success and handled error envelopes match this document.
 - [ ] `/chat/stream` is UTF-8 SSE with blank-line frame boundaries.
 - [ ] Unicode smart quotes, Persian, arrows, dashes, and emoji round-trip exactly.

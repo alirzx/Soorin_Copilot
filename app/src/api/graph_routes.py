@@ -8,6 +8,7 @@ from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 
+from src.api.auth import verify_api_key
 from src.api.dependencies import get_graph_service
 from src.api.schemas.graph import (
     GraphContextResponse,
@@ -34,7 +35,10 @@ def _validate_ip(value: str, *, field_name: str = "ip") -> str:
 
 
 @router.get("/status", response_model=GraphStatusResponse)
-def graph_status(service: GraphService = Depends(get_graph_service)) -> GraphStatusResponse:
+def graph_status(
+    service: GraphService = Depends(get_graph_service),
+    _auth: None = Depends(verify_api_key),
+) -> GraphStatusResponse:
     status = service.status()
     logger.info(
         "event=graph_api_status loaded=%s nodes=%s edges=%s artifact_available=%s refresh_enabled=%s refresh_running=%s refresh_consecutive_failures=%s",
@@ -50,7 +54,10 @@ def graph_status(service: GraphService = Depends(get_graph_service)) -> GraphSta
 
 
 @router.get("/stats", response_model=GraphStatsResponse)
-def graph_stats(service: GraphService = Depends(get_graph_service)) -> GraphStatsResponse:
+def graph_stats(
+    service: GraphService = Depends(get_graph_service),
+    _auth: None = Depends(verify_api_key),
+) -> GraphStatsResponse:
     stats = service.stats()
     logger.info(
         "event=graph_api_stats nodes=%s edges=%s",
@@ -61,7 +68,11 @@ def graph_stats(service: GraphService = Depends(get_graph_service)) -> GraphStat
 
 
 @router.get("/nodes/{ip}", response_model=GraphNodeResponse)
-def graph_node(ip: str, service: GraphService = Depends(get_graph_service)) -> GraphNodeResponse:
+def graph_node(
+    ip: str,
+    service: GraphService = Depends(get_graph_service),
+    _auth: None = Depends(verify_api_key),
+) -> GraphNodeResponse:
     target_ip = _validate_ip(ip)
     result = service.node(target_ip)
     logger.info("event=graph_api_node target_ip=%s found=%s", target_ip, result["found"])
@@ -74,6 +85,7 @@ def graph_neighbors(
     direction: Literal["in", "out", "both"] = Query(default="both"),
     limit: int = Query(default=20, gt=0),
     service: GraphService = Depends(get_graph_service),
+    _auth: None = Depends(verify_api_key),
 ) -> GraphNeighborsResponse:
     settings = get_settings()
     if limit > settings.graph_api_max_neighbors:
@@ -93,7 +105,10 @@ def graph_neighbors(
 
 
 @router.get("/nodes/{ip}/context", response_model=GraphContextResponse)
-def graph_context(ip: str) -> GraphContextResponse:
+def graph_context(
+    ip: str,
+    _auth: None = Depends(verify_api_key),
+) -> GraphContextResponse:
     target_ip = _validate_ip(ip)
     result = build_graph_context(target_ip)
     logger.info(
@@ -109,6 +124,7 @@ def graph_path(
     source: str = Query(...),
     target: str = Query(...),
     service: GraphService = Depends(get_graph_service),
+    _auth: None = Depends(verify_api_key),
 ) -> GraphPathResponse:
     source_ip = _validate_ip(source, field_name="source")
     target_ip = _validate_ip(target, field_name="target")

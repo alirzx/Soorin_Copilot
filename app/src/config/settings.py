@@ -99,6 +99,7 @@ class Settings:
     api_base_url: str
     api_timeout_seconds: int
     streamlit_server_port: int
+    copilot_api_key: str
     llm_enabled: bool
     llm_provider: str
     intent_router_deployment: LLMDeploymentName
@@ -450,6 +451,7 @@ def get_settings() -> Settings:
         api_base_url=os.getenv("SOORIN_API_BASE_URL", "http://127.0.0.1:6998").strip().rstrip("/"),
         api_timeout_seconds=_int("SOORIN_API_TIMEOUT_SECONDS", 120),
         streamlit_server_port=_int("STREAMLIT_SERVER_PORT", 8503),
+        copilot_api_key=os.getenv("SOORIN_COPILOT_API_KEY", "").strip(),
         llm_enabled=_bool("SOORIN_LLM_ENABLED", True),
         llm_provider=os.getenv("SOORIN_LLM_PROVIDER", "arvan").strip().lower(),
         intent_router_deployment=_deployment_name("SOORIN_INTENT_ROUTER_DEPLOYMENT"),
