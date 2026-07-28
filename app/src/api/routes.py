@@ -14,6 +14,7 @@ from pydantic import BaseModel, Field, field_validator
 from starlette.responses import StreamingResponse
 
 from src.api.dependencies import get_product_api_client
+from src.api.schemas.chat import ChatResponse, HealthResponse, LLMHealthResponse
 from src.config.settings import get_settings
 from src.core.copilot.service import CopilotService
 from src.core.context.models import approx_tokens, compact_preview
@@ -81,13 +82,13 @@ def encode_sse_event(event: LLMStreamEvent) -> str:
     return f"event: {event.type}\ndata: {data}\n\n"
 
 
-@router.get("/health")
-def health() -> dict[str, str]:
+@router.get("/health", response_model=HealthResponse)
+def health() -> HealthResponse:
     logger.debug("event=http_health status=ok")
-    return {"status": "ok"}
+    return HealthResponse(status="ok")
 
 
-@router.get("/llm/health")
+@router.get("/llm/health", response_model=LLMHealthResponse)
 def llm_health() -> dict[str, Any]:
     result = llm_client.health()
     logger.info(
@@ -100,7 +101,7 @@ def llm_health() -> dict[str, Any]:
     return envelope("ok", result)
 
 
-@router.post("/chat")
+@router.post("/chat", response_model=ChatResponse)
 def chat(request: ChatRequest) -> dict[str, Any]:
     request_id = uuid4().hex[:12]
     started = time.perf_counter()
@@ -172,7 +173,31 @@ def chat(request: ChatRequest) -> dict[str, Any]:
     return envelope("ok", result, warnings=warnings)
 
 
-@router.post("/chat/stream")
+@router.post(
+    "/chat/stream",
+    response_class=StreamingResponse,
+    responses={
+        200: {
+            "description": "UTF-8 Server-Sent Events carrying normalized Copilot stream events.",
+            "content": {
+                "text/event-stream": {
+                    "schema": {
+                        "type": "string",
+                        "description": (
+                            "SSE records use an event line and one JSON data line, followed by a blank line. "
+                            "Event types are reasoning_delta, answer_delta, usage, done, and error."
+                        ),
+                    },
+                    "example": (
+                        'event: answer_delta\\ndata: {"type":"answer_delta","text":"test"}\\n\\n'
+                        'event: done\\ndata: {"type":"done","data":{"session_id":"example",'
+                        '"provider":"arvan","model":"example-model","warnings":[]}}\\n\\n'
+                    ),
+                }
+            },
+        }
+    },
+)
 def chat_stream(request: ChatRequest) -> StreamingResponse:
     """Stream only final-model events while preserving the existing chat route."""
     request_id = uuid4().hex[:12]

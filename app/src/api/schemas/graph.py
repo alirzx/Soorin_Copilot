@@ -38,12 +38,22 @@ class GraphStatusResponse(BaseModel):
     last_known_good: bool = False
 
 
+class GraphTopDestination(BaseModel):
+    ip: str
+    incoming: int = Field(ge=0)
+
+
+class GraphTopSource(BaseModel):
+    ip: str
+    outgoing: int = Field(ge=0)
+
+
 class GraphStatsResponse(BaseModel):
     total_nodes: int = Field(ge=0)
     total_edges: int = Field(ge=0)
     avg_degree: float = Field(ge=0)
-    top_destinations: list[dict[str, int | str]]
-    top_sources: list[dict[str, int | str]]
+    top_destinations: list[GraphTopDestination]
+    top_sources: list[GraphTopSource]
     ip_range_distribution: dict[str, int]
 
 
