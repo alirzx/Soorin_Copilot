@@ -134,21 +134,20 @@ the Copilot proxy.
 
 ## 6. Public endpoint matrix
 
-All current success responses are UTF-8 JSON except `/chat/stream`. There is no
-Copilot-layer authentication today.
+All current success responses are UTF-8 JSON except `/chat/stream`. Copilot-layer authentication uses a static Bearer API key (`SOORIN_COPILOT_API_KEY`) sent as `Authorization: Bearer <SOORIN_COPILOT_API_KEY>`. Every endpoint except `GET /health` requires the key; protected endpoints return `401` without a valid token.
 
 | Method and path | Purpose | Input | Success | Errors and limits |
 |---|---|---|---|---|
-| `GET /health` | process liveness | none | 200 `{"status":"ok"}` | does not test models, Product API, Graph, or Qdrant |
-| `GET /llm/health` | configured deployment readiness | none | 200 envelope with chat/router/planner metadata | configuration only; no model call |
-| `POST /chat` | complete non-stream answer | `ChatRequest` | 200 `ChatResponse` | validation 422; handled `LLMError` is a 200 error envelope |
-| `POST /chat/stream` | interactive answer | `ChatRequest` | 200 UTF-8 SSE | validation 422 before stream; runtime failures are SSE `error` after 200 |
-| `GET /graph/status` | Graph load/refresh diagnostics | none | 200 `GraphStatusResponse` | may reveal local artifact paths |
-| `GET /graph/stats` | aggregate snapshot statistics | none | 200 `GraphStatsResponse` | no pagination; Graph unavailable may surface as server error |
-| `GET /graph/nodes/{ip}` | node existence/degree | syntactically valid IP | 200 `GraphNodeResponse` | malformed IP 422; absent node is 200 `found=false` |
-| `GET /graph/nodes/{ip}/neighbors` | direct observed peers | `direction`, `limit` | 200 `GraphNeighborsResponse` | `direction=in|out|both`; default 20; configured max default 1000; no cursor/offset |
-| `GET /graph/nodes/{ip}/context` | compact node context | valid path IP | 200 `GraphContextResponse` | fixed internal top-peer bound; no client limit |
-| `GET /graph/path` | directed shortest observed Graph path | required `source`, `target` | 200 `GraphPathResponse` | malformed/missing query 422; no hop-limit input |
+| `GET /health` | process liveness | none | 200 `{"status":"ok"}` does not test models, Product API, Graph, or Qdrant | no Authorization header required |
+| `GET /llm/health` | configured deployment readiness | none | 200 envelope with chat/router/planner metadata | configuration only; no model call; requires `Authorization: Bearer <SOORIN_COPILOT_API_KEY>` |
+| `POST /chat` | complete non-stream answer | `ChatRequest` | 200 `ChatResponse` | validation 422; handled `LLMError` is a 200 error envelope; requires `Authorization: Bearer <SOORIN_COPILOT_API_KEY>` |
+| `POST /chat/stream` | interactive answer | `ChatRequest` | 200 UTF-8 SSE | validation 422 before stream; runtime failures are SSE `error` after 200; requires `Authorization: Bearer <SOORIN_COPILOT_API_KEY>` |
+| `GET /graph/status` | Graph load/refresh diagnostics | none | 200 `GraphStatusResponse` | may reveal local artifact paths; requires `Authorization: Bearer <SOORIN_COPILOT_API_KEY>` |
+| `GET /graph/stats` | aggregate snapshot statistics | none | 200 `GraphStatsResponse` | no pagination; Graph unavailable may surface as server error; requires `Authorization: Bearer <SOORIN_COPILOT_API_KEY>` |
+| `GET /graph/nodes/{ip}` | node existence/degree | syntactically valid IP | 200 `GraphNodeResponse` | malformed IP 422; absent node is 200 `found=false`; requires `Authorization: Bearer <SOORIN_COPILOT_API_KEY>` |
+| `GET /graph/nodes/{ip}/neighbors` | direct observed peers | `direction`, `limit` | 200 `GraphNeighborsResponse` | `direction=in|out|both`; default 20; configured max default 1000; no cursor/offset; requires `Authorization: Bearer <SOORIN_COPILOT_API_KEY>` |
+| `GET /graph/nodes/{ip}/context` | compact node context | valid path IP | 200 `GraphContextResponse` | fixed internal top-peer bound; no client limit; requires `Authorization: Bearer <SOORIN_COPILOT_API_KEY>` |
+| `GET /graph/path` | directed shortest observed Graph path | required `source`, `target` | 200 `GraphPathResponse` | malformed/missing query 422; no hop-limit input; requires `Authorization: Bearer <SOORIN_COPILOT_API_KEY>` |
 
 FastAPI/Pydantic query validation uses HTTP 422 with a `detail` array. Custom IP
 validation uses HTTP 422 with `{"detail":"Invalid <field>."}`. Unexpected,
@@ -379,7 +378,11 @@ The reference UI in `app/app_st.py`:
 - loads the local Graph pickle directly and calls Python Graph helpers;
 - does **not** call the public `/graph/*` endpoints;
 - supports PyVis node select, empty-canvas clear, Explore-IP select, zoom, and
-  local Graph filters.
+  local Graph filters;
+- automatically attaches `Authorization: Bearer <SOORIN_COPILOT_API_KEY>` to every
+  protected request (`/chat`, `/chat/stream`, `/llm/health`) and omits the header
+  from the unauthenticated `/health` endpoint;
+- shows a sidebar warning when `SOORIN_COPILOT_API_KEY` is not configured.
 
 Streamlit-specific behavior that must not be copied: direct pickle access,
 in-process Graph functions, Streamlit session state as durable history, PyVis's
@@ -717,22 +720,15 @@ framework-specific proxy example is asserted.
 
 ## 20. Authentication and authorization
 
-Current Copilot endpoints accept requests without authentication. Product API
-credentials are used only on Copilot's outbound calls and must never reach the
-browser.
-
-Safe current integration strategy:
-
-1. Keep Copilot on a private network.
-2. Expose only Product BFF routes.
-3. Authenticate user and tenant at BFF.
-4. Parse all valid IPv4s from the natural-language message as well as
-   `ui_context.selected_ip` and authorize them before forwarding.
-5. Run Copilot's Product client under a tenant-appropriate service identity, or
-   enforce authorized asset scope again in Product provider endpoints.
-
-A UI-only selected-IP check is insufficient: a user can type another IP in the
-message, and explicit message entities correctly have higher routing authority.
+Copilot protected endpoints (`/chat`, `/chat/stream`, `/llm/health`, and
+all `/graph/*` routes) require a static Bearer API key sent as
+`Authorization: Bearer <SOORIN_COPILOT_API_KEY>`. The built-in Streamlit
+UI (`app/app_st.py`) automatically attaches this header to every protected
+request and omits it from `GET /health`. Missing or invalid tokens return
+`401`. This is a service-to-service auth layer only. The Copilot request
+still carries no user ID, tenant ID, organization ID, role, permission, or
+authorized-asset scope. Therefore these endpoints must not be internet/browser
+exposed as an authorization boundary.
 
 ## 21. Multi-tenant concerns
 

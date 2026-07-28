@@ -29,6 +29,20 @@ LEGACY_SELECTED_IP_KEY = "copilot_graph_context_ip"
 APP_DIR = Path(__file__).resolve().parent
 SIDEBAR_LOGO_PATH = APP_DIR / "assets" / "branding" / "soorinsec-logo2.png"
 
+
+def _get_auth_headers() -> dict[str, str]:
+    key = settings.copilot_api_key
+    if not key:
+        return {}
+    return {"Authorization": f"Bearer {key}"}
+
+
+def _check_api_key_ready() -> str | None:
+    if not settings.copilot_api_key:
+        return "SOORIN_COPILOT_API_KEY is not configured. The Copilot API key is required for chat, streaming, and LLM health checks."
+    return None
+
+
 # ============================================================
 st.set_page_config(page_title="Soorin Cyber Copilot", layout="wide")
 
@@ -92,13 +106,21 @@ def get_active_llm_label() -> str:
     model = ""
     provider = ""
     try:
-        response = requests.get(LLM_HEALTH_URL, timeout=10)
+        response = requests.get(
+            LLM_HEALTH_URL,
+            headers=_get_auth_headers(),
+            timeout=10,
+        )
         response.raise_for_status()
         payload = response.json()
         if payload.get("status") == "ok":
             metadata = payload.get("data") or {}
             model = str(metadata.get("model") or "").strip()
             provider = str(metadata.get("provider") or "").strip()
+    except requests.HTTPError as exc:
+        if exc.response is not None and exc.response.status_code == 401:
+            logger.warning("event=ui_llm_health_auth_failed")
+        return "unavailable"
     except (requests.RequestException, AttributeError, ValueError, TypeError):
         pass
 
@@ -133,10 +155,15 @@ def ask_copilot(message: str) -> tuple[str | None, str | None]:
         response = requests.post(
             CHAT_URL,
             json=payload,
+            headers=_get_auth_headers(),
             timeout=REQUEST_TIMEOUT_SECONDS,
         )
         response.raise_for_status()
         payload = response.json()
+    except requests.HTTPError as exc:
+        if exc.response is not None and exc.response.status_code == 401:
+            return None, "Authentication failed. Check that SOORIN_COPILOT_API_KEY is configured on the server."
+        return None, "The backend API returned an error."
     except requests.Timeout:
         return None, "The Copilot request timed out."
     except requests.ConnectionError:
@@ -182,15 +209,22 @@ def stream_copilot(message: str):
         with requests.post(
             CHAT_STREAM_URL,
             json=payload,
+            headers=_get_auth_headers(),
             timeout=REQUEST_TIMEOUT_SECONDS,
             stream=True,
         ) as response:
+            if response.status_code == 401:
+                raise ChatStreamClientError(
+                    "Authentication failed. Check that SOORIN_COPILOT_API_KEY is configured on the server."
+                )
             response.raise_for_status()
             response.encoding = "utf-8"
             for event in parse_sse_events(
                 response.iter_lines(chunk_size=1, decode_unicode=True)
             ):
                 yield event
+    except ChatStreamClientError:
+        raise
     except requests.Timeout as exc:
         raise ChatStreamClientError("The Copilot request timed out.") from exc
     except requests.ConnectionError as exc:
@@ -211,6 +245,11 @@ init_session_state()
 with st.sidebar:
     render_sidebar_branding()
     st.subheader("Workspace Status")
+
+    api_key_error = _check_api_key_ready()
+    if api_key_error:
+        st.warning(api_key_error)
+
     st.caption("API URL")
     st.code(API_BASE_URL, language=None)
 
