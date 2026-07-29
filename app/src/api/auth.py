@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
-from fastapi import HTTPException, Security
+import hmac
+from typing import Annotated
+
+from fastapi import Header, HTTPException, Security
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from src.config.settings import get_settings
@@ -12,19 +15,26 @@ bearer_scheme = HTTPBearer(auto_error=False)
 
 def verify_api_key(
     credentials: HTTPAuthorizationCredentials | None = Security(bearer_scheme),
+    copilot_api_key_header: Annotated[str | None, Header(alias="Soorin_copilot_api_key")] = None,
 ) -> None:
-    if credentials is None:
-        raise HTTPException(
-            status_code=401,
-            detail="Missing Authorization header",
-        )
     settings = get_settings()
     if not settings.copilot_api_key:
         raise HTTPException(
             status_code=401,
             detail="Invalid Bearer token",
         )
-    if credentials.credentials != settings.copilot_api_key:
+
+    if copilot_api_key_header is not None:
+        candidate = copilot_api_key_header.strip()
+    elif credentials is not None:
+        candidate = credentials.credentials
+    else:
+        raise HTTPException(
+            status_code=401,
+            detail="Missing Authorization header",
+        )
+
+    if not hmac.compare_digest(candidate, settings.copilot_api_key):
         raise HTTPException(
             status_code=401,
             detail="Invalid Bearer token",
