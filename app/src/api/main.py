@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 
 from src.api.dependencies import get_graph_refresh_service as get_api_graph_refresh_service
 from src.api.graph_routes import router as graph_router
@@ -18,6 +19,13 @@ logger = logging.getLogger(__name__)
 
 def create_app() -> FastAPI:
     app = FastAPI(title="Soorin Copilot API")
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_credentials=False,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
     app.include_router(router)
     app.include_router(graph_router)
 
