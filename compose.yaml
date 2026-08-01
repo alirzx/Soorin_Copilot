@@ -1,6 +1,8 @@
 name: soorin-copilot
 
 x-app-image: &app-image soorin-copilot:${SOORIN_IMAGE_TAG:-rag-local}
+x-app-env: &app-env
+  - ${SOORIN_APP_ENV_FILE:-./app/.env}
 
 services:
   api:
@@ -22,8 +24,7 @@ services:
       - app/run.py
       - --api
 
-    env_file:
-      - ./app/.env
+    env_file: *app-env
 
     environment:
       PYTHONPATH: /workspace/app
@@ -36,14 +37,15 @@ services:
       SOORIN_HOST: 0.0.0.0
       SOORIN_PORT: "6998"
 
-      # Container paths override host-local paths from app/.env.
       SOORIN_RAG_SOURCE_ROOT: ""
       SOORIN_RAG_QDRANT_MODE: local
       SOORIN_RAG_QDRANT_PATH: /workspace/data/qdrant-local
       SOORIN_RAG_EMBEDDING_LOCAL_FILES_ONLY: "true"
       SOORIN_RAG_EMBEDDING_CACHE_DIR: /home/soorin/.cache/huggingface/hub
+
       SOORIN_LOG_FILE_PATH: /workspace/data/runtime/logs/soorin-copilot.log
       SOORIN_EVIDENCE_SNAPSHOT_ROOT: /workspace/data/runtime/evidence
+
       HF_HOME: /home/soorin/.cache/huggingface
       HF_HUB_OFFLINE: "1"
       TRANSFORMERS_OFFLINE: "1"
@@ -59,6 +61,7 @@ services:
         read_only: false
         bind:
           create_host_path: false
+
       - type: bind
         source: ${SOORIN_HF_CACHE_HOST_PATH:?SOORIN_HF_CACHE_HOST_PATH is required}
         target: /home/soorin/.cache/huggingface
@@ -119,6 +122,8 @@ services:
       - --server.headless=true
       - --browser.gatherUsageStats=false
 
+    env_file: *app-env
+
     environment:
       PYTHONPATH: /workspace/app
 
@@ -132,7 +137,6 @@ services:
       STREAMLIT_BROWSER_GATHER_USAGE_STATS: "false"
 
     ports:
-      # Host port remains 8503; container port remains 8501.
       - "${SOORIN_UI_BIND_IP:-127.0.0.1}:${SOORIN_UI_PORT:-8503}:8501"
 
     volumes:
@@ -159,9 +163,7 @@ services:
         - >-
           from pathlib import Path;
           import urllib.request;
-          Path(
-          "/workspace/app/app_st.py"
-          ).open("rb").read(1);
+          Path("/workspace/app/app_st.py").open("rb").read(1);
           urllib.request.urlopen(
           "http://127.0.0.1:8501/_stcore/health",
           timeout=5
