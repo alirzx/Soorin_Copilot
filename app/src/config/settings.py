@@ -186,6 +186,10 @@ class Settings:
     conversation_summary_max_tokens: int
     conversation_summary_temperature: float
     conversation_summary_timeout_seconds: int
+    local_product_simulation_enabled: bool
+    thread_state_backend: str
+    local_sqlite_path: str
+    langgraph_checkpoint_backend: str
     system_prompt_path: str
     product_api_base_url: str
     product_topology_path: str
@@ -431,6 +435,17 @@ class Settings:
                 "SOORIN_EVIDENCE_SNAPSHOT_MODE must be none, metadata, summary, or redacted."
             )
 
+    def validate_local_persistence_configuration(self) -> None:
+        """Validate only explicitly enabled local-development persistence."""
+        sqlite_required = (
+            self.local_product_simulation_enabled
+            or self.thread_state_backend == "sqlite"
+        )
+        if sqlite_required and not self.local_sqlite_path:
+            raise ValueError(
+                "SOORIN_LOCAL_SQLITE_PATH is required when local SQLite persistence is enabled."
+            )
+
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:
     env_file_loaded = _load_env_file(ENV_PATH)
@@ -565,6 +580,24 @@ def get_settings() -> Settings:
         conversation_summary_max_tokens=_int("SOORIN_CONVERSATION_SUMMARY_MAX_TOKENS", 700),
         conversation_summary_temperature=_float("SOORIN_CONVERSATION_SUMMARY_TEMPERATURE", 0.0),
         conversation_summary_timeout_seconds=_int("SOORIN_CONVERSATION_SUMMARY_TIMEOUT_SECONDS", 30),
+        local_product_simulation_enabled=_bool(
+            "SOORIN_LOCAL_PRODUCT_SIMULATION_ENABLED",
+            False,
+        ),
+        thread_state_backend=_choice(
+            "SOORIN_THREAD_STATE_BACKEND",
+            "memory",
+            {"memory", "sqlite"},
+        ),
+        local_sqlite_path=os.getenv(
+            "SOORIN_LOCAL_SQLITE_PATH",
+            "data/runtime/copilot-local.sqlite3",
+        ).strip(),
+        langgraph_checkpoint_backend=_choice(
+            "SOORIN_LANGGRAPH_CHECKPOINT_BACKEND",
+            "none",
+            {"none", "sqlite"},
+        ),
         system_prompt_path=os.getenv("SOORIN_SYSTEM_PROMPT_PATH", "app/prompts/system_prompt.md").strip(),
         product_api_base_url=os.getenv("SOORIN_PRODUCT_API_BASE_URL", "").strip().rstrip("/"),
         product_topology_path=os.getenv("SOORIN_PRODUCT_TOPOLOGY_PATH", "/zeek/connections/unique-ip-pairs").strip(),
@@ -686,8 +719,9 @@ def get_settings() -> Settings:
     )
     settings.validate_product_paths()
     settings.validate_observability_configuration()
+    settings.validate_local_persistence_configuration()
     logger.info(
-        "event=settings_loaded env_file_path=%s env_file_loaded=%s router_deployment=%s chat_deployment=%s product_base_url_configured=%s product_token_present=%s product_hwid_present=%s product_username_present=%s product_password_present=%s product_captcha_bypass_present=%s rag_enabled=%s rag_backend=%s rag_source_configured=%s rag_qdrant_mode=%s rag_qdrant_configured=%s",
+        "event=settings_loaded env_file_path=%s env_file_loaded=%s router_deployment=%s chat_deployment=%s product_base_url_configured=%s product_token_present=%s product_hwid_present=%s product_username_present=%s product_password_present=%s product_captcha_bypass_present=%s rag_enabled=%s rag_backend=%s rag_source_configured=%s rag_qdrant_mode=%s rag_qdrant_configured=%s local_product_simulation_enabled=%s thread_state_backend=%s langgraph_checkpoint_backend=%s",
         ENV_PATH,
         env_file_loaded,
         settings.intent_router_deployment,
@@ -703,5 +737,8 @@ def get_settings() -> Settings:
         bool(settings.rag_source_root),
         settings.rag_qdrant_mode,
         bool(settings.rag_qdrant_path if settings.rag_qdrant_mode == "local" else settings.rag_qdrant_url),
+        settings.local_product_simulation_enabled,
+        settings.thread_state_backend,
+        settings.langgraph_checkpoint_backend,
     )
     return settings

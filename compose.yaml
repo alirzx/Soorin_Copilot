@@ -46,6 +46,11 @@ services:
       SOORIN_LOG_FILE_PATH: /workspace/data/runtime/logs/soorin-copilot.log
       SOORIN_EVIDENCE_SNAPSHOT_ROOT: /workspace/data/runtime/evidence
 
+      SOORIN_LOCAL_PRODUCT_SIMULATION_ENABLED: "${SOORIN_LOCAL_PRODUCT_SIMULATION_ENABLED:-false}"
+      SOORIN_THREAD_STATE_BACKEND: "${SOORIN_THREAD_STATE_BACKEND:-memory}"
+      SOORIN_LOCAL_SQLITE_PATH: "${SOORIN_LOCAL_SQLITE_PATH:-/workspace/data/runtime/copilot-local.sqlite3}"
+      SOORIN_LANGGRAPH_CHECKPOINT_BACKEND: "${SOORIN_LANGGRAPH_CHECKPOINT_BACKEND:-none}"
+
       HF_HOME: /home/soorin/.cache/huggingface
       HF_HUB_OFFLINE: "1"
       TRANSFORMERS_OFFLINE: "1"
