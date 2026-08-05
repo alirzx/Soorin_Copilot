@@ -99,6 +99,9 @@ Major groups:
 - RAG: enabled flag, source root, backend, Qdrant mode/server URL/local path, collection, score threshold, BGE model/dimension/revision/cache/local-only policy, chunking and upsert limits.
 - Prompts and router: system prompt path, router prompt path, confidence threshold, repair retry flag.
 - Conversation: history storage and deterministic summary limits.
+- Local persistence: disabled-by-default Product chat simulation, memory/SQLite
+  thread-state backend, local SQLite path, and reserved LangGraph checkpoint
+  backend selection.
 - Observability: console/JSON terminal logs, bounded rotating UTF-8 file logs, summary/detailed human traces, TTY-aware color, and disabled-by-default evidence snapshots.
 
 Validation currently enforces:
@@ -110,6 +113,7 @@ Validation currently enforces:
 - BGE default dimension must be 768.
 - Legacy SecureBERT model and collection values are rejected when RAG is enabled.
 - Log format, color, human-trace detail, and evidence snapshot modes are validated.
+- Local chat or SQLite thread-state mode requires a non-empty local database path.
 
 ## 5. LLM Deployments
 
@@ -280,7 +284,17 @@ Terminal status is evidence-driven. `completed` means every required validated c
 
 ### Workflow persistence model
 
-This release compiles LangGraph without a checkpointer and provides no SQLite or alternate checkpoint persistence. Request execution remains bounded, all workflow nodes and conditional edges remain active, and memory update remains exactly once per completed request. Conversation and routing state are process-local; interrupted requests cannot resume after a process restart. Durable checkpointing is a future architecture option, not a runtime feature of this release.
+LangGraph still compiles without a checkpointer. The installed official synchronous
+SQLite saver is compatible with the current synchronous invocation API, but the
+current `InvestigationState` contains model messages and rich evidence objects that
+Gate 3 does not permit to be serialized. `SOORIN_LANGGRAPH_CHECKPOINT_BACKEND=sqlite`
+therefore logs an explicit deferral and does not open a checkpoint database.
+Interrupted workflows cannot resume after a restart.
+
+Separately, Gate 3 provides an opt-in local SQLite `ChatRepository` and compact
+`ThreadStateStore`. These adapters do not persist arbitrary LangGraph state. They
+store owner-scoped local transcripts/request status and approved routing continuity
+only, and are disabled by default.
 
 ### Service responsibilities after refactor
 
@@ -571,7 +585,10 @@ Conversation history is trimmed to fit budget, preferring current evidence over 
 
 Implemented in `app/src/core/memory`.
 
-Current state is in-memory per process.
+The default remains in-memory per process. When explicitly enabled for local
+development, SQLite can persist Product-chat simulation records and compact routing
+continuity across process restarts. Raw recent history, working memory, episodes,
+and workflow execution state remain process-local.
 
 Conversation memory:
 
@@ -592,6 +609,20 @@ Routing state:
 - Knowledge-only routes can be selected and included in trace/provider status, but current persisted `last_provider`/`last_providers` are operational-provider oriented and do not persist `knowledge` as a last provider.
 - Stores safe Phase 2 continuity metadata: last plan ID, last review outcome, step evidence IDs, and capability statuses.
 - Planner output and synthesizer prose cannot mutate routing state.
+
+Local SQLite mode:
+
+- `SOORIN_LOCAL_PRODUCT_SIMULATION_ENABLED=true` enables the owner-scoped local
+  conversation/message repository.
+- `SOORIN_THREAD_STATE_BACKEND=sqlite` enables compact thread continuity keyed by
+  `conversation_id`, with legacy `session_id` fallback.
+- `request_id` is the conversation-scoped turn idempotency key.
+- State uses typed bounded JSON with schema versioning and optimistic revision;
+  credentials, provider payloads, prompts, full EvidencePacks, runtime clients,
+  locks, callbacks, and streams are never persisted.
+- Storage failures are logged by safe error class and remain non-fatal to chat.
+- This is local development/test infrastructure. Production ownership and durable
+  transcripts remain a future Product PostgreSQL or Product API adapter concern.
 
 Each successful service request constructs one new `SessionRoutingState` and calls the state store once. Explicit-message, UI, and session entity authority remains owned by the resolver/router normalization path. General detached turns preserve useful active entity state. Safe-failure requests preserve prior active state unless the current request supplied a valid explicit or UI-authoritative investigation entity; Planner arguments and final prose are never state inputs.
 
@@ -764,7 +795,9 @@ Remaining risks:
 - There is no durable workflow checkpointing; in-flight work cannot resume after a process restart.
 - Synchronous provider calls cannot be killed after a Python future timeout; transport-native timeouts must remain correctly configured.
 - Planner mode is offline-tested with fakes but requires deliberate manual parity testing before broad enablement.
-- Conversation and routing state are process-local and do not coordinate concurrent workers.
+- Raw conversation/episode memory remains process-local. Optional local SQLite
+  continuity does not provide production tenant authorization or multi-replica
+  coordination.
 - RAG availability and freshness depend on an externally maintained Qdrant collection; the application does not index at startup.
 
 The active upgrade roadmap is: establish durable conversation/thread identity and compact thread state; reduce synthesis pressure through route-aware Product projections, evidence deduplication, and delta context; add typed provenance-aware cross-conversation memory; then introduce an Organization Intelligence Plane that remains subordinate to live Product and Graph evidence. Neo4j, GraphRAG, Planner expansion, MCP/vendor tools, bulk enrichment, and side-effecting actions remain separate deferred capabilities.

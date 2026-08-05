@@ -1,12 +1,15 @@
 # Soorin Copilot Memory and Context Upgrade Design
 
-**Status:** target architecture and migration design. Nothing in this document
-claims that the proposed durable stores, user identity, Product chat persistence,
-or LangGraph checkpointing already exists.
+**Status:** target architecture plus verified Gate 3 local-persistence slice.
+Gate 3 implements disabled-by-default local SQLite `ChatRepository` and compact
+`ThreadStateStore` adapters. Trusted Product identity/authorization, production
+Product persistence, long-term memory, semantic memory, context compaction, and
+LangGraph checkpointing remain future work.
 
-**Source audit:** 2026-08-05, branch `dev`, HEAD `0291002`. Claims labelled
-“current” were verified against repository source, tests, configuration, or the
-current Product integration contract. No services or external providers were run.
+**Source audit:** 2026-08-05, branch `dev`, baseline HEAD `f9a62c6` plus the
+verified Gate 3 working tree. Claims labelled “current” were verified against
+repository source, tests, configuration, or the current Product integration
+contract. No services or external providers were run.
 
 ## 1. Executive summary
 
@@ -81,12 +84,15 @@ supplemental retrieval.
 | `session_id` | caller/UI plus Copilot | in-process continuity key | no |
 | raw recent turns | `MemoryStore` | current process/session | no |
 | working memory/episodes | in-memory repository | current process/session | no |
-| routing state | `SessionRoutingStateStore` | current process/session | no |
+| routing state | `SessionRoutingStateStore`; optional compact SQLite adapter | process/session or local restart continuity | opt-in local only |
+| local transcript/request status | optional SQLite `ChatRepository` | local user/conversation | opt-in local only |
 | graph artifacts/Qdrant | configured data paths | operational/index lifecycle | yes, independently |
 
 The request contract now accepts optional `conversation_id` and `request_id`,
 plus bounded `X-User-ID` metadata. These values form a typed request identity
-but create no ownership or authorization. There is no LangGraph checkpointer:
+but create no trusted ownership or authorization. Gate 3's local SQLite adapters
+enforce consistency between this metadata and local records; that is isolation for
+development simulation, not authentication. There is no LangGraph checkpointer:
 the graph is compiled without one and interrupted requests cannot resume after a
 restart. The internal usage reporter has a session field, but it does not create
 user or conversation ownership.
@@ -260,8 +266,9 @@ short transactional update for concurrent turns.
    idempotency rules; never resume arbitrary user work.
 7. Delete checkpoints with their thread retention policy.
 
-The local simulation can use SQLite for `ThreadStateStore`, canonical memory,
-and a LangGraph SQLite checkpointer. Production should use the existing Product
+The implemented local simulation uses SQLite for owner-scoped chat records and
+compact `ThreadStateStore` continuity only. It does not store canonical long-term
+memory or LangGraph checkpoints. Production should use the existing Product
 PostgreSQL server through a restricted Copilot schema or Product API adapter;
 no extra production database server is required.
 
@@ -461,15 +468,28 @@ and must never be the only copy of a fact.
 7. Are multiple Copilot replicas planned before durable thread state is added?
 8. Which response evidence/trace fields, if any, need a future frontend contract?
 
-## 20. Smallest safe first implementation slice
+## 20. Implemented migration gates
 
 Gate 2 added optional `conversation_id` and `request_id`, bounded
 `X-User-ID` metadata, a resolved request/thread identity contract, and the four
-storage ports. Persistence remains disabled and the legacy `session_id` path
-remains active. The next isolated gate may add local SQLite `ChatRepository`
-and `ThreadStateStore` adapters behind disabled defaults, before context
-compaction, checkpointing, typed long-term memory, semantic retrieval, Product
-adapters, or Organization Intelligence.
+storage ports. The legacy `session_id` path remains active.
+
+Gate 3 adds disabled-by-default stdlib SQLite adapters for local chat simulation
+and compact thread continuity. The schema contains local users, conversations,
+messages, request commits, thread states, and schema metadata. It uses foreign
+keys, parameterized SQL, explicit transactions, bounded values, typed JSON,
+conversation-scoped request idempotency, owner checks, and optimistic thread-state
+revisions. The official LangGraph SQLite checkpointer is deliberately deferred:
+the current workflow state needs a checkpoint-safe projection before it can be
+serialized without unrestricted messages or full evidence objects.
+
+Gate 4 may add a local-only Streamlit login/chatroom simulation over these ports.
+It should remain disabled by default, use opaque local user/conversation IDs,
+restore only bounded transcripts and approved compact continuity, preserve current
+API identity precedence, and avoid presenting local ownership metadata as Product
+authentication. Product adapters, context compaction, checkpointing, typed
+long-term memory, semantic retrieval, and Organization Intelligence remain later
+independent gates.
 
 ## Appendix A. Disposition of the removed OpenCode guide
 

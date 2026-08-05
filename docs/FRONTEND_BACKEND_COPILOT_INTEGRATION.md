@@ -1,6 +1,7 @@
 # Soorin Copilot Frontend and Backend Integration Contract
 
-Audit baseline: `dev` at `0291002` on 2026-08-05.
+Audit baseline: `dev` at `f9a62c6` plus the verified Gate 3 working tree on
+2026-08-05.
 
 This document separates **current verified behavior** from **production
 recommendations**. Current behavior was verified from route and service source,
@@ -108,8 +109,23 @@ Recommended normal chat flow:
 ```
 
 Product Backend owns chatroom/message persistence and ownership checks. Copilot
-does not currently validate Product chatroom ownership, and neither
+does not validate Product chatroom ownership, and neither
 `conversation_id` nor `session_id` is an authorization credential.
+
+For local development only, Gate 3 can opt into a SQLite-backed Product-chat
+simulation and compact thread-state restoration. It is disabled by default and
+does not change this API contract, authenticate `X-User-ID`, or replace Product
+Backend persistence. The relevant settings are:
+
+```env
+SOORIN_LOCAL_PRODUCT_SIMULATION_ENABLED=false
+SOORIN_THREAD_STATE_BACKEND=memory
+SOORIN_LOCAL_SQLITE_PATH=data/runtime/copilot-local.sqlite3
+SOORIN_LANGGRAPH_CHECKPOINT_BACKEND=none
+```
+
+The checkpoint setting is reserved: selecting `sqlite` currently logs a safe
+deferral because a checkpoint-safe workflow-state projection is not implemented.
 
 ## 5. Internal Copilot-to-Product request flow
 
@@ -960,7 +976,9 @@ then include the `Authorization: Bearer <token>` header automatically.
 
 - no tenant/user authorization (static API key only);
 - session IDs are arbitrary, unbounded strings and are not identity scoped;
-- in-memory session/routing state does not survive restart or safely span replicas;
+- raw session/episode memory does not survive restart or safely span replicas;
+- optional local SQLite routing continuity is development-only and is not a
+  production ownership, authorization, or multi-replica solution;
 - browser disconnect does not cancel upstream model/workflow execution;
 - no heartbeats during long pre-answer periods;
 - no public request/trace ID;
