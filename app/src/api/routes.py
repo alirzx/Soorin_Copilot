@@ -6,10 +6,9 @@ import json
 import logging
 import time
 from collections.abc import Iterator
-from typing import Any
-from uuid import uuid4
+from typing import Annotated, Any
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Header
 from pydantic import BaseModel, Field, field_validator
 from starlette.responses import StreamingResponse
 
@@ -23,6 +22,12 @@ from src.core.llm.client import LLMClient
 from src.core.llm.errors import LLMError
 from src.core.llm.providers.base import LLMStreamEvent
 from src.core.memory.routing_state import SessionRoutingStateStore
+from src.core.identity import (
+    IDENTIFIER_MAX_LENGTH,
+    IDENTIFIER_PATTERN,
+    RequestIdentity,
+    normalize_identifier,
+)
 from src.core.memory.store import MemoryStore
 from src.core.observability.llm_usage import ProductUsageReporter
 
@@ -59,8 +64,35 @@ class ChatUIContext(BaseModel):
 
 class ChatRequest(BaseModel):
     session_id: str | None = Field(default=None)
+    conversation_id: str | None = Field(default=None)
+    request_id: str | None = Field(default=None)
     message: str = Field(min_length=1)
     ui_context: ChatUIContext | None = Field(default=None)
+
+    @field_validator("session_id", "conversation_id", "request_id")
+    @classmethod
+    def validate_identifiers(cls, value: str | None, info: Any) -> str | None:
+        return normalize_identifier(value, field_name=info.field_name)
+
+
+UserIdHeader = Annotated[
+    str | None,
+    Header(
+        alias="X-User-ID",
+        min_length=1,
+        max_length=IDENTIFIER_MAX_LENGTH,
+        pattern=IDENTIFIER_PATTERN,
+    ),
+]
+
+
+def resolve_request_identity(request: ChatRequest, user_id: str | None) -> RequestIdentity:
+    return RequestIdentity.resolve(
+        user_id=user_id,
+        conversation_id=request.conversation_id,
+        session_id=request.session_id,
+        request_id=request.request_id,
+    )
 
 
 def envelope(
@@ -107,9 +139,11 @@ def llm_health(
 @router.post("/chat", response_model=ChatResponse)
 def chat(
     request: ChatRequest,
+    x_user_id: UserIdHeader = None,
     _auth: None = Depends(verify_api_key),
 ) -> dict[str, Any]:
-    request_id = uuid4().hex[:12]
+    identity = resolve_request_identity(request, x_user_id)
+    request_id = identity.request_id
     started = time.perf_counter()
     selected_ip_present = bool(request.ui_context and request.ui_context.selected_ip)
     session_for_log = (request.session_id or "").strip()
@@ -134,6 +168,7 @@ def chat(
             request.session_id,
             ui_context=request.ui_context.model_dump() if request.ui_context else None,
             request_id=request_id,
+            request_identity=identity,
         )
     except LLMError as exc:
         latency_ms = int((time.perf_counter() - started) * 1000)
@@ -206,10 +241,12 @@ def chat(
 )
 def chat_stream(
     request: ChatRequest,
+    x_user_id: UserIdHeader = None,
     _auth: None = Depends(verify_api_key),
 ) -> StreamingResponse:
     """Stream only final-model events while preserving the existing chat route."""
-    request_id = uuid4().hex[:12]
+    identity = resolve_request_identity(request, x_user_id)
+    request_id = identity.request_id
     session_for_log = (request.session_id or "").strip()
     started = time.perf_counter()
     logger.info(
@@ -230,6 +267,7 @@ def chat_stream(
                 request.session_id,
                 ui_context=request.ui_context.model_dump() if request.ui_context else None,
                 request_id=request_id,
+                request_identity=identity,
             ):
                 if event.type == "done":
                     status = "ok"

@@ -6,6 +6,8 @@ from dataclasses import dataclass, field
 from typing import Annotated, Any, Literal, TypedDict
 import operator
 
+from src.core.identity import RequestIdentity
+
 
 ToolStatus = Literal["ok", "empty", "not_configured", "unavailable", "invalid", "partial", "not_found"]
 Completeness = Literal["complete", "partial", "unknown"]
@@ -248,6 +250,7 @@ class CapabilitySpec:
 
 
 class InvestigationState(TypedDict, total=False):
+    request_identity: RequestIdentity
     request_id: str
     trace_id: str
     session_id: str

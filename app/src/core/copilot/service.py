@@ -26,6 +26,7 @@ from src.core.llm.errors import LLMError
 from src.core.llm.providers.base import LLMProviderResult, LLMStreamEvent
 from src.core.memory.routing_state import SessionRoutingStateStore
 from src.core.memory.episodes import MemoryContextKey
+from src.core.identity import RequestIdentity
 from src.core.memory.store import MemoryStore
 from src.core.product_client import ProductApiClient
 from src.core.rag.service import KnowledgeSearchService
@@ -352,12 +353,14 @@ class CopilotService:
         *,
         ui_context: dict[str, Any] | None = None,
         request_id: str | None = None,
+        request_identity: RequestIdentity | None = None,
     ) -> dict[str, Any]:
         return self._chat(
             message,
             session_id,
             ui_context=ui_context,
             request_id=request_id,
+            request_identity=request_identity,
         )
 
     def chat_stream(
@@ -367,6 +370,7 @@ class CopilotService:
         *,
         ui_context: dict[str, Any] | None = None,
         request_id: str | None = None,
+        request_identity: RequestIdentity | None = None,
     ) -> Iterator[LLMStreamEvent]:
         """Run the existing orchestration once and expose final-model events."""
         event_queue: SimpleQueue[LLMStreamEvent | None] = SimpleQueue()
@@ -378,6 +382,7 @@ class CopilotService:
                     session_id,
                     ui_context=ui_context,
                     request_id=request_id,
+                    request_identity=request_identity,
                     stream_sink=event_queue.put,
                 )
                 warnings = list(result.pop("_warnings", []))
@@ -436,11 +441,16 @@ class CopilotService:
         *,
         ui_context: dict[str, Any] | None = None,
         request_id: str | None = None,
+        request_identity: RequestIdentity | None = None,
         stream_sink: Callable[[LLMStreamEvent], None] | None = None,
         ) -> dict[str, Any]:
-        resolved_request_id = request_id or uuid4().hex[:12]
+        identity = request_identity or RequestIdentity.resolve(
+            session_id=session_id,
+            request_id=request_id,
+        )
+        resolved_request_id = identity.request_id
         workflow_trace_id = uuid4().hex[:16]
-        resolved_session_id = (session_id or "").strip() or uuid4().hex
+        resolved_session_id = identity.session_id
         trivial = self._trivial_response(message)
         if trivial is not None:
             session = resolved_session_id
@@ -488,6 +498,7 @@ class CopilotService:
                 ui_context=ui_context,
                 request_id=resolved_request_id,
                 trace_id=workflow_trace_id,
+                request_identity=identity,
                 stream_sink=stream_sink,
                 node_runtime=CopilotWorkflowNodes(self, stream_sink=stream_sink),
             )

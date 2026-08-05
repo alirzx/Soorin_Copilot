@@ -12,6 +12,7 @@ from uuid import uuid4
 
 from src.core.agent.contracts import InvestigationState, TaskSpec
 from src.core.agent.events import WorkflowEventContext, WorkflowEventLogger
+from src.core.identity import RequestIdentity
 
 
 logger = logging.getLogger(__name__)
@@ -512,6 +513,7 @@ class BoundedCopilotWorkflow:
         ui_context: dict[str, Any] | None,
         request_id: str,
         trace_id: str | None = None,
+        request_identity: RequestIdentity | None = None,
         stream_sink: Any = None,
         direct_executor: DirectExecutor | None = None,
         typed_executor: DirectExecutor | None = None,
@@ -519,9 +521,14 @@ class BoundedCopilotWorkflow:
         interrupt_on_clarification: bool = False,
     ) -> dict[str, Any]:
         resolved_trace_id = trace_id or uuid4().hex[:16]
-        session = session_id or ""
+        identity = request_identity or RequestIdentity.resolve(
+            session_id=session_id,
+            request_id=request_id,
+        )
+        session = identity.session_id
         workflow_id = f"wf-{request_id}"
         initial: InvestigationState = {
+            "request_identity": identity,
             "request_id": request_id,
             "trace_id": resolved_trace_id,
             "session_id": session,
@@ -530,7 +537,7 @@ class BoundedCopilotWorkflow:
             "ui_context": ui_context,
             "streaming": stream_sink is not None,
             "workflow_id": workflow_id,
-            "thread_id": request_id,
+            "thread_id": identity.thread_key,
             "started_at": _now(),
             "updated_at": _now(),
             "workflow_status": "running",
@@ -566,7 +573,7 @@ class BoundedCopilotWorkflow:
         events.emit(
             "langgraph_workflow_started",
             workflow_id=workflow_id,
-            thread_id=request_id,
+            thread_id=identity.thread_key,
             runtime=self.runtime,
             status="running",
         )
@@ -595,7 +602,7 @@ class BoundedCopilotWorkflow:
         events.emit(
             "langgraph_workflow_completed" if status.startswith("completed") else "langgraph_workflow_partial",
             workflow_id=workflow_id,
-            thread_id=request_id,
+            thread_id=identity.thread_key,
             status=status,
             tool_call_count=len(final.get("tool_results") or ()),
             planner_called=bool(final.get("planner_called")),
