@@ -1,46 +1,38 @@
 # Soorin Copilot Frontend and Backend Integration Contract
 
-Audit baseline: `dev` at `d25b80904fcc62afc948b3f4bfd1629d6c378b53`.
-Release reference: tag `copilot_release_3.0`, main release commit
-`21d69fff2db818711046f84d7de2d0174f76b51e`.
+Audit baseline: `dev` at `0291002` on 2026-08-05.
 
 This document separates **current verified behavior** from **production
 recommendations**. Current behavior was verified from route and service source,
-Pydantic schemas, tests, generated OpenAPI, the Streamlit client, and harmless
-raw local responses captured during this audit. The local API was no longer
-reachable during the final health recheck; no service was started or redeployed.
+Pydantic schemas, tests, configuration, the Streamlit client, and the documented
+Product chatroom/message flow. No service or external provider was started.
 
 ## 1. Purpose and audience
 
-This is the integration contract for Product frontend, Product backend/BFF,
+This is the integration contract for Product frontend, Product backend,
 security, QA, and Copilot maintainers. It answers four practical questions:
 
-1. Which Copilot endpoint should the browser use through the Product backend?
+1. Which Copilot endpoint does the Product browser call directly?
 2. What exact JSON and streaming frames exist today?
 3. Which identity, authorization, session, timeout, and persistence duties do
    not belong to the Copilot runtime?
 4. Which Graph and Product endpoints are public helpers versus internal data
    providers?
 
-Postman assets accompanying this document are test/documentation tools. They do
-not create a runtime proxy or expose an endpoint to a Product frontend.
+Postman assets accompanying this document are test/documentation tools.
 
 ## 2. Production architecture
 
-The implementation supports the following topology, but the Product BFF/API
-gateway layer is not implemented in this repository:
+The current Product topology is direct streaming:
 
 ```text
 Product browser
-  |  Product login/session; no Product secrets in the browser request
-  v
-Product Backend / BFF / API Gateway                 (must be implemented)
-  |  authenticate user, authorize tenant/assets, correlate, rate-limit
-  |  stream bytes without buffering
-  |  Bearer Authorization: SOORIN_COPILOT_API_KEY
+  |  Product login/session and selected chatroom
+  |  POST Copilot /chat/stream directly; receive SSE directly
+  |  current Copilot static key supplied by browser integration
   v
 Soorin Copilot API                                  (this repository)
-  |  validates static Bearer API key on every request except GET /health
+  |  validates static Copilot API key on every request except GET /health
   |-- Arvan-compatible Router / optional Planner / Chat deployments
   |-- Product login and bearer-token manager
   |-- Product profile endpoint
@@ -50,54 +42,74 @@ Soorin Copilot API                                  (this repository)
   |-- local NetworkX last-known-good Graph snapshot
   |-- Qdrant knowledge collection (optional)
   `-- Hugging Face embedding model cache (optional, lazy)
+
+Product browser
+  |  after a completed turn, store user/assistant messages
+  v
+Product Backend chatroom/message endpoints
+  v
+Product PostgreSQL
 ```
 
-Copilot currently exposes FastAPI on port `6998`. Compose binds it to loopback
-by default. The Product backend should use internal service discovery, not the
-browser-visible localhost address.
+There is no mandatory Product backend proxy or BFF in the current chat path.
+A gateway remains an optional future security-hardening choice, but the present
+browser calls Copilot directly and separately uses Product Backend endpoints for
+chatroom/message persistence.
 
 ## 3. Trust boundaries
 
 | Boundary | Trusted responsibility | Untrusted input |
 |---|---|---|
-| Browser -> Product backend | Product auth cookie/token, CSRF/CORS policy, UI state | message, session ID, selected IP, all explicit IP text |
-| Product backend -> Copilot | authorized tenant/user request and service identity | never assume browser fields became safe merely by proxying |
+| Browser -> Copilot | current message, session/chatroom continuity, selected IP, Copilot key | all message and UI fields remain untrusted input |
+| Browser -> Product backend | Product authentication, chatroom ownership, message persistence | chatroom/message input |
 | Copilot -> Product API | shared Product client, bearer token, `x-hwid`, configured paths | Product JSON is validated at provider boundaries |
 | Copilot -> Arvan | provider credentials and normalized messages | model output is routed through validation/review |
 | Copilot -> Graph/Qdrant | configured local or server data stores | snapshots may be stale, incomplete, or unavailable |
 
 **Authentication:** every Copilot endpoint except `GET /health` requires a
-static Bearer API key (`SOORIN_COPILOT_API_KEY`) sent as:
+static Copilot API key (`SOORIN_COPILOT_API_KEY`). Direct service callers may send:
 
 ```
 Authorization: Bearer <SOORIN_COPILOT_API_KEY>
 ```
 
-Missing or invalid tokens return `401`. This is a service-to-service auth layer
-only. The Copilot request still carries no user ID, tenant ID, organization ID,
-role, permission, or authorized-asset scope. Therefore these endpoints must not
-be internet/browser exposed as an authorization boundary.
+When the Product frontend keeps its Product JWT in `Authorization`, it may send
+the Copilot credential separately:
 
-## 4. Frontend-to-backend-to-Copilot request flow
+```http
+Soorin_copilot_api_key: <SOORIN_COPILOT_API_KEY>
+```
+
+The custom header takes precedence when present. Copilot does not decode or
+validate the Product JWT; Product authentication and authorization remain the
+Product Backend's responsibility for Product endpoints.
+
+Missing or invalid Copilot credentials return `401`. The static key does not
+identify or authorize a Product user, tenant, chatroom, or asset. In the current
+direct-browser flow the key is exposed to browser code, which is a known security
+limitation. Restrict exposure and origin/network access; an optional future
+gateway can move this credential out of the browser.
+
+## 4. Current direct-browser request flow
 
 Recommended normal chat flow:
 
 ```text
-1. Browser creates a new UUID for a Product conversation.
-2. Product backend validates the UUID and conversation ownership.
-3. Product backend forwards the same opaque UUID as session_id.
-4. Browser POSTs through the Product route, normally /api/copilot/chat/stream.
-5. BFF proxies POST /chat/stream to Copilot without response buffering.
-6. Browser incrementally parses UTF-8 SSE records and appends answer deltas.
-7. The done event commits the displayed assistant message.
-8. Every later message in that conversation reuses the same session_id.
-9. A new Product conversation gets a new UUID.
+1. Frontend creates or opens a Product chatroom through Product Backend APIs.
+2. The Product chatroom ID is the durable `conversation_id` target for the
+   planned contract; current clients continue to reuse their `session_id`.
+3. Frontend POSTs directly to Copilot `/chat/stream`.
+4. Copilot returns UTF-8 SSE directly to the Frontend.
+5. Frontend incrementally appends answer deltas and completes only on `done`.
+6. Frontend stores the user and completed assistant messages through existing
+   Product Backend chatroom/message endpoints.
+7. Product Backend stores those records in Product PostgreSQL.
+8. Every later turn reuses the Product chatroom and its Copilot continuity ID.
 ```
 
-The Product backend may instead own UUID creation. Whichever side creates it,
-the backend must validate ownership and must not accept an arbitrary UUID as an
-authorization credential. Do not embed user IDs, tenant IDs, or secrets in the
-session string.
+Product Backend owns chatroom/message persistence and ownership checks. Copilot
+does not currently validate Product chatroom ownership, and neither
+`conversation_id` nor `session_id` is an authorization credential.
 
 ## 5. Internal Copilot-to-Product request flow
 
@@ -121,33 +133,29 @@ Without login credentials, an aged bootstrap token is reused until a 401.
 Nested runtime flow:
 
 ```text
-Browser -> Product BFF -> Copilot /chat/stream
+Browser -> Copilot /chat/stream
   -> Product profile/detection providers and/or local Graph/Qdrant
   -> Router/Planner/Chat models
-  -> Copilot SSE -> Product BFF byte stream -> Browser
+  -> Copilot SSE -> Browser
+  -> Product Backend chatroom/message endpoints -> Product PostgreSQL
 ```
-
-Avoid a routing loop: the BFF's `/api/copilot/*` upstream must target the Copilot
-service, while Copilot's Product base URL must target the canonical Product API,
-not a wildcard route that sends `/profile`, `/auth/login`, or topology back into
-the Copilot proxy.
 
 ## 6. Public endpoint matrix
 
-All current success responses are UTF-8 JSON except `/chat/stream`. Copilot-layer authentication uses a static Bearer API key (`SOORIN_COPILOT_API_KEY`) sent as `Authorization: Bearer <SOORIN_COPILOT_API_KEY>`. Every endpoint except `GET /health` requires the key; protected endpoints return `401` without a valid token.
+All current success responses are UTF-8 JSON except `/chat/stream`. Copilot-layer authentication accepts either the service Bearer key (`Authorization: Bearer <SOORIN_COPILOT_API_KEY>`) or, when Product keeps its JWT in `Authorization`, `Soorin_copilot_api_key: <SOORIN_COPILOT_API_KEY>`. Every endpoint except `GET /health` requires a valid Copilot key; protected endpoints return `401` without one.
 
 | Method and path | Purpose | Input | Success | Errors and limits |
 |---|---|---|---|---|
 | `GET /health` | process liveness | none | 200 `{"status":"ok"}` does not test models, Product API, Graph, or Qdrant | no Authorization header required |
-| `GET /llm/health` | configured deployment readiness | none | 200 envelope with chat/router/planner metadata | configuration only; no model call; requires `Authorization: Bearer <SOORIN_COPILOT_API_KEY>` |
-| `POST /chat` | complete non-stream answer | `ChatRequest` | 200 `ChatResponse` | validation 422; handled `LLMError` is a 200 error envelope; requires `Authorization: Bearer <SOORIN_COPILOT_API_KEY>` |
-| `POST /chat/stream` | interactive answer | `ChatRequest` | 200 UTF-8 SSE | validation 422 before stream; runtime failures are SSE `error` after 200; requires `Authorization: Bearer <SOORIN_COPILOT_API_KEY>` |
-| `GET /graph/status` | Graph load/refresh diagnostics | none | 200 `GraphStatusResponse` | may reveal local artifact paths; requires `Authorization: Bearer <SOORIN_COPILOT_API_KEY>` |
-| `GET /graph/stats` | aggregate snapshot statistics | none | 200 `GraphStatsResponse` | no pagination; Graph unavailable may surface as server error; requires `Authorization: Bearer <SOORIN_COPILOT_API_KEY>` |
-| `GET /graph/nodes/{ip}` | node existence/degree | syntactically valid IP | 200 `GraphNodeResponse` | malformed IP 422; absent node is 200 `found=false`; requires `Authorization: Bearer <SOORIN_COPILOT_API_KEY>` |
-| `GET /graph/nodes/{ip}/neighbors` | direct observed peers | `direction`, `limit` | 200 `GraphNeighborsResponse` | `direction=in|out|both`; default 20; configured max default 1000; no cursor/offset; requires `Authorization: Bearer <SOORIN_COPILOT_API_KEY>` |
-| `GET /graph/nodes/{ip}/context` | compact node context | valid path IP | 200 `GraphContextResponse` | fixed internal top-peer bound; no client limit; requires `Authorization: Bearer <SOORIN_COPILOT_API_KEY>` |
-| `GET /graph/path` | directed shortest observed Graph path | required `source`, `target` | 200 `GraphPathResponse` | malformed/missing query 422; no hop-limit input; requires `Authorization: Bearer <SOORIN_COPILOT_API_KEY>` |
+| `GET /llm/health` | configured deployment readiness | none | 200 envelope with chat/router/planner metadata | configuration only; no model call; requires a valid Copilot key |
+| `POST /chat` | complete non-stream answer | `ChatRequest` | 200 `ChatResponse` | validation 422; handled `LLMError` is a 200 error envelope; requires a valid Copilot key |
+| `POST /chat/stream` | interactive answer | `ChatRequest` | 200 UTF-8 SSE | validation 422 before stream; runtime failures are SSE `error` after 200; requires a valid Copilot key |
+| `GET /graph/status` | Graph load/refresh diagnostics | none | 200 `GraphStatusResponse` | may reveal local artifact paths; requires a valid Copilot key |
+| `GET /graph/stats` | aggregate snapshot statistics | none | 200 `GraphStatsResponse` | no pagination; Graph unavailable may surface as server error; requires a valid Copilot key |
+| `GET /graph/nodes/{ip}` | node existence/degree | syntactically valid IP | 200 `GraphNodeResponse` | malformed IP 422; absent node is 200 `found=false`; requires a valid Copilot key |
+| `GET /graph/nodes/{ip}/neighbors` | direct observed peers | `direction`, `limit` | 200 `GraphNeighborsResponse` | `direction=in|out|both`; default 20; configured max default 1000; no cursor/offset; requires a valid Copilot key |
+| `GET /graph/nodes/{ip}/context` | compact node context | valid path IP | 200 `GraphContextResponse` | fixed internal top-peer bound; no client limit; requires a valid Copilot key |
+| `GET /graph/path` | directed shortest observed Graph path | required `source`, `target` | 200 `GraphPathResponse` | malformed/missing query 422; no hop-limit input; requires a valid Copilot key |
 
 FastAPI/Pydantic query validation uses HTTP 422 with a `detail` array. Custom IP
 validation uses HTTP 422 with `{"detail":"Invalid <field>."}`. Unexpected,
@@ -155,9 +163,11 @@ unhandled runtime exceptions use normal server error behavior.
 
 ## 7. Which endpoints the Product frontend should use
 
-The browser should call Product-owned routes, not the Copilot host directly.
+The browser calls `/chat/stream` on Copilot directly. Product-owned routes remain
+responsible for Product chatroom/message persistence and the Product's canonical
+live Graph UI.
 
-| Copilot endpoint | Browser uses through BFF? | Recommendation |
+| Copilot endpoint | Direct browser use | Recommendation |
 |---|---:|---|
 | `/chat/stream` | Yes | primary interactive chat transport |
 | `/chat` | Optional | fallback, tests, accessibility/non-interactive flows; do not retry after a stream already emitted text |
@@ -183,7 +193,7 @@ snapshot lists can show inconsistent nodes, edges, or freshness.
 | Arvan model endpoints | Copilot internal only | API credentials and orchestration contract |
 | Qdrant and Hugging Face cache | Copilot internal only | storage/model implementation details |
 
-Do not proxy diagnostics to ordinary users without field filtering and role
+Do not expose diagnostics to ordinary users without field filtering and role
 authorization. In particular, omit `raw_snapshot_path` and
 `processed_snapshot_path` from a normal frontend response.
 
@@ -201,17 +211,17 @@ Current facts:
 - Multiple API replicas do not share state. Without sticky routing, follow-ups
   can reach a replica with no prior context.
 
-Production ownership:
+Product ownership:
 
 1. Frontend may create `crypto.randomUUID()` for a new chat.
-2. Product backend validates UUID format and verifies that the Product thread is
-   owned by the authenticated user/tenant.
-3. It forwards and reuses the same opaque value for that thread.
+2. Product Backend verifies that the Product chatroom is owned by the
+   authenticated user.
+3. Frontend reuses the chatroom's Copilot continuity value for direct calls.
 4. It rejects cross-user reuse, regardless of UUID entropy.
 5. A new-chat action creates a new ID.
 
-The Product backend may map its conversation ID to a separate random Copilot
-session ID. That mapping is preferable if Product IDs expose business meaning.
+The planned contract uses Product `conversation_id` as the preferred durable
+thread key and retains `session_id` as the legacy/runtime fallback.
 
 ## 10. UI context and selected-IP lifecycle
 
@@ -642,90 +652,36 @@ reasoning as final answer text.
   but do not assume Copilot chat itself is idempotent.
 - Do not fall back to `/chat` after partial SSE output.
 
-## 18. Product backend proxy responsibilities
+## 18. Product persistence responsibilities
 
-The Product backend/BFF must implement actual routes or gateway mappings. Adding
-Postman requests is not an integration.
+The current Product Backend does not proxy Copilot. It owns Product users,
+chatrooms, chatroom ownership, persisted user/assistant messages, timestamps,
+and Product retention/deletion policy. The Frontend creates or opens a chatroom,
+calls Copilot directly, receives SSE directly, and stores the completed turn
+through existing Product Backend message endpoints. Only a completed assistant
+message after SSE `done` should be stored as complete; interrupted output may be
+stored separately according to Product policy.
 
-Required duties:
+## 19. Optional gateway hardening
 
-- authenticate Product user;
-- authorize tenant, thread, selected asset, and explicit message asset IPs;
-- validate body size, message length policy, UUID, IPv4, and allowed fields;
-- preserve the authorized session ID across one conversation;
-- generate/preserve Product request and correlation IDs;
-- address Copilot through an internal service URL;
-- add service-to-service identity (mTLS, signed gateway identity, or network plus
-  an application credential) before wider exposure;
-- enforce per-user/tenant rate limits, concurrency, and quotas;
-- audit metadata without logging credentials, full sensitive prompts, or raw
-  evidence payloads;
-- stream upstream bytes as they arrive, with no aggregation;
-- propagate browser disconnect upstream when supported;
-- translate pre-stream 401/403/429/502/503/504 consistently;
-- preserve an SSE `error` event that occurs after HTTP 200;
-- own browser CORS, CSRF, cookie, and same-site policy;
-- provide a graceful unavailable state;
-- optionally persist Product conversations and displayed messages.
-
-The BFF should not forward browser-supplied `Authorization`, `x-hwid`, Product
-API tokens, or model credentials to Copilot internal providers.
-
-## 19. Reverse proxy and timeout requirements
-
-Current relevant defaults:
-
-- browser reference UI timeout: `SOORIN_API_TIMEOUT_SECONDS`, example 180s;
-- current uncommitted Compose UI override: 600s;
-- bounded agent request budget: 120s;
-- Kimi router/chat read timeouts: 30s/360s;
-- GLM router/chat read timeouts: 15s/300s;
-- Product connect/read: 60s/300s;
-- Qdrant: 10s.
-
-These are different scopes, not one end-to-end deadline. Product proxy read/idle
-timeout should exceed the maximum permitted model stream duration and any
-pre-stream orchestration; 600 seconds matches the current UI integration
-expectation. Product teams should agree one end-to-end SLO and keep downstream
-budgets below the client/proxy deadline.
-
-Framework-neutral Nginx example:
-
-```nginx
-location /api/copilot/ {
-    # Trailing slashes map /api/copilot/chat/stream -> /chat/stream.
-    proxy_pass http://soorin-copilot-api:6998/;
-    proxy_http_version 1.1;
-
-    proxy_buffering off;
-    proxy_request_buffering off;
-    proxy_cache off;
-    gzip off;
-
-    proxy_read_timeout 600s;
-    proxy_send_timeout 600s;
-    send_timeout 600s;
-
-    proxy_set_header Host $host;
-    proxy_set_header X-Request-ID $request_id;
-    proxy_set_header Connection "";
-    add_header Cache-Control "no-cache" always;
-    add_header X-Accel-Buffering "no" always;
-}
-```
-
-Do not configure response compression/buffering at another gateway layer after
-Nginx. No Product backend framework was present in this repository, so no
-framework-specific proxy example is asserted.
+A future gateway or BFF is optional security hardening, not a current Product
+requirement. If adopted, it can remove the static Copilot key from browser code,
+enforce per-user/asset authorization and rate limits, propagate correlation and
+disconnect signals, and stream SSE without buffering. This optional deployment
+must preserve the existing Copilot `/chat/stream` wire contract and must not
+route Copilot's internal Product profile/detection/login calls back into itself.
 
 ## 20. Authentication and authorization
 
 Copilot protected endpoints (`/chat`, `/chat/stream`, `/llm/health`, and
-all `/graph/*` routes) require a static Bearer API key sent as
-`Authorization: Bearer <SOORIN_COPILOT_API_KEY>`. The built-in Streamlit
-UI (`app/app_st.py`) automatically attaches this header to every protected
-request and omits it from `GET /health`. Missing or invalid tokens return
-`401`. This is a service-to-service auth layer only. The Copilot request
+all `/graph/*` routes) require `SOORIN_COPILOT_API_KEY`. They accept either
+`Authorization: Bearer <SOORIN_COPILOT_API_KEY>` or, for a Product request
+that retains its Product JWT in `Authorization`,
+`Soorin_copilot_api_key: <SOORIN_COPILOT_API_KEY>`. The custom header takes
+precedence and an invalid custom key is rejected even when a Bearer credential
+is also supplied. The built-in Streamlit UI (`app/app_st.py`) uses the Bearer
+form for its protected requests and omits it from `GET /health`. Missing or
+invalid Copilot credentials return `401`. This is a service-to-service auth layer only. The Copilot request
 still carries no user ID, tenant ID, organization ID, role, permission, or
 authorized-asset scope. Therefore these endpoints must not be internet/browser
 exposed as an authorization boundary.
@@ -740,11 +696,11 @@ not authorization.
 Before multi-tenant production:
 
 - bind Product thread IDs to authenticated user and tenant in Product DB;
-- enforce that binding on every proxy request;
-- use a random internal Copilot session mapping where useful;
-- prevent direct Copilot access;
+- enforce that binding on Product chatroom/message requests;
+- pass typed conversation/user identity to Copilot without treating it as auth;
+- protect direct Copilot access and rotate the browser-visible static key;
 - define tenant-correct Product service credentials and Qdrant/Graph data scope;
-- decide whether future signed tenant/user context is required;
+- decide whether future signed tenant/user context or an optional gateway is required;
 - avoid multiple stateless Copilot replicas unless routing is sticky or runtime
   state is moved to a shared, tenant-scoped store.
 
@@ -792,14 +748,14 @@ pagination.
 
 ## 24. Error handling
 
-Frontend/BFF handling matrix:
+Frontend handling matrix:
 
 | Condition | Current signal | Action |
 |---|---|---|
 | invalid JSON/body/query | HTTP 422, `detail` string or array | show field-safe validation; do not retry unchanged |
-| Product BFF unauthenticated/unauthorized | recommended 401/403 | reauthenticate or show access denied; Copilot direct does not emit these today |
+| Product API unauthenticated/unauthorized | Product 401/403 | reauthenticate or show access denied |
 | quota/rate limit | recommended 429 | honor `Retry-After`; no immediate loop |
-| Copilot unavailable | BFF 502/503/504 | availability UI; retry only before output |
+| Copilot unavailable | network/5xx | availability UI; retry only before output |
 | handled non-stream LLM failure | HTTP 200 with `status=error` | inspect body status, show safe error |
 | stream model failure | HTTP 200 then SSE `error` | mark interrupted; no `done`; do not auto replay after partial text |
 | browser abort | `AbortError` | mark cancelled, not failed |
@@ -816,10 +772,10 @@ and a separate internal trace ID, but neither is currently returned in JSON,
 SSE, or headers. Therefore a Product request ID cannot yet be correlated to
 Copilot logs at wire level.
 
-Immediate BFF behavior:
+Immediate Frontend/Product behavior:
 
-- generate/preserve `X-Request-ID` for Product logs and return it to browser;
-- log upstream status, first-byte time, completion/error event, and disconnect;
+- generate/preserve a Product request ID for Product message records;
+- log safe status, first-byte time, completion/error event, and disconnect;
 - never log secrets, authorization headers, raw Product evidence, hidden
   reasoning, or full model responses.
 
@@ -867,8 +823,8 @@ asset IPs. Postman may buffer or display SSE differently from a browser and is
 not proof of proxy buffering behavior; use `curl -N` or browser integration for
 wire-level stream QA.
 
-The collection is for contract exploration and QA. Product frontend access
-still requires BFF routes/gateway mappings and authorization.
+The collection is for contract exploration and QA. It does not implement
+Product chatroom/message persistence or user authorization.
 
 ## 28. Deployment/service discovery
 
@@ -892,7 +848,7 @@ assume conversation continuity across replicas.
 
 | Variable | Required | Default | Purpose |
 |---|---|---|---|
-| `SOORIN_COPILOT_API_KEY` | yes | (none) | Static Bearer API key for service-to-service auth |
+| `SOORIN_COPILOT_API_KEY` | yes | (none) | Static Copilot API key for service-to-service auth |
 
 Set in `app/.env`:
 
@@ -921,9 +877,9 @@ Every endpoint except `GET /health` requires the API key:
 
 | Condition | Status | Body |
 |---|---|---|
-| Missing `Authorization` header | `401` | `{"detail":"Missing Authorization header"}` |
-| Invalid or missing Bearer token | `401` | `{"detail":"Invalid Bearer token"}` |
-| Valid Bearer token | `200` | Normal response |
+| Missing Bearer and custom Copilot credentials | `401` | `{"detail":"Missing Authorization header"}` |
+| Invalid Bearer or custom Copilot key | `401` | `{"detail":"Invalid Bearer token"}` |
+| Valid Bearer or custom Copilot key | `200` | Normal response |
 
 ### Development workflow
 
@@ -938,22 +894,24 @@ SOORIN_COPILOT_API_KEY=$SOORIN_COPILOT_API_KEY python app/run.py --api
 curl -H "Authorization: Bearer $SOORIN_COPILOT_API_KEY" http://127.0.0.1:6998/chat/stream
 ```
 
-### Production workflow (Browser → Product Backend → Copilot)
+### Current Product workflow
 
 ```text
 Browser
-  |  (Product login/session cookie)
-  v
-Product Backend / BFF / API Gateway
-  |  1. Authenticate user (Product session)
-  |  2. Authorize tenant/assets
-  |  3. Add Authorization header with Copilot API key
-  |  4. Proxy request to Copilot API
+  |  1. Authenticate with Product and create/open a Product chatroom
+  |  2. POST directly to Copilot /chat/stream
+  |  3. Keep Product JWT in Authorization and add Soorin_copilot_api_key,
+  |     or use the Copilot Bearer form when no Product JWT is present
   v
 Soorin Copilot API
-  |  Validates Bearer token against SOORIN_COPILOT_API_KEY
+  |  Validates the custom Copilot key when present; otherwise the Bearer key
   |  Rejects with 401 if missing or invalid
-  |  Proceeds with normal logic if valid
+  |  Streams SSE directly to Browser
+  v
+Browser
+  |  4. Persist user and completed assistant messages
+  v
+Product Backend chatroom/message endpoints -> Product PostgreSQL
 ```
 
 ### Example Authorization header
@@ -962,8 +920,17 @@ Soorin Copilot API
 Authorization: Bearer abc123def456ghi789jkl012mno345pqr678stu901vwx
 ```
 
-The Bearer token is the literal value of `SOORIN_COPILOT_API_KEY`. The Product
-Backend must keep this secret and never expose it to the browser.
+The Bearer token is the literal value of `SOORIN_COPILOT_API_KEY`. The current
+direct-browser integration necessarily exposes this shared key to browser code;
+it is not user authorization and should be treated as a temporary limitation.
+
+When the Product request keeps its own JWT in `Authorization`, send instead:
+
+```http
+Soorin_copilot_api_key: abc123def456ghi789jkl012mno345pqr678stu901vwx
+```
+
+This is a Copilot service credential, not a replacement for the Product JWT.
 
 ### OpenAPI / Swagger
 
@@ -1004,10 +971,11 @@ then include the `Authorization: Bearer <token>` header automatically.
 Before broad frontend release, Product and Copilot teams should decide and then
 implement, in priority order:
 
-1. Product BFF routes, user/tenant/asset authorization, and private Copilot
-   service identity.
-2. Product-owned conversation persistence and session ownership validation.
-3. Request/correlation ID propagation across Product and Copilot logs.
+1. Product chatroom/message integration and conversation ownership validation.
+2. `conversation_id`, `request_id`, and local/test `user_id` identity contracts.
+3. Context compaction and durable thread state.
+4. Decide whether an optional gateway is needed to remove the static key from
+   browser code and add stronger asset authorization/rate limits.
 4. True disconnect/cancellation propagation and optional SSE heartbeat policy.
 5. Whether Product canonical Graph or Copilot snapshot Graph owns each UI panel.
 6. Cursor/version pagination if browser Graph neighbor lists require page-through.
@@ -1017,12 +985,12 @@ implement, in priority order:
 9. Decide whether evidence/limitations/citations need a stable public response
    contract rather than remaining inside answer prose.
 
-No additional payload change is required to implement a basic authorized
-streaming chat page through the BFF.
+The current direct streaming path remains valid while the optional identifier
+fields and storage adapters are introduced backward-compatibly.
 
 ## 32. Frontend implementation checklist
 
-- [ ] Use Product BFF URL, never Copilot/Product internal provider URLs.
+- [ ] Call Copilot `/chat/stream` directly; never call internal provider URLs.
 - [ ] Create or obtain one authorized UUID per chat and reuse it.
 - [ ] Keep Product display history; send only current `message`.
 - [ ] Send `ui_context.selected_ip` as typed state, not injected prose.
@@ -1037,22 +1005,14 @@ streaming chat page through the BFF.
 - [ ] Show Graph `returned/total` truncation and path semantics.
 - [ ] Persist final messages only under authenticated Product ownership.
 
-## 33. Backend implementation checklist
+## 33. Product Backend integration checklist
 
-- [ ] Add authenticated Product proxy routes and private service discovery.
-- [ ] Validate body size, message policy, UUID, selected IP, and explicit IPs.
-- [ ] Enforce tenant/user/thread/asset ownership before proxying.
-- [ ] Keep Product/API/model credentials out of browser traffic and logs.
-- [ ] Preserve streaming bytes; disable buffering/cache/compression.
-- [ ] Set read/send timeouts above agreed Copilot end-to-end budget.
-- [ ] Propagate disconnect when framework/upstream supports it.
-- [ ] Rate-limit per user/tenant and cap concurrent generations.
-- [ ] Return/persist Product correlation ID and availability outcomes.
-- [ ] Translate only pre-stream HTTP failures; preserve in-stream error records.
-- [ ] Keep internal Product endpoints, `/llm/health`, and raw `/graph/status`
-      diagnostics off ordinary user routes.
-- [ ] Prevent proxy recursion between `/api/copilot/*` and Product data APIs.
-- [ ] Plan sticky sessions or shared tenant-scoped memory before multiple replicas.
+- [ ] Keep Product user, chatroom, message, retention, and deletion ownership.
+- [ ] Enforce user/chatroom ownership for every Product message operation.
+- [ ] Persist the user message and only the completed assistant message after `done`.
+- [ ] Preserve Product request/correlation IDs with persisted turns.
+- [ ] Keep Product/API/model credentials out of logs.
+- [ ] Decide separately whether an optional Copilot gateway is required.
 
 ## 34. QA acceptance checklist
 
@@ -1072,7 +1032,7 @@ streaming chat page through the BFF.
 - [ ] Deselect sends null/omits context and no stale selected IP is forwarded.
 - [ ] General detached questions do not receive stale asset context.
 - [ ] Browser cancel stops rendering and is recorded as cancelled.
-- [ ] Proxy emits chunks promptly with no gateway buffering.
+- [ ] Direct browser stream emits chunks promptly without client-side buffering.
 - [ ] 422, 401/403, 429, 502/503/504, partial stream, and disconnect are tested.
 - [ ] Missing Graph node is a normal 200 not-found state.
 - [ ] Neighbor truncation is visible and no unsupported pagination is implied.

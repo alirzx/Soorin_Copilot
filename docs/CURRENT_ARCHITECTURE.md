@@ -1,6 +1,6 @@
 # Soorin Copilot Current Architecture
 
-Audit date: 2026-07-20.
+Audit date: 2026-08-05.
 
 This document describes the implemented repository state. It distinguishes working behavior from partial foundations, placeholders, and deferred work. It should be updated after architecture-changing code changes.
 
@@ -80,6 +80,9 @@ Current API compatibility:
 - `/chat` keeps the existing envelope shape.
 - `/chat/stream` preserves the existing SSE event schema and adds UTF-8 charset.
 - There are graph read endpoints, but no RAG endpoint and no planner endpoint.
+- `GET /health` is public. Other current API routes require
+  `SOORIN_COPILOT_API_KEY`, accepted either as a standard Bearer credential or
+  as `Soorin_copilot_api_key` when a Product JWT must remain in `Authorization`.
 
 ## 4. Configuration
 
@@ -323,7 +326,7 @@ Already-running synchronous provider threads cannot be forcibly terminated after
 
 ### ToolResult and EvidencePack
 
-`ToolResult` is the canonical capability-output contract. It includes a stable model-context identity plus explicit inclusion, omission reason, representation, and token metadata. Product raw JSON remains internal in `raw_payload`/`provider_result`; only projected facts enter model context. Graph retrieval/serialization completeness, counts, truncation, and limitations survive conversion. Knowledge chunks, scores through the original result, citations, counts, backend, and freshness survive conversion. Unknown provider statuses fail closed as `invalid`; they are never normalized to success.
+`ToolResult` is the canonical capability-output contract. It includes a stable model-context identity plus explicit inclusion, omission reason, representation, and token metadata. Raw provider result objects remain internal in `raw_payload`/`provider_result`; when Product Profile or Detection evidence is included, the Context Composer currently serializes the complete minified JSON payload into model context. The configured Product views provide typed selection and inventory metadata but do not yet create field-level model projections. Graph retrieval/serialization completeness, counts, truncation, and limitations survive conversion. Knowledge chunks, scores through the original result, citations, counts, backend, and freshness survive conversion. Unknown provider statuses fail closed as `invalid`; they are never normalized to success.
 
 `EvidencePack` is constructed only from `ToolResult` records. It carries request/trace/plan IDs, resolved entities, plan summary, capability coverage, identity-keyed result coverage, graph completeness, citations, missing evidence, limitations, contradictions, supplemental history, and review outcome. Repeated capabilities remain separate ToolResults.
 
@@ -422,9 +425,9 @@ Detection and profile providers:
 - Cache by normalized IP using the detection cache settings.
 - Can return stale cached evidence on provider error if configured.
 - Track raw JSON size, approximate tokens, top-level key counts, cache hit/miss/stale status, HTTP status, and safe error classification.
-- Create safe path/type/length payload inventories and deterministic question-specific local projections.
+- Create safe path/type/length payload inventories and deterministic question-specific view metadata.
 
-Detection supports exactly `overview`, `identity_role`, `anomaly_risk`, `behavior`, and `evidence_deep`. Profile supports exactly `overview`, `identity_role`, `services_software`, `security_posture`, and `evidence_deep`. Selected fields become canonical path/value facts, ranked by request relevance, confidence, conflict, anomaly/risk severity, and identity importance. Facts are deduplicated before one merged projected block is serialized per provider/entity. `evidence_deep` contributes only remaining facts. Comprehensive requests remain under a hard token budget. A reviewer-approved supplemental Product view reuses the request-scoped raw result and cannot cause another Product fetch.
+Detection supports exactly `overview`, `identity_role`, `anomaly_risk`, `behavior`, and `evidence_deep`. Profile supports exactly `overview`, `identity_role`, `services_software`, `security_posture`, and `evidence_deep`. The selected views currently drive deterministic request metadata, inventory, facts, and review/trace labels; they do not yet select smaller field-level model projections. When included, the Context Composer serializes the complete minified Product payload for each provider/entity. Comprehensive requests remain under the global context budget. A reviewer-approved supplemental Product view reuses the request-scoped raw result and cannot cause another Product fetch.
 
 ## 11. Graph Topology
 
@@ -548,7 +551,7 @@ The context composer produces a dynamic system message with:
 - Explicit warning that operational evidence outranks documentation.
 - A compact reviewed-EvidencePack summary containing plan identity, provider coverage, graph completeness, review outcome, missing evidence, contradictions, and limitations.
 
-The composer input is rebuilt from canonical reviewed `ToolResult` objects. Complete Product Profile and Detection provider objects remain unchanged, while bounded `view_payload` projections become the exact model-facing Product context. There is no raw provider side channel.
+The composer input is rebuilt from canonical reviewed `ToolResult` objects. Complete Product Profile and Detection provider objects remain unchanged. `view_payload` currently equals the complete provider payload, and the exact model-facing Product representation is complete minified JSON when it fits the dynamic budget. There is no separate raw-provider side channel; however, this representation can be large and is not yet a view-aware field projection.
 
 Final synthesis receives the global system prompt, a compact reviewed EvidencePack summary, dynamic context reconstructed from EvidencePack provider results, bounded conversation history, and the current user request. No old provider loop or raw provider side channel can add current evidence outside that boundary. If retrieval review, context review, or required graph-context budgeting produces a safe-failure condition, the final LLM is not called. Streaming and non-streaming requests share this same orchestration and differ only in final model transport.
 
@@ -764,4 +767,4 @@ Remaining risks:
 - Conversation and routing state are process-local and do not coordinate concurrent workers.
 - RAG availability and freshness depend on an externally maintained Qdrant collection; the application does not index at startup.
 
-The safest next step is offline acceptance and operational parity testing of the stabilized parent/specialist workflow before adding any new capability. A future Neo4j implementation should remain behind the existing graph capability boundary with bounded parameterized read-only queries. GraphRAG, Planner expansion, MCP/vendor tools, bulk enrichment, and side-effecting actions remain deferred.
+The active upgrade roadmap is: establish durable conversation/thread identity and compact thread state; reduce synthesis pressure through route-aware Product projections, evidence deduplication, and delta context; add typed provenance-aware cross-conversation memory; then introduce an Organization Intelligence Plane that remains subordinate to live Product and Graph evidence. Neo4j, GraphRAG, Planner expansion, MCP/vendor tools, bulk enrichment, and side-effecting actions remain separate deferred capabilities.
