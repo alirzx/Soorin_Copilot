@@ -1,30 +1,117 @@
-"""Dormant Soorin-owned persistence ports for future memory adapters."""
+"""Soorin-owned persistence ports independent of concrete storage engines."""
 
 from __future__ import annotations
 
 from typing import Protocol, TypeVar
 
+from src.core.identity import RequestIdentity
+from src.core.memory.persistence import (
+    CompactThreadState,
+    LocalChatMessage,
+    LocalConversation,
+    LocalRequestCommit,
+)
 
-MessageT = TypeVar("MessageT")
-ThreadStateT = TypeVar("ThreadStateT")
 MemoryT = TypeVar("MemoryT")
 MatchT = TypeVar("MatchT")
 
 
-class ChatRepository(Protocol[MessageT]):
-    """Product-owned transcript boundary; no adapter is active in Gate 2."""
+class ChatRepository(Protocol):
+    """Product-owned transcript boundary; SQLite is local simulation only."""
 
-    def append(self, *, conversation_id: str, message: MessageT) -> None: ...
+    def create_conversation(
+        self,
+        *,
+        user_id: str,
+        conversation_id: str,
+        title: str = "",
+    ) -> LocalConversation: ...
 
-    def recent(self, *, conversation_id: str, limit: int) -> tuple[MessageT, ...]: ...
+    def list_conversations(
+        self,
+        *,
+        user_id: str,
+        limit: int = 50,
+    ) -> tuple[LocalConversation, ...]: ...
+
+    def get_conversation(
+        self,
+        *,
+        user_id: str,
+        conversation_id: str,
+    ) -> LocalConversation | None: ...
+
+    def append(
+        self,
+        *,
+        user_id: str,
+        conversation_id: str,
+        request_id: str,
+        role: str,
+        content: str,
+        status: str = "completed",
+    ) -> LocalChatMessage: ...
+
+    def recent(
+        self,
+        *,
+        user_id: str,
+        conversation_id: str,
+        limit: int = 50,
+    ) -> tuple[LocalChatMessage, ...]: ...
+
+    def delete_conversation(self, *, user_id: str, conversation_id: str) -> bool: ...
+
+    def begin_request(
+        self,
+        *,
+        user_id: str,
+        conversation_id: str,
+        request_id: str,
+    ) -> LocalRequestCommit: ...
+
+    def commit_turn(
+        self,
+        *,
+        user_id: str,
+        conversation_id: str,
+        request_id: str,
+        user_content: str,
+        assistant_content: str,
+    ) -> tuple[LocalChatMessage, LocalChatMessage]: ...
+
+    def mark_request_status(
+        self,
+        *,
+        user_id: str,
+        conversation_id: str,
+        request_id: str,
+        status: str,
+    ) -> LocalRequestCommit: ...
+
+    def request_status(
+        self,
+        *,
+        user_id: str,
+        conversation_id: str,
+        request_id: str,
+    ) -> LocalRequestCommit | None: ...
 
 
-class ThreadStateStore(Protocol[ThreadStateT]):
+class ThreadStateStore(Protocol):
     """Copilot-owned compact thread-state boundary."""
 
-    def load(self, *, thread_key: str) -> ThreadStateT | None: ...
+    def load(self, *, identity: RequestIdentity) -> CompactThreadState | None: ...
 
-    def save(self, *, thread_key: str, state: ThreadStateT) -> None: ...
+    def save(
+        self,
+        *,
+        identity: RequestIdentity,
+        state: CompactThreadState,
+        expected_revision: int,
+    ) -> CompactThreadState: ...
+
+    def delete(self, *, identity: RequestIdentity) -> bool: ...
 
 
 class LongTermMemoryStore(Protocol[MemoryT]):
