@@ -59,6 +59,14 @@ class MemoryStore:
         history.append({"role": role, "content": content})
         self._history[session_id] = history[-self.max_messages :]
 
+    def clear_session(self, session_id: str) -> None:
+        """Remove process-local continuity when an identity binding changes."""
+        self._history.pop(session_id, None)
+        self._latest_completed_turns.pop(session_id, None)
+        self._summaries.pop(session_id, None)
+        self._recorded_request_ids.pop(session_id, None)
+        self.repository.clear_session(session_id)
+
     def record_turn(
         self,
         session_id: str,

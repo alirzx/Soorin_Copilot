@@ -863,6 +863,14 @@ class CopilotWorkflowNodes:
             last_capability_statuses=tuple(f"{item.source_capability}:{item.status}" for item in results),
         )
         self.service.routing_state_store.set(state["session_id"], new_state)
+        identity = state.get("request_identity")
+        if identity is not None:
+            self.service.persist_thread_continuity(identity, new_state)
+            self.service.persist_completed_local_turn(
+                identity,
+                user_content=state["message"].strip(),
+                assistant_content=synthesis["answer"],
+            )
         return {
             "active_entity_state": new_state,
             "memory_update_result": {"completed": True, "request_id": state["request_id"]},

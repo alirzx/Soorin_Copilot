@@ -109,6 +109,8 @@ class EpisodicMemoryStore(Protocol):
 class MemoryRepository(WorkingMemoryStore, EpisodicMemoryStore, Protocol):
     """Future-compatible boundary for durable memory implementations."""
 
+    def clear_session(self, session_id: str) -> None: ...
+
 
 class InMemoryMemoryRepository:
     def __init__(self, max_episodes_per_session: int = 20) -> None:
@@ -129,3 +131,7 @@ class InMemoryMemoryRepository:
         records = self._episodes.setdefault(episode.session_id, [])
         records.append(episode)
         self._episodes[episode.session_id] = records[-self.max_episodes_per_session :]
+
+    def clear_session(self, session_id: str) -> None:
+        self._working.pop(session_id, None)
+        self._episodes.pop(session_id, None)

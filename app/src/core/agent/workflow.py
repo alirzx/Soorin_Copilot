@@ -143,6 +143,13 @@ class BoundedCopilotWorkflow:
 
     def __init__(self, settings: Any | None = None) -> None:
         self.settings = settings
+        checkpoint_backend = str(
+            getattr(settings, "langgraph_checkpoint_backend", "none")
+        )
+        if checkpoint_backend == "sqlite":
+            logger.warning(
+                "event=langgraph_checkpoint_deferred backend=sqlite reason=checkpoint_safe_state_projection_required"
+            )
         try:
             from langgraph.graph import END, START, StateGraph
         except ModuleNotFoundError:
@@ -158,9 +165,10 @@ class BoundedCopilotWorkflow:
             self.runtime = "langgraph"
             self.graph = self._compile_graph()
         logger.info(
-            "event=langgraph_initialized runtime=%s bounded=true recursion_limit=%s persistence=none",
+            "event=langgraph_initialized runtime=%s bounded=true recursion_limit=%s persistence=none configured_checkpoint_backend=%s",
             self.runtime,
             self.recursion_limit,
+            checkpoint_backend,
         )
 
     @staticmethod

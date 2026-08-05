@@ -27,6 +27,9 @@ from src.core.llm.providers.base import LLMProviderResult, LLMStreamEvent
 from src.core.memory.routing_state import SessionRoutingStateStore
 from src.core.memory.episodes import MemoryContextKey
 from src.core.identity import RequestIdentity
+from src.core.memory.persistence import CompactThreadState
+from src.core.memory.ports import ChatRepository, ThreadStateStore
+from src.core.memory.routing_state import SessionRoutingState
 from src.core.memory.store import MemoryStore
 from src.core.product_client import ProductApiClient
 from src.core.rag.service import KnowledgeSearchService
@@ -76,11 +79,21 @@ class CopilotService:
         *,
         product_client: ProductApiClient | None = None,
         usage_reporter: ProductUsageReporter | None = None,
+        chat_repository: ChatRepository | None = None,
+        thread_state_store: ThreadStateStore | None = None,
     ) -> None:
         self.settings = settings
         self.llm_client = llm_client
         self.memory_store = memory_store
         self.routing_state_store = routing_state_store or SessionRoutingStateStore()
+        self.chat_repository = chat_repository
+        self.thread_state_store = thread_state_store
+        self._persistence_lock = RLock()
+        self._session_identity_bindings: dict[
+            str,
+            tuple[str | None, str | None, str],
+        ] = {}
+        self._thread_revisions: dict[tuple[str | None, str], int] = {}
         self.system_prompt = self._load_system_prompt()
         self.entity_resolver = EntityResolver()
         self.fallback_router = DeterministicFallbackRouter()
@@ -121,6 +134,158 @@ class CopilotService:
         self.context_composer = ContextComposer(settings)
         self.snapshot_writer = EvidenceSnapshotWriter(settings)
         self.workflow = BoundedCopilotWorkflow(settings)
+
+    @staticmethod
+    def _local_chat_identity(
+        identity: RequestIdentity,
+    ) -> tuple[str, str] | None:
+        if not identity.user_id or not identity.conversation_id:
+            return None
+        return identity.user_id, identity.conversation_id
+
+    def restore_thread_continuity(self, identity: RequestIdentity) -> None:
+        """Load only approved routing continuity before entity resolution."""
+        if self.thread_state_store is None:
+            return
+        binding = (identity.user_id, identity.conversation_id, identity.thread_key)
+        revision_key = (identity.user_id, identity.thread_key)
+        with self._persistence_lock:
+            previous_binding = self._session_identity_bindings.get(identity.session_id)
+            if previous_binding is not None and previous_binding != binding:
+                self.memory_store.clear_session(identity.session_id)
+                self.routing_state_store.clear(identity.session_id)
+            self._session_identity_bindings[identity.session_id] = binding
+            try:
+                persisted = self.thread_state_store.load(identity=identity)
+            except Exception as exc:
+                self.memory_store.clear_session(identity.session_id)
+                self.routing_state_store.clear(identity.session_id)
+                self._thread_revisions.pop(revision_key, None)
+                logger.warning(
+                    "event=thread_state_load_failed request_id=%s error_type=%s",
+                    identity.request_id,
+                    type(exc).__name__,
+                )
+                return
+            if persisted is None:
+                self._thread_revisions[revision_key] = 0
+                return
+            self.routing_state_store.set(
+                identity.session_id,
+                persisted.to_routing_state(),
+            )
+            self._thread_revisions[revision_key] = persisted.revision
+            logger.info(
+                "event=thread_state_loaded request_id=%s revision=%s active_entity_count=%s",
+                identity.request_id,
+                persisted.revision,
+                len(persisted.active_entities),
+            )
+
+    def persist_thread_continuity(
+        self,
+        identity: RequestIdentity,
+        routing_state: SessionRoutingState,
+    ) -> None:
+        """Persist compact terminal continuity without affecting the response."""
+        if self.thread_state_store is None:
+            return
+        revision_key = (identity.user_id, identity.thread_key)
+        with self._persistence_lock:
+            expected_revision = self._thread_revisions.get(revision_key, 0)
+            state = CompactThreadState.from_routing_state(
+                identity,
+                routing_state,
+                revision=expected_revision,
+            )
+            try:
+                saved = self.thread_state_store.save(
+                    identity=identity,
+                    state=state,
+                    expected_revision=expected_revision,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "event=thread_state_save_failed request_id=%s error_type=%s",
+                    identity.request_id,
+                    type(exc).__name__,
+                )
+                return
+            self._thread_revisions[revision_key] = saved.revision
+            logger.info(
+                "event=thread_state_saved request_id=%s revision=%s active_entity_count=%s",
+                identity.request_id,
+                saved.revision,
+                len(saved.active_entities),
+            )
+
+    def begin_local_request(self, identity: RequestIdentity) -> None:
+        local_identity = self._local_chat_identity(identity)
+        if self.chat_repository is None or local_identity is None:
+            return
+        user_id, conversation_id = local_identity
+        try:
+            self.chat_repository.begin_request(
+                user_id=user_id,
+                conversation_id=conversation_id,
+                request_id=identity.request_id,
+            )
+        except Exception as exc:
+            logger.warning(
+                "event=local_chat_request_begin_failed request_id=%s error_type=%s",
+                identity.request_id,
+                type(exc).__name__,
+            )
+
+    def persist_completed_local_turn(
+        self,
+        identity: RequestIdentity,
+        *,
+        user_content: str,
+        assistant_content: str,
+    ) -> None:
+        local_identity = self._local_chat_identity(identity)
+        if self.chat_repository is None or local_identity is None:
+            return
+        user_id, conversation_id = local_identity
+        try:
+            self.chat_repository.commit_turn(
+                user_id=user_id,
+                conversation_id=conversation_id,
+                request_id=identity.request_id,
+                user_content=user_content,
+                assistant_content=assistant_content,
+            )
+        except Exception as exc:
+            logger.warning(
+                "event=local_chat_turn_commit_failed request_id=%s error_type=%s",
+                identity.request_id,
+                type(exc).__name__,
+            )
+
+    def finalize_uncommitted_local_request(
+        self,
+        identity: RequestIdentity,
+        *,
+        request_success: bool,
+    ) -> None:
+        local_identity = self._local_chat_identity(identity)
+        if self.chat_repository is None or local_identity is None:
+            return
+        user_id, conversation_id = local_identity
+        try:
+            self.chat_repository.mark_request_status(
+                user_id=user_id,
+                conversation_id=conversation_id,
+                request_id=identity.request_id,
+                status="interrupted" if request_success else "failed",
+            )
+        except Exception as exc:
+            logger.warning(
+                "event=local_chat_request_finalize_failed request_id=%s error_type=%s",
+                identity.request_id,
+                type(exc).__name__,
+            )
 
     def _current_capability_provider_ids(self) -> tuple[int, int, int, int]:
         return (
@@ -451,6 +616,8 @@ class CopilotService:
         resolved_request_id = identity.request_id
         workflow_trace_id = uuid4().hex[:16]
         resolved_session_id = identity.session_id
+        self.restore_thread_continuity(identity)
+        self.begin_local_request(identity)
         trivial = self._trivial_response(message)
         if trivial is not None:
             session = resolved_session_id
@@ -469,7 +636,13 @@ class CopilotService:
                     trivial,
                     general_context,
                     providers=("deterministic",),
+                    request_id=resolved_request_id,
                 )
+            self.persist_completed_local_turn(
+                identity,
+                user_content=message.strip(),
+                assistant_content=trivial,
+            )
             if stream_sink is not None:
                 stream_sink(LLMStreamEvent("answer_delta", text=trivial))
             logger.info(
@@ -506,6 +679,10 @@ class CopilotService:
             return result
         finally:
             self.usage_reporter.finish_request(usage_scope, request_success=request_success)
+            self.finalize_uncommitted_local_request(
+                identity,
+                request_success=request_success,
+            )
 
     def close(self) -> None:
         """Release owned local resources during application shutdown."""

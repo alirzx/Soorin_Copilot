@@ -22,6 +22,7 @@ from src.core.llm.client import LLMClient
 from src.core.llm.errors import LLMError
 from src.core.llm.providers.base import LLMStreamEvent
 from src.core.memory.routing_state import SessionRoutingStateStore
+from src.core.memory.factory import build_local_persistence
 from src.core.identity import (
     IDENTIFIER_MAX_LENGTH,
     IDENTIFIER_PATTERN,
@@ -40,6 +41,7 @@ routing_state_store = SessionRoutingStateStore()
 product_client = get_product_api_client()
 usage_reporter = ProductUsageReporter(settings, product_client)
 llm_client = LLMClient(settings, usage_recorder=usage_reporter)
+local_persistence = build_local_persistence(settings)
 copilot_service = CopilotService(
     settings,
     llm_client,
@@ -47,6 +49,8 @@ copilot_service = CopilotService(
     routing_state_store,
     product_client=product_client,
     usage_reporter=usage_reporter,
+    chat_repository=local_persistence.chat_repository,
+    thread_state_store=local_persistence.thread_state_store,
 )
 
 
