@@ -35,7 +35,7 @@ sequenceDiagram
     participant LLM as Arvan chat deployment
 
     UI->>API: POST /chat or /chat/stream
-    API->>Service: message, session_id, optional ui_context
+    API->>Service: message, resolved request identity, optional ui_context
     Service->>Workflow: invoke request with runtime dependencies
     Workflow->>Entity: resolve explicit/UI/session entities
     Workflow->>Router: classify with configured Kimi/GLM/GPT deployment

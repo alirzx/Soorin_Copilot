@@ -77,15 +77,16 @@ supplemental retrieval.
 | `request_id` | API route | one chat request | no |
 | `trace_id` | service/workflow | one chat request | no |
 | LangGraph `workflow_id` | workflow | one chat request | no |
-| LangGraph `thread_id` | workflow | currently equals request ID | no |
+| LangGraph `thread_id` | workflow | resolved request `thread_key` | no |
 | `session_id` | caller/UI plus Copilot | in-process continuity key | no |
 | raw recent turns | `MemoryStore` | current process/session | no |
 | working memory/episodes | in-memory repository | current process/session | no |
 | routing state | `SessionRoutingStateStore` | current process/session | no |
 | graph artifacts/Qdrant | configured data paths | operational/index lifecycle | yes, independently |
 
-There is no current `user_id`, `conversation_id`, or `chatroom_id` field in the
-Copilot request contract or state stores. There is no LangGraph checkpointer:
+The request contract now accepts optional `conversation_id` and `request_id`,
+plus bounded `X-User-ID` metadata. These values form a typed request identity
+but create no ownership or authorization. There is no LangGraph checkpointer:
 the graph is compiled without one and interrupted requests cannot resume after a
 restart. The internal usage reporter has a session field, but it does not create
 user or conversation ownership.
@@ -176,11 +177,10 @@ development-only and is not production authorization.
 | Organization intelligence | approved organization facts/baselines | live Product or Graph truth |
 | Semantic indexes | retrieval pointers/embeddings | canonical fact ownership |
 
-## 7. Backward-compatible future API proposal
+## 7. Backward-compatible identity contract
 
-Keep the current `ChatRequest` valid. A future Product-only trusted adapter may
-introduce an optional envelope/header-derived identity context rather than
-breaking browser payloads:
+The current `ChatRequest` remains valid and now accepts this optional identity
+context without breaking legacy browser payloads:
 
 ```json
 {
@@ -194,12 +194,12 @@ breaking browser payloads:
 }
 ```
 
-All new identifiers are optional. `conversation_id` is preferred for durable
-thread identity; `session_id` remains the fallback. A server-generated
-`request_id` preserves old-client compatibility. For local simulation only,
-`X-User-ID: local-user-id` may supply a typed user identity. It must never be
-treated as production-grade authentication or authorization. Public response
-and SSE event shapes remain unchanged initially.
+All new identifiers are optional. `conversation_id` is the preferred future
+durable thread identity; `session_id` remains the active process-local
+fallback. A server-generated `request_id` preserves old-client compatibility.
+`X-User-ID: local-user-id` may supply typed identity metadata, but it is not
+authentication or authorization. Public response and SSE event shapes remain
+unchanged.
 
 ### 7.1 Possible future integration capabilities
 
@@ -463,13 +463,13 @@ and must never be the only copy of a fact.
 
 ## 20. Smallest safe first implementation slice
 
-First add optional `conversation_id` and `request_id`, a development-only typed
-`X-User-ID`, a resolved request/thread identity contract, and the four storage
-ports. Keep persistence disabled and preserve the legacy `session_id` request
-path. Then add isolated local SQLite `ChatRepository` and `ThreadStateStore`
-adapters behind disabled defaults. This establishes identity and adapter
-boundaries before context compaction, checkpointing, typed long-term memory,
-semantic retrieval, Product adapters, or Organization Intelligence.
+Gate 2 added optional `conversation_id` and `request_id`, bounded
+`X-User-ID` metadata, a resolved request/thread identity contract, and the four
+storage ports. Persistence remains disabled and the legacy `session_id` path
+remains active. The next isolated gate may add local SQLite `ChatRepository`
+and `ThreadStateStore` adapters behind disabled defaults, before context
+compaction, checkpointing, typed long-term memory, semantic retrieval, Product
+adapters, or Organization Intelligence.
 
 ## Appendix A. Disposition of the removed OpenCode guide
 

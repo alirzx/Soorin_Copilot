@@ -96,8 +96,8 @@ Recommended normal chat flow:
 
 ```text
 1. Frontend creates or opens a Product chatroom through Product Backend APIs.
-2. The Product chatroom ID is the durable `conversation_id` target for the
-   planned contract; current clients continue to reuse their `session_id`.
+2. The Product chatroom ID may be sent as `conversation_id`; legacy clients
+   continue to reuse their `session_id`.
 3. Frontend POSTs directly to Copilot `/chat/stream`.
 4. Copilot returns UTF-8 SSE directly to the Frontend.
 5. Frontend incrementally appends answer deltas and completes only on `done`.
@@ -202,9 +202,10 @@ authorization. In particular, omit `raw_snapshot_path` and
 Current facts:
 
 - `session_id` is optional and nullable.
-- Any non-empty string is accepted; there is no UUID check or maximum length.
-- Empty or absent values are replaced by a server-generated 32-character UUID4
-  hex string.
+- Supplied values are trimmed, limited to 128 conservative identifier
+  characters, and reject blank/control-character input with HTTP 422.
+- An absent value is replaced by a server-generated 32-character UUID4 hex
+  string.
 - The resolved ID is returned in `/chat` data and `/chat/stream` `done.data`.
 - State is keyed only by this string, not by user or tenant.
 - Conversation and routing state are in process memory and are lost on restart.
@@ -220,8 +221,9 @@ Product ownership:
 4. It rejects cross-user reuse, regardless of UUID entropy.
 5. A new-chat action creates a new ID.
 
-The planned contract uses Product `conversation_id` as the preferred durable
-thread key and retains `session_id` as the legacy/runtime fallback.
+The request identity contract uses Product `conversation_id` as the preferred
+future durable thread key and retains `session_id` as the active legacy/runtime
+fallback. Neither field is an authorization decision.
 
 ## 10. UI context and selected-IP lifecycle
 
@@ -275,11 +277,16 @@ Request:
 
 ```ts
 type ChatRequest = {
-  session_id?: string | null;       // currently arbitrary non-empty string
+  session_id?: string | null;       // bounded legacy/runtime continuity ID
+  conversation_id?: string | null;  // preferred future durable thread ID
+  request_id?: string | null;       // one turn; generated when absent
   message: string;                  // JSON string, min_length=1
   ui_context?: { selected_ip?: string | null } | null;
 };
 ```
+
+Both chat routes also accept optional `X-User-ID` metadata. It is bounded and
+validated but never authenticates or authorizes the request.
 
 Successful response, captured locally with the harmless prompt "Just say test.":
 
@@ -431,6 +438,8 @@ export interface ChatUIContext {
 
 export interface ChatRequest {
   session_id?: string | null;
+  conversation_id?: string | null;
+  request_id?: string | null;
   message: string;
   ui_context?: ChatUIContext | null;
 }
@@ -972,21 +981,21 @@ Before broad frontend release, Product and Copilot teams should decide and then
 implement, in priority order:
 
 1. Product chatroom/message integration and conversation ownership validation.
-2. `conversation_id`, `request_id`, and local/test `user_id` identity contracts.
-3. Context compaction and durable thread state.
+2. Context compaction and durable thread state.
+3. Trusted Product ownership validation for identity metadata.
 4. Decide whether an optional gateway is needed to remove the static key from
    browser code and add stronger asset authorization/rate limits.
 4. True disconnect/cancellation propagation and optional SSE heartbeat policy.
 5. Whether Product canonical Graph or Copilot snapshot Graph owns each UI panel.
 6. Cursor/version pagination if browser Graph neighbor lists require page-through.
 7. Remove or role-filter filesystem path diagnostics from user-facing status.
-8. Optional API hardening: session length/UUID policy and strict IPv4 UI-context
-   validation, coordinated as a versioned behavior change.
+8. Optional API hardening: strict IPv4 UI-context validation, coordinated as a
+   versioned behavior change.
 9. Decide whether evidence/limitations/citations need a stable public response
    contract rather than remaining inside answer prose.
 
-The current direct streaming path remains valid while the optional identifier
-fields and storage adapters are introduced backward-compatibly.
+The current direct streaming path remains valid with the optional identifier
+fields and dormant storage ports introduced backward-compatibly.
 
 ## 32. Frontend implementation checklist
 
