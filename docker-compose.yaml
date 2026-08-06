@@ -1,22 +1,25 @@
 name: soorin-copilot
 
-x-app-image: &app-image soorin-copilot:${SOORIN_IMAGE_TAG:-rag-local}
-x-app-env: &app-env
-  - ${SOORIN_APP_ENV_FILE:-./app/.env}
+x-app-image: &app-image soorin-copilot:${SOORIN_IMAGE_TAG:-copilot_release_3.1}
+
+x-common-service: &common-service
+  image: *app-image
+  pull_policy: never
+  restart: "${SOORIN_RESTART_POLICY:-unless-stopped}"
+  init: true
+  security_opt:
+    - no-new-privileges:true
+  logging:
+    driver: json-file
+    options:
+      max-size: 10m
+      max-file: "5"
+  networks:
+    - copilot-network
 
 services:
   api:
-    image: *app-image
-    pull_policy: never
-
-    build:
-      context: .
-      dockerfile: Dockerfile
-      args:
-        PYTHON_VERSION: "3.12"
-        APP_UID: "${APP_UID:-10001}"
-        APP_GID: "${APP_GID:-10001}"
-
+    <<: *common-service
     container_name: soorin-copilot-api
 
     command:
@@ -24,7 +27,8 @@ services:
       - app/run.py
       - --api
 
-    env_file: *app-env
+    env_file:
+      - ./.env
 
     environment:
       PYTHONPATH: /workspace/app
@@ -32,7 +36,6 @@ services:
       API_HOST: 0.0.0.0
       API_PORT: "6998"
       API_RELOAD: "false"
-      LOG_LEVEL: "${SOORIN_LOG_LEVEL:-INFO}"
 
       SOORIN_HOST: 0.0.0.0
       SOORIN_PORT: "6998"
@@ -52,25 +55,23 @@ services:
       HF_HUB_DISABLE_TELEMETRY: "1"
 
     ports:
-      - "${SOORIN_API_BIND_IP:-127.0.0.1}:${SOORIN_API_PORT:-6998}:6998"
+      - "${SOORIN_API_BIND_IP:-0.0.0.0}:${SOORIN_API_HOST_PORT:-6998}:6998"
 
     volumes:
       - type: bind
-        source: ${SOORIN_DATA_HOST_PATH:?SOORIN_DATA_HOST_PATH is required}
+        source: ./data
         target: /workspace/data
         read_only: false
         bind:
           create_host_path: false
 
       - type: bind
-        source: ${SOORIN_HF_CACHE_HOST_PATH:?SOORIN_HF_CACHE_HOST_PATH is required}
+        source: ./huggingface
         target: /home/soorin/.cache/huggingface
         read_only: true
         bind:
           create_host_path: false
 
-    restart: "${SOORIN_RESTART_POLICY:-unless-stopped}"
-    init: true
     stop_grace_period: 60s
 
     healthcheck:
@@ -93,22 +94,8 @@ services:
       start_period: 120s
       retries: 6
 
-    logging:
-      driver: json-file
-      options:
-        max-size: 10m
-        max-file: "5"
-
-    security_opt:
-      - no-new-privileges:true
-
-    networks:
-      - copilot-network
-
   ui:
-    image: *app-image
-    pull_policy: never
-
+    <<: *common-service
     container_name: soorin-copilot-ui
 
     command:
@@ -122,13 +109,12 @@ services:
       - --server.headless=true
       - --browser.gatherUsageStats=false
 
-    env_file: *app-env
-
     environment:
       PYTHONPATH: /workspace/app
 
       SOORIN_API_BASE_URL: http://api:6998
       SOORIN_COPILOT_API_URL: http://api:6998
+      SOORIN_COPILOT_API_KEY: "${SOORIN_COPILOT_API_KEY:?SOORIN_COPILOT_API_KEY is required}"
       SOORIN_API_TIMEOUT_SECONDS: "${SOORIN_API_TIMEOUT_SECONDS:-600}"
 
       STREAMLIT_SERVER_ADDRESS: 0.0.0.0
@@ -137,11 +123,11 @@ services:
       STREAMLIT_BROWSER_GATHER_USAGE_STATS: "false"
 
     ports:
-      - "${SOORIN_UI_BIND_IP:-127.0.0.1}:${SOORIN_UI_PORT:-8503}:8501"
+      - "${SOORIN_UI_BIND_IP:-0.0.0.0}:${SOORIN_UI_HOST_PORT:-8503}:8501"
 
     volumes:
       - type: bind
-        source: ${SOORIN_DATA_HOST_PATH:?SOORIN_DATA_HOST_PATH is required}
+        source: ./data
         target: /workspace/data
         read_only: true
         bind:
@@ -151,8 +137,6 @@ services:
       api:
         condition: service_healthy
 
-    restart: "${SOORIN_RESTART_POLICY:-unless-stopped}"
-    init: true
     stop_grace_period: 20s
 
     healthcheck:
@@ -172,18 +156,6 @@ services:
       timeout: 10s
       start_period: 90s
       retries: 5
-
-    logging:
-      driver: json-file
-      options:
-        max-size: 10m
-        max-file: "5"
-
-    security_opt:
-      - no-new-privileges:true
-
-    networks:
-      - copilot-network
 
 networks:
   copilot-network:
