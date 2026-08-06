@@ -26,6 +26,7 @@ from src.core.memory.persistence import (
     LocalPersistenceOwnershipError,
     LocalPersistenceSchemaError,
     LocalRequestCommit,
+    LocalUser,
     utc_now,
 )
 
@@ -44,6 +45,7 @@ CREATE TABLE IF NOT EXISTS local_users (
 CREATE TABLE IF NOT EXISTS local_conversations (
     conversation_id TEXT PRIMARY KEY,
     user_id TEXT NOT NULL REFERENCES local_users(user_id) ON DELETE CASCADE,
+    session_id TEXT NOT NULL,
     title TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
@@ -51,6 +53,9 @@ CREATE TABLE IF NOT EXISTS local_conversations (
 
 CREATE INDEX IF NOT EXISTS idx_local_conversations_owner
 ON local_conversations(user_id, updated_at DESC, conversation_id);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_local_conversations_session
+ON local_conversations(session_id);
 
 CREATE TABLE IF NOT EXISTS local_messages (
     message_id TEXT PRIMARY KEY,
@@ -157,21 +162,32 @@ class LocalSQLiteDatabase:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             with self.connect() as connection:
                 try:
-                    connection.executescript(
-                        "BEGIN IMMEDIATE;\n"
-                        + _SCHEMA_SQL
-                        + "\nINSERT OR IGNORE INTO schema_metadata(key, value) "
-                        + "VALUES ('local_schema_version', '"
-                        + str(LOCAL_SCHEMA_VERSION)
-                        + "');\nCOMMIT;"
+                    connection.execute(
+                        "CREATE TABLE IF NOT EXISTS schema_metadata ("
+                        "key TEXT PRIMARY KEY, value TEXT NOT NULL)"
                     )
                     row = connection.execute(
                         "SELECT value FROM schema_metadata WHERE key = ?",
                         ("local_schema_version",),
                     ).fetchone()
-                    if row is None or row["value"] != str(LOCAL_SCHEMA_VERSION):
+                    if row is not None and row["value"] == "1":
+                        connection.execute("BEGIN IMMEDIATE")
+                        try:
+                            self._upgrade_v1_to_v2(connection)
+                            connection.commit()
+                        except Exception:
+                            connection.rollback()
+                            raise
+                    elif row is not None and row["value"] != str(LOCAL_SCHEMA_VERSION):
                         raise LocalPersistenceSchemaError(
                             "Local SQLite schema version is incompatible."
+                        )
+
+                    connection.executescript(_SCHEMA_SQL)
+                    if row is None:
+                        connection.execute(
+                            "INSERT INTO schema_metadata(key, value) VALUES (?, ?)",
+                            ("local_schema_version", str(LOCAL_SCHEMA_VERSION)),
                         )
                 except Exception:
                     if connection.in_transaction:
@@ -184,6 +200,32 @@ class LocalSQLiteDatabase:
                 "Local SQLite schema initialization failed."
             ) from exc
 
+    @staticmethod
+    def _upgrade_v1_to_v2(connection: sqlite3.Connection) -> None:
+        """Add stable conversation sessions without deleting Gate 3 records."""
+        columns = {
+            row["name"]
+            for row in connection.execute("PRAGMA table_info(local_conversations)")
+        }
+        if "session_id" not in columns:
+            connection.execute("ALTER TABLE local_conversations ADD COLUMN session_id TEXT")
+        rows = connection.execute(
+            "SELECT conversation_id FROM local_conversations WHERE session_id IS NULL OR session_id = ''"
+        ).fetchall()
+        for row in rows:
+            connection.execute(
+                "UPDATE local_conversations SET session_id = ? WHERE conversation_id = ?",
+                (uuid4().hex, row["conversation_id"]),
+            )
+        connection.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_local_conversations_session "
+            "ON local_conversations(session_id)"
+        )
+        connection.execute(
+            "UPDATE schema_metadata SET value = ? WHERE key = ?",
+            (str(LOCAL_SCHEMA_VERSION), "local_schema_version"),
+        )
+
     def foreign_keys_enabled(self) -> bool:
         with self.connect() as connection:
             row = connection.execute("PRAGMA foreign_keys").fetchone()
@@ -194,6 +236,7 @@ def _conversation(row: sqlite3.Row) -> LocalConversation:
     return LocalConversation(
         conversation_id=row["conversation_id"],
         user_id=row["user_id"],
+        session_id=row["session_id"],
         title=row["title"],
         created_at=row["created_at"],
         updated_at=row["updated_at"],
@@ -224,11 +267,53 @@ def _commit(row: sqlite3.Row) -> LocalRequestCommit:
     )
 
 
+def _user(row: sqlite3.Row) -> LocalUser:
+    return LocalUser(user_id=row["user_id"], created_at=row["created_at"])
+
+
 class SQLiteChatRepository:
     """Owner-scoped local transcript adapter for future UI simulation."""
 
     def __init__(self, database: LocalSQLiteDatabase) -> None:
         self.database = database
+
+    def create_user(self, *, user_id: str | None = None) -> LocalUser:
+        user = _identifier(user_id, "user_id") if user_id is not None else f"local-user-{uuid4().hex}"
+        now = utc_now()
+        with self.database.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                connection.execute(
+                    "INSERT OR IGNORE INTO local_users(user_id, created_at) VALUES (?, ?)",
+                    (user, now),
+                )
+                row = connection.execute(
+                    "SELECT * FROM local_users WHERE user_id = ?", (user,)
+                ).fetchone()
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
+        if row is None:
+            raise LocalPersistenceError("Local user creation failed.")
+        return _user(row)
+
+    def list_users(self, *, limit: int = 50) -> tuple[LocalUser, ...]:
+        bounded = _limit(limit)
+        with self.database.connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM local_users ORDER BY created_at DESC, user_id ASC LIMIT ?",
+                (bounded,),
+            ).fetchall()
+        return tuple(_user(row) for row in rows)
+
+    def get_user(self, *, user_id: str) -> LocalUser | None:
+        user = _identifier(user_id, "user_id")
+        with self.database.connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM local_users WHERE user_id = ?", (user,)
+            ).fetchone()
+        return _user(row) if row is not None else None
 
     @staticmethod
     def _assert_owner(
@@ -254,10 +339,12 @@ class SQLiteChatRepository:
         *,
         user_id: str,
         conversation_id: str,
+        session_id: str | None = None,
         title: str = "",
     ) -> LocalConversation:
         user = _identifier(user_id, "user_id")
         conversation = _identifier(conversation_id, "conversation_id")
+        session = _identifier(session_id, "session_id") if session_id is not None else uuid4().hex
         if not isinstance(title, str) or len(title) > MAX_CONVERSATION_TITLE_CHARS:
             raise LocalPersistenceError("Invalid local conversation title.")
         now = utc_now()
@@ -280,10 +367,10 @@ class SQLiteChatRepository:
                     connection.execute(
                         """
                         INSERT INTO local_conversations(
-                            conversation_id, user_id, title, created_at, updated_at
-                        ) VALUES (?, ?, ?, ?, ?)
+                            conversation_id, user_id, session_id, title, created_at, updated_at
+                        ) VALUES (?, ?, ?, ?, ?, ?)
                         """,
-                        (conversation, user, title, now, now),
+                        (conversation, user, session, title, now, now),
                     )
                 connection.commit()
             except Exception:
@@ -515,6 +602,10 @@ class SQLiteChatRepository:
                 connection.execute(
                     "DELETE FROM local_conversations WHERE conversation_id = ?",
                     (conversation,),
+                )
+                connection.execute(
+                    "DELETE FROM local_thread_states WHERE conversation_id = ? AND user_id = ?",
+                    (conversation, user),
                 )
                 connection.commit()
                 return True

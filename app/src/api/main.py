@@ -9,6 +9,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from src.api.dependencies import get_graph_refresh_service as get_api_graph_refresh_service
 from src.api.graph_routes import router as graph_router
+from src.api.local_simulation_routes import router as local_simulation_router
 from src.api.routes import copilot_service, router
 from src.config.settings import get_settings
 from src.core.graph.refresh import set_graph_refresh_service
@@ -28,6 +29,7 @@ def create_app() -> FastAPI:
     )
     app.include_router(router)
     app.include_router(graph_router)
+    app.include_router(local_simulation_router)
 
     @app.on_event("startup")
     def on_startup() -> None:

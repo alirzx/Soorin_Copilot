@@ -624,6 +624,24 @@ Local SQLite mode:
 - This is local development/test infrastructure. Production ownership and durable
   transcripts remain a future Product PostgreSQL or Product API adapter concern.
 
+### Local Streamlit simulation
+
+Gate 4 adds an opt-in local development simulation. With
+`SOORIN_LOCAL_PRODUCT_SIMULATION_ENABLED=true` and
+`SOORIN_STREAMLIT_AUTH_BACKEND=local_simulation`, Streamlit shows a password-free
+local user selector, local chatrooms, and the existing topology workspace. It
+calls protected `/local-simulation/*` routes for user and conversation metadata,
+then calls the existing `/chat/stream` endpoint directly for every turn.
+
+Each local conversation receives an opaque `conversation_id` and one stable
+`session_id`. The conversation ID remains the durable thread key; the session ID
+is reused as compatibility/runtime metadata. Completed user/assistant turns are
+committed only by the existing SSE workflow and reloaded after `done`; Streamlit
+does not write transcript messages itself. Local users are development metadata,
+not Product users or authentication claims. OIDC is not configured, and durable
+Working Memory, Episodes, semantic cross-chat retrieval, and LangGraph
+checkpointing remain deferred.
+
 Each successful service request constructs one new `SessionRoutingState` and calls the state store once. Explicit-message, UI, and session entity authority remains owned by the resolver/router normalization path. General detached turns preserve useful active entity state. Safe-failure requests preserve prior active state unless the current request supplied a valid explicit or UI-authoritative investigation entity; Planner arguments and final prose are never state inputs.
 
 ## 16. Phase 2.1 Observability

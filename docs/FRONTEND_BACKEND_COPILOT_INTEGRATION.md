@@ -127,6 +127,19 @@ SOORIN_LANGGRAPH_CHECKPOINT_BACKEND=none
 The checkpoint setting is reserved: selecting `sqlite` currently logs a safe
 deferral because a checkpoint-safe workflow-state projection is not implemented.
 
+Gate 4 adds a separate local simulation UI/API boundary. It is enabled only when
+both local product simulation and the `local_simulation` Streamlit auth backend
+are configured. The browser still sends the existing direct `/chat/stream`
+request and unchanged dual Copilot credentials. It additionally sends the local
+selected user as `X-User-ID`; this is untrusted local metadata, not Product
+authorization. Local user/chatroom CRUD uses protected `/local-simulation/*`
+routes, while completed messages remain owned by the existing `/chat/stream`
+workflow.
+
+The production Browser -> Copilot stream -> Product Backend message-persistence
+flow remains unchanged. OIDC is optional future work and no external provider is
+required or configured for the local simulation.
+
 ## 5. Internal Copilot-to-Product request flow
 
 These calls are made by Copilot through the shared `ProductApiClient`. They are

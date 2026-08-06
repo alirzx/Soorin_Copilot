@@ -192,7 +192,7 @@ def test_streamlit_still_uses_bearer_for_builtin_ui_calls() -> None:
     source = Path(__file__).resolve().parents[2] / "app_st.py"
     text = source.read_text(encoding="utf-8")
 
-    assert 'return {"Authorization": f"Bearer {key}"}' in text
+    assert "return copilot_auth_headers(settings.copilot_api_key)" in text
     assert "requests.get(HEALTH_URL, timeout=10)" in text
     assert "requests.get(\n            LLM_HEALTH_URL,\n            headers=_get_auth_headers()," in text
     assert "requests.post(\n            CHAT_URL,\n            json=payload,\n            headers=_get_auth_headers()," in text

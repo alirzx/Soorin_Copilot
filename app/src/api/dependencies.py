@@ -8,6 +8,7 @@ from src.config.settings import Settings, get_settings
 from src.core.graph.build_service import GraphBuildService
 from src.core.graph.refresh import GraphRefreshService
 from src.core.graph.service import GraphService
+from src.core.memory.factory import LocalPersistenceAdapters, build_local_persistence
 from src.core.product_client import ProductApiClient
 
 
@@ -32,3 +33,9 @@ def get_graph_build_service() -> GraphBuildService:
 def get_graph_refresh_service() -> GraphRefreshService:
     settings: Settings = get_settings()
     return GraphRefreshService(settings, get_product_api_client())
+
+
+@lru_cache(maxsize=1)
+def get_local_persistence() -> LocalPersistenceAdapters:
+    """Build disabled-by-default local simulation adapters once per process."""
+    return build_local_persistence(get_settings())

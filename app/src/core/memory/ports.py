@@ -10,6 +10,7 @@ from src.core.memory.persistence import (
     LocalChatMessage,
     LocalConversation,
     LocalRequestCommit,
+    LocalUser,
 )
 
 MemoryT = TypeVar("MemoryT")
@@ -19,11 +20,18 @@ MatchT = TypeVar("MatchT")
 class ChatRepository(Protocol):
     """Product-owned transcript boundary; SQLite is local simulation only."""
 
+    def create_user(self, *, user_id: str | None = None) -> LocalUser: ...
+
+    def list_users(self, *, limit: int = 50) -> tuple[LocalUser, ...]: ...
+
+    def get_user(self, *, user_id: str) -> LocalUser | None: ...
+
     def create_conversation(
         self,
         *,
         user_id: str,
         conversation_id: str,
+        session_id: str | None = None,
         title: str = "",
     ) -> LocalConversation: ...
 

@@ -13,7 +13,7 @@ from pydantic import BaseModel, Field, field_validator
 from starlette.responses import StreamingResponse
 
 from src.api.auth import verify_api_key
-from src.api.dependencies import get_product_api_client
+from src.api.dependencies import get_local_persistence, get_product_api_client
 from src.api.schemas.chat import ChatResponse, HealthResponse, LLMHealthResponse
 from src.config.settings import get_settings
 from src.core.copilot.service import CopilotService
@@ -22,7 +22,6 @@ from src.core.llm.client import LLMClient
 from src.core.llm.errors import LLMError
 from src.core.llm.providers.base import LLMStreamEvent
 from src.core.memory.routing_state import SessionRoutingStateStore
-from src.core.memory.factory import build_local_persistence
 from src.core.identity import (
     IDENTIFIER_MAX_LENGTH,
     IDENTIFIER_PATTERN,
@@ -41,7 +40,7 @@ routing_state_store = SessionRoutingStateStore()
 product_client = get_product_api_client()
 usage_reporter = ProductUsageReporter(settings, product_client)
 llm_client = LLMClient(settings, usage_recorder=usage_reporter)
-local_persistence = build_local_persistence(settings)
+local_persistence = get_local_persistence()
 copilot_service = CopilotService(
     settings,
     llm_client,

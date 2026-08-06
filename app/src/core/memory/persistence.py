@@ -11,7 +11,7 @@ from src.core.identity import RequestIdentity, normalize_identifier
 from src.core.memory.routing_state import SessionRoutingState
 
 
-LOCAL_SCHEMA_VERSION = 1
+LOCAL_SCHEMA_VERSION = 2
 THREAD_STATE_SCHEMA_VERSION = 1
 MAX_THREAD_STATE_BYTES = 16_384
 MAX_CHAT_CONTENT_CHARS = 100_000
@@ -43,6 +43,7 @@ class LocalPersistenceSchemaError(LocalPersistenceError):
 class LocalConversation:
     conversation_id: str
     user_id: str
+    session_id: str
     title: str
     created_at: str
     updated_at: str
@@ -57,6 +58,14 @@ class LocalChatMessage:
     content: str
     status: str
     position: int
+    created_at: str
+
+
+@dataclass(frozen=True)
+class LocalUser:
+    """Minimal password-free local-development user record."""
+
+    user_id: str
     created_at: str
 
 

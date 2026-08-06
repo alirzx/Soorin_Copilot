@@ -14,6 +14,8 @@ from src.config.settings import get_settings
 from src.core.graph.loader import set_graph_path, load_graph
 from src.web.chat_stream import ChatStreamProtocolError, parse_sse_events
 from src.web.copilot_help import render_copilot_help_button
+from src.web.local_simulation import copilot_auth_headers
+from src.web.local_simulation_ui import run_local_simulation_workspace
 from src.web.pages.topology import build_copilot_ui_context, show_topology_page
 
 logger = logging.getLogger(__name__)
@@ -31,10 +33,7 @@ SIDEBAR_LOGO_PATH = APP_DIR / "assets" / "branding" / "soorinsec-logo2.png"
 
 
 def _get_auth_headers() -> dict[str, str]:
-    key = settings.copilot_api_key
-    if not key:
-        return {}
-    return {"Authorization": f"Bearer {key}"}
+    return copilot_auth_headers(settings.copilot_api_key)
 
 
 def _check_api_key_ready() -> str | None:
@@ -45,6 +44,14 @@ def _check_api_key_ready() -> str | None:
 
 # ============================================================
 st.set_page_config(page_title="Soorin Cyber Copilot", layout="wide")
+
+if settings.streamlit_auth_backend == "local_simulation":
+    run_local_simulation_workspace(settings)
+    st.stop()
+if settings.streamlit_auth_backend == "oidc":
+    st.title("Soorin Copilot")
+    st.info("OIDC is reserved for a future configured integration. Use the local simulation mode for offline development.")
+    st.stop()
 
 # ============================================================
 # INIT GRAPH (Load once at startup)

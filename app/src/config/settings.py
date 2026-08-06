@@ -187,6 +187,8 @@ class Settings:
     conversation_summary_temperature: float
     conversation_summary_timeout_seconds: int
     local_product_simulation_enabled: bool
+    streamlit_auth_backend: str
+    local_test_user_creation_enabled: bool
     thread_state_backend: str
     local_sqlite_path: str
     langgraph_checkpoint_backend: str
@@ -445,6 +447,14 @@ class Settings:
             raise ValueError(
                 "SOORIN_LOCAL_SQLITE_PATH is required when local SQLite persistence is enabled."
             )
+        if (
+            self.streamlit_auth_backend == "local_simulation"
+            and not self.local_product_simulation_enabled
+        ):
+            raise ValueError(
+                "SOORIN_STREAMLIT_AUTH_BACKEND=local_simulation requires "
+                "SOORIN_LOCAL_PRODUCT_SIMULATION_ENABLED=true."
+            )
 
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:
@@ -584,6 +594,15 @@ def get_settings() -> Settings:
             "SOORIN_LOCAL_PRODUCT_SIMULATION_ENABLED",
             False,
         ),
+        streamlit_auth_backend=_choice(
+            "SOORIN_STREAMLIT_AUTH_BACKEND",
+            "none",
+            {"none", "local_simulation", "oidc"},
+        ),
+        local_test_user_creation_enabled=_bool(
+            "SOORIN_LOCAL_TEST_USER_CREATION_ENABLED",
+            False,
+        ),
         thread_state_backend=_choice(
             "SOORIN_THREAD_STATE_BACKEND",
             "memory",
@@ -721,7 +740,7 @@ def get_settings() -> Settings:
     settings.validate_observability_configuration()
     settings.validate_local_persistence_configuration()
     logger.info(
-        "event=settings_loaded env_file_path=%s env_file_loaded=%s router_deployment=%s chat_deployment=%s product_base_url_configured=%s product_token_present=%s product_hwid_present=%s product_username_present=%s product_password_present=%s product_captcha_bypass_present=%s rag_enabled=%s rag_backend=%s rag_source_configured=%s rag_qdrant_mode=%s rag_qdrant_configured=%s local_product_simulation_enabled=%s thread_state_backend=%s langgraph_checkpoint_backend=%s",
+        "event=settings_loaded env_file_path=%s env_file_loaded=%s router_deployment=%s chat_deployment=%s product_base_url_configured=%s product_token_present=%s product_hwid_present=%s product_username_present=%s product_password_present=%s product_captcha_bypass_present=%s rag_enabled=%s rag_backend=%s rag_source_configured=%s rag_qdrant_mode=%s rag_qdrant_configured=%s local_product_simulation_enabled=%s streamlit_auth_backend=%s local_test_user_creation_enabled=%s thread_state_backend=%s langgraph_checkpoint_backend=%s",
         ENV_PATH,
         env_file_loaded,
         settings.intent_router_deployment,
@@ -738,6 +757,8 @@ def get_settings() -> Settings:
         settings.rag_qdrant_mode,
         bool(settings.rag_qdrant_path if settings.rag_qdrant_mode == "local" else settings.rag_qdrant_url),
         settings.local_product_simulation_enabled,
+        settings.streamlit_auth_backend,
+        settings.local_test_user_creation_enabled,
         settings.thread_state_backend,
         settings.langgraph_checkpoint_backend,
     )

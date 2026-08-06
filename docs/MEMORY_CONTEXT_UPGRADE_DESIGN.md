@@ -484,12 +484,14 @@ the current workflow state needs a checkpoint-safe projection before it can be
 serialized without unrestricted messages or full evidence objects.
 
 Gate 4 may add a local-only Streamlit login/chatroom simulation over these ports.
-It should remain disabled by default, use opaque local user/conversation IDs,
-restore only bounded transcripts and approved compact continuity, preserve current
-API identity precedence, and avoid presenting local ownership metadata as Product
-authentication. Product adapters, context compaction, checkpointing, typed
-long-term memory, semantic retrieval, and Organization Intelligence remain later
-independent gates.
+Gate 4 is now implemented as a disabled-by-default local simulation. It uses
+opaque local user/conversation IDs, restores SQLite-backed transcript metadata and
+approved compact continuity, preserves current API identity precedence, and does
+not present local ownership metadata as Product authentication. A version-2 local
+SQLite migration adds one stable `session_id` per conversation while preserving
+Gate 3 records. Product adapters, durable WorkingMemory/Episode persistence,
+context compaction, checkpointing, typed long-term memory, semantic retrieval,
+and Organization Intelligence remain later independent gates.
 
 ## Appendix A. Disposition of the removed OpenCode guide
 
