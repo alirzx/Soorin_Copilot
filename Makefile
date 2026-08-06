@@ -1,17 +1,27 @@
 SHELL := /bin/bash
+.DEFAULT_GOAL := help
 
 # ---------------------------------------------------------------------
-# Deployment inputs
+# Project and deployment inputs
 # ---------------------------------------------------------------------
 
-COMPOSE_ENV ?= compose.env
-COMPOSE := docker compose --env-file "$(COMPOSE_ENV)"
+ROOT_DIR := $(abspath $(dir $(lastword $(MAKEFILE_LIST))))
+COMPOSE_FILE ?= $(ROOT_DIR)/docker-compose.yaml
+ENV_FILE ?= $(ROOT_DIR)/.env
+DOCKERFILE ?= $(ROOT_DIR)/Dockerfile
+DATA_DIR ?= $(ROOT_DIR)/data
+HF_CACHE_DIR ?= $(ROOT_DIR)/huggingface
+EXPORT_DIR ?= $(ROOT_DIR)/dist
 
-# Prefer the project virtual environment locally; fall back to system
-# Python on deployment hosts where no .venv exists.
+COMPOSE := docker compose \
+	--project-directory "$(ROOT_DIR)" \
+	-f "$(COMPOSE_FILE)" \
+	--env-file "$(ENV_FILE)"
+
+# Prefer the project virtual environment locally; fall back to system Python.
 PYTHON ?= $(shell \
-	if [ -x ".venv/bin/python" ]; then \
-		printf '%s' ".venv/bin/python"; \
+	if [ -x "$(ROOT_DIR)/.venv/bin/python" ]; then \
+		printf '%s' "$(ROOT_DIR)/.venv/bin/python"; \
 	elif command -v python3 >/dev/null 2>&1; then \
 		command -v python3; \
 	else \
@@ -19,164 +29,150 @@ PYTHON ?= $(shell \
 	fi \
 )
 
-# Read a key from compose.env without exporting or printing secrets.
-define compose_env_value
-$(strip $(shell sed -n 's/^$(1)=//p' "$(COMPOSE_ENV)" 2>/dev/null | tail -n 1))
+# Read a key from the unified deployment .env without exporting or printing it.
+define env_value
+$(strip $(shell sed -n 's/^$(1)=//p' "$(ENV_FILE)" 2>/dev/null | tail -n 1))
 endef
 
-IMAGE_TAG := $(or $(call compose_env_value,SOORIN_IMAGE_TAG),dev-local)
+IMAGE_TAG := $(or $(call env_value,SOORIN_IMAGE_TAG),dev-local)
 IMAGE := soorin-copilot:$(IMAGE_TAG)
 
-API_BIND_IP := $(or $(call compose_env_value,SOORIN_API_BIND_IP),127.0.0.1)
-API_PORT := $(or $(call compose_env_value,SOORIN_API_PORT),6998)
-UI_BIND_IP := $(or $(call compose_env_value,SOORIN_UI_BIND_IP),127.0.0.1)
-UI_PORT := $(or $(call compose_env_value,SOORIN_UI_PORT),8503)
+API_BIND_IP := $(or $(call env_value,SOORIN_API_BIND_IP),127.0.0.1)
+API_PORT := $(or $(call env_value,SOORIN_API_HOST_PORT),6998)
+UI_BIND_IP := $(or $(call env_value,SOORIN_UI_BIND_IP),127.0.0.1)
+UI_PORT := $(or $(call env_value,SOORIN_UI_HOST_PORT),8503)
 
-APP_UID := $(or $(call compose_env_value,APP_UID),10001)
-APP_GID := $(or $(call compose_env_value,APP_GID),10001)
+# Build-time only. These values are baked into the image and intentionally
+# do not belong to the deployment .env.
+# The defaults preserve the current server image and runtime ownership.
+BUILD_APP_UID ?= 1000
+BUILD_APP_GID ?= 1000
+PYTHON_VERSION ?= 3.12
 
-APP_ENV_FILE := $(or $(call compose_env_value,SOORIN_APP_ENV_FILE),./app/.env)
-DATA_HOST_PATH := $(call compose_env_value,SOORIN_DATA_HOST_PATH)
-HF_CACHE_HOST_PATH := $(call compose_env_value,SOORIN_HF_CACHE_HOST_PATH)
-
-# Read non-secret RAG deployment metadata from the configured application
-# environment file. APP_ENV_FILE may be relative or absolute.
-RAG_COLLECTION := $(strip $(shell \
-	sed -n 's/^SOORIN_RAG_COLLECTION=//p' "$(APP_ENV_FILE)" 2>/dev/null | tail -n 1 \
-))
-RAG_MODEL := $(strip $(shell \
-	sed -n 's/^SOORIN_RAG_EMBEDDING_MODEL=//p' "$(APP_ENV_FILE)" 2>/dev/null | tail -n 1 \
-))
-RAG_REVISION := $(strip $(shell \
-	sed -n 's/^SOORIN_RAG_EMBEDDING_REVISION=//p' "$(APP_ENV_FILE)" 2>/dev/null | tail -n 1 \
-))
+RAG_COLLECTION := $(call env_value,SOORIN_RAG_COLLECTION)
+RAG_MODEL := $(call env_value,SOORIN_RAG_EMBEDDING_MODEL)
+RAG_REVISION := $(call env_value,SOORIN_RAG_EMBEDDING_REVISION)
+RAG_DIMENSION := $(or $(call env_value,SOORIN_RAG_EMBEDDING_DIMENSION),768)
 RAG_MODEL_CACHE_KEY := models--$(subst /,--,$(RAG_MODEL))
-RAG_CONFIG_PATH := $(HF_CACHE_HOST_PATH)/hub/$(RAG_MODEL_CACHE_KEY)/snapshots/$(RAG_REVISION)/config.json
+RAG_CONFIG_PATH := $(HF_CACHE_DIR)/hub/$(RAG_MODEL_CACHE_KEY)/snapshots/$(RAG_REVISION)/config.json
 
 .PHONY: \
-	help preflight check-ports config test-local \
+	help show-config preflight check-ports config test-local \
 	build build-no-cache up down restart logs ps health \
-	inspect-image inspect-size export
+	inspect-image inspect-size export clean-export
 
 # ---------------------------------------------------------------------
-# Help
+# Help and non-secret configuration
 # ---------------------------------------------------------------------
 
 help:
 	@echo "Available targets:"
-	@echo "  make preflight        Validate deployment files, mounts, RAG data and permissions"
+	@echo "  make preflight        Validate files, image, mounts, RAG data and permissions"
 	@echo "  make check-ports      Verify configured API and UI host ports are available"
-	@echo "  make config           Validate the resolved Compose configuration"
+	@echo "  make config           Validate docker-compose.yaml with the unified .env"
+	@echo "  make show-config      Print non-secret resolved deployment values"
 	@echo "  make test-local       Run the complete offline test suite"
-	@echo "  make build            Build the image using Docker cache"
-	@echo "  make build-no-cache   Build the image without Docker cache"
-	@echo "  make up               Recreate and start containers without rebuilding"
-	@echo "  make down             Stop containers while preserving host-mounted data"
+	@echo "  make build            Build the image directly with Docker cache"
+	@echo "  make build-no-cache   Build the image directly without Docker cache"
+	@echo "  make up               Validate, then start the prebuilt image"
+	@echo "  make down             Stop containers while preserving bind-mounted data"
 	@echo "  make restart          Recreate containers without rebuilding"
 	@echo "  make logs             Follow API and UI logs"
 	@echo "  make ps               Show Compose service status"
 	@echo "  make health           Check API, OpenAPI and Streamlit health"
 	@echo "  make inspect-image    Verify CPU-only and image-content contracts"
 	@echo "  make inspect-size     Show the largest installed runtime packages"
-	@echo "  make export           Export the image and generate its SHA-256 checksum"
-	@echo
-	@echo "Configuration:"
-	@echo "  COMPOSE_ENV=$(COMPOSE_ENV)"
-	@echo "  APP_ENV_FILE=$(APP_ENV_FILE)"
-	@echo "  IMAGE=$(IMAGE)"
+	@echo "  make export           Export the image tar and SHA-256 checksum into dist/"
+	@echo "  make clean-export     Remove generated image archives from dist/"
+
+show-config:
+	@echo "ROOT_DIR=$(ROOT_DIR)"
+	@echo "COMPOSE_FILE=$(COMPOSE_FILE)"
+	@echo "ENV_FILE=$(ENV_FILE)"
+	@echo "IMAGE=$(IMAGE)"
+	@echo "DATA_DIR=$(DATA_DIR)"
+	@echo "HF_CACHE_DIR=$(HF_CACHE_DIR)"
+	@echo "API=$(API_BIND_IP):$(API_PORT)"
+	@echo "UI=$(UI_BIND_IP):$(UI_PORT)"
+	@echo "BUILD_APP_UID=$(BUILD_APP_UID)"
+	@echo "BUILD_APP_GID=$(BUILD_APP_GID)"
 
 # ---------------------------------------------------------------------
 # Validation
 # ---------------------------------------------------------------------
 
 preflight:
-	@test -f "$(COMPOSE_ENV)" || \
-		(echo "Preflight failed: $(COMPOSE_ENV) is missing."; exit 1)
-	@test -f "$(APP_ENV_FILE)" || \
-		(echo "Preflight failed: $(APP_ENV_FILE) is missing."; exit 1)
+	@test -f "$(COMPOSE_FILE)" || \
+		(echo "Preflight failed: $(COMPOSE_FILE) is missing."; exit 1)
+	@test -f "$(ENV_FILE)" || \
+		(echo "Preflight failed: $(ENV_FILE) is missing."; exit 1)
+	@test -f "$(DOCKERFILE)" || \
+		(echo "Preflight failed: $(DOCKERFILE) is missing."; exit 1)
 	@command -v docker >/dev/null 2>&1 || \
 		(echo "Preflight failed: docker is unavailable."; exit 1)
 	@docker compose version >/dev/null 2>&1 || \
 		(echo "Preflight failed: Docker Compose v2 is unavailable."; exit 1)
 	@test -x "$(PYTHON)" || command -v "$(PYTHON)" >/dev/null 2>&1 || \
 		(echo "Preflight failed: Python interpreter is unavailable: $(PYTHON)"; exit 1)
+	@docker image inspect "$(IMAGE)" >/dev/null 2>&1 || \
+		(echo "Preflight failed: image is not loaded: $(IMAGE)"; exit 1)
 
-	@test -n "$(DATA_HOST_PATH)" || \
-		(echo "Preflight failed: SOORIN_DATA_HOST_PATH is not configured."; exit 1)
-	@test -d "$(DATA_HOST_PATH)" || \
-		(echo "Preflight failed: data host path does not exist: $(DATA_HOST_PATH)"; exit 1)
-
-	@test -n "$(HF_CACHE_HOST_PATH)" || \
-		(echo "Preflight failed: SOORIN_HF_CACHE_HOST_PATH is not configured."; exit 1)
-	@test -d "$(HF_CACHE_HOST_PATH)" || \
-		(echo "Preflight failed: Hugging Face cache does not exist: $(HF_CACHE_HOST_PATH)"; exit 1)
+	@test -d "$(DATA_DIR)" || \
+		(echo "Preflight failed: data directory does not exist: $(DATA_DIR)"; exit 1)
+	@test -d "$(HF_CACHE_DIR)" || \
+		(echo "Preflight failed: Hugging Face cache does not exist: $(HF_CACHE_DIR)"; exit 1)
 
 	@test -n "$(RAG_COLLECTION)" || \
-		(echo "Preflight failed: SOORIN_RAG_COLLECTION is missing from $(APP_ENV_FILE)."; exit 1)
+		(echo "Preflight failed: SOORIN_RAG_COLLECTION is missing from $(ENV_FILE)."; exit 1)
 	@test -n "$(RAG_MODEL)" || \
-		(echo "Preflight failed: SOORIN_RAG_EMBEDDING_MODEL is missing from $(APP_ENV_FILE)."; exit 1)
+		(echo "Preflight failed: SOORIN_RAG_EMBEDDING_MODEL is missing from $(ENV_FILE)."; exit 1)
 	@test -n "$(RAG_REVISION)" || \
-		(echo "Preflight failed: SOORIN_RAG_EMBEDDING_REVISION is missing from $(APP_ENV_FILE)."; exit 1)
+		(echo "Preflight failed: SOORIN_RAG_EMBEDDING_REVISION is missing from $(ENV_FILE)."; exit 1)
 
-	@$(PYTHON) -c 'import os, stat, sys; \
-p=sys.argv[1]; uid=int(sys.argv[2]); gid=int(sys.argv[3]); s=os.stat(p); \
-checks=((s.st_uid==uid, stat.S_IWUSR|stat.S_IXUSR), \
-(s.st_gid==gid, stat.S_IWGRP|stat.S_IXGRP), \
-(True, stat.S_IWOTH|stat.S_IXOTH)); \
-ok=any(owner and (s.st_mode & mask)==mask for owner,mask in checks); \
-sys.exit(0 if ok else "Preflight failed: data path is not writable/traversable by APP_UID/APP_GID.")' \
-		"$(DATA_HOST_PATH)" "$(APP_UID)" "$(APP_GID)"
-
-	@test -f "$(DATA_HOST_PATH)/qdrant-local/meta.json" || \
-		(echo "Preflight failed: qdrant-local/meta.json is missing."; exit 1)
-
-	@$(PYTHON) -c 'import json, sys; \
-data=json.load(open(sys.argv[1], encoding="utf-8")); collection=sys.argv[2]; \
-sys.exit(0 if collection in data.get("collections", {}) \
-else "Preflight failed: configured Qdrant collection is absent from metadata.")' \
-		"$(DATA_HOST_PATH)/qdrant-local/meta.json" "$(RAG_COLLECTION)"
-
-	@test -f "$(DATA_HOST_PATH)/processed/topology_graph.pkl" || \
-		(echo "Preflight failed: processed/topology_graph.pkl is missing."; exit 1)
-	@test -f "$(DATA_HOST_PATH)/raw/topology_raw.json" || \
-		(echo "Preflight failed: raw/topology_raw.json is missing."; exit 1)
-	@test -f "$(DATA_HOST_PATH)/processed/topology_stats.json" || \
-		(echo "Preflight failed: processed/topology_stats.json is missing."; exit 1)
-
-	@test -r "$(RAG_CONFIG_PATH)" || \
-		(echo "Preflight failed: cached embedding model revision is unreadable: $(RAG_CONFIG_PATH)"; exit 1)
-
-	@$(PYTHON) -c 'import json, sys; \
-data=json.load(open(sys.argv[1], encoding="utf-8")); \
-sys.exit(0 if int(data.get("hidden_size", 0)) == 768 \
-else "Preflight failed: cached embedding model hidden_size is not 768.")' \
+	@$(PYTHON) -c 'from pathlib import Path; import sys; \
+required=sys.argv[1:]; missing=[p for p in required if not Path(p).is_file()]; \
+sys.exit("Preflight failed: missing runtime files: " + ", ".join(missing) if missing else 0)' \
+		"$(DATA_DIR)/qdrant-local/meta.json" \
+		"$(DATA_DIR)/processed/topology_graph.pkl" \
+		"$(DATA_DIR)/raw/topology_raw.json" \
+		"$(DATA_DIR)/processed/topology_stats.json" \
 		"$(RAG_CONFIG_PATH)"
 
-	@$(PYTHON) -c 'import os, stat, sys; \
-root=sys.argv[1]; config=sys.argv[2]; uid=int(sys.argv[3]); gid=int(sys.argv[4]); \
-def allowed(path, owner_mask, group_mask, other_mask): \
- s=os.stat(path); \
- return ((s.st_uid==uid and (s.st_mode & owner_mask)==owner_mask) or \
-         (s.st_gid==gid and (s.st_mode & group_mask)==group_mask) or \
-         ((s.st_mode & other_mask)==other_mask)); \
-ok=allowed(root, stat.S_IRUSR|stat.S_IXUSR, stat.S_IRGRP|stat.S_IXGRP, stat.S_IROTH|stat.S_IXOTH) \
-and allowed(config, stat.S_IRUSR, stat.S_IRGRP, stat.S_IROTH); \
-sys.exit(0 if ok else "Preflight failed: APP_UID/APP_GID cannot read the Hugging Face cache.")' \
-		"$(HF_CACHE_HOST_PATH)" "$(RAG_CONFIG_PATH)" "$(APP_UID)" "$(APP_GID)"
+	@$(PYTHON) -c 'import json, sys; \
+meta=json.load(open(sys.argv[1], encoding="utf-8")); collection=sys.argv[2]; \
+sys.exit(0 if collection in meta.get("collections", {}) \
+else "Preflight failed: configured Qdrant collection is absent from metadata.")' \
+		"$(DATA_DIR)/qdrant-local/meta.json" "$(RAG_COLLECTION)"
+
+	@$(PYTHON) -c 'import json, sys; \
+config=json.load(open(sys.argv[1], encoding="utf-8")); expected=int(sys.argv[2]); \
+actual=int(config.get("hidden_size", 0)); \
+sys.exit(0 if actual == expected \
+else f"Preflight failed: cached embedding dimension is {actual}, expected {expected}.")' \
+		"$(RAG_CONFIG_PATH)" "$(RAG_DIMENSION)"
+
+	@docker run --rm --entrypoint sh \
+		-v "$(DATA_DIR):/workspace/data" \
+		-v "$(HF_CACHE_DIR):/home/soorin/.cache/huggingface:ro" \
+		"$(IMAGE)" -c \
+		'test -w /workspace/data && \
+		test -r "/home/soorin/.cache/huggingface/hub/$(RAG_MODEL_CACHE_KEY)/snapshots/$(RAG_REVISION)/config.json"' || \
+		(echo "Preflight failed: the image user cannot write data or read the model cache."; exit 1)
 
 	@$(COMPOSE) config --quiet
 	@echo "Preflight passed."
 
-# Run this before starting containers. It is intentionally separate from
-# preflight because occupied ports are expected while the stack is running.
+# Run before starting a stopped stack. Occupied ports are expected while it runs.
 check-ports:
 	@$(PYTHON) -c 'import socket, sys; \
 pairs=((sys.argv[1], int(sys.argv[2]), "API"), (sys.argv[3], int(sys.argv[4]), "UI")); \
 failed=[]; \
 exec("for host, port, name in pairs:\n" \
-"    sock=socket.socket()\n" \
+"    bind_host = \"0.0.0.0\" if host in {\"::\", \"[::]\"} else host\n" \
+"    family = socket.AF_INET6 if \"::\" in bind_host else socket.AF_INET\n" \
+"    sock=socket.socket(family)\n" \
 "    try:\n" \
-"        sock.bind((host, port))\n" \
+"        sock.bind((bind_host, port))\n" \
 "    except OSError as exc:\n" \
 "        failed.append(f\"{name} {host}:{port} ({exc})\")\n" \
 "    finally:\n" \
@@ -190,26 +186,46 @@ config:
 	@echo "Compose configuration is valid."
 
 # ---------------------------------------------------------------------
-# Testing and lifecycle
+# Testing and image build
 # ---------------------------------------------------------------------
 
 test-local:
-	PYTHONPATH=app $(PYTHON) -m pytest -q app/src/tests
+	cd "$(ROOT_DIR)" && PYTHONPATH=app "$(PYTHON)" -m pytest -q app/src/tests
 
 build:
-	DOCKER_BUILDKIT=1 $(COMPOSE) build api
+	@test -f "$(ENV_FILE)" || \
+		(echo "Build failed: $(ENV_FILE) is missing."; exit 1)
+	DOCKER_BUILDKIT=1 docker build \
+		--build-arg PYTHON_VERSION="$(PYTHON_VERSION)" \
+		--build-arg APP_UID="$(BUILD_APP_UID)" \
+		--build-arg APP_GID="$(BUILD_APP_GID)" \
+		-f "$(DOCKERFILE)" \
+		-t "$(IMAGE)" \
+		"$(ROOT_DIR)"
 
 build-no-cache:
-	DOCKER_BUILDKIT=1 $(COMPOSE) build --no-cache api
+	@test -f "$(ENV_FILE)" || \
+		(echo "Build failed: $(ENV_FILE) is missing."; exit 1)
+	DOCKER_BUILDKIT=1 docker build --no-cache \
+		--build-arg PYTHON_VERSION="$(PYTHON_VERSION)" \
+		--build-arg APP_UID="$(BUILD_APP_UID)" \
+		--build-arg APP_GID="$(BUILD_APP_GID)" \
+		-f "$(DOCKERFILE)" \
+		-t "$(IMAGE)" \
+		"$(ROOT_DIR)"
 
-up:
-	$(COMPOSE) up -d --force-recreate --no-build
+# ---------------------------------------------------------------------
+# Lifecycle
+# ---------------------------------------------------------------------
+
+up: preflight check-ports
+	$(COMPOSE) up -d --no-build --remove-orphans
 
 down:
 	$(COMPOSE) down --remove-orphans
 
-restart:
-	$(COMPOSE) up -d --force-recreate --no-build
+restart: preflight
+	$(COMPOSE) up -d --force-recreate --no-build --remove-orphans
 
 logs:
 	$(COMPOSE) logs -f --tail=200
@@ -218,12 +234,22 @@ ps:
 	$(COMPOSE) ps
 
 health:
-	@curl -fsS "http://127.0.0.1:$(API_PORT)/health"
-	@echo
-	@curl -fsS "http://127.0.0.1:$(API_PORT)/openapi.json" >/dev/null
-	@echo "OpenAPI OK"
-	@curl -fsS "http://127.0.0.1:$(UI_PORT)/_stcore/health"
-	@echo
+	@API_HEALTH_HOST="$(API_BIND_IP)"; \
+	if [ "$$API_HEALTH_HOST" = "0.0.0.0" ] || \
+	   [ "$$API_HEALTH_HOST" = "::" ] || \
+	   [ "$$API_HEALTH_HOST" = "[::]" ]; then \
+		API_HEALTH_HOST=127.0.0.1; \
+	fi; \
+	UI_HEALTH_HOST="$(UI_BIND_IP)"; \
+	if [ "$$UI_HEALTH_HOST" = "0.0.0.0" ] || \
+	   [ "$$UI_HEALTH_HOST" = "::" ] || \
+	   [ "$$UI_HEALTH_HOST" = "[::]" ]; then \
+		UI_HEALTH_HOST=127.0.0.1; \
+	fi; \
+	curl -fsS "http://$$API_HEALTH_HOST:$(API_PORT)/health"; echo; \
+	curl -fsS "http://$$API_HEALTH_HOST:$(API_PORT)/openapi.json" >/dev/null; \
+	echo "OpenAPI OK"; \
+	curl -fsS "http://$$UI_HEALTH_HOST:$(UI_PORT)/_stcore/health"; echo
 
 # ---------------------------------------------------------------------
 # Image inspection and export
@@ -245,6 +271,7 @@ print("CPU Torch OK:", torch.__version__)'
 test -z "$$(find /workspace/data -type f -print -quit)"; \
 test -z "$$(find /home/soorin/.cache/huggingface -type f -print -quit)"; \
 test ! -e /workspace/app/.env; \
+test ! -e /workspace/.env; \
 test ! -e /workspace/compose.env'
 	@echo "Image content safeguards passed."
 
@@ -254,9 +281,16 @@ inspect-size:
 du -sh /opt/venv/lib/python3.12/site-packages/* 2>/dev/null | sort -h | tail -25'
 
 export:
+	@mkdir -p "$(EXPORT_DIR)"
 	docker save \
-		-o "soorin-copilot-$(IMAGE_TAG).tar" \
+		-o "$(EXPORT_DIR)/soorin-copilot-$(IMAGE_TAG).tar" \
 		"$(IMAGE)"
 	sha256sum \
-		"soorin-copilot-$(IMAGE_TAG).tar" \
-		> "soorin-copilot-$(IMAGE_TAG).tar.sha256"
+		"$(EXPORT_DIR)/soorin-copilot-$(IMAGE_TAG).tar" \
+		> "$(EXPORT_DIR)/soorin-copilot-$(IMAGE_TAG).tar.sha256"
+	@echo "Exported to $(EXPORT_DIR)"
+
+clean-export:
+	rm -f \
+		"$(EXPORT_DIR)/soorin-copilot-$(IMAGE_TAG).tar" \
+		"$(EXPORT_DIR)/soorin-copilot-$(IMAGE_TAG).tar.sha256"

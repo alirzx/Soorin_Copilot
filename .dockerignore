@@ -28,8 +28,6 @@ compose.env.*
 
 # Keep safe examples available
 !.env.example
-!app/.env.example
-!compose.env.example
 
 # Generated and runtime data
 data/
@@ -71,3 +69,4 @@ copilot_tmp_response_test/
 .agents/
 .mimocode/
 Dockerfile.rebase
+huggingface/

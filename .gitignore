@@ -31,10 +31,8 @@ wheels/
 !.env.example
 app/.env
 app/.env.*
-!app/.env.example
 compose.env
 compose.env.*
-!compose.env.example
 
 # Certificates and private keys
 *.pem
@@ -88,3 +86,4 @@ desktop.ini
 
 
 postman/
+huggingface/
