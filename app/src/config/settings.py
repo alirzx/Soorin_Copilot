@@ -186,6 +186,13 @@ class Settings:
     conversation_summary_max_tokens: int
     conversation_summary_temperature: float
     conversation_summary_timeout_seconds: int
+    durable_working_memory_enabled: bool
+    memory_relevant_turn_limit: int
+    memory_relevant_turn_token_budget: int
+    memory_episode_retention_limit: int
+    memory_episode_context_limit: int
+    memory_episode_context_token_budget: int
+    memory_context_token_budget: int
     local_product_simulation_enabled: bool
     streamlit_auth_backend: str
     local_test_user_creation_enabled: bool
@@ -590,6 +597,23 @@ def get_settings() -> Settings:
         conversation_summary_max_tokens=_int("SOORIN_CONVERSATION_SUMMARY_MAX_TOKENS", 700),
         conversation_summary_temperature=_float("SOORIN_CONVERSATION_SUMMARY_TEMPERATURE", 0.0),
         conversation_summary_timeout_seconds=_int("SOORIN_CONVERSATION_SUMMARY_TIMEOUT_SECONDS", 30),
+        durable_working_memory_enabled=_bool("SOORIN_DURABLE_WORKING_MEMORY_ENABLED", True),
+        memory_relevant_turn_limit=max(0, _int("SOORIN_MEMORY_RELEVANT_TURN_LIMIT", 4)),
+        memory_relevant_turn_token_budget=max(
+            0, _int("SOORIN_MEMORY_RELEVANT_TURN_TOKEN_BUDGET", 900)
+        ),
+        memory_episode_retention_limit=max(
+            1, _int("SOORIN_MEMORY_EPISODE_RETENTION_LIMIT", 12)
+        ),
+        memory_episode_context_limit=max(
+            0, _int("SOORIN_MEMORY_EPISODE_CONTEXT_LIMIT", 2)
+        ),
+        memory_episode_context_token_budget=max(
+            0, _int("SOORIN_MEMORY_EPISODE_CONTEXT_TOKEN_BUDGET", 300)
+        ),
+        memory_context_token_budget=max(
+            0, _int("SOORIN_MEMORY_CONTEXT_TOKEN_BUDGET", 1400)
+        ),
         local_product_simulation_enabled=_bool(
             "SOORIN_LOCAL_PRODUCT_SIMULATION_ENABLED",
             False,
