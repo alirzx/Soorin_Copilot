@@ -291,10 +291,11 @@ Gate 3 does not permit to be serialized. `SOORIN_LANGGRAPH_CHECKPOINT_BACKEND=sq
 therefore logs an explicit deferral and does not open a checkpoint database.
 Interrupted workflows cannot resume after a restart.
 
-Separately, Gate 3 provides an opt-in local SQLite `ChatRepository` and compact
+Separately, Gate 5 provides an opt-in local SQLite `ChatRepository` and bounded
 `ThreadStateStore`. These adapters do not persist arbitrary LangGraph state. They
-store owner-scoped local transcripts/request status and approved routing continuity
-only, and are disabled by default.
+store owner-scoped transcripts/request status plus one versioned
+`ThreadMemoryState` with routing continuity, working-summary provenance, bounded
+turn references, and bounded episode summaries. They are disabled by default.
 
 ### Service responsibilities after refactor
 
@@ -586,9 +587,8 @@ Conversation history is trimmed to fit budget, preferring current evidence over 
 Implemented in `app/src/core/memory`.
 
 The default remains in-memory per process. When explicitly enabled for local
-development, SQLite can persist Product-chat simulation records and compact routing
-continuity across process restarts. Raw recent history, working memory, episodes,
-and workflow execution state remain process-local.
+development, SQLite persists Product-chat simulation records and bounded thread
+memory across process restarts. Full workflow execution state remains process-local.
 
 Conversation memory:
 
@@ -600,6 +600,10 @@ Conversation memory:
 - Detaches raw history when entity, pair, or topic changes; a previous episode summary re-enters only for a matching context key.
 - Retains bounded old episode records without treating them as current provider evidence.
 - Does not use an LLM for summaries.
+- Selects same-conversation turns deterministically by active topic/entity,
+  investigation relevance, and recency, with strict turn, episode, and total budgets.
+- Produces a storage-neutral `MemoryContextPackage` before final model context;
+  fresh operational evidence remains authoritative over memory.
 
 Routing state:
 
@@ -624,9 +628,11 @@ Local SQLite mode:
 - This is local development/test infrastructure. Production ownership and durable
   transcripts remain a future Product PostgreSQL or Product API adapter concern.
 
-### Local Streamlit simulation
+### Unified internal Streamlit workspace
 
-Gate 4 adds an opt-in local development simulation. With
+Gate 5 routes legacy and local-simulation chat through one `ChatBackend` contract,
+`ConversationController`, chronological message renderer, and SSE event loop.
+`LegacyDirectBackend` preserves the existing single-session developer workflow. With
 `SOORIN_LOCAL_PRODUCT_SIMULATION_ENABLED=true` and
 `SOORIN_STREAMLIT_AUTH_BACKEND=local_simulation`, Streamlit shows a password-free
 local user selector, local chatrooms, and the existing topology workspace. It
@@ -638,9 +644,10 @@ Each local conversation receives an opaque `conversation_id` and one stable
 is reused as compatibility/runtime metadata. Completed user/assistant turns are
 committed only by the existing SSE workflow and reloaded after `done`; Streamlit
 does not write transcript messages itself. Local users are development metadata,
-not Product users or authentication claims. OIDC is not configured, and durable
-Working Memory, Episodes, semantic cross-chat retrieval, and LangGraph
-checkpointing remain deferred.
+not Product users or authentication claims. OIDC is not configured. Working
+summary, relevant turns, and episodes are restored through the same memory ports.
+Semantic cross-chat retrieval, Product/PostgreSQL adapters, Qdrant memory search,
+and LangGraph checkpointing remain deferred.
 
 Each successful service request constructs one new `SessionRoutingState` and calls the state store once. Explicit-message, UI, and session entity authority remains owned by the resolver/router normalization path. General detached turns preserve useful active entity state. Safe-failure requests preserve prior active state unless the current request supplied a valid explicit or UI-authoritative investigation entity; Planner arguments and final prose are never state inputs.
 
@@ -708,6 +715,8 @@ Current UI:
 - UI context includes selected graph IP only when one is selected.
 - Help content explains asset authority, evidence sources, example prompts, and precision tips.
 - Topology page is embedded beside the chat area.
+- Legacy and local-simulation modes share one backend protocol, controller,
+  chronological chat renderer, and SSE event-processing path.
 
 ## 19. Deployment
 

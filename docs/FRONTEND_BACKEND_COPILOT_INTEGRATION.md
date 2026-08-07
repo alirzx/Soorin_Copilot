@@ -405,7 +405,8 @@ still matters for UX, but true upstream cancellation is a required follow-up.
 
 ## 13. Current Streamlit implementation
 
-The reference UI in `app/app_st.py`:
+The reference UI uses `app/app_st.py` as a shell and shared controllers under
+`app/src/web`:
 
 - creates `uuid4().hex` once in `st.session_state.session_id`;
 - reuses it for all messages until "Clear chat";
@@ -429,6 +430,8 @@ The reference UI in `app/app_st.py`:
   protected request (`/chat`, `/chat/stream`, `/llm/health`) and omits the header
   from the unauthenticated `/health` endpoint;
 - shows a sidebar warning when `SOORIN_COPILOT_API_KEY` is not configured.
+- selects `LegacyDirectBackend` or `LocalSimulationBackend` behind one
+  `ChatBackend` contract and one conversation/message/SSE renderer.
 
 Streamlit-specific behavior that must not be copied: direct pickle access,
 in-process Graph functions, Streamlit session state as durable history, PyVis's
@@ -823,11 +826,10 @@ That is not implemented in this audit to avoid changing the runtime contract.
 
 ## 26. Chat persistence responsibilities
 
-Current Copilot memory is bounded, in-process memory. It stores recent raw
-user/assistant turns, compact summaries/episodes, and active routing entities.
-It is not durable and is lost on restart. The Streamlit UI separately stores
-display messages only in Streamlit session state. No Product database chat
-persistence was found in this repository.
+Current Copilot memory is bounded. Its default backend remains in process, while
+the opt-in local simulation persists owner-scoped transcripts and one bounded
+`ThreadMemoryState` in development SQLite. Relevant-turn retrieval is deterministic
+and same-conversation only; it does not use embeddings or cross-chat search.
 
 Recommended division:
 
@@ -841,9 +843,13 @@ Product database
 
 Copilot runtime
   bounded active entity and routing/workflow memory
-  compact short-term context
+  compact short-term context through storage-neutral memory ports
   no claim of durable chat history
 ```
+
+Production must replace SQLite with Product Memory API/PostgreSQL adapters that
+preserve ownership, revision, transcript, thread-state, summary, and episode
+semantics. Copilot SQLite is development/test/demo infrastructure only.
 
 Persist only the final committed assistant message after `done`; store partial
 output separately as interrupted if Product policy requires it.
@@ -989,9 +995,11 @@ then include the `Authorization: Bearer <token>` header automatically.
 
 - no tenant/user authorization (static API key only);
 - session IDs are arbitrary, unbounded strings and are not identity scoped;
-- raw session/episode memory does not survive restart or safely span replicas;
-- optional local SQLite routing continuity is development-only and is not a
-  production ownership, authorization, or multi-replica solution;
+- Product Memory API/PostgreSQL adapters are not implemented;
+- deterministic retrieval is same-conversation only; semantic/cross-conversation
+  memory and a Qdrant memory index are not implemented;
+- local SQLite thread memory is development-only and is not a production
+  ownership, authorization, or multi-replica solution;
 - browser disconnect does not cancel upstream model/workflow execution;
 - no heartbeats during long pre-answer periods;
 - no public request/trace ID;

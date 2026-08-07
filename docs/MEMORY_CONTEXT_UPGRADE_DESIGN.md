@@ -483,15 +483,29 @@ revisions. The official LangGraph SQLite checkpointer is deliberately deferred:
 the current workflow state needs a checkpoint-safe projection before it can be
 serialized without unrestricted messages or full evidence objects.
 
-Gate 4 may add a local-only Streamlit login/chatroom simulation over these ports.
 Gate 4 is now implemented as a disabled-by-default local simulation. It uses
 opaque local user/conversation IDs, restores SQLite-backed transcript metadata and
 approved compact continuity, preserves current API identity precedence, and does
 not present local ownership metadata as Product authentication. A version-2 local
 SQLite migration adds one stable `session_id` per conversation while preserving
-Gate 3 records. Product adapters, durable WorkingMemory/Episode persistence,
-context compaction, checkpointing, typed long-term memory, semantic retrieval,
-and Organization Intelligence remain later independent gates.
+Gate 3 records. Product adapters, full context compaction, checkpointing, typed
+long-term memory, semantic retrieval, and Organization Intelligence remain later
+independent gates.
+
+Gate 5 unifies legacy and local-simulation chat behind one UI-side backend
+contract and shared controller/SSE renderer. It adds one versioned bounded
+`ThreadMemoryState`, an idempotent SQLite v2-to-v3 migration, persisted working
+summary provenance, bounded completed-turn references, bounded episode summaries,
+deterministic same-conversation relevant-turn selection, and a budgeted
+`MemoryContextPackage` before final model context composition.
+
+Still deferred are Product Memory API/PostgreSQL adapters, semantic or
+cross-conversation retrieval, BGE/Qdrant memory indexing, full LangGraph
+checkpointing, Organization Intelligence, and Profile/Detection multi-view or
+delta context compaction. A future Product adapter must preserve owner scope,
+stable session identity, optimistic revision, schema version, ordered completed
+transcript reads, bounded episode retention, and non-fatal unavailable/conflict
+classification; endpoint paths remain a Product contract decision.
 
 ## Appendix A. Disposition of the removed OpenCode guide
 
