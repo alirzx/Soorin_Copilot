@@ -4,12 +4,11 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from uuid import uuid4
-
 import streamlit as st
 
 from src.config.settings import Settings
-from src.web.copilot_help import render_copilot_help_button
+from src.web.chat_backend import ConversationController, LocalSimulationBackend
+from src.web.chat_ui import render_conversation_chat
 from src.web.local_simulation import (
     LOCAL_CONVERSATION_KEY,
     LOCAL_DELETE_CONFIRMATION_KEY,
@@ -148,73 +147,19 @@ def _chat(client: LocalSimulationApiClient, user_id: str) -> None:
     st.caption(f"Conversation: {conversation.title or conversation.conversation_id[:12]}")
     selected_ip = st.session_state.get("selected_copilot_ip")
     st.caption(f"Selected topology asset: {selected_ip or 'none'}")
-    for item in st.session_state.get(LOCAL_MESSAGES_KEY, []):
-        role = str(item.get("role") or "")
-        if role in {"user", "assistant"}:
-            with st.chat_message(role):
-                st.markdown(str(item.get("content") or ""))
-    render_copilot_help_button()
-    streaming = bool(st.session_state.get(LOCAL_STREAMING_KEY))
-    prompt = st.chat_input(
-        "Ask a cybersecurity investigation question",
-        key=f"local_chat_input_{conversation.conversation_id}",
-        max_chars=4000,
-        disabled=streaming,
-        submit_mode="disable",
-    )
-    if not prompt:
-        return
-    request_id = uuid4().hex
-    st.session_state[LOCAL_PENDING_REQUEST_KEY] = request_id
-    st.session_state[LOCAL_STREAMING_KEY] = True
-    with st.chat_message("user"):
-        st.markdown(prompt)
-    status = st.status("Connecting to Copilot", expanded=False)
-    answer_parts: list[str] = []
-    completed = False
-    error = ""
-    with st.chat_message("assistant"):
-        placeholder = st.empty()
-        try:
-            status.update(label="Investigating", state="running", expanded=False)
-            for event in client.stream_chat(
-                user_id=user_id,
-                conversation=conversation,
-                request_id=request_id,
-                message=prompt,
-                selected_ip=selected_ip,
-            ):
-                if event.get("type") == "answer_delta" and isinstance(event.get("text"), str):
-                    answer_parts.append(event["text"])
-                    placeholder.markdown("".join(answer_parts) + "▌")
-                elif event.get("type") == "done":
-                    completed = True
-                elif event.get("type") == "error":
-                    error = str(event.get("message") or "The Copilot request failed.")
-                    break
-        except LocalSimulationClientError as exc:
-            error = str(exc)
-        finally:
-            st.session_state[LOCAL_STREAMING_KEY] = False
-            st.session_state.pop(LOCAL_PENDING_REQUEST_KEY, None)
-    if completed:
-        status.update(label="Response complete", state="complete", expanded=False)
-        try:
-            st.session_state[LOCAL_MESSAGES_KEY] = client.get_messages(user_id, conversation.conversation_id)
-            logger.info("event=local_ui_stream_completed request_id=%s", request_id)
-            st.rerun()
-        except LocalSimulationClientError as exc:
-            st.error(str(exc))
-    else:
-        status.update(label="Request failed", state="error", expanded=False)
-        if answer_parts:
-            placeholder.markdown("".join(answer_parts))
-        st.error(error or "The Copilot stream ended before completion.")
-        try:
-            st.session_state[LOCAL_MESSAGES_KEY] = client.get_messages(user_id, conversation.conversation_id)
-        except LocalSimulationClientError:
-            pass
-        logger.info("event=local_ui_stream_failed request_id=%s", request_id)
+    backend = LocalSimulationBackend(client, st.session_state)
+    controller = ConversationController(backend)
+    if render_conversation_chat(
+        controller,
+        conversation,
+        selected_ip=selected_ip,
+        input_key=f"local_chat_input_{conversation.conversation_id}",
+        streaming_key=LOCAL_STREAMING_KEY,
+        error_types=(LocalSimulationClientError, RuntimeError),
+    ):
+        st.session_state[LOCAL_MESSAGES_KEY] = backend.get_messages(conversation.conversation_id)
+        logger.info("event=local_ui_stream_completed")
+        st.rerun()
 
 
 def run_local_simulation_workspace(settings: Settings) -> None:

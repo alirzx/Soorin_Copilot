@@ -13,7 +13,8 @@ import streamlit as st
 from src.config.settings import get_settings
 from src.core.graph.loader import set_graph_path, load_graph
 from src.web.chat_stream import ChatStreamProtocolError, parse_sse_events
-from src.web.copilot_help import render_copilot_help_button
+from src.web.chat_backend import ConversationController, LegacyDirectBackend
+from src.web.chat_ui import render_conversation_chat
 from src.web.local_simulation import copilot_auth_headers
 from src.web.local_simulation_ui import run_local_simulation_workspace
 from src.web.pages.topology import build_copilot_ui_context, show_topology_page
@@ -301,74 +302,17 @@ with left_col:
         "and Knowledge tools for each question."
     )
 
-    for item in st.session_state.messages:
-        with st.chat_message(item["role"]):
-            st.markdown(item["content"])
-
-    submitted_turn = st.container()
-    render_copilot_help_button()
-
-    if prompt := st.chat_input("Ask a cybersecurity question"):
-        st.session_state.messages.append({"role": "user", "content": prompt})
-        with submitted_turn:
-            with st.chat_message("user"):
-                st.markdown(prompt)
-            thinking_status = st.status("Thinking...", expanded=True)
-            with thinking_status:
-                thinking_placeholder = st.empty()
-                thinking_placeholder.caption("Waiting for the model response...")
-            with st.chat_message("assistant"):
-                answer_placeholder = st.empty()
-                reasoning_parts: list[str] = []
-                answer_parts: list[str] = []
-                stream_complete = False
-                stream_error = ""
-                try:
-                    for event in stream_copilot(prompt):
-                        event_type = event.get("type")
-                        text = event.get("text")
-                        if event_type == "reasoning_delta" and isinstance(text, str):
-                            reasoning_parts.append(text)
-                            thinking_placeholder.markdown("".join(reasoning_parts))
-                        elif event_type == "answer_delta" and isinstance(text, str):
-                            answer_parts.append(text)
-                            answer_placeholder.markdown("".join(answer_parts) + "▌")
-                        elif event_type == "done":
-                            stream_complete = True
-                        elif event_type == "error":
-                            stream_error = str(
-                                event.get("message")
-                                or "The Copilot could not complete the streamed response."
-                            )
-                            break
-                except ChatStreamClientError as exc:
-                    stream_error = str(exc)
-
-                answer = "".join(answer_parts).strip()
-                if stream_complete and answer:
-                    answer_placeholder.markdown(answer)
-                    thinking_status.update(
-                        label="Thinking complete",
-                        state="complete",
-                        expanded=False,
-                    )
-                    st.session_state.messages.append({"role": "assistant", "content": answer})
-                else:
-                    stream_error = stream_error or "The Copilot stream ended without a complete answer."
-                    if answer:
-                        answer_placeholder.markdown(answer)
-                    st.error(stream_error)
-                    thinking_status.update(
-                        label="Response interrupted",
-                        state="error",
-                        expanded=True,
-                    )
-                    if not answer:
-                        st.session_state.messages.append(
-                            {"role": "assistant", "content": stream_error}
-                        )
-        if stream_complete and answer or not answer:
-            st.rerun()
+    legacy_backend = LegacyDirectBackend(st.session_state, stream_copilot)
+    legacy_conversation = legacy_backend.list_conversations()[0]
+    if render_conversation_chat(
+        ConversationController(legacy_backend),
+        legacy_conversation,
+        selected_ip=selected_ip,
+        input_key="legacy_chat_input",
+        streaming_key="legacy_chat_streaming",
+        error_types=(ChatStreamClientError,),
+    ):
+        st.rerun()
 
 with right_col:
     show_topology_page(embedded=True)
