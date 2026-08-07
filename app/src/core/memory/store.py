@@ -21,6 +21,7 @@ from src.core.memory.episodes import (
     WorkingMemory,
 )
 from src.core.memory.persistence import ThreadMemoryState
+from src.core.memory.long_term import RetrievedLongTermMemory
 from src.core.memory.routing_state import SessionRoutingState
 
 
@@ -184,6 +185,7 @@ class MemoryStore:
         *,
         context_key: MemoryContextKey | None = None,
         request_id: str = "",
+        long_term_memories: tuple[RetrievedLongTermMemory, ...] = (),
     ) -> ConversationSnapshot:
         transitioned = False
         previous_episode_summary_included = False
@@ -216,6 +218,7 @@ class MemoryStore:
             context_key=context_key,
             active_entities=routing_state.active_entities,
             request_id=request_id,
+            long_term_memories=long_term_memories,
         )
         messages = package.model_messages()
         recent = [item for item in messages if item.get("role") in {"user", "assistant"}]
@@ -269,6 +272,7 @@ class MemoryStore:
         context_key: MemoryContextKey | None,
         active_entities: tuple[str, ...] = (),
         request_id: str = "",
+        long_term_memories: tuple[RetrievedLongTermMemory, ...] = (),
     ) -> MemoryContextPackage:
         """Select bounded same-conversation continuity without model or embedding calls."""
         started = datetime.now(timezone.utc)
@@ -277,6 +281,10 @@ class MemoryStore:
         episode_limit = max(0, int(getattr(settings, "memory_episode_context_limit", 2)))
         episode_budget = max(0, int(getattr(settings, "memory_episode_context_token_budget", 300)))
         total_budget = max(0, int(getattr(settings, "memory_context_token_budget", 1400)))
+        long_term_budget = max(
+            0,
+            int(getattr(settings, "memory_context_long_term_token_budget", 500)),
+        )
         summary = str(self._summaries.get(session_id, {}).get("text") or "")
         summary_tokens = approx_tokens(summary)
         omitted: list[str] = []
@@ -286,7 +294,9 @@ class MemoryStore:
             omitted.append("working_summary_over_budget")
 
         candidates = list(self._turns.get(session_id, ()))
-        if not candidates:
+        # Legacy raw messages have no context key. Once typed episodes exist,
+        # relabeling those messages with the current key can reattach an old episode.
+        if not candidates and not self.repository.list_episodes(session_id):
             history = self.get(session_id)
             legacy_key = context_key or MemoryContextKey(topic_family="general")
             for index in range(0, len(history) - 1):
@@ -312,6 +322,14 @@ class MemoryStore:
             active.clear()
             candidates = [
                 item for item in candidates if item.context_key.topic_family == "general"
+            ]
+        elif context_key is not None and context_key.entities:
+            current_entities = set(context_key.entities)
+            candidates = [
+                item
+                for item in candidates
+                if item.context_key == context_key
+                or bool(current_entities.intersection(item.context_key.entities))
             ]
 
         def priority(item: RelevantTurn) -> tuple[int, int, int, str]:
@@ -378,12 +396,27 @@ class MemoryStore:
             used -= approx_tokens(removed.compact_summary)
             omitted.append("episode_summary_over_budget")
 
+        selected_long_term: list[RetrievedLongTermMemory] = []
+        used_long_term_tokens = 0
+        seen_statements: set[str] = set()
+        for item in long_term_memories:
+            normalized = item.memory.statement.strip().casefold()
+            if not normalized or normalized in seen_statements:
+                continue
+            if used_long_term_tokens + item.estimated_tokens > long_term_budget:
+                omitted.append("long_term_memory_over_budget")
+                continue
+            selected_long_term.append(item)
+            seen_statements.add(normalized)
+            used_long_term_tokens += item.estimated_tokens
+
         package = MemoryContextPackage(
             working_summary=summary,
             relevant_turns=tuple(selected),
             episode_summaries=tuple(selected_episodes),
+            long_term_memories=tuple(selected_long_term),
             active_entities=tuple(active_entities),
-            estimated_tokens=max(0, used),
+            estimated_tokens=max(0, used + used_long_term_tokens),
             omitted=tuple(dict.fromkeys(omitted)),
         )
         latency_ms = int((datetime.now(timezone.utc) - started).total_seconds() * 1000)
@@ -396,11 +429,19 @@ class MemoryStore:
             latency_ms,
         )
         logger.info(
-            "event=memory_context_composed request_id=%s selected_turns=%s episode_count=%s estimated_tokens=%s omitted_count=%s",
+            "event=memory_context_composed request_id=%s selected_turns=%s episode_count=%s long_term_count=%s estimated_tokens=%s omitted_count=%s",
             request_id,
             len(selected),
             len(selected_episodes),
+            len(selected_long_term),
             package.estimated_tokens,
+            len(package.omitted),
+        )
+        logger.info(
+            "event=long_term_memory_context_composed request_id=%s selected_count=%s estimated_tokens=%s omitted_count=%s",
+            request_id,
+            len(selected_long_term),
+            used_long_term_tokens,
             len(package.omitted),
         )
         return package

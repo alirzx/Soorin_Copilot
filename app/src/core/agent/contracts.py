@@ -277,6 +277,7 @@ class InvestigationState(TypedDict, total=False):
     model_messages: list[dict[str, str]]
     conversation_snapshot: Any
     memory_context_key: Any
+    long_term_memory_selection: Any
     synthesis_request: dict[str, Any]
     context_review: dict[str, Any]
     synthesis_result: dict[str, Any]

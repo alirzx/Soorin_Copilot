@@ -53,6 +53,7 @@ copilot_service = CopilotService(
     usage_reporter=usage_reporter,
     chat_repository=local_persistence.chat_repository,
     thread_state_store=local_persistence.thread_state_store,
+    long_term_memory_store=local_persistence.long_term_memory_store,
 )
 
 

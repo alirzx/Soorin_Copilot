@@ -28,11 +28,19 @@ from src.core.memory.routing_state import SessionRoutingStateStore
 from src.core.memory.episodes import MemoryContextKey
 from src.core.identity import RequestIdentity
 from src.core.memory.persistence import ThreadMemoryState
-from src.core.memory.ports import ChatRepository, ThreadStateStore
+from src.core.memory.ports import ChatRepository, LongTermMemoryStore, ThreadStateStore
+from src.core.memory.retrieval import (
+    LazyCrossEncoderReranker,
+    LongTermMemoryCoordinator,
+    LongTermMemoryRetriever,
+    LongTermMemorySelection,
+    MemorySemanticIndex,
+)
 from src.core.memory.routing_state import SessionRoutingState
 from src.core.memory.store import MemoryStore
 from src.core.product_client import ProductApiClient
 from src.core.rag.service import KnowledgeSearchService
+from src.core.rag.qdrant_store import QdrantVectorStore
 from src.core.observability import EvidenceSnapshotWriter, ProductUsageReporter
 
 
@@ -81,6 +89,8 @@ class CopilotService:
         usage_reporter: ProductUsageReporter | None = None,
         chat_repository: ChatRepository | None = None,
         thread_state_store: ThreadStateStore | None = None,
+        long_term_memory_store: LongTermMemoryStore | None = None,
+        long_term_memory_retriever: LongTermMemoryRetriever | None = None,
     ) -> None:
         self.settings = settings
         self.llm_client = llm_client
@@ -88,6 +98,7 @@ class CopilotService:
         self.routing_state_store = routing_state_store or SessionRoutingStateStore()
         self.chat_repository = chat_repository
         self.thread_state_store = thread_state_store
+        self.long_term_memory_store = long_term_memory_store
         self._persistence_lock = RLock()
         self._session_identity_bindings: dict[
             str,
@@ -105,6 +116,57 @@ class CopilotService:
         self.detection_provider = DetectionContextProvider(settings, product_client)
         self.asset_profile_provider = AssetProfileContextProvider(settings, product_client)
         self.knowledge_service = KnowledgeSearchService(settings)
+        self.long_term_memory_retriever = long_term_memory_retriever
+        self.long_term_memory_coordinator: LongTermMemoryCoordinator | None = None
+        if (
+            self.long_term_memory_retriever is None
+            and bool(getattr(settings, "long_term_memory_enabled", False))
+            and self.long_term_memory_store is not None
+        ):
+            semantic_index = None
+            if bool(getattr(settings, "memory_vector_index_enabled", False)):
+                shared_client_factory = None
+                knowledge_vector_store = self.knowledge_service.vector_store
+                if isinstance(knowledge_vector_store, QdrantVectorStore):
+                    shared_client_factory = knowledge_vector_store._get_client
+                memory_vector_store = QdrantVectorStore(
+                    mode=settings.rag_qdrant_mode,
+                    path=settings.rag_qdrant_path,
+                    url=settings.rag_qdrant_url,
+                    collection=getattr(settings, "memory_qdrant_collection", "soorin_copilot_memory_v1"),
+                    dimension=settings.rag_embedding_dimension,
+                    distance=settings.rag_distance,
+                    api_key=settings.rag_qdrant_api_key,
+                    timeout_seconds=settings.rag_qdrant_timeout_seconds,
+                    batch_size=settings.rag_upsert_batch_size,
+                    embedding_model=settings.rag_embedding_model,
+                    client_factory=shared_client_factory,
+                )
+                semantic_index = MemorySemanticIndex(
+                    self.knowledge_service.embedder,
+                    memory_vector_store,
+                )
+            reranker = (
+                LazyCrossEncoderReranker(
+                    getattr(settings, "memory_rerank_model", ""),
+                    timeout_seconds=getattr(settings, "memory_rerank_timeout_seconds", 10.0),
+                )
+                if bool(getattr(settings, "memory_rerank_enabled", False))
+                else None
+            )
+            self.long_term_memory_retriever = LongTermMemoryRetriever(
+                self.long_term_memory_store,
+                semantic_index,
+                candidate_k=getattr(settings, "memory_retrieval_candidate_k", 20),
+                top_k=getattr(settings, "memory_retrieval_top_k", 5),
+                min_score=getattr(settings, "memory_min_score", 0.35),
+                context_token_budget=getattr(settings, "memory_context_long_term_token_budget", 500),
+                reranker=reranker,
+            )
+            self.long_term_memory_coordinator = LongTermMemoryCoordinator(
+                self.long_term_memory_store,
+                semantic_index,
+            )
         self._capability_runtime_lock = RLock()
         self.capability_registry = build_capability_registry(
             asset_profile_provider=self.asset_profile_provider,
@@ -134,6 +196,37 @@ class CopilotService:
         self.context_composer = ContextComposer(settings)
         self.snapshot_writer = EvidenceSnapshotWriter(settings)
         self.workflow = BoundedCopilotWorkflow(settings)
+
+    def retrieve_long_term_memory(
+        self,
+        *,
+        identity: RequestIdentity,
+        message: str,
+        entity_ids: tuple[str, ...],
+    ) -> LongTermMemorySelection:
+        """Retrieve owner-scoped context without influencing route or tool selection."""
+        if self.long_term_memory_retriever is None or not identity.user_id:
+            return LongTermMemorySelection(status="disabled")
+        query = message
+        if entity_ids:
+            query = f"{message}\nResolved entities: {', '.join(entity_ids)}"
+        try:
+            return self.long_term_memory_retriever.retrieve(
+                query=query,
+                user_id=identity.user_id,
+                entity_ids=entity_ids,
+                request_id=identity.request_id,
+            )
+        except Exception as exc:
+            logger.warning(
+                "event=memory_retrieval_completed request_id=%s status=unavailable error_type=%s",
+                identity.request_id,
+                type(exc).__name__,
+            )
+            return LongTermMemorySelection(
+                status="unavailable",
+                limitations=("long_term_memory_unavailable",),
+            )
 
     @staticmethod
     def _local_chat_identity(

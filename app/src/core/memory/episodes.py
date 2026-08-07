@@ -8,6 +8,7 @@ from typing import Protocol
 from uuid import uuid4
 
 from src.core.agent.contracts import TaskSpec
+from src.core.memory.long_term import RetrievedLongTermMemory
 
 
 def _now() -> str:
@@ -123,13 +124,18 @@ class MemoryContextPackage:
     working_summary: str = ""
     relevant_turns: tuple[RelevantTurn, ...] = ()
     episode_summaries: tuple[EpisodeRecord, ...] = ()
+    long_term_memories: tuple[RetrievedLongTermMemory, ...] = ()
     active_entities: tuple[str, ...] = ()
     estimated_tokens: int = 0
     omitted: tuple[str, ...] = ()
 
     def model_messages(self) -> list[dict[str, str]]:
         messages: list[dict[str, str]] = []
-        if self.working_summary:
+        normalized_long_term = {
+            item.memory.statement.strip().casefold()
+            for item in self.long_term_memories
+        }
+        if self.working_summary and self.working_summary.strip().casefold() not in normalized_long_term:
             messages.append(
                 {
                     "role": "system",
@@ -141,6 +147,7 @@ class MemoryContextPackage:
                 episode.compact_summary
                 for episode in self.episode_summaries
                 if episode.compact_summary
+                and episode.compact_summary.strip().casefold() not in normalized_long_term
             )
             if summaries:
                 messages.append(
@@ -149,6 +156,17 @@ class MemoryContextPackage:
                         "content": f"[SOORIN RELEVANT EPISODES]\n{summaries}",
                     }
                 )
+        if self.long_term_memories:
+            messages.append(
+                {
+                    "role": "system",
+                    "content": (
+                        "[SOORIN VALIDATED LONG-TERM MEMORY]\n"
+                        "Current operational evidence overrides memory. Treat historical entries as context only.\n"
+                        + "\n".join(item.model_text() for item in self.long_term_memories)
+                    ),
+                }
+            )
         for turn in self.relevant_turns:
             messages.extend(
                 (

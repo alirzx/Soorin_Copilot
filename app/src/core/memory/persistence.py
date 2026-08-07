@@ -12,7 +12,7 @@ from src.core.memory.episodes import EpisodeRecord, MemoryContextKey, TurnRefere
 from src.core.memory.routing_state import SessionRoutingState
 
 
-LOCAL_SCHEMA_VERSION = 3
+LOCAL_SCHEMA_VERSION = 4
 THREAD_STATE_SCHEMA_VERSION = 2
 MAX_THREAD_STATE_BYTES = 16_384
 MAX_CHAT_CONTENT_CHARS = 100_000

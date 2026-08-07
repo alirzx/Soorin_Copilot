@@ -59,10 +59,21 @@ class CopilotWorkflowNodes:
             recent_messages=recent,
             request_id=state["request_id"],
         )
+        retrieve_long_term = getattr(self.service, "retrieve_long_term_memory", None)
+        long_term_selection = (
+            retrieve_long_term(
+                identity=state["request_identity"],
+                message=state["message"].strip(),
+                entity_ids=tuple(item.value for item in resolution.entities),
+            )
+            if retrieve_long_term is not None
+            else None
+        )
         update: dict[str, Any] = {
             "resolved_entities": resolution,
             "active_entity_state": routing_state,
             "recent_messages": recent,
+            "long_term_memory_selection": long_term_selection,
             "next_edge": "route",
         }
         if (
@@ -497,6 +508,10 @@ class CopilotWorkflowNodes:
         pack = state["evidence_pack"]
         package = context_package_from_evidence(pack, state["resolved_entities"])
         context_key = state.get("memory_context_key") or MemoryContextKey.from_task(task)
+        long_term_selection = state.get("long_term_memory_selection")
+        long_term_memories = tuple(
+            getattr(long_term_selection, "memories", ()) or ()
+        )
         snapshot = (
             self.service.memory_store.prepare_for_model(
                 state["session_id"],
@@ -504,8 +519,9 @@ class CopilotWorkflowNodes:
                 state["active_entity_state"],
                 context_key=context_key,
                 request_id=state["request_id"],
+                long_term_memories=long_term_memories,
             )
-            if self.settings.chat_store_history
+            if self.settings.chat_store_history or long_term_memories
             else None
         )
         history = list(snapshot.messages if snapshot else [])
