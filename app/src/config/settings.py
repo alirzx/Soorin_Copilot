@@ -193,6 +193,17 @@ class Settings:
     memory_episode_context_limit: int
     memory_episode_context_token_budget: int
     memory_context_token_budget: int
+    long_term_memory_enabled: bool
+    long_term_memory_backend: str
+    memory_vector_index_enabled: bool
+    memory_qdrant_collection: str
+    memory_retrieval_candidate_k: int
+    memory_retrieval_top_k: int
+    memory_min_score: float
+    memory_rerank_enabled: bool
+    memory_rerank_model: str
+    memory_rerank_timeout_seconds: float
+    memory_context_long_term_token_budget: int
     local_product_simulation_enabled: bool
     streamlit_auth_backend: str
     local_test_user_creation_enabled: bool
@@ -449,6 +460,7 @@ class Settings:
         sqlite_required = (
             self.local_product_simulation_enabled
             or self.thread_state_backend == "sqlite"
+            or (self.long_term_memory_enabled and self.long_term_memory_backend == "sqlite")
         )
         if sqlite_required and not self.local_sqlite_path:
             raise ValueError(
@@ -462,6 +474,30 @@ class Settings:
                 "SOORIN_STREAMLIT_AUTH_BACKEND=local_simulation requires "
                 "SOORIN_LOCAL_PRODUCT_SIMULATION_ENABLED=true."
             )
+
+    def validate_long_term_memory_configuration(self) -> None:
+        if not self.long_term_memory_enabled:
+            return
+        if self.long_term_memory_backend != "sqlite":
+            raise ValueError("Only the local SQLite long-term memory backend is currently available.")
+        if self.memory_vector_index_enabled:
+            if not self.memory_qdrant_collection:
+                raise ValueError("SOORIN_MEMORY_QDRANT_COLLECTION must not be blank.")
+            if self.memory_qdrant_collection == self.rag_collection:
+                raise ValueError("Long-term memory and SOC knowledge require separate Qdrant collections.")
+            if self.rag_qdrant_mode == "local" and not self.rag_qdrant_path:
+                raise ValueError("Local memory indexing requires SOORIN_RAG_QDRANT_PATH.")
+            if self.rag_qdrant_mode == "server" and not self.rag_qdrant_url:
+                raise ValueError("Server memory indexing requires SOORIN_RAG_QDRANT_URL.")
+            if self.rag_embedding_model.lower() in LEGACY_RAG_EMBEDDING_MODELS:
+                raise ValueError("SecureBERT is not supported for long-term memory embeddings.")
+            if (
+                self.rag_embedding_model == DEFAULT_RAG_EMBEDDING_MODEL
+                and self.rag_embedding_dimension != DEFAULT_RAG_EMBEDDING_DIMENSION
+            ):
+                raise ValueError("BAAI/bge-base-en-v1.5 long-term memory embeddings require dimension 768.")
+        if self.memory_rerank_enabled and not self.memory_rerank_model:
+            raise ValueError("SOORIN_MEMORY_RERANK_MODEL is required when reranking is enabled.")
 
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:
@@ -614,6 +650,29 @@ def get_settings() -> Settings:
         memory_context_token_budget=max(
             0, _int("SOORIN_MEMORY_CONTEXT_TOKEN_BUDGET", 1400)
         ),
+        long_term_memory_enabled=_bool("SOORIN_LONG_TERM_MEMORY_ENABLED", False),
+        long_term_memory_backend=_choice(
+            "SOORIN_LONG_TERM_MEMORY_BACKEND", "sqlite", {"sqlite"}
+        ),
+        memory_vector_index_enabled=_bool("SOORIN_MEMORY_VECTOR_INDEX_ENABLED", False),
+        memory_qdrant_collection=os.getenv(
+            "SOORIN_MEMORY_QDRANT_COLLECTION", "soorin_copilot_memory_v1"
+        ).strip(),
+        memory_retrieval_candidate_k=max(
+            1, min(100, _int("SOORIN_MEMORY_RETRIEVAL_CANDIDATE_K", 20))
+        ),
+        memory_retrieval_top_k=max(
+            1, min(20, _int("SOORIN_MEMORY_RETRIEVAL_TOP_K", 5))
+        ),
+        memory_min_score=min(1.0, max(0.0, _float("SOORIN_MEMORY_MIN_SCORE", 0.35))),
+        memory_rerank_enabled=_bool("SOORIN_MEMORY_RERANK_ENABLED", False),
+        memory_rerank_model=os.getenv("SOORIN_MEMORY_RERANK_MODEL", "").strip(),
+        memory_rerank_timeout_seconds=max(
+            0.1, _float("SOORIN_MEMORY_RERANK_TIMEOUT_SECONDS", 10.0)
+        ),
+        memory_context_long_term_token_budget=max(
+            0, _int("SOORIN_MEMORY_CONTEXT_LONG_TERM_TOKEN_BUDGET", 500)
+        ),
         local_product_simulation_enabled=_bool(
             "SOORIN_LOCAL_PRODUCT_SIMULATION_ENABLED",
             False,
@@ -763,6 +822,7 @@ def get_settings() -> Settings:
     settings.validate_product_paths()
     settings.validate_observability_configuration()
     settings.validate_local_persistence_configuration()
+    settings.validate_long_term_memory_configuration()
     logger.info(
         "event=settings_loaded env_file_path=%s env_file_loaded=%s router_deployment=%s chat_deployment=%s product_base_url_configured=%s product_token_present=%s product_hwid_present=%s product_username_present=%s product_password_present=%s product_captcha_bypass_present=%s rag_enabled=%s rag_backend=%s rag_source_configured=%s rag_qdrant_mode=%s rag_qdrant_configured=%s local_product_simulation_enabled=%s streamlit_auth_backend=%s local_test_user_creation_enabled=%s thread_state_backend=%s langgraph_checkpoint_backend=%s",
         ENV_PATH,
