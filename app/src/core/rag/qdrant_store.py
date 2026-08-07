@@ -7,7 +7,7 @@ import re
 import uuid
 from collections.abc import Sequence
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from src.core.rag.vector_store import (
     VectorCollectionInfo,
@@ -51,6 +51,7 @@ class QdrantVectorStore:
         path: str = "",
         embedding_model: str = "",
         client: Any | None = None,
+        client_factory: Callable[[], Any] | None = None,
     ) -> None:
         self.mode = mode.strip().lower()
         self.url = url.strip().rstrip("/")
@@ -63,6 +64,7 @@ class QdrantVectorStore:
         self.timeout_seconds = float(timeout_seconds)
         self.batch_size = max(1, int(batch_size))
         self._client = client
+        self._client_factory = client_factory
 
         if self.mode not in VALID_MODES:
             raise ValueError(
@@ -111,6 +113,9 @@ class QdrantVectorStore:
     def _get_client(self) -> Any:
         """Create and cache the Qdrant client only when first used."""
         if self._client is not None:
+            return self._client
+        if self._client_factory is not None:
+            self._client = self._client_factory()
             return self._client
 
         from qdrant_client import QdrantClient
