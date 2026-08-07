@@ -6,7 +6,7 @@ from typing import Protocol, TypeVar
 
 from src.core.identity import RequestIdentity
 from src.core.memory.persistence import (
-    CompactThreadState,
+    ThreadMemoryState,
     LocalChatMessage,
     LocalConversation,
     LocalRequestCommit,
@@ -109,15 +109,15 @@ class ChatRepository(Protocol):
 class ThreadStateStore(Protocol):
     """Copilot-owned compact thread-state boundary."""
 
-    def load(self, *, identity: RequestIdentity) -> CompactThreadState | None: ...
+    def load(self, *, identity: RequestIdentity) -> ThreadMemoryState | None: ...
 
     def save(
         self,
         *,
         identity: RequestIdentity,
-        state: CompactThreadState,
+        state: ThreadMemoryState,
         expected_revision: int,
-    ) -> CompactThreadState: ...
+    ) -> ThreadMemoryState: ...
 
     def delete(self, *, identity: RequestIdentity) -> bool: ...
 

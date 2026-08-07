@@ -18,7 +18,7 @@ from src.core.memory.persistence import (
     MAX_CONVERSATION_TITLE_CHARS,
     MAX_THREAD_STATE_BYTES,
     THREAD_STATE_SCHEMA_VERSION,
-    CompactThreadState,
+    ThreadMemoryState,
     LocalChatMessage,
     LocalConversation,
     LocalPersistenceConflictError,
@@ -170,10 +170,12 @@ class LocalSQLiteDatabase:
                         "SELECT value FROM schema_metadata WHERE key = ?",
                         ("local_schema_version",),
                     ).fetchone()
-                    if row is not None and row["value"] == "1":
+                    if row is not None and row["value"] in {"1", "2"}:
                         connection.execute("BEGIN IMMEDIATE")
                         try:
-                            self._upgrade_v1_to_v2(connection)
+                            if row["value"] == "1":
+                                self._upgrade_v1_to_v2(connection)
+                            self._upgrade_v2_to_v3(connection)
                             connection.commit()
                         except Exception:
                             connection.rollback()
@@ -221,6 +223,55 @@ class LocalSQLiteDatabase:
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_local_conversations_session "
             "ON local_conversations(session_id)"
         )
+        connection.execute(
+            "UPDATE schema_metadata SET value = ? WHERE key = ?",
+            ("2", "local_schema_version"),
+        )
+
+    @staticmethod
+    def _upgrade_v2_to_v3(connection: sqlite3.Connection) -> None:
+        """Upgrade routing-only JSON to the bounded Gate 5 memory contract."""
+        tables = {
+            row["name"]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
+        if "local_thread_states" in tables:
+            rows = connection.execute(
+                "SELECT thread_key, state_json, schema_version FROM local_thread_states"
+            ).fetchall()
+            defaults = {
+                "recent_turn_references": [],
+                "recent_episodes": [],
+                "summary_updated_at": "",
+                "summary_source_request_id": "",
+                "summary_size_tokens": 0,
+            }
+            for row in rows:
+                if row["schema_version"] == THREAD_STATE_SCHEMA_VERSION:
+                    continue
+                try:
+                    payload = json.loads(row["state_json"])
+                except (TypeError, ValueError) as exc:
+                    raise LocalPersistenceSchemaError(
+                        "Existing thread state is malformed."
+                    ) from exc
+                if not isinstance(payload, dict):
+                    raise LocalPersistenceSchemaError(
+                        "Existing thread state is malformed."
+                    )
+                for key, value in defaults.items():
+                    payload.setdefault(key, value)
+                connection.execute(
+                    "UPDATE local_thread_states SET schema_version = ?, state_json = ? "
+                    "WHERE thread_key = ?",
+                    (
+                        THREAD_STATE_SCHEMA_VERSION,
+                        json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+                        row["thread_key"],
+                    ),
+                )
         connection.execute(
             "UPDATE schema_metadata SET value = ? WHERE key = ?",
             (str(LOCAL_SCHEMA_VERSION), "local_schema_version"),
@@ -820,7 +871,7 @@ class SQLiteThreadStateStore:
                 "Local thread ownership validation failed."
             )
 
-    def load(self, *, identity: RequestIdentity) -> CompactThreadState | None:
+    def load(self, *, identity: RequestIdentity) -> ThreadMemoryState | None:
         with self.database.connect() as connection:
             row = connection.execute(
                 "SELECT * FROM local_thread_states WHERE thread_key = ?",
@@ -839,7 +890,7 @@ class SQLiteThreadStateStore:
                 "Persisted thread state is malformed."
             ) from exc
         try:
-            return CompactThreadState.from_payload(
+            return ThreadMemoryState.from_payload(
                 payload,
                 thread_key=row["thread_key"],
                 user_id=row["user_id"],
@@ -858,9 +909,9 @@ class SQLiteThreadStateStore:
         self,
         *,
         identity: RequestIdentity,
-        state: CompactThreadState,
+        state: ThreadMemoryState,
         expected_revision: int,
-    ) -> CompactThreadState:
+    ) -> ThreadMemoryState:
         if (
             state.thread_key != identity.thread_key
             or state.user_id != identity.user_id

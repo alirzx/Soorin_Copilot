@@ -13,10 +13,14 @@ from src.core.context.models import approx_tokens, compact_preview
 from src.core.memory.episodes import (
     EpisodeRecord,
     InMemoryMemoryRepository,
+    MemoryContextPackage,
     MemoryContextKey,
     MemoryRepository,
+    RelevantTurn,
+    TurnReference,
     WorkingMemory,
 )
+from src.core.memory.persistence import ThreadMemoryState
 from src.core.memory.routing_state import SessionRoutingState
 
 
@@ -38,16 +42,24 @@ class ConversationSnapshot:
     episode_transition: bool = False
     previous_episode_summary_included: bool = False
     episode_count: int = 0
+    memory_context: MemoryContextPackage | None = None
 
 
 class MemoryStore:
-    def __init__(self, max_messages: int, repository: MemoryRepository | None = None) -> None:
+    def __init__(
+        self,
+        max_messages: int,
+        repository: MemoryRepository | None = None,
+        *,
+        max_episodes: int = 20,
+    ) -> None:
         self.max_messages = max(0, max_messages)
         self._history: dict[str, list[dict[str, str]]] = {}
         self._latest_completed_turns: dict[str, list[dict[str, str]]] = {}
         self._summaries: dict[str, dict[str, Any]] = {}
         self._recorded_request_ids: dict[str, set[str]] = {}
-        self.repository = repository or InMemoryMemoryRepository()
+        self._turns: dict[str, list[RelevantTurn]] = {}
+        self.repository = repository or InMemoryMemoryRepository(max_episodes)
 
     def get(self, session_id: str) -> list[dict[str, str]]:
         return list(self._history.get(session_id, []))
@@ -65,6 +77,7 @@ class MemoryStore:
         self._latest_completed_turns.pop(session_id, None)
         self._summaries.pop(session_id, None)
         self._recorded_request_ids.pop(session_id, None)
+        self._turns.pop(session_id, None)
         self.repository.clear_session(session_id)
 
     def record_turn(
@@ -92,6 +105,7 @@ class MemoryStore:
                 )
                 return
         working = self.repository.get_working(session_id)
+        opened = working is None or working.context_key != context_key
         if working is None or working.context_key != context_key:
             working = WorkingMemory(
                 session_id=session_id,
@@ -110,6 +124,27 @@ class MemoryStore:
         working.last_scope = scope
         working.limitations = tuple(dict.fromkeys(compact_preview(item, limit=200) for item in limitations))[:8]
         self.repository.set_working(working)
+        logger.info(
+            "event=%s request_id=%s episode_ref=%s provider_count=%s limitation_count=%s",
+            "episode_opened" if opened else "episode_updated",
+            request_id,
+            working.episode_id,
+            len(working.last_providers),
+            len(working.limitations),
+        )
+        now = datetime.now(timezone.utc).isoformat()
+        self._turns.setdefault(session_id, []).append(
+            RelevantTurn(
+                request_id=request_id,
+                context_key=context_key,
+                user_content=user_content,
+                assistant_content=assistant_content,
+                created_at=now,
+                retrieval_reason="raw_recent_turn",
+                estimated_tokens=approx_tokens(user_content) + approx_tokens(assistant_content),
+            )
+        )
+        self._turns[session_id] = self._turns[session_id][-max(1, self.max_messages // 2) :]
         if request_id:
             recorded.add(request_id)
 
@@ -175,11 +210,15 @@ class MemoryStore:
                 )
 
         summary = self._summaries.get(session_id)
-        recent = self.get(session_id)[-max(2, settings.conversation_recent_raw_messages) :]
-        messages: list[dict[str, str]] = []
-        if summary:
-            messages.append({"role": "system", "content": f"[SOORIN CONVERSATION SUMMARY]\n{summary['text']}"})
-        messages.extend(recent)
+        package = self.compose_memory_context(
+            session_id,
+            settings,
+            context_key=context_key,
+            active_entities=routing_state.active_entities,
+            request_id=request_id,
+        )
+        messages = package.model_messages()
+        recent = [item for item in messages if item.get("role") in {"user", "assistant"}]
         after_tokens = sum(approx_tokens(item.get("content", "")) for item in messages)
         return ConversationSnapshot(
             messages=messages,
@@ -195,6 +234,7 @@ class MemoryStore:
             episode_transition=transitioned,
             previous_episode_summary_included=previous_episode_summary_included,
             episode_count=len(self.repository.list_episodes(session_id)),
+            memory_context=package,
         )
 
     @staticmethod
@@ -220,6 +260,235 @@ class MemoryStore:
                     recent.append(dict(item))
                     keys.add(key)
         return recent[-max(2, limit) :]
+
+    def compose_memory_context(
+        self,
+        session_id: str,
+        settings: Settings,
+        *,
+        context_key: MemoryContextKey | None,
+        active_entities: tuple[str, ...] = (),
+        request_id: str = "",
+    ) -> MemoryContextPackage:
+        """Select bounded same-conversation continuity without model or embedding calls."""
+        started = datetime.now(timezone.utc)
+        max_turns = max(0, int(getattr(settings, "memory_relevant_turn_limit", 4)))
+        turn_budget = max(0, int(getattr(settings, "memory_relevant_turn_token_budget", 900)))
+        episode_limit = max(0, int(getattr(settings, "memory_episode_context_limit", 2)))
+        episode_budget = max(0, int(getattr(settings, "memory_episode_context_token_budget", 300)))
+        total_budget = max(0, int(getattr(settings, "memory_context_token_budget", 1400)))
+        summary = str(self._summaries.get(session_id, {}).get("text") or "")
+        summary_tokens = approx_tokens(summary)
+        omitted: list[str] = []
+        if summary_tokens > total_budget:
+            summary = ""
+            summary_tokens = 0
+            omitted.append("working_summary_over_budget")
+
+        candidates = list(self._turns.get(session_id, ()))
+        if not candidates:
+            history = self.get(session_id)
+            legacy_key = context_key or MemoryContextKey(topic_family="general")
+            for index in range(0, len(history) - 1):
+                user = history[index]
+                assistant = history[index + 1]
+                if user.get("role") != "user" or assistant.get("role") != "assistant":
+                    continue
+                user_content = str(user.get("content") or "")
+                assistant_content = str(assistant.get("content") or "")
+                candidates.append(
+                    RelevantTurn(
+                        request_id=f"legacy-{index}",
+                        context_key=legacy_key,
+                        user_content=user_content,
+                        assistant_content=assistant_content,
+                        created_at=f"legacy-{index:08d}",
+                        retrieval_reason="raw_recent_turn",
+                        estimated_tokens=approx_tokens(user_content) + approx_tokens(assistant_content),
+                    )
+                )
+        active = set(active_entities)
+        if context_key is not None and context_key.topic_family == "general":
+            active.clear()
+            candidates = [
+                item for item in candidates if item.context_key.topic_family == "general"
+            ]
+
+        def priority(item: RelevantTurn) -> tuple[int, int, int, str]:
+            exact = int(context_key is not None and item.context_key == context_key)
+            entity_match = int(bool(active.intersection(item.context_key.entities)))
+            investigation = int(item.context_key.topic_family != "general")
+            return exact, entity_match, investigation, item.created_at
+
+        ranked = sorted(candidates, key=priority, reverse=True)
+        selected: list[RelevantTurn] = []
+        used_turn_tokens = 0
+        for candidate in ranked:
+            if len(selected) >= max_turns:
+                break
+            if used_turn_tokens + candidate.estimated_tokens > turn_budget:
+                continue
+            reason = (
+                "active_topic"
+                if context_key is not None and candidate.context_key == context_key
+                else "active_entity"
+                if active.intersection(candidate.context_key.entities)
+                else "recent_investigation"
+                if candidate.context_key.topic_family != "general"
+                else "recent_turn"
+            )
+            selected.append(
+                RelevantTurn(
+                    **{**candidate.__dict__, "retrieval_reason": reason}
+                )
+            )
+            used_turn_tokens += candidate.estimated_tokens
+        selected.sort(key=lambda item: item.created_at)
+
+        episodes = list(self.repository.list_episodes(session_id))
+        matching_episodes = [
+            item
+            for item in reversed(episodes)
+            if item.compact_summary
+            and item.compact_summary != summary
+            and (
+                context_key is None
+                or item.context_key == context_key
+                or bool(active.intersection(item.context_key.entities))
+            )
+        ]
+        selected_episodes: list[EpisodeRecord] = []
+        used_episode_tokens = 0
+        for episode in matching_episodes:
+            tokens = approx_tokens(episode.compact_summary)
+            if len(selected_episodes) >= episode_limit:
+                break
+            if used_episode_tokens + tokens > episode_budget:
+                continue
+            selected_episodes.append(episode)
+            used_episode_tokens += tokens
+
+        used = summary_tokens + used_turn_tokens + used_episode_tokens
+        while selected and used > total_budget:
+            removed = selected.pop(0)
+            used -= removed.estimated_tokens
+            omitted.append("older_relevant_turn_over_budget")
+        while selected_episodes and used > total_budget:
+            removed = selected_episodes.pop()
+            used -= approx_tokens(removed.compact_summary)
+            omitted.append("episode_summary_over_budget")
+
+        package = MemoryContextPackage(
+            working_summary=summary,
+            relevant_turns=tuple(selected),
+            episode_summaries=tuple(selected_episodes),
+            active_entities=tuple(active_entities),
+            estimated_tokens=max(0, used),
+            omitted=tuple(dict.fromkeys(omitted)),
+        )
+        latency_ms = int((datetime.now(timezone.utc) - started).total_seconds() * 1000)
+        logger.info(
+            "event=recent_turns_selected request_id=%s candidate_count=%s selected_count=%s estimated_tokens=%s latency_ms=%s",
+            request_id,
+            len(candidates),
+            len(selected),
+            used_turn_tokens,
+            latency_ms,
+        )
+        logger.info(
+            "event=memory_context_composed request_id=%s selected_turns=%s episode_count=%s estimated_tokens=%s omitted_count=%s",
+            request_id,
+            len(selected),
+            len(selected_episodes),
+            package.estimated_tokens,
+            len(package.omitted),
+        )
+        return package
+
+    def durable_components(
+        self,
+        session_id: str,
+        *,
+        turn_limit: int,
+        episode_limit: int,
+    ) -> dict[str, Any]:
+        """Export only approved bounded components for a ThreadMemoryState."""
+        working = self.repository.get_working(session_id)
+        summary = self._summaries.get(session_id, {})
+        references = tuple(
+            TurnReference(
+                request_id=item.request_id,
+                context_key=item.context_key,
+                created_at=item.created_at,
+            )
+            for item in self._turns.get(session_id, ())[-max(0, turn_limit) :]
+        )
+        return {
+            "working_memory": working,
+            "recent_turn_references": references,
+            "recent_episodes": tuple(self.repository.list_episodes(session_id)[-max(0, episode_limit) :]),
+            "summary_updated_at": str(summary.get("summary_updated_at") or ""),
+            "summary_source_request_id": str(summary.get("summary_source_request_id") or ""),
+            "summary_size_tokens": approx_tokens(str(summary.get("text") or "")),
+        }
+
+    def restore_durable_state(
+        self,
+        state: ThreadMemoryState,
+        transcript: tuple[Any, ...] = (),
+    ) -> None:
+        """Restore compact state and owned transcript rows after process recreation."""
+        session_id = state.session_id
+        self.clear_session(session_id)
+        if state.working_memory is not None:
+            self.repository.set_working(state.working_memory)
+            if state.working_memory.compact_summary:
+                self._summaries[session_id] = {
+                    "text": state.working_memory.compact_summary,
+                    "summary_updated_at": state.summary_updated_at,
+                    "summary_source_request_id": state.summary_source_request_id,
+                    "summary_source_message_count": len(state.recent_turn_references) * 2,
+                }
+        for episode in state.recent_episodes:
+            self.repository.add_episode(episode)
+
+        refs = {item.request_id: item for item in state.recent_turn_references}
+        grouped: dict[str, dict[str, Any]] = {}
+        for message in transcript:
+            request = str(getattr(message, "request_id", ""))
+            role = str(getattr(message, "role", ""))
+            if request in refs and role in {"user", "assistant"}:
+                grouped.setdefault(request, {})[role] = message
+        restored: list[RelevantTurn] = []
+        for reference in state.recent_turn_references:
+            pair = grouped.get(reference.request_id, {})
+            if "user" not in pair or "assistant" not in pair:
+                continue
+            user_content = str(pair["user"].content)
+            assistant_content = str(pair["assistant"].content)
+            self.append(session_id, "user", user_content)
+            self.append(session_id, "assistant", assistant_content)
+            restored.append(
+                RelevantTurn(
+                    request_id=reference.request_id,
+                    context_key=reference.context_key,
+                    user_content=user_content,
+                    assistant_content=assistant_content,
+                    created_at=reference.created_at,
+                    retrieval_reason="raw_recent_turn",
+                    estimated_tokens=approx_tokens(user_content) + approx_tokens(assistant_content),
+                )
+            )
+        self._turns[session_id] = restored
+        if restored:
+            latest = restored[-1]
+            self._latest_completed_turns[session_id] = [
+                {"role": "user", "content": latest.user_content},
+                {"role": "assistant", "content": latest.assistant_content},
+            ]
+            self._recorded_request_ids[session_id] = {
+                item.request_id for item in restored if item.request_id
+            }
 
     def _activate_context(
         self,
@@ -318,6 +587,12 @@ class MemoryStore:
                 turn_count=sum(1 for item in history if item.get("role") == "user"),
             )
         )
+        logger.info(
+            "event=episode_closed episode_ref=%s turn_count=%s summary_tokens=%s",
+            working.episode_id,
+            sum(1 for item in history if item.get("role") == "user"),
+            approx_tokens(summary),
+        )
 
     def compact_if_needed(
         self,
@@ -359,6 +634,7 @@ class MemoryStore:
             "text": text,
             "summary_updated_at": datetime.now(timezone.utc).isoformat(),
             "summary_source_message_count": len(history),
+            "summary_source_request_id": request_id,
         }
         self._history[session_id] = recent
         working = self.repository.get_working(session_id)

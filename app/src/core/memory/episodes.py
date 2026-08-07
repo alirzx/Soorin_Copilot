@@ -94,6 +94,71 @@ class WorkingMemory:
     limitations: tuple[str, ...] = ()
 
 
+@dataclass(frozen=True)
+class TurnReference:
+    """Bounded metadata for one completed turn; transcript text stays in ChatRepository."""
+
+    request_id: str
+    context_key: MemoryContextKey
+    created_at: str = field(default_factory=_now)
+
+
+@dataclass(frozen=True)
+class RelevantTurn:
+    """One selected same-conversation turn prepared for model context."""
+
+    request_id: str
+    context_key: MemoryContextKey
+    user_content: str
+    assistant_content: str
+    created_at: str
+    retrieval_reason: str
+    estimated_tokens: int
+
+
+@dataclass(frozen=True)
+class MemoryContextPackage:
+    """Storage-neutral, bounded memory sections consumed by context composition."""
+
+    working_summary: str = ""
+    relevant_turns: tuple[RelevantTurn, ...] = ()
+    episode_summaries: tuple[EpisodeRecord, ...] = ()
+    active_entities: tuple[str, ...] = ()
+    estimated_tokens: int = 0
+    omitted: tuple[str, ...] = ()
+
+    def model_messages(self) -> list[dict[str, str]]:
+        messages: list[dict[str, str]] = []
+        if self.working_summary:
+            messages.append(
+                {
+                    "role": "system",
+                    "content": f"[SOORIN CONVERSATION SUMMARY]\n{self.working_summary}",
+                }
+            )
+        if self.episode_summaries:
+            summaries = "\n".join(
+                episode.compact_summary
+                for episode in self.episode_summaries
+                if episode.compact_summary
+            )
+            if summaries:
+                messages.append(
+                    {
+                        "role": "system",
+                        "content": f"[SOORIN RELEVANT EPISODES]\n{summaries}",
+                    }
+                )
+        for turn in self.relevant_turns:
+            messages.extend(
+                (
+                    {"role": "user", "content": turn.user_content},
+                    {"role": "assistant", "content": turn.assistant_content},
+                )
+            )
+        return messages
+
+
 class WorkingMemoryStore(Protocol):
     def get_working(self, session_id: str) -> WorkingMemory | None: ...
 

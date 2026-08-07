@@ -1,6 +1,15 @@
 """Bounded working and episodic memory package."""
 
-from src.core.memory.episodes import EpisodeRecord, MemoryContextKey, MemoryRepository, WorkingMemory
+from src.core.memory.episodes import (
+    EpisodeRecord,
+    MemoryContextKey,
+    MemoryContextPackage,
+    MemoryRepository,
+    RelevantTurn,
+    TurnReference,
+    WorkingMemory,
+)
+from src.core.memory.persistence import ThreadMemoryState
 from src.core.identity import RequestIdentity
 from src.core.memory.ports import (
     ChatRepository,
@@ -14,9 +23,13 @@ __all__ = [
     "EpisodeRecord",
     "LongTermMemoryStore",
     "MemoryContextKey",
+    "MemoryContextPackage",
     "MemoryRepository",
     "RequestIdentity",
     "SemanticMemoryIndex",
     "ThreadStateStore",
     "WorkingMemory",
+    "RelevantTurn",
+    "TurnReference",
+    "ThreadMemoryState",
 ]
