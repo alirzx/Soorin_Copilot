@@ -96,6 +96,42 @@ CREATE TABLE IF NOT EXISTS local_thread_states (
     state_json TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS local_long_term_memories (
+    memory_id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL REFERENCES local_users(user_id) ON DELETE CASCADE,
+    memory_type TEXT NOT NULL,
+    statement TEXT NOT NULL,
+    epistemic_status TEXT NOT NULL,
+    confidence REAL NOT NULL CHECK (confidence >= 0 AND confidence <= 1),
+    source_request_id TEXT NOT NULL,
+    source_conversation_id TEXT NOT NULL,
+    evidence_refs_json TEXT NOT NULL,
+    provenance_category TEXT NOT NULL,
+    valid_from TEXT NOT NULL,
+    valid_until TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    revision INTEGER NOT NULL CHECK (revision > 0),
+    status TEXT NOT NULL,
+    index_status TEXT NOT NULL,
+    supersedes_memory_id TEXT
+);
+
+CREATE TABLE IF NOT EXISTS local_long_term_memory_entities (
+    memory_id TEXT NOT NULL REFERENCES local_long_term_memories(memory_id) ON DELETE CASCADE,
+    entity_id TEXT NOT NULL,
+    PRIMARY KEY (memory_id, entity_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_local_long_term_memory_owner
+ON local_long_term_memories(user_id, status, updated_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_local_long_term_memory_type
+ON local_long_term_memories(user_id, memory_type, epistemic_status, status);
+
+CREATE INDEX IF NOT EXISTS idx_local_long_term_memory_entity
+ON local_long_term_memory_entities(entity_id, memory_id);
 """
 
 
@@ -170,12 +206,18 @@ class LocalSQLiteDatabase:
                         "SELECT value FROM schema_metadata WHERE key = ?",
                         ("local_schema_version",),
                     ).fetchone()
-                    if row is not None and row["value"] in {"1", "2"}:
+                    if row is not None and row["value"] in {"1", "2", "3"}:
                         connection.execute("BEGIN IMMEDIATE")
                         try:
-                            if row["value"] == "1":
+                            version = int(row["value"])
+                            if version == 1:
                                 self._upgrade_v1_to_v2(connection)
-                            self._upgrade_v2_to_v3(connection)
+                                version = 2
+                            if version == 2:
+                                self._upgrade_v2_to_v3(connection)
+                                version = 3
+                            if version == 3:
+                                self._upgrade_v3_to_v4(connection)
                             connection.commit()
                         except Exception:
                             connection.rollback()
@@ -272,6 +314,49 @@ class LocalSQLiteDatabase:
                         row["thread_key"],
                     ),
                 )
+        connection.execute(
+            "UPDATE schema_metadata SET value = ? WHERE key = ?",
+            ("3", "local_schema_version"),
+        )
+
+    @staticmethod
+    def _upgrade_v3_to_v4(connection: sqlite3.Connection) -> None:
+        """Add typed canonical long-term memory without altering Gate 5 state."""
+        connection.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS local_long_term_memories (
+                memory_id TEXT PRIMARY KEY,
+                user_id TEXT NOT NULL REFERENCES local_users(user_id) ON DELETE CASCADE,
+                memory_type TEXT NOT NULL,
+                statement TEXT NOT NULL,
+                epistemic_status TEXT NOT NULL,
+                confidence REAL NOT NULL CHECK (confidence >= 0 AND confidence <= 1),
+                source_request_id TEXT NOT NULL,
+                source_conversation_id TEXT NOT NULL,
+                evidence_refs_json TEXT NOT NULL,
+                provenance_category TEXT NOT NULL,
+                valid_from TEXT NOT NULL,
+                valid_until TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                revision INTEGER NOT NULL CHECK (revision > 0),
+                status TEXT NOT NULL,
+                index_status TEXT NOT NULL,
+                supersedes_memory_id TEXT
+            );
+            CREATE TABLE IF NOT EXISTS local_long_term_memory_entities (
+                memory_id TEXT NOT NULL REFERENCES local_long_term_memories(memory_id) ON DELETE CASCADE,
+                entity_id TEXT NOT NULL,
+                PRIMARY KEY (memory_id, entity_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_local_long_term_memory_owner
+            ON local_long_term_memories(user_id, status, updated_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_local_long_term_memory_type
+            ON local_long_term_memories(user_id, memory_type, epistemic_status, status);
+            CREATE INDEX IF NOT EXISTS idx_local_long_term_memory_entity
+            ON local_long_term_memory_entities(entity_id, memory_id);
+            """
+        )
         connection.execute(
             "UPDATE schema_metadata SET value = ? WHERE key = ?",
             (str(LOCAL_SCHEMA_VERSION), "local_schema_version"),

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Protocol, TypeVar
+from typing import Protocol
 
 from src.core.identity import RequestIdentity
 from src.core.memory.persistence import (
@@ -12,9 +12,12 @@ from src.core.memory.persistence import (
     LocalRequestCommit,
     LocalUser,
 )
-
-MemoryT = TypeVar("MemoryT")
-MatchT = TypeVar("MatchT")
+from src.core.memory.long_term import (
+    EpistemicStatus,
+    LongTermMemoryRecord,
+    MemoryStatus,
+    MemoryType,
+)
 
 
 class ChatRepository(Protocol):
@@ -122,15 +125,54 @@ class ThreadStateStore(Protocol):
     def delete(self, *, identity: RequestIdentity) -> bool: ...
 
 
-class LongTermMemoryStore(Protocol[MemoryT]):
+class LongTermMemoryStore(Protocol):
     """Validated durable-memory boundary, separate from raw chat messages."""
 
-    def get(self, *, memory_id: str) -> MemoryT | None: ...
+    def get(self, *, user_id: str, memory_id: str) -> LongTermMemoryRecord | None: ...
 
-    def put(self, *, memory: MemoryT) -> None: ...
+    def put(self, *, memory: LongTermMemoryRecord) -> LongTermMemoryRecord: ...
+
+    def update(
+        self,
+        *,
+        memory: LongTermMemoryRecord,
+        expected_revision: int,
+    ) -> LongTermMemoryRecord: ...
+
+    def list(
+        self,
+        *,
+        user_id: str,
+        entity_ids: tuple[str, ...] = (),
+        memory_types: tuple[MemoryType, ...] = (),
+        statuses: tuple[MemoryStatus, ...] = ("active",),
+        epistemic_statuses: tuple[EpistemicStatus, ...] = (),
+        limit: int = 100,
+    ) -> tuple[LongTermMemoryRecord, ...]: ...
+
+    def invalidate(
+        self,
+        *,
+        user_id: str,
+        memory_id: str,
+        expected_revision: int,
+    ) -> LongTermMemoryRecord: ...
+
+    def supersede(
+        self,
+        *,
+        user_id: str,
+        memory_id: str,
+        replacement: LongTermMemoryRecord,
+        expected_revision: int,
+    ) -> tuple[LongTermMemoryRecord, LongTermMemoryRecord]: ...
+
+    def delete(self, *, user_id: str, memory_id: str) -> bool: ...
 
 
-class SemanticMemoryIndex(Protocol[MatchT]):
+class SemanticMemoryIndex(Protocol):
     """Retrieval-only index boundary; canonical memory remains elsewhere."""
 
-    def search(self, *, query: str, limit: int) -> tuple[MatchT, ...]: ...
+    def index(self, memory: LongTermMemoryRecord) -> None: ...
+
+    def delete(self, memory_id: str) -> None: ...
