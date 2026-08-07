@@ -496,15 +496,16 @@ class SSEAndStreamlitContractTests(unittest.TestCase):
 
     def test_previous_sidebar_and_bottom_input_fixes_remain_present(self) -> None:
         source = (Path(__file__).resolve().parents[2] / "app_st.py").read_text(encoding="utf-8")
-        history_loop = source.index("for item in st.session_state.messages:")
-        input_call = source.index('st.chat_input("Ask a cybersecurity question")')
+        chat_ui = (Path(__file__).resolve().parents[1] / "web" / "chat_ui.py").read_text(encoding="utf-8")
+        history_loop = chat_ui.index("for item in messages:")
+        input_call = chat_ui.index("prompt = st.chat_input(")
 
         self.assertLess(history_loop, input_call)
-        self.assertIn("submitted_turn = st.container()", source)
+        self.assertIn("render_conversation_chat(", source)
         self.assertIn("LLM: {get_active_llm_label()}", source)
         self.assertNotIn("RAG: planned", source)
-        self.assertEqual(source.count('st.session_state.messages.append({"role": "user"'), 1)
-        self.assertEqual(source.count('st.session_state.messages.append({"role": "assistant"'), 1)
+        self.assertNotIn('st.session_state.messages.append({"role": "user"', source)
+        self.assertNotIn('st.session_state.messages.append({"role": "assistant"', source)
 
 
 if __name__ == "__main__":
