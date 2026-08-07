@@ -27,7 +27,7 @@ from src.core.llm.providers.base import LLMProviderResult, LLMStreamEvent
 from src.core.memory.routing_state import SessionRoutingStateStore
 from src.core.memory.episodes import MemoryContextKey
 from src.core.identity import RequestIdentity
-from src.core.memory.persistence import CompactThreadState
+from src.core.memory.persistence import ThreadMemoryState
 from src.core.memory.ports import ChatRepository, ThreadStateStore
 from src.core.memory.routing_state import SessionRoutingState
 from src.core.memory.store import MemoryStore
@@ -144,7 +144,7 @@ class CopilotService:
         return identity.user_id, identity.conversation_id
 
     def restore_thread_continuity(self, identity: RequestIdentity) -> None:
-        """Load only approved routing continuity before entity resolution."""
+        """Load approved routing and bounded conversation continuity."""
         if self.thread_state_store is None:
             return
         binding = (identity.user_id, identity.conversation_id, identity.thread_key)
@@ -174,13 +174,38 @@ class CopilotService:
                 identity.session_id,
                 persisted.to_routing_state(),
             )
+            transcript: tuple[Any, ...] = ()
+            local_identity = self._local_chat_identity(identity)
+            if self.chat_repository is not None and local_identity is not None:
+                try:
+                    transcript = self.chat_repository.recent(
+                        user_id=local_identity[0],
+                        conversation_id=local_identity[1],
+                        limit=max(2, self.settings.memory_relevant_turn_limit * 2),
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "event=memory_persistence_failed request_id=%s operation=transcript_restore error_type=%s",
+                        identity.request_id,
+                        type(exc).__name__,
+                    )
+            settings = getattr(self, "settings", None)
+            if settings is not None and settings.durable_working_memory_enabled:
+                self.memory_store.restore_durable_state(persisted, transcript)
             self._thread_revisions[revision_key] = persisted.revision
             logger.info(
-                "event=thread_state_loaded request_id=%s revision=%s active_entity_count=%s",
+                "event=thread_memory_loaded request_id=%s revision=%s active_entity_count=%s episode_count=%s",
                 identity.request_id,
                 persisted.revision,
                 len(persisted.active_entities),
+                len(persisted.recent_episodes),
             )
+            if persisted.working_memory and persisted.working_memory.compact_summary:
+                logger.info(
+                    "event=working_summary_restored request_id=%s summary_tokens=%s",
+                    identity.request_id,
+                    persisted.summary_size_tokens,
+                )
 
     def persist_thread_continuity(
         self,
@@ -193,10 +218,21 @@ class CopilotService:
         revision_key = (identity.user_id, identity.thread_key)
         with self._persistence_lock:
             expected_revision = self._thread_revisions.get(revision_key, 0)
-            state = CompactThreadState.from_routing_state(
+            settings = getattr(self, "settings", None)
+            components = (
+                self.memory_store.durable_components(
+                    identity.session_id,
+                    turn_limit=settings.memory_relevant_turn_limit,
+                    episode_limit=settings.memory_episode_retention_limit,
+                )
+                if settings is not None and settings.durable_working_memory_enabled
+                else {}
+            )
+            state = ThreadMemoryState.from_routing_state(
                 identity,
                 routing_state,
                 revision=expected_revision,
+                **components,
             )
             try:
                 saved = self.thread_state_store.save(
@@ -213,10 +249,11 @@ class CopilotService:
                 return
             self._thread_revisions[revision_key] = saved.revision
             logger.info(
-                "event=thread_state_saved request_id=%s revision=%s active_entity_count=%s",
+                "event=thread_memory_saved request_id=%s revision=%s active_entity_count=%s episode_count=%s",
                 identity.request_id,
                 saved.revision,
                 len(saved.active_entities),
+                len(saved.recent_episodes),
             )
 
     def begin_local_request(self, identity: RequestIdentity) -> None:

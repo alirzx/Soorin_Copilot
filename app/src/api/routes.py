@@ -35,7 +35,10 @@ from src.core.observability.llm_usage import ProductUsageReporter
 logger = logging.getLogger(__name__)
 router = APIRouter()
 settings = get_settings()
-memory_store = MemoryStore(settings.conversation_max_messages)
+memory_store = MemoryStore(
+    settings.conversation_max_messages,
+    max_episodes=settings.memory_episode_retention_limit,
+)
 routing_state_store = SessionRoutingStateStore()
 product_client = get_product_api_client()
 usage_reporter = ProductUsageReporter(settings, product_client)
