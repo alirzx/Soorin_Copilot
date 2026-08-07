@@ -828,8 +828,11 @@ That is not implemented in this audit to avoid changing the runtime contract.
 
 Current Copilot memory is bounded. Its default backend remains in process, while
 the opt-in local simulation persists owner-scoped transcripts and one bounded
-`ThreadMemoryState` in development SQLite. Relevant-turn retrieval is deterministic
-and same-conversation only; it does not use embeddings or cross-chat search.
+`ThreadMemoryState` in development SQLite. Same-conversation relevant-turn
+retrieval remains deterministic. Separately, disabled-by-default typed long-term
+memory can retrieve validated owner-scoped records across conversations using
+exact metadata plus the existing BGE/Qdrant boundary. It enriches final context
+only and never suppresses current Product or Graph calls.
 
 Recommended division:
 
@@ -849,7 +852,16 @@ Copilot runtime
 
 Production must replace SQLite with Product Memory API/PostgreSQL adapters that
 preserve ownership, revision, transcript, thread-state, summary, and episode
-semantics. Copilot SQLite is development/test/demo infrastructure only.
+semantics. For typed long-term memory, the future adapter also needs canonical
+create/get/update/delete/search plus approve/promote, invalidate, and supersede
+semantics over stable memory IDs, user scope, entity/type/status filters,
+epistemic/provenance/validity fields, optimistic revision, and index state. A
+possible backend shape is `POST /copilot/memory`, `GET|PUT|DELETE
+/copilot/memory/{id}`, `GET /copilot/memory/search`, and explicit
+`approve`/`invalidate` actions; Product owns the final URLs and authorization.
+Copilot never connects directly to Product PostgreSQL, and Qdrant is a rebuildable
+retrieval index rather than the canonical fact store. Copilot SQLite is
+development/test/demo infrastructure only.
 
 Persist only the final committed assistant message after `done`; store partial
 output separately as interrupted if Product policy requires it.
@@ -996,8 +1008,8 @@ then include the `Authorization: Bearer <token>` header automatically.
 - no tenant/user authorization (static API key only);
 - session IDs are arbitrary, unbounded strings and are not identity scoped;
 - Product Memory API/PostgreSQL adapters are not implemented;
-- deterministic retrieval is same-conversation only; semantic/cross-conversation
-  memory and a Qdrant memory index are not implemented;
+- typed cross-conversation memory is disabled by default and requires a trusted
+  user identity plus an explicitly configured canonical/index backend;
 - local SQLite thread memory is development-only and is not a production
   ownership, authorization, or multi-replica solution;
 - browser disconnect does not cancel upstream model/workflow execution;

@@ -605,6 +605,35 @@ Conversation memory:
 - Produces a storage-neutral `MemoryContextPackage` before final model context;
   fresh operational evidence remains authoritative over memory.
 
+Typed long-term memory (Gate 6/7, disabled by default):
+
+- Canonical records are atomic typed facts/outcomes: validated finding,
+  investigation outcome, analyst correction, approved asset fact, known benign
+  behavior, or hypothesis resolution. Assistant prose is never promoted
+  automatically.
+- `LongTermMemoryStore` owns create/get/revision-checked update, structured list,
+  supersede, invalidate, and delete semantics. Local development uses the v4
+  SQLite schema with user ownership and entity-link tables; SQLite is not a
+  production memory database.
+- Promotion is deterministic. Active authority requires analyst confirmation,
+  trusted structured-source validation, or explicitly historical outcome status.
+- The existing lazy BGE embedder and Qdrant adapter support a separate
+  `soorin_copilot_memory_v1` collection. SQLite/Product remains canonical;
+  Qdrant contains only an atomic retrieval projection and safe filter metadata.
+- Retrieval combines owner-scoped exact entity lookup with dense candidates,
+  canonical reload, validity/freshness policy, deduplication, and bounded Top-K.
+  An optional local-only CrossEncoder reranks only the candidate pool and safely
+  falls back to BGE order when disabled or unavailable.
+- Long-term entries join the existing `MemoryContextPackage` under an independent
+  token budget and carry type, epistemic status, freshness, provenance, and entity
+  binding. Storage/index implementation names are not sent to synthesis.
+- Retrieval occurs before semantic routing but is read-only for routing and plan
+  selection. It does not suppress Profile, Detection, Graph, or Knowledge calls;
+  current operational evidence always outranks memory.
+- Index failures never roll back canonical memory. Records expose explicit
+  `pending`, `synced`, `stale`, `failed`, or `not_indexed` state, and reconciliation
+  rebuilds from canonical records without startup-time indexing.
+
 Routing state:
 
 - Stores active IP, active entity pair, previous intent, previous scope, previous direction, previous depth, and previous operational provider state.
@@ -646,8 +675,9 @@ committed only by the existing SSE workflow and reloaded after `done`; Streamlit
 does not write transcript messages itself. Local users are development metadata,
 not Product users or authentication claims. OIDC is not configured. Working
 summary, relevant turns, and episodes are restored through the same memory ports.
-Semantic cross-chat retrieval, Product/PostgreSQL adapters, Qdrant memory search,
-and LangGraph checkpointing remain deferred.
+Product/PostgreSQL adapters and LangGraph checkpointing remain deferred. Typed
+owner-scoped cross-conversation retrieval is available only when explicitly
+enabled and a trusted `user_id` is present.
 
 Each successful service request constructs one new `SessionRoutingState` and calls the state store once. Explicit-message, UI, and session entity authority remains owned by the resolver/router normalization path. General detached turns preserve useful active entity state. Safe-failure requests preserve prior active state unless the current request supplied a valid explicit or UI-authoritative investigation entity; Planner arguments and final prose are never state inputs.
 
@@ -787,6 +817,8 @@ Implemented:
 - BGE embedding configuration and lazy Hugging Face embedder.
 - Context composer with provider coverage, budgets, and limitations.
 - In-memory conversation and routing state.
+- Disabled-by-default typed long-term memory with local SQLite canonical storage,
+  separate Qdrant/BGE retrieval, and optional bounded reranking.
 - UTF-8-safe SSE streaming.
 - Bounded typed agent contracts, registry, task mapping, and reviewer foundation.
 - Active deterministic direct-plan compiler and bounded multi-step Planner.
@@ -809,7 +841,6 @@ Deferred or not implemented:
 - SIEM/Splunk integrations.
 - Alert actions.
 - Report-generation endpoints.
-- Long-term durable memory.
 - Durable cross-process episodic conversation memory.
 - Human approval workflows.
 - Automatic remediation.
@@ -827,4 +858,9 @@ Remaining risks:
   coordination.
 - RAG availability and freshness depend on an externally maintained Qdrant collection; the application does not index at startup.
 
-The active upgrade roadmap is: establish durable conversation/thread identity and compact thread state; reduce synthesis pressure through route-aware Product projections, evidence deduplication, and delta context; add typed provenance-aware cross-conversation memory; then introduce an Organization Intelligence Plane that remains subordinate to live Product and Graph evidence. Neo4j, GraphRAG, Planner expansion, MCP/vendor tools, bulk enrichment, and side-effecting actions remain separate deferred capabilities.
+The active upgrade roadmap is: validate Gate 6/7 retrieval against local approved
+memory, then add Gate 8 freshness/evidence-gap decisions without weakening live
+evidence authority; after that, introduce an Organization Intelligence Plane that
+remains subordinate to live Product and Graph evidence. Neo4j, GraphRAG, Planner
+expansion, MCP/vendor tools, bulk enrichment, and side-effecting actions remain
+separate deferred capabilities.

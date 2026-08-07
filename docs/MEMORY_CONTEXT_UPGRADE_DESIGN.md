@@ -1,10 +1,11 @@
 # Soorin Copilot Memory and Context Upgrade Design
 
-**Status:** target architecture plus verified Gate 3 local-persistence slice.
+**Status:** target architecture plus verified Gates 3-7 local memory slices.
 Gate 3 implements disabled-by-default local SQLite `ChatRepository` and compact
-`ThreadStateStore` adapters. Trusted Product identity/authorization, production
-Product persistence, long-term memory, semantic memory, context compaction, and
-LangGraph checkpointing remain future work.
+`ThreadStateStore` adapters; Gates 5-7 add bounded short-term context and typed
+long-term exact/BGE retrieval. Trusted Product identity/authorization, production
+Product persistence, Gate 8 tool-gap decisions, context compaction, and LangGraph
+checkpointing remain future work.
 
 **Source audit:** 2026-08-05, branch `dev`, baseline HEAD `f9a62c6` plus the
 verified Gate 3 working tree. Claims labelled “current” were verified against
@@ -499,13 +500,35 @@ summary provenance, bounded completed-turn references, bounded episode summaries
 deterministic same-conversation relevant-turn selection, and a budgeted
 `MemoryContextPackage` before final model context composition.
 
-Still deferred are Product Memory API/PostgreSQL adapters, semantic or
-cross-conversation retrieval, BGE/Qdrant memory indexing, full LangGraph
-checkpointing, Organization Intelligence, and Profile/Detection multi-view or
-delta context compaction. A future Product adapter must preserve owner scope,
-stable session identity, optimistic revision, schema version, ordered completed
-transcript reads, bounded episode retention, and non-fatal unavailable/conflict
-classification; endpoint paths remain a Product contract decision.
+Gates 6/7 add one typed long-term-memory path to that package. Canonical atomic
+records use six bounded SOC/NOC memory types, explicit epistemic/promotion state,
+validity, provenance, source references, optimistic revision, lifecycle status,
+and index-consistency status. Local SQLite schema v4 is the development source of
+truth. A separate Qdrant collection indexes deterministic atomic retrieval text
+with the existing lazy BGE boundary; generic document chunking is not used.
+
+Retrieval is owner-scoped exact metadata/entity search plus bounded BGE recall,
+canonical reload and freshness filtering, deduplication, then optional local-only
+CrossEncoder reranking of the small candidate pool. Failures fall back safely and
+never alter epistemic confidence. The final long-term section has an independent
+token budget and exposes only type, authority, freshness, provenance, entity
+binding, and statement. Current Product/Graph evidence remains authoritative,
+and memory cannot suppress current workflow capabilities in this gate.
+
+Canonical writes complete before best-effort index writes. Index failure marks
+the canonical record failed/stale without deleting it; explicit reconciliation
+uses canonical records as truth and never runs automatically at startup.
+Candidate creation is available as a typed operation, but terminal workflow code
+does not invent candidates when structured authority is insufficient and never
+auto-promotes assistant prose.
+
+Still deferred are Product Memory API/PostgreSQL adapters, full LangGraph
+checkpointing, Organization Intelligence, Profile/Detection multi-view or delta
+context compaction, and Gate 8 memory-first evidence-gap/tool-skipping decisions.
+A future Product adapter must preserve owner scope, stable IDs, optimistic
+revision, lifecycle/index status, provenance, exact structured search, and
+non-fatal unavailable/conflict classification; endpoint paths remain a Product
+contract decision.
 
 ## Appendix A. Disposition of the removed OpenCode guide
 
