@@ -278,6 +278,9 @@ class InvestigationState(TypedDict, total=False):
     conversation_snapshot: Any
     memory_context_key: Any
     long_term_memory_selection: Any
+    evidence_requirements: Any
+    evidence_gap_plan: Any
+    memory_tool_results: list[ToolResult]
     synthesis_request: dict[str, Any]
     context_review: dict[str, Any]
     synthesis_result: dict[str, Any]

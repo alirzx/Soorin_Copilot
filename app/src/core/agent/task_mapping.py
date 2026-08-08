@@ -104,10 +104,10 @@ def compile_direct_plan(task: TaskSpec, *, plan_id: str | None = None) -> Execut
             detail = "deep" if task.detail_level in {"detailed", "deep", "report"} else task.detail_level
             views = select_product_views(provider, task.request, detail)
             purpose = (
-                "assess_anomaly"
-                if provider == "detection" and any(view in views for view in ("anomaly_risk", "behavior"))
+                "explain_detection"
+                if provider == "detection" and "evidence" in views
                 else "establish_identity"
-                if "identity_role" in views
+                if "identity" in views
                 else "asset_summary"
             )
             for entity in targets:

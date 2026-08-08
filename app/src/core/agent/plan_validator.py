@@ -12,7 +12,12 @@ from pydantic import ValidationError
 
 from src.core.agent.contracts import ExecutionPlan, PlanStep
 from src.core.agent.registry import CapabilityRegistry
-from src.core.context.product_views import approved_views, normalize_purpose, select_product_views
+from src.core.context.product_views import (
+    approved_views,
+    normalize_product_views,
+    normalize_purpose,
+    select_product_views,
+)
 
 
 KNOWLEDGE_PURPOSES = {
@@ -60,13 +65,19 @@ class PlanValidator:
         self.max_entities = max(1, max_entities)
         self.max_graph_depth = max(0, max_graph_depth)
 
-    def validate(self, plan: ExecutionPlan) -> ExecutionPlan:
+    def validate(
+        self,
+        plan: ExecutionPlan,
+        *,
+        satisfied_capabilities: tuple[str, ...] = (),
+    ) -> ExecutionPlan:
         if len(plan.task.entities) > self.max_entities:
             raise PlanValidationError("maximum_entities_exceeded", "Plan target entity limit exceeded.")
         if any(entity not in plan.task.entities for entity in plan.target_entities):
             raise PlanValidationError("entity_authority_violation", "Plan attempted to introduce an unresolved target entity.")
+        satisfied = set(satisfied_capabilities)
         if not plan.steps:
-            if plan.task.required_capabilities or plan.task.optional_capabilities:
+            if set(plan.task.required_capabilities + plan.task.optional_capabilities) - satisfied:
                 raise PlanValidationError("plan_steps_missing", "Plan contains no execution steps.")
             return replace(plan, validated=True, maximum_allowed_calls=self.max_calls)
         if len(plan.steps) > min(self.max_calls, plan.maximum_allowed_calls):
@@ -147,21 +158,21 @@ class PlanValidator:
                     detail = "deep"
                 if detail not in {"brief", "standard", "deep"}:
                     raise PlanValidationError("product_detail_invalid", "Plan requested an invalid Product detail level.")
-                views = tuple(
+                views = normalize_product_views(provider, tuple(
                     arguments.get("views")
                     or select_product_views(provider, plan.task.request, detail)
-                )
-                if len(views) > 5 or any(view not in approved_views(provider) for view in views):
+                ))
+                if len(views) > 6 or any(view not in approved_views(provider) for view in views):
                     raise PlanValidationError("product_view_invalid", "Plan requested an unapproved Product evidence view.")
                 arguments["views"] = list(dict.fromkeys(views))
                 arguments["detail"] = detail
                 arguments.setdefault("max_context_tokens", 5000 if detail == "deep" else 3000)
                 arguments.setdefault(
                     "purpose",
-                    "assess_anomaly"
-                    if provider == "detection" and "anomaly_risk" in views
+                    "explain_detection"
+                    if provider == "detection" and "evidence" in views
                     else "establish_identity"
-                    if "identity_role" in views
+                    if "identity" in views
                     else "asset_summary",
                 )
                 arguments["purpose"] = normalize_purpose(
@@ -251,13 +262,13 @@ class PlanValidator:
 
         self._validate_dag(normalized)
         planned_capabilities = {step.capability for step in normalized}
-        missing_required = set(plan.task.required_capabilities) - planned_capabilities
+        missing_required = set(plan.task.required_capabilities) - planned_capabilities - satisfied
         if missing_required:
             raise PlanValidationError(
                 "required_capability_missing",
                 "Plan omitted a capability required by the validated TaskSpec.",
             )
-        missing_optional = set(plan.task.optional_capabilities) - planned_capabilities
+        missing_optional = set(plan.task.optional_capabilities) - planned_capabilities - satisfied
         if missing_optional:
             raise PlanValidationError(
                 "optional_capability_missing",

@@ -9,6 +9,15 @@ from typing import Any
 
 from src.core.agent.contracts import InvestigationState
 from src.core.agent.events import WorkflowEventContext, WorkflowEventLogger
+from src.core.agent.evidence_policy import (
+    EvidenceRequirementPolicy,
+    MemorySufficiencyGate,
+    apply_gap_plan,
+    build_gap_plan,
+    evidence_refs_from_validated_result,
+    log_gap_plan,
+    structured_memory_statement,
+)
 from src.core.agent.evidence import apply_context_inclusion, context_package_from_evidence
 from src.core.agent.plan_validator import PlanValidationError
 from src.core.agent.planner import PlannerError
@@ -25,6 +34,7 @@ from src.core.llm.errors import LLMError
 from src.core.llm.providers.base import LLMProviderResult, LLMStreamEvent
 from src.core.llm.token_estimator import TokenEstimator
 from src.core.memory.episodes import MemoryContextKey
+from src.core.memory.long_term import LongTermMemoryRecord
 from src.core.memory.routing_state import SessionRoutingState
 
 
@@ -40,6 +50,8 @@ class CopilotWorkflowNodes:
         self.settings = service.settings
         self.stream_sink = stream_sink
         self.context_composer = ContextComposer(self.settings)
+        self.evidence_requirement_policy = EvidenceRequirementPolicy()
+        self.memory_sufficiency_gate = MemorySufficiencyGate()
 
     def resolve_entities(self, state: InvestigationState) -> dict[str, Any]:
         session = state["session_id"]
@@ -169,11 +181,20 @@ class CopilotWorkflowNodes:
                 "next_edge": "safe_failure",
             }
         planner_selected = task.workflow_mode == "multi_step" and self.settings.planner_enabled
+        requirements = self.evidence_requirement_policy.derive(task)
+        selection = state.get("long_term_memory_selection")
+        memories = tuple(getattr(selection, "memories", ()) or ())
+        decisions = self.memory_sufficiency_gate.evaluate(requirements, memories)
+        gap_plan = build_gap_plan(requirements, decisions)
+        log_gap_plan(state["request_id"], gap_plan)
         return {
             "task": task,
             "workflow_mode": task.workflow_mode,
             "planner_called": planner_selected,
             "memory_context_key": MemoryContextKey.from_task(task),
+            "evidence_requirements": requirements,
+            "evidence_gap_plan": gap_plan,
+            "memory_tool_results": [],
             "next_edge": "planner" if planner_selected else "direct",
         }
 
@@ -223,9 +244,31 @@ class CopilotWorkflowNodes:
 
     def validate_plan(self, state: InvestigationState) -> dict[str, Any]:
         _registry, validator, _executor = self.service._capability_runtime_snapshot()
-        plan = state["execution_plan"]
+        plan, gap_plan, memory_results = apply_gap_plan(
+            state["execution_plan"],
+            state["evidence_gap_plan"],
+        )
+        for selection in gap_plan.view_selections:
+            logger.info(
+                "event=view_selected request_id=%s capability=%s views=%s entity_count=%s reason=%s",
+                state["request_id"],
+                selection.capability,
+                ",".join(selection.views),
+                len(selection.entities),
+                selection.reason,
+            )
+        for result in memory_results:
+            logger.info(
+                "event=tool_skipped_from_memory request_id=%s capability=%s entity_count=%s reason=memory_reused_authoritative",
+                state["request_id"],
+                result.source_capability,
+                len(result.entities),
+            )
         try:
-            validated = validator.validate(plan)
+            validated = validator.validate(
+                plan,
+                satisfied_capabilities=gap_plan.skipped_capabilities,
+            )
         except PlanValidationError as exc:
             fallback_allowed = plan.source == "llm" and not state.get("fallback_used")
             return {
@@ -244,6 +287,8 @@ class CopilotWorkflowNodes:
             }
         return {
             "execution_plan": validated,
+            "evidence_gap_plan": gap_plan,
+            "memory_tool_results": memory_results,
             "plan_validation_result": {"valid": True, "fallback_allowed": False},
             "next_edge": "execute",
         }
@@ -270,8 +315,8 @@ class CopilotWorkflowNodes:
             },
         )
         return {
-            "tool_results": results,
-            "capability_results": results,
+            "tool_results": [*(state.get("memory_tool_results") or ()), *results],
+            "capability_results": [*(state.get("memory_tool_results") or ()), *results],
             "iteration_count": int(state.get("iteration_count", 0)) + 1,
             "next_edge": "build_evidence",
         }
@@ -409,11 +454,15 @@ class CopilotWorkflowNodes:
     def join_specialist_results(self, state: InvestigationState) -> dict[str, Any]:
         """Restore deterministic parent-plan result order before evidence review."""
         results = [
+            *(state.get("memory_tool_results") or ()),
             *(state.get("specialist_tool_results") or ()),
             *(state.get("generic_tool_results") or ()),
         ]
         by_step = {item.step_id: item for item in results}
-        ordered = [by_step[step.id] for step in state["execution_plan"].steps if step.id in by_step]
+        ordered = [
+            *[item for item in results if item.provider == "long_term_memory"],
+            *[by_step[step.id] for step in state["execution_plan"].steps if step.id in by_step],
+        ]
         return {
             "tool_results": ordered,
             "capability_results": ordered,
@@ -887,13 +936,67 @@ class CopilotWorkflowNodes:
                 user_content=state["message"].strip(),
                 assistant_content=synthesis["answer"],
             )
+        proposed_count = self._propose_long_term_candidates(state)
         return {
             "active_entity_state": new_state,
-            "memory_update_result": {"completed": True, "request_id": state["request_id"]},
+            "memory_update_result": {
+                "completed": True,
+                "request_id": state["request_id"],
+                "long_term_candidate_count": proposed_count,
+            },
             "terminal": True,
             "completed_at": state.get("updated_at"),
             "next_edge": "terminal",
         }
+
+    def _propose_long_term_candidates(self, state: InvestigationState) -> int:
+        coordinator = getattr(self.service, "long_term_memory_coordinator", None)
+        identity = state.get("request_identity")
+        requirements = state.get("evidence_requirements")
+        if (
+            coordinator is None
+            or identity is None
+            or not identity.user_id
+            or requirements is None
+        ):
+            return 0
+        created = 0
+        for result in state.get("tool_results") or ():
+            refs = evidence_refs_from_validated_result(
+                requirements,
+                result,
+                existing_refs=(result.step_id,) if result.step_id else (),
+            )
+            statement = structured_memory_statement(result, refs)
+            if statement is None:
+                continue
+            try:
+                coordinator.create_candidate(LongTermMemoryRecord.candidate(
+                    memory_type="validated_finding",
+                    user_id=identity.user_id,
+                    entity_ids=result.entities,
+                    statement=statement,
+                    source_request_id=identity.request_id,
+                    source_conversation_id=identity.thread_key,
+                    evidence_refs=refs,
+                    provenance_category="investigation",
+                ))
+            except (RuntimeError, ValueError, OSError) as exc:
+                logger.warning(
+                    "event=long_term_memory_candidate_failed request_id=%s capability=%s error_type=%s",
+                    state["request_id"],
+                    result.source_capability,
+                    type(exc).__name__,
+                )
+                continue
+            created += 1
+            logger.info(
+                "event=long_term_memory_candidate_proposed request_id=%s capability=%s evidence_class_count=%s",
+                state["request_id"],
+                result.source_capability,
+                sum(ref.startswith("evidence_class_") for ref in refs),
+            )
+        return created
 
     def clarification_response(self, state: InvestigationState) -> dict[str, Any]:
         clarification = state.get("clarification") or {}

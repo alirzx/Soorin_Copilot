@@ -114,17 +114,16 @@ class EvidenceReviewer:
                     continue
                 usable = any(
                     result.context_included
-                    and result.context_representation == "full_minified"
+                    and result.context_representation in {"unreviewed", "projected", "full_minified", "memory_reuse"}
                     and result.source_payload_complete
                     and result.projection_usable
                     and not result.projection_truncated
-                    and result.projection_omitted_count == 0
                     for result in entity_results
                 )
                 if usable:
                     continue
                 limitation = (
-                    f"{capability} retrieval succeeded for {entity}, but its complete minified payload "
+                    f"{capability} retrieval succeeded for {entity}, but a usable validated projection "
                     "was not available in model context."
                 )
                 return ReviewDecision(
@@ -136,14 +135,13 @@ class EvidenceReviewer:
         limitations: list[str] = []
         dedicated_anomaly_evidence = any(
             result.source_capability == "asset.get_detection"
-            and "anomaly_risk" in result.selected_views
+            and "evidence" in result.selected_views
             and result.status in {"ok", "partial"}
             and result.context_included
-            and result.context_representation == "full_minified"
+            and result.context_representation in {"projected", "full_minified"}
             and result.source_payload_complete
             and result.projection_usable
             and not result.projection_truncated
-            and result.projection_omitted_count == 0
             for result in required
         )
         for result in required:
@@ -230,7 +228,7 @@ class EvidenceReviewer:
         )
         dedicated_anomaly_evidence = any(
             result.source_capability == "asset.get_detection"
-            and "anomaly_risk" in result.selected_views
+            and "evidence" in result.selected_views
             and result.status in {"ok", "partial"}
             and result.source_payload_complete
             and result.projection_usable

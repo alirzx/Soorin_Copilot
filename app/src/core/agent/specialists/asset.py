@@ -32,12 +32,14 @@ class AssetInvestigationSpecialist(BoundedSpecialistSubgraph):
             entities=plan.task.entities,
             executed_capabilities=capabilities,
             result_statuses=tuple((item.source_capability, item.status) for item in results),
-            identity_role_fact_count=sum("identity_role" in item.selected_views for item in results),
+            identity_role_fact_count=sum(
+                bool({"overview", "identity"}.intersection(item.selected_views)) for item in results
+            ),
             service_software_fact_count=sum(
-                bool({"services", "software"}.intersection(item.selected_views)) for item in results
+                bool({"network", "activity", "full"}.intersection(item.selected_views)) for item in results
             ),
             risk_behavior_fact_count=sum(
-                bool({"anomaly_risk", "behavior"}.intersection(item.selected_views)) for item in results
+                bool({"security", "evidence", "full"}.intersection(item.selected_views)) for item in results
             ),
             conflicts=tuple(dict.fromkeys(value for item in results for value in item.contradictions)),
             missing_evidence=missing,
