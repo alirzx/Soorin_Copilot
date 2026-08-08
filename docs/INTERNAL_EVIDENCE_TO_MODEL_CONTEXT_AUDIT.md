@@ -1,5 +1,17 @@
 # Internal Evidence To Model Context Audit
 
+> **Gate 8 update:** This audit originally captured the pre-Gate-8 full-minified
+> Product contract. Claims below that Product views are metadata-only, that full
+> Profile/Detection JSON is the default model representation, or that long-term
+> memory can never suppress a call are historical findings. Current code retains
+> canonical payloads internally, retrieves four compact Detection views plus
+> deep `full`, projects the current full Profile into six approved views, applies
+> deterministic memory sufficiency and evidence gaps, reserves Graph budget,
+> deduplicates exact equivalent facts, and permits delta only with an accessible
+> compatible baseline. Current tags are `ASSET_PROFILE_CONTEXT_JSON` and
+> `ASSET_DETECTION_CONTEXT_JSON`; full JSON reaches synthesis only through a
+> validated `full` view.
+
 ## 1. Executive Summary
 
 This audit traces how Soorin Copilot evidence moves from internal providers into the final synthesis-model messages on branch `dev`.

@@ -1,11 +1,12 @@
 # Soorin Copilot Memory and Context Upgrade Design
 
-**Status:** target architecture plus verified Gates 3-7 local memory slices.
+**Status:** target architecture plus verified Gates 3-8 local memory/context slices.
 Gate 3 implements disabled-by-default local SQLite `ChatRepository` and compact
 `ThreadStateStore` adapters; Gates 5-7 add bounded short-term context and typed
-long-term exact/BGE retrieval. Trusted Product identity/authorization, production
-Product persistence, Gate 8 tool-gap decisions, context compaction, and LangGraph
-checkpointing remain future work.
+long-term exact/BGE retrieval. Gate 8 adds deterministic evidence requirements,
+memory sufficiency/gap decisions, Product view selection, and bounded context
+compaction. Trusted Product identity/authorization, production Product
+persistence, and LangGraph checkpointing remain future work.
 
 **Source audit:** 2026-08-05, branch `dev`, baseline HEAD `f9a62c6` plus the
 verified Gate 3 working tree. Claims labelled “current” were verified against
@@ -126,17 +127,17 @@ window guard. History is dropped before current evidence when needed.
 
 - Graph is scope-specific and serialized under per-scope plus global budgets.
 - Knowledge chunks and citations compete in the same global dynamic budget.
-- Profile and Detection retain raw payloads internally and serialize full
-  minified JSON into model context when included.
-- Product “views” currently select metadata/inventory/fact labels, not a
-  field-level model projection. This is an implemented multi-view foundation,
-  not completed view-aware context reduction.
+- Profile retains its full raw payload internally and exposes deterministic
+  overview/identity/security/network/activity/full model projections.
+- Detection retrieves approved overview/evidence/similarity/cluster/full views
+  through the shared Product client; compact views are normal defaults.
+- Model context uses selected projections, exact fact deduplication, bounded list
+  metadata, evidence-class budgets, and conservative delta eligibility.
 
 ### 3.2 Verified pressure and duplication risks
 
-1. Full Profile and Detection JSON can consume the dynamic budget before Graph
-   and Knowledge. If required Product blocks do not fit, synthesis fails safely;
-   it does not silently truncate them.
+1. Explicit full Profile/Detection remains expensive. It is deep-only and cannot
+   consume the Graph reserve; omission is explicit if it cannot fit.
 2. A combined plan can retrieve Profile and Detection for each asset and then
    also add a reviewed EvidencePack summary and provider manifest. These are
    useful but overlapping representations.
@@ -154,8 +155,8 @@ window guard. History is dropped before current evidence when needed.
 | --- | --- |
 | Non-durable continuity | `MemoryStore`, episode repository, and routing-state store are dictionaries in one process. |
 | No cross-conversation memory | no user/conversation identity or typed durable memory store exists. |
-| Repeated retrieval | capability execution is request-scoped; only Product provider cache/request reuse exists. |
-| Large synthesis input | full Product JSON is model-facing; context also includes manifest, evidence summary, graph/knowledge, history. |
+| Repeated retrieval | Gate 8 can explicitly skip only fully authoritative, fresh, complete, entity-bound revision/historical evidence; volatile operational requirements refresh. |
+| Large synthesis input | selected Product projections and evidence-class budgets replace default full JSON; explicit full mode remains costly. |
 | Organization knowledge rebuilt on demand | no validated organizational fact/baseline store or semantic memory index exists. |
 
 ## 5. Target identifier model

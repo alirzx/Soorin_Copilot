@@ -341,7 +341,25 @@ Already-running synchronous provider threads cannot be forcibly terminated after
 
 ### ToolResult and EvidencePack
 
-`ToolResult` is the canonical capability-output contract. It includes a stable model-context identity plus explicit inclusion, omission reason, representation, and token metadata. Raw provider result objects remain internal in `raw_payload`/`provider_result`; when Product Profile or Detection evidence is included, the Context Composer currently serializes the complete minified JSON payload into model context. The configured Product views provide typed selection and inventory metadata but do not yet create field-level model projections. Graph retrieval/serialization completeness, counts, truncation, and limitations survive conversion. Knowledge chunks, scores through the original result, citations, counts, backend, and freshness survive conversion. Unknown provider statuses fail closed as `invalid`; they are never normalized to success.
+`ToolResult` is the canonical capability-output contract. It includes a stable model-context identity plus explicit inclusion, omission reason, representation, and token metadata. Raw provider result objects remain internal in `raw_payload`/`provider_result`; the model receives only the validated Product projection selected for unresolved evidence classes. Full Product JSON is model-facing only for an explicit validated `full` view. Graph retrieval/serialization completeness, counts, truncation, and limitations survive conversion. Knowledge chunks, scores through the original result, citations, counts, backend, and freshness survive conversion. Unknown provider statuses fail closed as `invalid`; they are never normalized to success.
+
+### Memory-first evidence-gap policy (Gate 8)
+
+After `TaskSpec`, deterministic code derives typed evidence requirements. The
+`MemorySufficiencyGate` evaluates coverage, exact entity binding, authority,
+freshness class, completeness, and active contradiction. Its explicit outcomes
+are `memory_sufficient`, `memory_sufficient_verification_required`,
+`live_evidence_required`, `contradictory_memory`, and `memory_unavailable`.
+Semantic similarity never establishes entity identity or authority. Current
+Detection, Graph, risk, and activity requirements normally retain a live
+verification call. Only fully satisfied revision-based or explicitly historical
+requirements may skip a call. A skip is represented by a validated memory-backed
+`ToolResult`, logged, shown in Human Trace, and accepted by PlanValidator; it is
+never treated as an absent capability.
+
+Both direct and Planner plans converge on the same deterministic gap application,
+`ViewSelector`, and `PlanValidator`. Neither Router nor Planner can supply raw
+URLs, disable freshness checks, or force unvalidated full payloads.
 
 `EvidencePack` is constructed only from `ToolResult` records. It carries request/trace/plan IDs, resolved entities, plan summary, capability coverage, identity-keyed result coverage, graph completeness, citations, missing evidence, limitations, contradictions, supplemental history, and review outcome. Repeated capabilities remain separate ToolResults.
 
@@ -430,19 +448,33 @@ Product client behavior:
 Product endpoints:
 
 - Topology: `SOORIN_PRODUCT_TOPOLOGY_PATH`, default `/zeek/connections/unique-ip-pairs`.
-- Detection: `SOORIN_PRODUCT_ASSET_DETECTION_PATH`, default `/asset-detection/test/{ip}`.
+- Detection full: `SOORIN_PRODUCT_ASSET_DETECTION_PATH`, default `/asset-detection/test/{ip}`.
+- Detection overview/evidence/similarity/cluster: the four
+  `SOORIN_PRODUCT_ASSET_DETECTION_*_PATH` settings, defaulting to
+  `/asset-detection/{ip}/{view}`.
 - Asset profile: `SOORIN_PRODUCT_ASSET_PROFILE_PATH`, default `/profile/{ip}`.
 - Login: `SOORIN_PRODUCT_LOGIN_PATH`, default `/auth/login`.
 
 Detection and profile providers:
 
-- Fetch full JSON once per provider/entity/request and preserve the unchanged typed raw provider result.
-- Cache by normalized IP using the detection cache settings.
+- Profile fetches the current full `/profile/{ip}` JSON once per entity/request
+  and preserves it unchanged internally. The Product profile-overview endpoint
+  is intentionally not used.
+- Detection fetches only selected `overview`, `evidence`, `similarity`, `cluster`,
+  or deep `full` views. Every view uses the same Product session, login/token
+  refresh, retry, Bearer authorization, and `x-hwid` machinery.
+- Cache keys include normalized IP and Detection view.
 - Can return stale cached evidence on provider error if configured.
 - Track raw JSON size, approximate tokens, top-level key counts, cache hit/miss/stale status, HTTP status, and safe error classification.
-- Create safe path/type/length payload inventories and deterministic question-specific view metadata.
+- Create safe path/type/length inventories and deterministic model projections.
 
-Detection supports exactly `overview`, `identity_role`, `anomaly_risk`, `behavior`, and `evidence_deep`. Profile supports exactly `overview`, `identity_role`, `services_software`, `security_posture`, and `evidence_deep`. The selected views currently drive deterministic request metadata, inventory, facts, and review/trace labels; they do not yet select smaller field-level model projections. When included, the Context Composer serializes the complete minified Product payload for each provider/entity. Comprehensive requests remain under the global context budget. A reviewer-approved supplemental Product view reuses the request-scoped raw result and cannot cause another Product fetch.
+Detection supports `overview`, `evidence`, `similarity`, `cluster`, and `full`.
+Similarity means rule/tag/role affinity, not embedding-space similarity. Cluster
+means rule/tag/role-affinity grouping, not unsupervised ML clustering; population
+one is weak cohort evidence. Profile supports deterministic `overview`,
+`identity`, `security`, `network`, `activity`, and `full` projections from the
+current full endpoint. Large lists carry total/included/omitted counts and a
+stable selection rule. `full` is deep/exhaustive-only by default.
 
 ## 11. Graph Topology
 
@@ -566,17 +598,40 @@ The context composer produces a dynamic system message with:
 - Explicit warning that operational evidence outranks documentation.
 - A compact reviewed-EvidencePack summary containing plan identity, provider coverage, graph completeness, review outcome, missing evidence, contradictions, and limitations.
 
-The composer input is rebuilt from canonical reviewed `ToolResult` objects. Complete Product Profile and Detection provider objects remain unchanged. `view_payload` currently equals the complete provider payload, and the exact model-facing Product representation is complete minified JSON when it fits the dynamic budget. There is no separate raw-provider side channel; however, this representation can be large and is not yet a view-aware field projection.
+The composer input is rebuilt from canonical reviewed `ToolResult` objects.
+Complete provider objects remain unchanged internally; `view_payload` is the
+deterministic model projection. Exact same-key/value identity facts are collapsed
+with source/path support, while contradictions, different timestamps, and
+current-versus-historical observations remain distinct. Compatible delta context
+requires an entity/view/schema-matched complete baseline already accessible in
+current memory; otherwise the compact current view is sent.
 
 Final synthesis receives the global system prompt, a compact reviewed EvidencePack summary, dynamic context reconstructed from EvidencePack provider results, bounded conversation history, and the current user request. No old provider loop or raw provider side channel can add current evidence outside that boundary. If retrieval review, context review, or required graph-context budgeting produces a safe-failure condition, the final LLM is not called. Streaming and non-streaming requests share this same orchestration and differ only in final model transport.
 
 Budget controls:
 
 - Uses configured context window, reserved output tokens, safety margin, and base input token estimate.
-- Graph exhaustive requests allocate graph context before narrative product detail.
-- Product payloads can be compacted when exhaustive graph context needs priority.
+- Evidence-class caps bound Profile and Detection, and Graph capacity is reserved
+  before Product sections. Operational evidence outranks optional Knowledge.
+- Full Product payloads cannot silently starve required Graph evidence.
 - Required graph context that cannot fit creates a safe context limitation.
 - Knowledge context participates in the same budget and may be omitted with logged reason.
+
+Gate 8 offline fixture measurements use the repository's conservative
+`characters / 4` estimator; they are regression indicators, not measured
+production tokenizer savings:
+
+| Request shape | Selected views | Full estimate | Compact estimate | Estimated reduction |
+| --- | --- | ---: | ---: | ---: |
+| Quick asset summary | Profile overview | 11,306 | 56 | 99.5% |
+| Classification | Detection overview | 11,561 | 59 | 99.5% |
+| Classification explanation | Detection overview + evidence | 11,561 | 165 | 98.6% |
+| Identity / AD analysis | Profile identity | 11,306 | 104 | 99.1% |
+| Risk analysis | Profile security | 11,306 | 126 | 98.9% |
+| Similarity | Detection similarity | 11,561 | 173 | 98.5% |
+| Cluster | Detection cluster | 11,561 | 168 | 98.5% |
+| Network activity | Profile network + activity | 11,306 | 169 | 98.5% |
+| Deep investigation | Detection full | 11,561 | 11,561 | 0.0% |
 
 Input estimates are deployment/model labeled and multiplied by `SOORIN_LLM_TOKEN_ESTIMATE_MULTIPLIER` (default `1.35`). Output reservation is dynamic: brief uses 1,536 tokens, standard uses 4,096, and deep/report uses up to 6,144, always capped by the deployment. Immediately before synthesis, a hard guard enforces `calibrated input + selected output reservation + configured safety margin <= context window`. It removes eligible history, performs one bounded context recomposition, and may reduce output only to a detail-policy floor. If the invariant still fails, the provider is not called. Traces report remaining-before-safety and remaining-usable tokens separately.
 
@@ -627,9 +682,10 @@ Typed long-term memory (Gate 6/7, disabled by default):
 - Long-term entries join the existing `MemoryContextPackage` under an independent
   token budget and carry type, epistemic status, freshness, provenance, and entity
   binding. Storage/index implementation names are not sent to synthesis.
-- Retrieval occurs before semantic routing but is read-only for routing and plan
-  selection. It does not suppress Profile, Detection, Graph, or Knowledge calls;
-  current operational evidence always outranks memory.
+- Retrieval occurs before semantic routing. Gate 8 consumes only typed,
+  owner/entity-bound, authoritative records after TaskSpec. It may suppress a
+  fully satisfied revision-based/historical call explicitly; volatile evidence
+  refreshes and current operational evidence still outranks memory.
 - Index failures never roll back canonical memory. Records expose explicit
   `pending`, `synced`, `stale`, `failed`, or `not_indexed` state, and reconciliation
   rebuilds from canonical records without startup-time indexing.
@@ -693,7 +749,7 @@ Phase 3 adds node lifecycle events on the same allowlisted logging path:
 - specialist start/completion/failure/skip and specialist-node lifecycle events
 - workflow start, completion, partial, and failure events
 
-The detailed human workflow trace is adapted from final `InvestigationState`. It includes request/entity authority, routing, task/plan, `LANGGRAPH WORKFLOW`, `SPECIALISTS`, capability execution, evidence coverage, context/token budget, memory transition, bounded LLM-call counts, final status, and limitation reasons. It never renders prompts, model responses, credentials, or evidence payloads.
+The detailed human workflow trace is adapted from final `InvestigationState`. It includes request/entity authority, routing, task/plan, evidence requirements, memory sufficiency/gap decisions, selected views, memory-skipped calls, `LANGGRAPH WORKFLOW`, `SPECIALISTS`, capability execution, evidence coverage, context/token budget, memory transition, bounded LLM-call counts, final status, and limitation reasons. It never renders prompts, model responses, credentials, memory statements, or evidence payloads.
 
 Machine workflow events use compact allowlisted metadata with request, trace, session, plan, and step identifiers and support console or JSON formatting. They never contain complete prompts, full model responses, raw Product JSON, credentials, headers, or hidden reasoning.
 

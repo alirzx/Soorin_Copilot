@@ -831,8 +831,10 @@ the opt-in local simulation persists owner-scoped transcripts and one bounded
 `ThreadMemoryState` in development SQLite. Same-conversation relevant-turn
 retrieval remains deterministic. Separately, disabled-by-default typed long-term
 memory can retrieve validated owner-scoped records across conversations using
-exact metadata plus the existing BGE/Qdrant boundary. It enriches final context
-only and never suppresses current Product or Graph calls.
+exact metadata plus the existing BGE/Qdrant boundary. Gate 8 may explicitly
+reuse fully authoritative revision-based or historical evidence; current
+Detection, Graph, risk, and activity requirements still require verification.
+This internal policy does not change frontend request or SSE schemas.
 
 Recommended division:
 
