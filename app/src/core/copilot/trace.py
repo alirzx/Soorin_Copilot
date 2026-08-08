@@ -27,6 +27,7 @@ _DETAILED_SECTION_ORDER = (
     "IDENTITY AND ENTITY RESOLUTION",
     "ROUTING DECISION",
     "TASK AND PLAN",
+    "MEMORY SUFFICIENCY AND EVIDENCE GAP",
     "LANGGRAPH WORKFLOW",
     "SPECIALISTS",
     "CAPABILITY EXECUTION",
@@ -329,6 +330,18 @@ def trace_from_investigation_state(state: dict[str, Any]) -> CopilotRequestTrace
         plan_source=getattr(plan, "source", ""),
         validated=bool(getattr(plan, "validated", False)),
         step_count=len(getattr(plan, "steps", ()) or ()),
+    )
+    gap_plan = state.get("evidence_gap_plan")
+    trace.put(
+        "MEMORY SUFFICIENCY AND EVIDENCE GAP",
+        requirement_count=len(getattr(getattr(gap_plan, "requirements", None), "requirements", ()) or ()),
+        decisions=[item.decision for item in (getattr(gap_plan, "decisions", ()) or ())],
+        reasons=[item.reason_code for item in (getattr(gap_plan, "decisions", ()) or ())],
+        skipped_capabilities=list(getattr(gap_plan, "skipped_capabilities", ()) or ()),
+        selected_views=[
+            f"{item.capability}:{','.join(item.views)}"
+            for item in (getattr(gap_plan, "view_selections", ()) or ())
+        ],
     )
     trace.put(
         "LANGGRAPH WORKFLOW",
