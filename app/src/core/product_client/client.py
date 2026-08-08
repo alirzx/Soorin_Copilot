@@ -284,12 +284,27 @@ class ProductApiClient:
             found=found,
         )
 
-    def get_asset_detection(self, ip: str, *, request_id: str = "") -> ProductAssetResponse:
-        """Fetch one complete asset-detection JSON payload without reshaping it."""
+    def get_asset_detection(
+        self,
+        ip: str,
+        *,
+        request_id: str = "",
+        view: str = "full",
+    ) -> ProductAssetResponse:
+        """Fetch one approved Detection view through the shared authenticated client."""
+        paths = {
+            "full": self.settings.product_asset_detection_path,
+            "overview": self.settings.product_asset_detection_overview_path,
+            "evidence": self.settings.product_asset_detection_evidence_path,
+            "similarity": self.settings.product_asset_detection_similarity_path,
+            "cluster": self.settings.product_asset_detection_cluster_path,
+        }
+        if view not in paths:
+            raise ProductApiConfigError("Unsupported Product asset-detection view.")
         return self._get_asset_json(
             ip,
-            self.settings.product_asset_detection_path,
-            endpoint_name="asset_detection",
+            paths[view],
+            endpoint_name=f"asset_detection_{view}",
             request_id=request_id,
         )
 

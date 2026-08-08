@@ -9,7 +9,8 @@ from typing import Any
 
 from src.config.settings import Settings, get_settings
 from src.core.context.models import CopilotContextPackage, approx_tokens
-from src.core.context.product_views import payload_inventory
+from src.core.context.compaction import deduplicate_payloads
+from src.core.context.product_views import build_product_view, payload_inventory
 
 
 logger = logging.getLogger(__name__)
@@ -55,6 +56,8 @@ ONE_HOP_CONTEXT_MAX_TOKENS = 1800
 TWO_HOP_CONTEXT_MAX_TOKENS = 2500
 COMPARISON_CONTEXT_MAX_TOKENS = 2200
 FULL_NEIGHBORS_CONTEXT_MAX_TOKENS = 3000
+PROFILE_CONTEXT_MAX_TOKENS = 3200
+DETECTION_CONTEXT_MAX_TOKENS = 2400
 
 
 class ContextComposer:
@@ -77,6 +80,7 @@ class ContextComposer:
         self.last_knowledge_included_count = 0
         self.last_recomposition_attempted = False
         self.required_context_missing_reason: str | None = None
+        self._product_projection_stats: dict[str, tuple[int, int]] = {}
 
     def compose(
         self,
@@ -102,13 +106,18 @@ class ContextComposer:
         reserved_output_tokens: int | None,
     ) -> str:
         """Allocate complete Product evidence before bounded Graph and Knowledge context."""
+        self._product_projection_stats = {}
         profile_sections = self._compose_json_sections(
             package.asset_profiles,
-            "ASSET_PROFILE_FULL_MINIFIED_JSON",
+            "ASSET_PROFILE_CONTEXT_JSON",
         )
         detection_sections = self._compose_json_sections(
             package.detections,
-            "ASSET_DETECTION_FULL_MINIFIED_JSON",
+            "ASSET_DETECTION_CONTEXT_JSON",
+        )
+        profile_sections, detection_sections, dedup_support, collapsed_count = self._deduplicate_product_sections(
+            profile_sections,
+            detection_sections,
         )
         output_reserve = (
             self.settings.llm_reserved_output_tokens
@@ -138,12 +147,24 @@ class ContextComposer:
             "calibrated_dynamic_capacity": calibrated_capacity,
         }
 
-        profile_text = "\n\n".join(section for _, _, section in profile_sections)
-        detection_text = "\n\n".join(section for _, _, section in detection_sections)
-        for provider_name, ip, _ in [*profile_sections, *detection_sections]:
-            key = f"{provider_name}:{ip}"
-            self.last_inclusion[key] = (True, None)
-            self.last_representation[key] = "full_minified"
+        graph_reserve = min(
+            max_dynamic_tokens // 2,
+            sum(self._graph_context_cap(item.context) for item in package.graph_results),
+        )
+        product_global_cap = max(0, max_dynamic_tokens - graph_reserve)
+        profile_text, profile_used = self._fit_product_sections(
+            profile_sections,
+            min(PROFILE_CONTEXT_MAX_TOKENS, product_global_cap),
+            package.asset_profiles,
+        )
+        detection_text, detection_used = self._fit_product_sections(
+            detection_sections,
+            min(DETECTION_CONTEXT_MAX_TOKENS, max(0, product_global_cap - profile_used)),
+            package.detections,
+        )
+        if dedup_support and approx_tokens(dedup_support) <= max(0, product_global_cap - profile_used - detection_used):
+            detection_text = "\n\n".join(part for part in (detection_text, dedup_support) if part)
+            detection_used += approx_tokens(dedup_support)
         for index, graph_result in enumerate(package.graph_results):
             identity = str(graph_result.context.get("context_identity") or f"graph:{index}")
             self.last_inclusion[identity] = (False, "not_included")
@@ -157,38 +178,9 @@ class ContextComposer:
         product_required_tokens = approx_tokens(product_required_text)
         self.last_budget["required_product_tokens"] = approx_tokens(product_text)
         self.last_budget["manifest_tokens"] = approx_tokens(manifest)
-        if product_text and product_required_tokens > max_dynamic_tokens:
-            for provider_name, ip, _ in [*profile_sections, *detection_sections]:
-                key = f"{provider_name}:{ip}"
-                self.last_inclusion[key] = (False, "required_product_payloads_exceed_context")
-                self.last_representation[key] = "excluded"
+        if product_required_tokens > max_dynamic_tokens:
             self.required_context_missing = True
-            self.required_context_missing_reason = "required_product_payloads_exceed_context"
-            profile_text = ""
-            detection_text = ""
-            manifest = self._compose_provider_manifest(package, graph_included=False)
-            limitation = (
-                "[SOORIN_CONTEXT_LIMITATION]\nRequired complete Product evidence could not fit "
-                "within the safe model context window and was not truncated.\n"
-                "[/SOORIN_CONTEXT_LIMITATION]"
-            )
-            text = "\n\n".join((manifest, limitation))
-            self.last_parts = {
-                "status": manifest,
-                "asset_profile": "",
-                "detection": "",
-                "graph": "",
-                "knowledge": "",
-                "fusion": "",
-            }
-            logger.error(
-                "event=required_product_context_not_included request_id=%s product_tokens=%s manifest_tokens=%s max_dynamic_tokens=%s safe_failure=true",
-                request_id,
-                self.last_budget["required_product_tokens"],
-                approx_tokens(manifest),
-                max_dynamic_tokens,
-            )
-            return text
+            self.required_context_missing_reason = "required_product_projections_exceed_context"
 
         used_tokens = product_required_tokens
         included_graphs: list[tuple[str, CopilotContextPackage, str]] = []
@@ -305,6 +297,30 @@ class ContextComposer:
             self.required_context_missing,
             self.required_context_missing_reason or "none",
         )
+        logger.info(
+            "event=evidence_deduplicated request_id=%s collapsed_count=%s",
+            request_id,
+            collapsed_count,
+        )
+        logger.info(
+            "event=context_budget_allocated request_id=%s profile_tokens=%s detection_tokens=%s graph_reserved_tokens=%s knowledge_tokens=%s",
+            request_id,
+            approx_tokens(profile_text),
+            approx_tokens(detection_text),
+            graph_reserve,
+            approx_tokens(knowledge_text),
+        )
+        logger.info(
+            "event=delta_context_skipped request_id=%s reason=baseline_not_supplied_to_composer",
+            request_id,
+        )
+        logger.info(
+            "event=context_compaction_completed request_id=%s raw_estimated_tokens=%s compacted_tokens=%s token_savings_estimate=%s",
+            request_id,
+            sum(getattr(item, "raw_json_approx_tokens", 0) for item in [*package.asset_profiles, *package.detections]),
+            approx_tokens(product_text),
+            max(0, sum(getattr(item, "raw_json_approx_tokens", 0) for item in [*package.asset_profiles, *package.detections]) - approx_tokens(product_text)),
+        )
         return text
 
     @staticmethod
@@ -353,8 +369,7 @@ class ContextComposer:
                 }
             )
 
-    @staticmethod
-    def _compose_json_sections(results: list[Any], tag: str) -> list[tuple[str, str, str]]:
+    def _compose_json_sections(self, results: list[Any], tag: str) -> list[tuple[str, str, str]]:
         sections: list[tuple[str, str, str]] = []
         seen_entities: set[str] = set()
         provider_name = "asset_profile" if "ASSET_PROFILE" in tag else "detection"
@@ -364,14 +379,92 @@ class ContextComposer:
             if result.ip in seen_entities:
                 continue
             seen_entities.add(result.ip)
+            serialized = result.serialized_json
+            try:
+                parsed = json.loads(serialized)
+            except (TypeError, ValueError):
+                parsed = None
+            already_projected = isinstance(parsed, dict) and "views" in parsed and "projection_metadata" in parsed
+            if not result.full_payload_included and not already_projected and result.raw_payload is not None:
+                projected = build_product_view(
+                    result.raw_payload,
+                    provider=provider_name,
+                    views=("overview",),
+                    detail="brief",
+                    max_context_tokens=1000,
+                    purpose="composer_default_projection",
+                )
+                serialized = json.dumps(projected.payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+                parsed = projected.payload
+            source_scalars = payload_inventory(result.raw_payload).scalar_count if result.raw_payload is not None else 0
+            projected_scalars = payload_inventory(parsed).scalar_count if parsed is not None else 0
+            self._product_projection_stats[f"{provider_name}:{result.ip}"] = (source_scalars, projected_scalars)
             sections.append(
                 (
                     provider_name,
                     result.ip,
-                    "\n".join((f'[{tag} ip="{result.ip}"]', result.serialized_json, f'[/{tag}]')),
+                    "\n".join((f'[{tag} ip="{result.ip}"]', serialized, f'[/{tag}]')),
                 )
             )
         return sections
+
+    def _fit_product_sections(
+        self,
+        sections: list[tuple[str, str, str]],
+        token_cap: int,
+        provider_results: list[Any],
+    ) -> tuple[str, int]:
+        selected: list[str] = []
+        used = 0
+        by_ip = {item.ip: item for item in provider_results}
+        for provider, ip, section in sections:
+            tokens = approx_tokens(section)
+            key = f"{provider}:{ip}"
+            result = by_ip.get(ip)
+            if used + tokens <= max(0, token_cap):
+                selected.append(section)
+                used += tokens
+                self.last_inclusion[key] = (True, None)
+                self.last_representation[key] = (
+                    "full_minified" if result and result.full_payload_included else "projected"
+                )
+            else:
+                self.last_inclusion[key] = (False, "evidence_class_budget_exceeded")
+                self.last_representation[key] = "excluded"
+                self.required_context_missing = True
+                self.required_context_missing_reason = "required_product_projection_excluded"
+        return "\n\n".join(selected), used
+
+    @staticmethod
+    def _deduplicate_product_sections(
+        profiles: list[tuple[str, str, str]],
+        detections: list[tuple[str, str, str]],
+    ) -> tuple[list[tuple[str, str, str]], list[tuple[str, str, str]], str, int]:
+        sections = [*profiles, *detections]
+        parsed: list[tuple[str, Any]] = []
+        wrappers: list[tuple[str, str, str, str]] = []
+        for provider, ip, section in sections:
+            lines = section.splitlines()
+            if len(lines) < 3:
+                continue
+            parsed.append((f"{provider}:{ip}", json.loads("\n".join(lines[1:-1]))))
+            wrappers.append((provider, ip, lines[0], lines[-1]))
+        deduped = deduplicate_payloads(parsed)
+        rebuilt = [
+            (provider, ip, "\n".join((opening, json.dumps(payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True), closing)))
+            for (provider, ip, opening, closing), payload in zip(wrappers, deduped.payloads)
+        ]
+        profile_count = len(profiles)
+        supported = [item for item in deduped.canonical_facts if len(item["support"]) > 1]
+        support_text = ""
+        if supported:
+            support_text = "[SOORIN_DEDUPLICATED_FACT_SUPPORT]\n" + json.dumps(
+                supported,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            ) + "\n[/SOORIN_DEDUPLICATED_FACT_SUPPORT]"
+        return rebuilt[:profile_count], rebuilt[profile_count:], support_text, deduped.collapsed_count
 
     @staticmethod
     def _combined_status(results: list[Any]) -> str:
@@ -386,28 +479,20 @@ class ContextComposer:
             key = f"{provider_name}:{item.ip}"
             included = self.last_inclusion.get(key, (False, None))[0]
             representation = self.last_representation.get(key, "excluded")
-            scalar_count = (
-                payload_inventory(item.raw_payload).scalar_count
-                if item.raw_payload is not None
-                else 0
-            )
+            source_scalar_count, projected_scalar_count = self._product_projection_stats.get(key, (0, 0))
             entities[item.ip] = {
                 "status": item.status,
                 "payload_included": included,
-                "payload_complete": bool(
-                    included
-                    and item.full_payload_fetched
-                    and representation == "full_minified"
-                    and not item.context_truncated
-                ),
-                "model_representation_projected": False,
+                "payload_complete": bool(included and not item.context_truncated),
+                "model_representation_projected": representation == "projected",
                 "representation": representation,
                 "stale": bool(item.stale),
-                "source_payload_complete": bool(item.full_payload_fetched),
-                "projection_usable": bool(item.full_payload_fetched),
-                "usable_fact_count": scalar_count,
+                "source_payload_complete": bool(item.raw_payload_present and not item.context_truncated),
+                "full_payload_fetched": bool(item.full_payload_fetched),
+                "projection_usable": bool(item.serialized_json),
+                "usable_fact_count": projected_scalar_count,
                 "projection_truncated": False,
-                "projection_omitted_count": 0,
+                "projection_omitted_count": max(0, source_scalar_count - projected_scalar_count),
             }
         return {
             "status": self._combined_status(results),

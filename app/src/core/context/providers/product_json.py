@@ -57,15 +57,22 @@ class FullJsonContextProvider:
         self.result_type = result_type
         # Profile intentionally follows the established product-context cache policy,
         # but keeps an independent provider-local namespace.
-        self._cache: dict[str, _CacheEntry] = {}
+        self._cache: dict[tuple[str, str], _CacheEntry] = {}
         self._lock = threading.Lock()
 
-    def fetch(self, ip: str, request_id: str, *, session_id: str = "") -> ResultT:
+    def fetch(
+        self,
+        ip: str,
+        request_id: str,
+        *,
+        session_id: str = "",
+        view: str = "full",
+    ) -> ResultT:
         started = time.perf_counter()
         try:
             normalized_ip = str(ipaddress.ip_address(str(ip).strip()))
         except ValueError:
-            return self._unavailable(started, str(ip), "ValueError", "Invalid IP address.")
+            return self._unavailable(started, str(ip), "ValueError", "Invalid IP address.", view=view)
 
         logger.info(
             "event=%s_provider_started request_id=%s session_id=%s target_ip=%s cache_enabled=%s",
@@ -75,7 +82,8 @@ class FullJsonContextProvider:
             normalized_ip,
             self.settings.detection_cache_enabled,
         )
-        cached = self._get_cache_entry(normalized_ip)
+        cache_key = (normalized_ip, view)
+        cached = self._get_cache_entry(cache_key)
         miss_reason = self._cache_miss_reason(cached)
         if cached and miss_reason is None:
             age = self._cache_age(cached)
@@ -91,6 +99,7 @@ class FullJsonContextProvider:
                 started=started,
                 cache_hit=True,
                 cache_age_seconds=age,
+                view=view,
             )
 
         logger.info(
@@ -101,7 +110,10 @@ class FullJsonContextProvider:
             miss_reason,
         )
         try:
-            response = self.fetcher(normalized_ip, request_id=request_id)
+            if self.provider_name == "detection":
+                response = self.fetcher(normalized_ip, request_id=request_id, view=view)
+            else:
+                response = self.fetcher(normalized_ip, request_id=request_id)
         except ProductApiError as exc:
             latency_ms = int((time.perf_counter() - started) * 1000)
             if cached and self.settings.detection_stale_on_error:
@@ -122,6 +134,7 @@ class FullJsonContextProvider:
                     stale=True,
                     error_type=type(exc).__name__,
                     safe_error=_safe_error(exc),
+                    view=view,
                 )
             logger.warning(
                 "event=%s_provider_failed request_id=%s status=unavailable error_type=%s stale_fallback=false latency_ms=%s",
@@ -130,17 +143,18 @@ class FullJsonContextProvider:
                 type(exc).__name__,
                 latency_ms,
             )
-            return self._unavailable(started, normalized_ip, type(exc).__name__, _safe_error(exc))
+            return self._unavailable(started, normalized_ip, type(exc).__name__, _safe_error(exc), view=view)
 
         if self.settings.detection_cache_enabled:
             with self._lock:
-                self._cache[normalized_ip] = _CacheEntry(response=copy.deepcopy(response), stored_at=time.time())
+                self._cache[cache_key] = _CacheEntry(response=copy.deepcopy(response), stored_at=time.time())
         return self._from_response(
             response,
             started=started,
             cache_hit=False,
             cache_age_seconds=0,
             cache_miss_reason=miss_reason,
+            view=view,
         )
 
     def _from_response(
@@ -154,6 +168,7 @@ class FullJsonContextProvider:
         stale: bool = False,
         error_type: str | None = None,
         safe_error: str | None = None,
+        view: str = "full",
     ) -> ResultT:
         payload = copy.deepcopy(response.raw_payload)
         serialized = _serialize(payload)
@@ -163,10 +178,11 @@ class FullJsonContextProvider:
         fetched_at = datetime.now(timezone.utc).isoformat()
         latency_ms = int((time.perf_counter() - started) * 1000)
         logger.info(
-            "event=%s_provider_completed status=%s target_ip=%s asset_found=%s http_status=%s cache_hit=%s stale=%s provider_latency_ms=%s raw_json_bytes=%s raw_json_chars=%s raw_json_approx_tokens=%s raw_top_level_key_count=%s raw_payload_present=%s full_payload_fetched=%s",
+            "event=%s_provider_completed status=%s target_ip=%s view=%s asset_found=%s http_status=%s cache_hit=%s stale=%s provider_latency_ms=%s raw_json_bytes=%s raw_json_chars=%s raw_json_approx_tokens=%s raw_top_level_key_count=%s raw_payload_present=%s full_payload_fetched=%s",
             self.provider_name,
             status,
             response.target_ip,
+            view,
             response.found,
             response.status_code,
             cache_hit,
@@ -177,7 +193,7 @@ class FullJsonContextProvider:
             approx_tokens(serialized),
             top_level_count,
             payload is not None,
-            payload is not None,
+            payload is not None and view == "full",
         )
         return self.result_type(
             provider=self.provider_name,
@@ -195,7 +211,7 @@ class FullJsonContextProvider:
             raw_json_approx_tokens=approx_tokens(serialized),
             raw_top_level_key_count=top_level_count,
             raw_payload_present=payload is not None,
-            full_payload_fetched=payload is not None,
+            full_payload_fetched=payload is not None and view == "full",
             asset_found=response.found,
             http_status=response.status_code,
             fetched_at=fetched_at,
@@ -203,9 +219,20 @@ class FullJsonContextProvider:
             latency_ms=latency_ms,
             error_type=error_type,
             safe_error=safe_error,
+            requested_view=view,
+            returned_view=view,
+            source_endpoint=response.endpoint_path,
         )
 
-    def _unavailable(self, started: float, ip: str, error_type: str, safe_error: str) -> ResultT:
+    def _unavailable(
+        self,
+        started: float,
+        ip: str,
+        error_type: str,
+        safe_error: str,
+        *,
+        view: str = "full",
+    ) -> ResultT:
         return self.result_type(
             provider=self.provider_name,
             status="unavailable",
@@ -215,13 +242,15 @@ class FullJsonContextProvider:
             latency_ms=int((time.perf_counter() - started) * 1000),
             error_type=error_type,
             safe_error=safe_error,
+            requested_view=view,
+            returned_view=view,
         )
 
-    def _get_cache_entry(self, ip: str) -> _CacheEntry | None:
+    def _get_cache_entry(self, cache_key: tuple[str, str]) -> _CacheEntry | None:
         if not self.settings.detection_cache_enabled:
             return None
         with self._lock:
-            return self._cache.get(ip)
+            return self._cache.get(cache_key)
 
     def _cache_miss_reason(self, entry: _CacheEntry | None) -> str | None:
         if not self.settings.detection_cache_enabled:
