@@ -1,0 +1,458 @@
+"""Focused offline tests for Gate 8 memory, views, and compaction."""
+
+from __future__ import annotations
+
+from dataclasses import replace
+from types import SimpleNamespace
+from typing import Any
+from unittest.mock import patch
+
+from src.config.settings import get_settings
+from src.core.agent.contracts import ExecutionPlan, PlanStep, TaskSpec, ToolResult
+from src.core.agent.nodes import CopilotWorkflowNodes
+from src.core.agent.evidence_policy import (
+    EvidenceRequirementPolicy,
+    MemorySufficiencyGate,
+    ViewSelector,
+    apply_gap_plan,
+    build_gap_plan,
+    evidence_refs_from_validated_result,
+    structured_memory_statement,
+)
+from src.core.context.compaction import build_delta_context, deduplicate_payloads
+from src.core.context.product_views import build_product_view, payload_inventory, select_product_views
+from src.core.memory.long_term import LongTermMemoryRecord, MemoryPromotionPolicy, RetrievedLongTermMemory
+from src.core.identity import RequestIdentity
+from src.core.product_client import ProductApiClient
+
+
+IP = "192.0.2.10"
+
+
+def _task(
+    request: str,
+    capabilities: tuple[str, ...],
+    *,
+    detail: str = "standard",
+) -> TaskSpec:
+    return TaskSpec(
+        request=request,
+        intent="asset_investigation",
+        scope="node_summary",
+        direction="both",
+        entities=(IP,),
+        required_capabilities=capabilities,
+        detail_level=detail,
+    )
+
+
+def _memory(
+    statement: str = "The asset is an approved domain controller.",
+    *,
+    entity: str = IP,
+    evidence_refs: tuple[str, ...] = (
+        "evidence_class_asset_identity",
+        "evidence_class_asset_role",
+        "complete",
+    ),
+    memory_type: str = "approved_asset_fact",
+    freshness: str = "current",
+) -> RetrievedLongTermMemory:
+    record = LongTermMemoryRecord(
+        memory_id=f"mem_{abs(hash((statement, entity))) % 100000}",
+        memory_type=memory_type,  # type: ignore[arg-type]
+        user_id="user_test",
+        entity_ids=(entity,),
+        statement=statement,
+        epistemic_status="analyst_confirmed",
+        confidence=1.0,
+        source_request_id="req_test",
+        source_conversation_id="conv_test",
+        evidence_refs=evidence_refs,
+        provenance_category="analyst",
+        status="active",
+    )
+    return RetrievedLongTermMemory(record, 1.0, "exact_entity", freshness)  # type: ignore[arg-type]
+
+
+def test_requirement_policy_and_view_selector_are_deterministic() -> None:
+    policy = EvidenceRequirementPolicy()
+    task = _task("Why is this classified as a domain controller?", ("asset.get_detection", "asset.get_profile"))
+    requirements = policy.derive(task)
+    classes = {item.evidence_class for item in requirements.requirements}
+
+    assert {"detection_classification", "detection_explanation", "detection_contradictions"} <= classes
+    detection = requirements.for_capability("asset.get_detection")
+    assert ViewSelector().select(detection) == ("overview", "evidence")
+    assert select_product_views("detection", "Which assets resemble it?", "standard") == ("similarity",)
+    assert select_product_views("detection", "Show its cluster cohort", "standard") == ("cluster",)
+    assert select_product_views("asset_profile", "Analyze authentication identity", "standard") == ("identity",)
+    assert select_product_views("detection", "Give raw exhaustive behavior", "deep") == ("full",)
+
+
+def test_memory_gate_applies_six_checks_and_current_refresh_policy() -> None:
+    gate = MemorySufficiencyGate()
+    role = EvidenceRequirementPolicy().derive(_task("What was its approved role?", ("asset.get_profile",)))
+    role_requirement = next(item for item in role.requirements if item.evidence_class == "asset_role")
+
+    sufficient = gate._evaluate_one(role_requirement, (_memory(),))
+    mismatch = gate._evaluate_one(role_requirement, (_memory(entity="192.0.2.99"),))
+    no_coverage = gate._evaluate_one(
+        role_requirement,
+        (_memory(memory_type="hypothesis_resolution", evidence_refs=("complete",)),),
+    )
+
+    assert sufficient.decision == "memory_sufficient"
+    assert mismatch.reason_code == "memory_entity_mismatch"
+    assert no_coverage.reason_code == "memory_partial"
+
+    current = EvidenceRequirementPolicy().derive(
+        _task("What is its current classification confidence?", ("asset.get_detection",))
+    )
+    current_decision = gate._evaluate_one(
+        current.requirements[0],
+        (_memory(evidence_refs=("evidence_class_detection_classification", "complete")),),
+    )
+    assert current_decision.decision == "memory_sufficient_verification_required"
+
+
+def test_promoted_matching_memory_satisfies_but_missing_or_wrong_entity_does_not() -> None:
+    requirements = EvidenceRequirementPolicy().derive(
+        _task("What was its approved role?", ("asset.get_profile",))
+    )
+    role = next(item for item in requirements.requirements if item.evidence_class == "asset_role")
+    candidate = LongTermMemoryRecord.candidate(
+        memory_type="validated_finding",
+        user_id="user_test",
+        entity_ids=(IP,),
+        statement='{"role":"domain_controller"}',
+        source_request_id="req_test",
+        source_conversation_id="conv_test",
+        evidence_refs=("source-step", "evidence_class_asset_role"),
+    )
+    promoted = MemoryPromotionPolicy.promote(
+        candidate,
+        epistemic_status="analyst_confirmed",
+        confidence=1.0,
+        provenance_category="analyst",
+    )
+    matching = RetrievedLongTermMemory(promoted, 1.0, "exact_entity", "current")
+
+    gate = MemorySufficiencyGate()
+    assert gate._evaluate_one(role, (matching,)).decision == "memory_sufficient"
+    assert gate._evaluate_one(role, (_memory(evidence_refs=("source-step",)),)).reason_code == "memory_partial"
+    assert gate._evaluate_one(role, (_memory(entity="192.0.2.99"),)).reason_code == "memory_entity_mismatch"
+
+
+def test_structured_result_adds_only_supported_evidence_classes_and_preserves_refs() -> None:
+    requirements = EvidenceRequirementPolicy().derive(
+        _task("What was its approved role?", ("asset.get_profile",))
+    )
+    result = ToolResult(
+        status="ok",
+        entities=(IP,),
+        source_capability="asset.get_profile",
+        retrieved_at="2026-08-08T00:00:00+00:00",
+        freshness="current",
+        completeness="complete",
+        provider="asset_profile",
+        view_payload={"views": {"overview": {"role": "domain_controller"}}},
+        context_included=True,
+        source_payload_complete=True,
+        projection_usable=True,
+        step_id="profile-step",
+    )
+
+    refs = evidence_refs_from_validated_result(
+        requirements,
+        result,
+        existing_refs=("provider-evidence-7", "provider-evidence-7"),
+    )
+    statement = structured_memory_statement(result, refs)
+
+    assert refs[0] == "provider-evidence-7"
+    assert refs.count("provider-evidence-7") == 1
+    assert "evidence_class_asset_identity" in refs
+    assert "evidence_class_asset_role" in refs
+    assert not any(ref.startswith("evidence_class_detection_") for ref in refs)
+    assert statement is not None and "domain_controller" in statement
+
+
+def test_workflow_proposes_candidate_from_validated_structured_evidence() -> None:
+    requirements = EvidenceRequirementPolicy().derive(
+        _task("What was its approved role?", ("asset.get_profile",))
+    )
+    result = ToolResult(
+        status="ok",
+        entities=(IP,),
+        source_capability="asset.get_profile",
+        retrieved_at="2026-08-08T00:00:00+00:00",
+        freshness="current",
+        completeness="complete",
+        provider="asset_profile",
+        view_payload={"views": {"overview": {"role": "domain_controller"}}},
+        context_included=True,
+        source_payload_complete=True,
+        projection_usable=True,
+        step_id="profile-step",
+    )
+
+    class Coordinator:
+        def __init__(self) -> None:
+            self.candidates: list[LongTermMemoryRecord] = []
+
+        def create_candidate(self, memory: LongTermMemoryRecord) -> LongTermMemoryRecord:
+            self.candidates.append(memory)
+            return memory
+
+    coordinator = Coordinator()
+    nodes = object.__new__(CopilotWorkflowNodes)
+    nodes.service = SimpleNamespace(long_term_memory_coordinator=coordinator)
+    created = nodes._propose_long_term_candidates({
+        "request_id": "req_test",
+        "request_identity": RequestIdentity.resolve(
+            user_id="user_test",
+            conversation_id="conv_test",
+            session_id="session_test",
+            request_id="req_test",
+        ),
+        "evidence_requirements": requirements,
+        "tool_results": [result],
+    })
+
+    assert created == 1
+    assert coordinator.candidates[0].status == "candidate"
+    assert "evidence_class_asset_role" in coordinator.candidates[0].evidence_refs
+    assert "domain_controller" in coordinator.candidates[0].statement
+
+
+def test_memory_gate_rejects_partial_exhaustive_and_contradictory_memory() -> None:
+    task = _task("Give a deep exhaustive profile", ("asset.get_profile",), detail="deep")
+    requirement = EvidenceRequirementPolicy().derive(task).requirements[0]
+    gate = MemorySufficiencyGate()
+    partial = _memory(evidence_refs=(f"evidence_class_{requirement.evidence_class}",))
+    contradiction = _memory(
+        "The asset is not a domain controller.",
+        evidence_refs=(f"evidence_class_{requirement.evidence_class}", "complete", "contradiction"),
+    )
+    first = _memory(evidence_refs=(f"evidence_class_{requirement.evidence_class}", "complete"))
+
+    assert gate._evaluate_one(requirement, (partial,)).reason_code == "memory_incomplete_live_refresh"
+    assert gate._evaluate_one(requirement, (first, contradiction)).decision == "contradictory_memory"
+
+
+def test_gap_plan_skips_only_fully_satisfied_call_and_records_memory_result() -> None:
+    task = _task("What was its approved role?", ("asset.get_profile",))
+    requirements = EvidenceRequirementPolicy().derive(task)
+    decisions = MemorySufficiencyGate().evaluate(requirements, (_memory(),))
+    plan = ExecutionPlan(
+        task=task,
+        steps=(PlanStep("profile", "asset.get_profile", arguments={"entities": [IP]}),),
+        target_entities=(IP,),
+    )
+
+    updated, gap, memory_results = apply_gap_plan(plan, build_gap_plan(requirements, decisions))
+
+    assert updated.steps == ()
+    assert gap.skipped_capabilities == ("asset.get_profile",)
+    assert memory_results[0].provider == "long_term_memory"
+    assert memory_results[0].context_representation == "memory_reuse"
+
+
+def test_profile_views_project_current_full_payload_and_bound_large_lists() -> None:
+    payload = {
+        "id": "asset-1", "hostname": "dc-01", "ip_address": IP, "risk_score": 77,
+        "identity": {
+            "kerberos": {"domain": "example.test", "is_kdc": True, "serviceClasses": list(range(30))},
+            "ldap": {"isServer": True}, "ntlm": {"domain": "EXAMPLE"}, "smb": {"sysvol": True},
+        },
+        "trafficSeries": [{"at": index, "bytes": index * 10} for index in range(30)],
+        "futureHugeField": [f"noise-{index}" for index in range(200)],
+    }
+    identity = build_product_view(
+        payload, provider="asset_profile", views=("identity",), detail="standard",
+        max_context_tokens=1000, purpose="identity",
+    )
+    overview = build_product_view(
+        payload, provider="asset_profile", views=("overview",), detail="brief",
+        max_context_tokens=1000, purpose="summary",
+    )
+    full = build_product_view(
+        payload, provider="asset_profile", views=("full",), detail="deep",
+        max_context_tokens=8000, purpose="exhaustive",
+    )
+
+    kerberos = identity.payload["views"]["identity"]["kerberos"]
+    assert kerberos["serviceClasses"]["total_count"] == 30
+    assert kerberos["serviceClasses"]["omitted_count"] == 18
+    assert overview.payload["views"]["overview"]["risk_score"] == 77
+    assert "futureHugeField" not in overview.payload["views"]["overview"]
+    assert full.payload == payload
+    assert identity.token_estimate < payload_inventory(payload).approx_tokens
+
+
+def test_detection_views_preserve_contract_semantics_and_reduce_payload() -> None:
+    full_payload = {
+        "assetName": "dc-01", "ip": IP, "status": "classified", "suggestedType": "domain_controller",
+        "modelConfidence": 0.98, "mappingConfidence": 0.91, "unknownScore": 0.02,
+        "topPositiveFeatures": [f"feature-{index}" for index in range(40)],
+        "ruleVotes": [{"rule": index, "vote": 1} for index in range(40)],
+        "neighbors": [{"ip": f"192.0.2.{index}", "distance": index / 100} for index in range(30)],
+        "clusterId": "role-dc", "population": 1, "purity": 1.0, "members": [{"ip": IP}],
+        "rawSignals": ["x" * 100 for _ in range(200)],
+    }
+    overview = build_product_view(full_payload, provider="detection", views=("overview",), detail="brief", max_context_tokens=1000, purpose="classification")
+    evidence = build_product_view(full_payload, provider="detection", views=("evidence",), detail="standard", max_context_tokens=1000, purpose="why")
+    similarity = build_product_view(full_payload, provider="detection", views=("similarity",), detail="standard", max_context_tokens=1000, purpose="similar")
+    cluster = build_product_view(full_payload, provider="detection", views=("cluster",), detail="standard", max_context_tokens=1000, purpose="cluster")
+    full = build_product_view(full_payload, provider="detection", views=("full",), detail="deep", max_context_tokens=8000, purpose="raw")
+
+    assert overview.payload["views"]["overview"]["suggested_type"] == "domain_controller"
+    assert evidence.payload["views"]["evidence"]["rule_votes"]["format"] == "tsv"
+    assert evidence.payload["views"]["evidence"]["rule_votes"]["omitted_count"] == 28
+    assert "not model embedding-space similarity" in similarity.payload["views"]["similarity"]["semantic_limitation"]
+    assert "not unsupervised ML clustering" in cluster.payload["views"]["cluster"]["semantic_limitation"]
+    assert "Population one" in cluster.payload["views"]["cluster"]["semantic_limitation"]
+    assert full.payload == full_payload
+    assert overview.token_estimate < full.token_estimate
+
+
+class _Response:
+    status_code = 200
+
+    def __init__(self, payload: dict[str, Any]) -> None:
+        self.payload = payload
+
+    def json(self) -> dict[str, Any]:
+        return self.payload
+
+
+class _Session:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, Any]] = []
+
+    def mount(self, *_args: Any, **_kwargs: Any) -> None:
+        return None
+
+    def get(self, url: str, *, headers: dict[str, str], timeout: tuple[int, int]) -> _Response:
+        self.calls.append({"url": url, "headers": headers, "timeout": timeout})
+        return _Response({"assetFound": True, "ip": IP})
+
+    def request(
+        self,
+        method: str,
+        url: str,
+        *,
+        headers: dict[str, str],
+        timeout: tuple[int, int],
+        **_kwargs: Any,
+    ) -> _Response:
+        assert method == "GET"
+        return self.get(url, headers=headers, timeout=timeout)
+
+
+def test_detection_view_paths_reuse_product_auth_and_hwid() -> None:
+    settings = replace(
+        get_settings(),
+        product_api_base_url="http://product.invalid",
+        product_api_token="Bearer test-token",
+        product_hwid="test-hwid",
+        product_asset_detection_overview_path="/asset-detection/{ip}/overview",
+        product_asset_detection_evidence_path="/asset-detection/{ip}/evidence",
+        product_asset_detection_similarity_path="/asset-detection/{ip}/similarity",
+        product_asset_detection_cluster_path="/asset-detection/{ip}/cluster",
+        product_connect_timeout_seconds=1,
+        product_read_timeout_seconds=1,
+        product_max_retries=0,
+    )
+    session = _Session()
+    with patch("src.core.product_client.client.requests.Session", return_value=session):
+        client = ProductApiClient(settings)
+    for view in ("overview", "evidence", "similarity", "cluster"):
+        client.get_asset_detection(IP, view=view)
+
+    assert [call["url"].rsplit("/", 1)[-1] for call in session.calls] == ["overview", "evidence", "similarity", "cluster"]
+    assert all(call["headers"]["Authorization"] == "Bearer test-token" for call in session.calls)
+    assert all(call["headers"]["x-hwid"] == "test-hwid" for call in session.calls)
+
+
+def test_dedup_preserves_support_conflicts_and_timestamp_distinctions() -> None:
+    result = deduplicate_payloads([
+        ("profile", {"ip": IP, "role": "dc", "observedAt": "2026-01-01"}),
+        ("detection", {"ip": IP, "role": "dc", "observedAt": "2026-01-02"}),
+        ("memory", {"role": "server"}),
+    ])
+
+    assert result.collapsed_count == 2
+    role = next(item for item in result.canonical_facts if item["fact"] == "role" and item["value"] == "dc")
+    assert len(role["support"]) == 2
+    assert any(item["fact"] == "role" and item["value"] == "server" for item in result.canonical_facts)
+    assert result.payloads[0]["observedAt"] != result.payloads[1]["observedAt"]
+
+
+def test_delta_requires_accessible_compatible_baseline() -> None:
+    current = {"role": "dc", "risk": 7, "new": True}
+    baseline = {"role": "dc", "risk": 4, "removed": True}
+
+    absent = build_delta_context(current, baseline=None, current_identity=f"{IP}:overview")
+    mismatch = build_delta_context(
+        current, baseline=baseline, current_identity=f"{IP}:overview",
+        baseline_identity="192.0.2.99:overview", baseline_accessible=True,
+        baseline_schema_version="product-view-v1",
+    )
+    delta = build_delta_context(
+        current, baseline=baseline, current_identity=f"{IP}:overview",
+        baseline_identity=f"{IP}:overview", baseline_accessible=True,
+        baseline_schema_version="product-view-v1",
+    )
+
+    assert absent.reason == "baseline_absent" and absent.payload == current
+    assert mismatch.reason == "baseline_identity_mismatch"
+    assert delta.created
+    assert delta.payload["changed"] == {"risk": 7}
+    assert delta.payload["new"] == {"new": True}
+    assert delta.payload["removed"] == {"removed": True}
+
+
+def test_offline_context_efficiency_matrix_uses_expected_minimum_views() -> None:
+    profile = {
+        "id": "asset-1", "hostname": "dc-01", "ip": IP, "riskScore": 88,
+        "kerberos": {"domain": "example.test", "principals": list(range(100))},
+        "alerts": [{"id": index, "severity": "high"} for index in range(50)],
+        "openPorts": list(range(200)), "trafficSeries": [{"at": index, "bytes": index} for index in range(100)],
+        "rawLogs": ["x" * 200 for _ in range(200)],
+    }
+    detection = {
+        "ip": IP, "suggestedType": "domain_controller", "modelConfidence": 0.98,
+        "topPositiveFeatures": list(range(100)),
+        "ruleVotes": [{"rule": index, "vote": 1} for index in range(100)],
+        "neighbors": [{"ip": f"198.51.100.{index}", "distance": index / 100} for index in range(50)],
+        "clusterId": "dc", "population": 50, "members": [{"ip": f"198.51.100.{index}"} for index in range(50)],
+        "rawSignals": ["x" * 200 for _ in range(200)],
+    }
+    cases = (
+        ("asset_profile", profile, "quick asset summary", "standard", ("overview",)),
+        ("detection", detection, "show classification confidence", "standard", ("overview",)),
+        ("detection", detection, "why this classification and its rules", "standard", ("overview", "evidence")),
+        ("asset_profile", profile, "analyze authentication identity", "standard", ("identity",)),
+        ("asset_profile", profile, "analyze risk and alerts", "standard", ("security",)),
+        ("detection", detection, "show similar assets", "standard", ("similarity",)),
+        ("detection", detection, "show cluster cohort", "standard", ("cluster",)),
+        ("asset_profile", profile, "analyze network activity", "standard", ("network", "activity")),
+        ("detection", detection, "deep raw investigation", "deep", ("full",)),
+    )
+    for provider, payload, request, detail, expected_views in cases:
+        views = select_product_views(provider, request, detail)
+        projected = build_product_view(
+            payload,
+            provider=provider,
+            views=views,
+            detail=detail,
+            max_context_tokens=8000,
+            purpose="offline_efficiency",
+        )
+        assert views == expected_views
+        if views == ("full",):
+            assert projected.token_estimate == payload_inventory(payload).approx_tokens
+        else:
+            assert projected.token_estimate < payload_inventory(payload).approx_tokens

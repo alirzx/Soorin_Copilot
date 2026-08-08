@@ -171,6 +171,7 @@ def test_canonical_model_projection_and_promotion_policy() -> None:
     )
     assert promoted.authoritative
     assert promoted.revision == item.revision + 1
+    assert promoted.evidence_refs == item.evidence_refs
     with pytest.raises(ValueError):
         MemoryPromotionPolicy.promote(
             item,

@@ -547,11 +547,12 @@ class TestEvidenceAndReview:
         assert not decision.supplemental_allowed
         assert decision.next_capability is None
         assert len(calls) == 1
-        assert first.selected_views == ("overview", "identity_role")
-        assert first.view_payload == first.raw_payload
-        assert "must-not-appear" in json.dumps(first.view_payload)
+        assert first.selected_views == ("overview", "identity")
+        assert first.view_payload != first.raw_payload
+        assert first.view_payload["views"]["identity"]["name"] == "dc-1"
+        assert "must-not-appear" not in json.dumps(first.view_payload)
         assert not first.projection_truncated
-        assert first.projection_omitted_count == 0
+        assert first.projection_omitted_count > 0
 
     def test_task_steps_are_recommendations_not_plan_security_limits(self):
         current = task("a")

@@ -189,33 +189,29 @@ class ExhaustiveGraphBudgetTests(unittest.TestCase):
         self.assertFalse(graph_coverage["complete_for_user_request"])
         self.assertIn('"omitted_peer_count"', composer.last_parts["graph"])
         self.assertIn('"continuation_guidance"', composer.last_parts["graph"])
-        self.assertIn("[ASSET_PROFILE_FULL_MINIFIED_JSON", composer.last_parts["asset_profile"])
-        self.assertIn("[ASSET_DETECTION_FULL_MINIFIED_JSON", composer.last_parts["detection"])
+        self.assertIn("[ASSET_PROFILE_CONTEXT_JSON", composer.last_parts["asset_profile"])
+        self.assertIn("[ASSET_DETECTION_CONTEXT_JSON", composer.last_parts["detection"])
         self.assertTrue(product_coverage["asset_profile"]["payload_complete"])
         self.assertTrue(product_coverage["asset_detection"]["payload_complete"])
 
-    def test_oversized_complete_product_payloads_fail_without_truncation(self) -> None:
+    def test_oversized_complete_product_payloads_use_compact_views_without_starving_graph(self) -> None:
         composer = ContextComposer(settings())
         composer.compose(package(large_products=True), base_input_tokens=5500)
         coverage = manifest(composer)["provider_coverage"]
         profile_entity = coverage["asset_profile"]["entities"][TARGET]
         detection_entity = coverage["asset_detection"]["entities"][TARGET]
 
-        self.assertEqual(composer.last_parts["asset_profile"], "")
-        self.assertEqual(composer.last_parts["detection"], "")
-        self.assertEqual(composer.last_parts["graph"], "")
-        self.assertEqual(profile_entity["representation"], "excluded")
-        self.assertEqual(detection_entity["representation"], "excluded")
-        self.assertFalse(coverage["asset_profile"]["payload_complete"])
-        self.assertFalse(coverage["asset_detection"]["payload_complete"])
+        self.assertIn("[ASSET_PROFILE_CONTEXT_JSON", composer.last_parts["asset_profile"])
+        self.assertIn("[ASSET_DETECTION_CONTEXT_JSON", composer.last_parts["detection"])
+        self.assertTrue(composer.last_parts["graph"])
+        self.assertEqual(profile_entity["representation"], "projected")
+        self.assertEqual(detection_entity["representation"], "projected")
+        self.assertTrue(coverage["asset_profile"]["payload_complete"])
+        self.assertTrue(coverage["asset_detection"]["payload_complete"])
         self.assertTrue(profile_entity["source_payload_complete"])
         self.assertFalse(profile_entity["projection_truncated"])
-        self.assertEqual(profile_entity["projection_omitted_count"], 0)
-        self.assertTrue(composer.required_context_missing)
-        self.assertEqual(
-            composer.required_context_missing_reason,
-            "required_product_payloads_exceed_context",
-        )
+        self.assertGreater(profile_entity["projection_omitted_count"], 0)
+        self.assertFalse(composer.required_context_missing)
 
     def test_history_budget_drops_stale_assistant_report_before_user_context(self) -> None:
         stale_report = "STALE-PEER-LIST " * 4000
@@ -253,11 +249,7 @@ class ExhaustiveGraphBudgetTests(unittest.TestCase):
             fixed_tokens + approx_tokens(text) + 12288 + 2048,
             32768,
         )
-        self.assertFalse(coverage["model_input_graph_included"])
-        self.assertEqual(
-            composer.required_context_missing_reason,
-            "required_product_payloads_exceed_context",
-        )
+        self.assertTrue(coverage["model_input_graph_included"])
 
     def test_impossibly_small_budget_marks_required_graph_missing(self) -> None:
         composer = ContextComposer(
@@ -275,7 +267,8 @@ class ExhaustiveGraphBudgetTests(unittest.TestCase):
         self.assertEqual(composer.last_parts["graph"], "")
         self.assertFalse(graph_coverage["model_input_graph_included"])
         self.assertFalse(graph_coverage["complete_for_user_request"])
-        self.assertIn("Required complete Product evidence could not fit", text)
+        self.assertIn("[SOORIN_PROVIDER_MANIFEST]", text)
+        self.assertEqual(composer.required_context_missing_reason, "required_graph_context_excluded")
 
     def test_node_summary_and_direct_relationship_remain_on_existing_representation(self) -> None:
         graph = exhaustive_graph()

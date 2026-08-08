@@ -126,9 +126,9 @@ def _mixed_plan() -> ExecutionPlan:
     return ExecutionPlan(
         task=task,
         steps=(
-            PlanStep("profile-a", "asset.get_profile", arguments={"entities": [ENTITY_A], "views": ["identity_role"]}),
+            PlanStep("profile-a", "asset.get_profile", arguments={"entities": [ENTITY_A], "views": ["identity"]}),
             PlanStep("profile-b", "asset.get_profile", arguments={"entities": [ENTITY_B], "views": ["services"]}),
-            PlanStep("detection-a", "asset.get_detection", arguments={"entities": [ENTITY_A], "views": ["anomaly_risk"]}),
+            PlanStep("detection-a", "asset.get_detection", arguments={"entities": [ENTITY_A], "views": ["evidence"]}),
             PlanStep("graph-pair", "graph.compare_assets", arguments={"entities": [ENTITY_A, ENTITY_B]}),
         ),
         validated=True,
