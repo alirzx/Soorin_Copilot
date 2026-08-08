@@ -214,6 +214,10 @@ class Settings:
     product_api_base_url: str
     product_topology_path: str
     product_asset_detection_path: str
+    product_asset_detection_overview_path: str
+    product_asset_detection_evidence_path: str
+    product_asset_detection_similarity_path: str
+    product_asset_detection_cluster_path: str
     product_asset_profile_path: str
     product_login_path: str
     product_api_token: str
@@ -704,6 +708,18 @@ def get_settings() -> Settings:
         product_api_base_url=os.getenv("SOORIN_PRODUCT_API_BASE_URL", "").strip().rstrip("/"),
         product_topology_path=os.getenv("SOORIN_PRODUCT_TOPOLOGY_PATH", "/zeek/connections/unique-ip-pairs").strip(),
         product_asset_detection_path=os.getenv("SOORIN_PRODUCT_ASSET_DETECTION_PATH", "/asset-detection/test/{ip}").strip(),
+        product_asset_detection_overview_path=os.getenv(
+            "SOORIN_PRODUCT_ASSET_DETECTION_OVERVIEW_PATH", "/asset-detection/{ip}/overview"
+        ).strip(),
+        product_asset_detection_evidence_path=os.getenv(
+            "SOORIN_PRODUCT_ASSET_DETECTION_EVIDENCE_PATH", "/asset-detection/{ip}/evidence"
+        ).strip(),
+        product_asset_detection_similarity_path=os.getenv(
+            "SOORIN_PRODUCT_ASSET_DETECTION_SIMILARITY_PATH", "/asset-detection/{ip}/similarity"
+        ).strip(),
+        product_asset_detection_cluster_path=os.getenv(
+            "SOORIN_PRODUCT_ASSET_DETECTION_CLUSTER_PATH", "/asset-detection/{ip}/cluster"
+        ).strip(),
         product_asset_profile_path=os.getenv("SOORIN_PRODUCT_ASSET_PROFILE_PATH", "/profile/{ip}").strip(),
         product_login_path=os.getenv("SOORIN_PRODUCT_LOGIN_PATH", "/auth/login").strip(),
         product_api_token=os.getenv("SOORIN_PRODUCT_API_TOKEN", "").strip(),
