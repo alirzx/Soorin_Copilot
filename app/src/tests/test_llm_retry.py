@@ -44,16 +44,16 @@ class LLMTransientRetryTests(unittest.TestCase):
             get_settings(),
             llm_enabled=True,
             llm_provider="arvan",
-            intent_router_deployment="glm",
-            chat_deployment="glm",
-            glm_base_url="https://example.invalid/v1",
-            glm_api_key=self.secret,
+            router_base_url="https://example.invalid/v1",
+            router_api_key=self.secret,
+            synthesizer_base_url="https://example.invalid/v1",
+            synthesizer_api_key=self.secret,
             llm_max_transient_retries=1,
             llm_retry_base_delay_seconds=0.0,
             llm_retry_max_delay_seconds=0.0,
-            glm_connect_timeout_seconds=8,
-            glm_router_timeout_seconds=15,
-            glm_chat_timeout_seconds=300,
+            llm_connect_timeout_seconds=8,
+            router_timeout_seconds=15,
+            synthesizer_timeout_seconds=300,
         )
         self.client = LLMClient(self.settings)
         self.messages = [{"role": "user", "content": "hello"}]
@@ -139,14 +139,14 @@ class LLMTransientRetryTests(unittest.TestCase):
         self.client.chat(
             self.messages,
             request_id="router-timeout",
-            timeout_seconds=self.settings.glm_router_timeout_seconds,
+            timeout_seconds=self.settings.router_timeout_seconds,
             purpose="intent_router",
             transient_retries=0,
         )
         self.client.chat(
             self.messages,
             request_id="chat-timeout",
-            timeout_seconds=self.settings.glm_chat_timeout_seconds,
+            timeout_seconds=self.settings.synthesizer_timeout_seconds,
             purpose="chat",
         )
 

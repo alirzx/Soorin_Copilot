@@ -118,7 +118,7 @@ The system supports three named OpenAI-compatible deployments through the existi
 - `glm`, default model label `GLM-5.2`.
 - `gpt55`, default model label `GPT-5.5`.
 
-`SOORIN_INTENT_ROUTER_DEPLOYMENT` selects the semantic router model, `SOORIN_CHAT_DEPLOYMENT` selects final synthesis, and `SOORIN_PLANNER_DEPLOYMENT` selects the optional Planner. Release defaults are Kimi for routing/synthesis and GLM for planning; GPT remains configurable but inactive. All aliases use the same typed `ArvanDeploymentConfig` contract.
+The LLM configuration is role-based: `SOORIN_ROUTER_*`, `SOORIN_PLANNER_*`, and `SOORIN_SYNTHESIZER_*` independently configure the semantic Router, optional Planner, and final Synthesizer. All roles use the shared OpenAI-compatible transport settings and the typed `LLMRoleConfig` contract. The current example intentionally uses `CHANGE_ME_MODEL` placeholders; real deployment URLs, models, and keys are supplied only through private runtime configuration.
 
 The provider:
 
@@ -259,7 +259,7 @@ resolve_entities
 ```
 
 - Direct tasks use `compile_direct_plan`; the Planner is skipped.
-- Multi-step tasks use the existing provider-neutral LLM client with `SOORIN_PLANNER_DEPLOYMENT`.
+- Multi-step tasks use the existing provider-neutral LLM client with the role-based `SOORIN_PLANNER_*` settings.
 - Planner output is a proposal. It cannot execute tools, invent entities, introduce URLs, change permissions, or mutate state.
 - Planner receives one model call only. A rejected plan may receive one deterministic mechanical repair for known structural defects; malformed model output falls back safely without another Planner call.
 - Planner failure or plan rejection falls back explicitly to a deterministic plan when one is safe.
@@ -343,7 +343,7 @@ Arguments are never replaced after validation. Duplicate equivalent calls are re
 ### Planner and execution settings
 
 - `SOORIN_PLANNER_ENABLED`
-- `SOORIN_PLANNER_DEPLOYMENT`
+- `SOORIN_ROUTER_*`, `SOORIN_PLANNER_*`, and `SOORIN_SYNTHESIZER_*`
 - `SOORIN_PLANNER_REPAIR_ENABLED`
 - `SOORIN_AGENT_MAX_SUPPLEMENTAL_RETRIEVALS` (hard-capped at 1)
 - `SOORIN_AGENT_MAX_CAPABILITY_CALLS` (hard-capped at 6)
@@ -352,7 +352,7 @@ Arguments are never replaced after validation. Duplicate equivalent calls are re
 - `SOORIN_AGENT_EXECUTOR_MAX_CONCURRENCY` (hard-capped at 4)
 - `SOORIN_AGENT_REQUEST_TIMEOUT_SECONDS`
 
-`SOORIN_PLANNER_ENABLED` defaults to `false`. One Planner proposal is an architectural fixed bound rather than a misleading configurable planning-pass value. Enable Planner testing explicitly with `SOORIN_PLANNER_ENABLED=true` and `SOORIN_PLANNER_DEPLOYMENT=glm`.
+`SOORIN_PLANNER_ENABLED` defaults to `false`. One Planner proposal is an architectural fixed bound rather than a misleading configurable planning-pass value. Enable Planner testing explicitly with `SOORIN_PLANNER_ENABLED=true` and provide the private `SOORIN_PLANNER_*` role configuration.
 
 ## 9. Evidence Reviewer
 

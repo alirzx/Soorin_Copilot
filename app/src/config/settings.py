@@ -8,11 +8,7 @@ from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 
-from src.config.llm_deployments import (
-    ArvanDeploymentConfig,
-    LLMDeploymentName,
-    VALID_LLM_DEPLOYMENTS,
-)
+from src.config.llm_deployments import LLMRoleConfig
 
 
 APP_DIR = Path(__file__).resolve().parents[2]
@@ -77,12 +73,79 @@ def _choice(name: str, default: str, choices: set[str]) -> str:
     return value
 
 
-def _deployment_name(name: str, default: LLMDeploymentName = "kimi") -> LLMDeploymentName:
-    value = (os.getenv(name) or default).strip().lower()
-    if value not in VALID_LLM_DEPLOYMENTS:
-        valid = ", ".join(VALID_LLM_DEPLOYMENTS)
-        raise ValueError(f"Invalid LLM deployment alias for {name}. Valid aliases: {valid}")
-    return value  # type: ignore[return-value]
+def _role_config(role: str, settings: "Settings") -> LLMRoleConfig:
+    values = {
+        "router": (
+            settings.router_base_url,
+            settings.router_model,
+            settings.router_api_key,
+            settings.router_timeout_seconds,
+            settings.router_max_tokens,
+            settings.router_retry_max_tokens,
+            settings.router_temperature,
+            settings.router_top_p,
+            settings.router_supports_temperature,
+            settings.router_supports_top_p,
+        ),
+        "planner": (
+            settings.planner_base_url,
+            settings.planner_model,
+            settings.planner_api_key,
+            settings.planner_timeout_seconds,
+            settings.planner_max_tokens,
+            settings.planner_retry_max_tokens,
+            settings.planner_temperature,
+            settings.planner_top_p,
+            settings.planner_supports_temperature,
+            settings.planner_supports_top_p,
+        ),
+        "synthesizer": (
+            settings.synthesizer_base_url,
+            settings.synthesizer_model,
+            settings.synthesizer_api_key,
+            settings.synthesizer_timeout_seconds,
+            settings.synthesizer_max_tokens,
+            settings.synthesizer_retry_max_tokens,
+            settings.synthesizer_temperature,
+            settings.synthesizer_top_p,
+            settings.synthesizer_supports_temperature,
+            settings.synthesizer_supports_top_p,
+        ),
+    }
+    try:
+        (
+            base_url,
+            model,
+            api_key,
+            timeout_seconds,
+            max_tokens,
+            retry_max_tokens,
+            temperature,
+            top_p,
+            supports_temperature,
+            supports_top_p,
+        ) = values[role]
+    except KeyError as exc:
+        raise ValueError("Unknown LLM role. Valid roles: router, planner, synthesizer") from exc
+    return LLMRoleConfig(
+        name=role,  # type: ignore[arg-type]
+        base_url=base_url,
+        chat_path=settings.llm_chat_path,
+        model=model,
+        api_key=api_key,
+        auth_scheme=settings.llm_auth_scheme,
+        connect_timeout_seconds=settings.llm_connect_timeout_seconds,
+        role_max_tokens=max_tokens,
+        # Repair budgets may intentionally exceed the normal role budget.
+        maximum_completion_tokens=max(max_tokens, retry_max_tokens),
+        timeout_seconds=timeout_seconds,
+        retry_max_tokens=retry_max_tokens,
+        temperature=temperature,
+        top_p=top_p,
+        supports_temperature=supports_temperature,
+        supports_top_p=supports_top_p,
+        provider_type=settings.llm_provider,
+    )
 @dataclass(frozen=True)
 class Settings:
     api_host: str
@@ -102,10 +165,7 @@ class Settings:
     copilot_api_key: str
     llm_enabled: bool
     llm_provider: str
-    intent_router_deployment: LLMDeploymentName
-    chat_deployment: LLMDeploymentName
     planner_enabled: bool
-    planner_deployment: LLMDeploymentName
     planner_repair_enabled: bool
     planner_system_prompt_path: str
     agent_max_supplemental_retrievals: int
@@ -114,60 +174,39 @@ class Settings:
     agent_max_graph_depth: int
     agent_executor_max_concurrency: int
     agent_request_timeout_seconds: float
-    kimi_base_url: str
-    kimi_chat_path: str
-    kimi_model: str
-    kimi_api_key: str
-    kimi_auth_scheme: str
-    kimi_connect_timeout_seconds: int
-    kimi_router_timeout_seconds: int
-    kimi_chat_timeout_seconds: int
-    kimi_max_tokens: int
-    kimi_router_max_tokens: int
-    kimi_router_retry_max_tokens: int
-    kimi_chat_max_tokens: int
-    kimi_router_temperature: float | None
-    kimi_router_top_p: float | None
-    kimi_chat_temperature: float | None
-    kimi_chat_top_p: float | None
-    kimi_supports_temperature: bool
-    kimi_supports_top_p: bool
-    glm_base_url: str
-    glm_chat_path: str
-    glm_model: str
-    glm_api_key: str
-    glm_auth_scheme: str
-    glm_connect_timeout_seconds: int
-    glm_router_timeout_seconds: int
-    glm_chat_timeout_seconds: int
-    glm_max_tokens: int
-    glm_router_max_tokens: int
-    glm_router_retry_max_tokens: int
-    glm_chat_max_tokens: int
-    glm_router_temperature: float | None
-    glm_router_top_p: float | None
-    glm_chat_temperature: float | None
-    glm_chat_top_p: float | None
-    glm_supports_temperature: bool
-    glm_supports_top_p: bool
-    gpt55_base_url: str
-    gpt55_chat_path: str
-    gpt55_model: str
-    gpt55_api_key: str
-    gpt55_auth_scheme: str
-    gpt55_connect_timeout_seconds: int
-    gpt55_router_timeout_seconds: int
-    gpt55_chat_timeout_seconds: int
-    gpt55_max_tokens: int
-    gpt55_router_max_tokens: int
-    gpt55_router_retry_max_tokens: int
-    gpt55_chat_max_tokens: int
-    gpt55_router_temperature: float | None
-    gpt55_router_top_p: float | None
-    gpt55_chat_temperature: float | None
-    gpt55_chat_top_p: float | None
-    gpt55_supports_temperature: bool
-    gpt55_supports_top_p: bool
+    llm_auth_scheme: str
+    llm_chat_path: str
+    llm_connect_timeout_seconds: int
+    router_base_url: str
+    router_model: str
+    router_api_key: str
+    router_timeout_seconds: int
+    router_max_tokens: int
+    router_retry_max_tokens: int
+    router_temperature: float | None
+    router_top_p: float | None
+    router_supports_temperature: bool
+    router_supports_top_p: bool
+    planner_base_url: str
+    planner_model: str
+    planner_api_key: str
+    planner_timeout_seconds: int
+    planner_max_tokens: int
+    planner_retry_max_tokens: int
+    planner_temperature: float | None
+    planner_top_p: float | None
+    planner_supports_temperature: bool
+    planner_supports_top_p: bool
+    synthesizer_base_url: str
+    synthesizer_model: str
+    synthesizer_api_key: str
+    synthesizer_timeout_seconds: int
+    synthesizer_max_tokens: int
+    synthesizer_retry_max_tokens: int
+    synthesizer_temperature: float | None
+    synthesizer_top_p: float | None
+    synthesizer_supports_temperature: bool
+    synthesizer_supports_top_p: bool
     llm_max_transient_retries: int
     llm_retry_base_delay_seconds: float
     llm_retry_max_delay_seconds: float
@@ -277,102 +316,30 @@ class Settings:
     llm_usage_reporting_enabled: bool
     llm_usage_reporting_url: str
 
-    def deployment(self, name: LLMDeploymentName) -> ArvanDeploymentConfig:
-        """Build any named OpenAI-compatible deployment through one contract."""
-        if name == "kimi":
-            return ArvanDeploymentConfig(
-                name="kimi",
-                base_url=self.kimi_base_url,
-                chat_path=self.kimi_chat_path,
-                model=self.kimi_model,
-                api_key=self.kimi_api_key,
-                auth_scheme=self.kimi_auth_scheme,
-                connect_timeout_seconds=self.kimi_connect_timeout_seconds,
-                maximum_completion_tokens=self.kimi_max_tokens,
-                router_read_timeout_seconds=self.kimi_router_timeout_seconds,
-                router_max_tokens=self.kimi_router_max_tokens,
-                router_repair_max_tokens=self.kimi_router_retry_max_tokens,
-                chat_read_timeout_seconds=self.kimi_chat_timeout_seconds,
-                chat_max_tokens=self.kimi_chat_max_tokens,
-                router_temperature=self.kimi_router_temperature,
-                router_top_p=self.kimi_router_top_p,
-                chat_temperature=self.kimi_chat_temperature,
-                chat_top_p=self.kimi_chat_top_p,
-                supports_temperature=self.kimi_supports_temperature,
-                supports_top_p=self.kimi_supports_top_p,
-                provider_type=self.llm_provider,
-            )
-        if name == "glm":
-            return ArvanDeploymentConfig(
-                name="glm",
-                base_url=self.glm_base_url,
-                chat_path=self.glm_chat_path,
-                model=self.glm_model,
-                api_key=self.glm_api_key,
-                auth_scheme=self.glm_auth_scheme,
-                connect_timeout_seconds=self.glm_connect_timeout_seconds,
-                maximum_completion_tokens=self.glm_max_tokens,
-                router_read_timeout_seconds=self.glm_router_timeout_seconds,
-                router_max_tokens=self.glm_router_max_tokens,
-                router_repair_max_tokens=self.glm_router_retry_max_tokens,
-                chat_read_timeout_seconds=self.glm_chat_timeout_seconds,
-                chat_max_tokens=self.glm_chat_max_tokens,
-                router_temperature=self.glm_router_temperature,
-                router_top_p=self.glm_router_top_p,
-                chat_temperature=self.glm_chat_temperature,
-                chat_top_p=self.glm_chat_top_p,
-                supports_temperature=self.glm_supports_temperature,
-                supports_top_p=self.glm_supports_top_p,
-                provider_type=self.llm_provider,
-            )
-        if name == "gpt55":
-            return ArvanDeploymentConfig(
-                name="gpt55",
-                base_url=self.gpt55_base_url,
-                chat_path=self.gpt55_chat_path,
-                model=self.gpt55_model,
-                api_key=self.gpt55_api_key,
-                auth_scheme=self.gpt55_auth_scheme,
-                connect_timeout_seconds=self.gpt55_connect_timeout_seconds,
-                maximum_completion_tokens=self.gpt55_max_tokens,
-                router_read_timeout_seconds=self.gpt55_router_timeout_seconds,
-                router_max_tokens=self.gpt55_router_max_tokens,
-                router_repair_max_tokens=self.gpt55_router_retry_max_tokens,
-                chat_read_timeout_seconds=self.gpt55_chat_timeout_seconds,
-                chat_max_tokens=self.gpt55_chat_max_tokens,
-                router_temperature=self.gpt55_router_temperature,
-                router_top_p=self.gpt55_router_top_p,
-                chat_temperature=self.gpt55_chat_temperature,
-                chat_top_p=self.gpt55_chat_top_p,
-                supports_temperature=self.gpt55_supports_temperature,
-                supports_top_p=self.gpt55_supports_top_p,
-                provider_type=self.llm_provider,
-            )
-        valid = ", ".join(VALID_LLM_DEPLOYMENTS)
-        raise ValueError(f"Invalid LLM deployment alias. Valid aliases: {valid}")
+    def role(self, name: str) -> LLMRoleConfig:
+        """Build one role configuration without model-name-based branching."""
+        return _role_config(name, self)
 
-    def deployment_for_purpose(self, purpose: str) -> ArvanDeploymentConfig:
+    def deployment_for_purpose(self, purpose: str) -> LLMRoleConfig:
         if purpose == "chat":
-            alias = self.chat_deployment
+            role = "synthesizer"
         elif purpose in {"planner", "planner_repair"}:
-            alias = self.planner_deployment
+            role = "planner"
         else:
-            alias = self.intent_router_deployment
-        return self.deployment(alias)
+            role = "router"
+        return self.role(role)
 
     def validate_selected_llm_deployments(self) -> None:
-        """Fail startup safely when an enabled selected deployment has no endpoint."""
+        """Fail startup safely when an enabled role has no endpoint."""
         if not self.llm_enabled or self.llm_provider != "arvan":
             return
-        aliases = [self.intent_router_deployment, self.chat_deployment]
+        roles = ["router", "synthesizer"]
         if self.planner_enabled:
-            aliases.append(self.planner_deployment)
-        selected = dict.fromkeys(aliases)
-        missing = [alias for alias in selected if not self.deployment(alias).base_url]
+            roles.append("planner")
+        missing = [role for role in roles if not self.role(role).base_url]
         if missing:
             raise ValueError(
-                "Selected LLM deployment base URL is not configured for: "
-                + ", ".join(missing)
+                "Selected LLM role base URL is not configured for: " + ", ".join(missing)
             )
 
     def validate_product_paths(self) -> None:
@@ -454,10 +421,7 @@ def get_settings() -> Settings:
         copilot_api_key=os.getenv("SOORIN_COPILOT_API_KEY", "").strip(),
         llm_enabled=_bool("SOORIN_LLM_ENABLED", True),
         llm_provider=os.getenv("SOORIN_LLM_PROVIDER", "arvan").strip().lower(),
-        intent_router_deployment=_deployment_name("SOORIN_INTENT_ROUTER_DEPLOYMENT"),
-        chat_deployment=_deployment_name("SOORIN_CHAT_DEPLOYMENT"),
         planner_enabled=_bool("SOORIN_PLANNER_ENABLED", False),
-        planner_deployment=_deployment_name("SOORIN_PLANNER_DEPLOYMENT", "glm"),
         planner_repair_enabled=_bool("SOORIN_PLANNER_REPAIR_ENABLED", True),
         planner_system_prompt_path=os.getenv(
             "SOORIN_PLANNER_SYSTEM_PROMPT_PATH",
@@ -469,81 +433,39 @@ def get_settings() -> Settings:
         agent_max_graph_depth=max(0, min(2, _int("SOORIN_AGENT_MAX_GRAPH_DEPTH", 2))),
         agent_executor_max_concurrency=max(1, min(4, _int("SOORIN_AGENT_EXECUTOR_MAX_CONCURRENCY", 4))),
         agent_request_timeout_seconds=max(1.0, _float("SOORIN_AGENT_REQUEST_TIMEOUT_SECONDS", 120.0)),
-        kimi_base_url=os.getenv("SOORIN_LLM_KIMI_BASE_URL", "").strip().rstrip("/"),
-        kimi_chat_path=os.getenv("SOORIN_LLM_KIMI_CHAT_PATH", "/chat/completions").strip(),
-        kimi_model=os.getenv("SOORIN_LLM_KIMI_MODEL", "kimi-k3").strip(),
-        kimi_api_key=os.getenv("SOORIN_LLM_KIMI_API_KEY", "").strip(),
-        kimi_auth_scheme=os.getenv("SOORIN_LLM_KIMI_AUTH_SCHEME", "apikey").strip(),
-        kimi_connect_timeout_seconds=_int("SOORIN_LLM_KIMI_CONNECT_TIMEOUT_SECONDS", 8),
-        kimi_router_timeout_seconds=_int("SOORIN_LLM_KIMI_ROUTER_TIMEOUT_SECONDS", 30),
-        kimi_chat_timeout_seconds=_int("SOORIN_LLM_KIMI_CHAT_TIMEOUT_SECONDS", 360),
-        kimi_max_tokens=_int("SOORIN_LLM_KIMI_MAX_TOKENS", 12288),
-        kimi_router_max_tokens=_int("SOORIN_LLM_KIMI_ROUTER_MAX_TOKENS", 924),
-        kimi_router_retry_max_tokens=_int("SOORIN_LLM_KIMI_ROUTER_RETRY_MAX_TOKENS", 1284),
-        kimi_chat_max_tokens=_int("SOORIN_LLM_KIMI_CHAT_MAX_TOKENS", 12288),
-        kimi_router_temperature=_optional_float("SOORIN_LLM_KIMI_ROUTER_TEMPERATURE"),
-        kimi_router_top_p=_optional_float("SOORIN_LLM_KIMI_ROUTER_TOP_P"),
-        kimi_chat_temperature=_optional_float("SOORIN_LLM_KIMI_CHAT_TEMPERATURE"),
-        kimi_chat_top_p=_optional_float("SOORIN_LLM_KIMI_CHAT_TOP_P"),
-        kimi_supports_temperature=_bool("SOORIN_LLM_KIMI_SUPPORTS_TEMPERATURE", False),
-        kimi_supports_top_p=_bool("SOORIN_LLM_KIMI_SUPPORTS_TOP_P", False),
-        glm_base_url=os.getenv("SOORIN_LLM_GLM_BASE_URL", "").strip().rstrip("/"),
-        glm_chat_path=os.getenv("SOORIN_LLM_GLM_CHAT_PATH", "/chat/completions").strip(),
-        glm_model=os.getenv("SOORIN_LLM_GLM_MODEL", "GLM-5.2").strip(),
-        glm_api_key=os.getenv("SOORIN_LLM_GLM_API_KEY", "").strip(),
-        glm_auth_scheme=os.getenv("SOORIN_LLM_GLM_AUTH_SCHEME", "apikey").strip(),
-        glm_connect_timeout_seconds=_int("SOORIN_LLM_GLM_CONNECT_TIMEOUT_SECONDS", 8),
-        glm_router_timeout_seconds=_int("SOORIN_LLM_GLM_ROUTER_TIMEOUT_SECONDS", 15),
-        glm_chat_timeout_seconds=_int("SOORIN_LLM_GLM_CHAT_TIMEOUT_SECONDS", 300),
-        glm_max_tokens=_int("SOORIN_LLM_GLM_MAX_TOKENS", 12288),
-        glm_router_max_tokens=_int("SOORIN_LLM_GLM_ROUTER_MAX_TOKENS", 384),
-        glm_router_retry_max_tokens=_int("SOORIN_LLM_GLM_ROUTER_RETRY_MAX_TOKENS", 640),
-        glm_chat_max_tokens=_int("SOORIN_LLM_GLM_CHAT_MAX_TOKENS", 4096),
-        glm_router_temperature=_optional_float("SOORIN_LLM_GLM_ROUTER_TEMPERATURE"),
-        glm_router_top_p=_optional_float("SOORIN_LLM_GLM_ROUTER_TOP_P"),
-        glm_chat_temperature=_optional_float("SOORIN_LLM_GLM_CHAT_TEMPERATURE"),
-        glm_chat_top_p=_optional_float("SOORIN_LLM_GLM_CHAT_TOP_P"),
-        glm_supports_temperature=_bool("SOORIN_LLM_GLM_SUPPORTS_TEMPERATURE", True),
-        glm_supports_top_p=_bool("SOORIN_LLM_GLM_SUPPORTS_TOP_P", True),
-        gpt55_base_url=os.getenv("SOORIN_LLM_GPT55_BASE_URL", "").strip().rstrip("/"),
-        gpt55_chat_path=os.getenv("SOORIN_LLM_GPT55_CHAT_PATH", "/chat/completions").strip(),
-        gpt55_model=os.getenv("SOORIN_LLM_GPT55_MODEL", "GPT-5.5").strip(),
-        gpt55_api_key=os.getenv("SOORIN_LLM_GPT55_API_KEY", "").strip(),
-        gpt55_auth_scheme=os.getenv("SOORIN_LLM_GPT55_AUTH_SCHEME", "apikey").strip(),
-        gpt55_connect_timeout_seconds=_int(
-            "SOORIN_LLM_GPT55_CONNECT_TIMEOUT_SECONDS",
-            8,
-        ),
-        gpt55_router_timeout_seconds=_int(
-            "SOORIN_LLM_GPT55_ROUTER_TIMEOUT_SECONDS",
-            30,
-        ),
-        gpt55_chat_timeout_seconds=_int(
-            "SOORIN_LLM_GPT55_CHAT_TIMEOUT_SECONDS",
-            360,
-        ),
-        gpt55_max_tokens=_int(
-            "SOORIN_LLM_GPT55_MAX_TOKENS",
-            12288,
-        ),
-        gpt55_router_max_tokens=_int(
-            "SOORIN_LLM_GPT55_ROUTER_MAX_TOKENS",
-            924,
-        ),
-        gpt55_router_retry_max_tokens=_int(
-            "SOORIN_LLM_GPT55_ROUTER_RETRY_MAX_TOKENS",
-            1284,
-        ),
-        gpt55_chat_max_tokens=_int(
-            "SOORIN_LLM_GPT55_CHAT_MAX_TOKENS",
-            12288,
-        ),
-        gpt55_router_temperature=_optional_float("SOORIN_LLM_GPT55_ROUTER_TEMPERATURE"),
-        gpt55_router_top_p=_optional_float("SOORIN_LLM_GPT55_ROUTER_TOP_P"),
-        gpt55_chat_temperature=_optional_float("SOORIN_LLM_GPT55_CHAT_TEMPERATURE"),
-        gpt55_chat_top_p=_optional_float("SOORIN_LLM_GPT55_CHAT_TOP_P"),
-        gpt55_supports_temperature=_bool("SOORIN_LLM_GPT55_SUPPORTS_TEMPERATURE", False),
-        gpt55_supports_top_p=_bool("SOORIN_LLM_GPT55_SUPPORTS_TOP_P", False),
+        llm_auth_scheme=os.getenv("SOORIN_LLM_AUTH_SCHEME", "apikey").strip(),
+        llm_chat_path=os.getenv("SOORIN_LLM_CHAT_PATH", "/chat/completions").strip(),
+        llm_connect_timeout_seconds=_int("SOORIN_LLM_CONNECT_TIMEOUT_SECONDS", 8),
+        router_base_url=os.getenv("SOORIN_ROUTER_BASE_URL", "").strip().rstrip("/"),
+        router_model=os.getenv("SOORIN_ROUTER_MODEL", "CHANGE_ME_MODEL").strip(),
+        router_api_key=os.getenv("SOORIN_ROUTER_API_KEY", "").strip(),
+        router_timeout_seconds=_int("SOORIN_ROUTER_TIMEOUT_SECONDS", 30),
+        router_max_tokens=_int("SOORIN_ROUTER_MAX_TOKENS", 924),
+        router_retry_max_tokens=_int("SOORIN_ROUTER_RETRY_MAX_TOKENS", 1284),
+        router_temperature=_optional_float("SOORIN_ROUTER_TEMPERATURE"),
+        router_top_p=_optional_float("SOORIN_ROUTER_TOP_P"),
+        router_supports_temperature=_bool("SOORIN_ROUTER_SUPPORTS_TEMPERATURE", False),
+        router_supports_top_p=_bool("SOORIN_ROUTER_SUPPORTS_TOP_P", False),
+        planner_base_url=os.getenv("SOORIN_PLANNER_BASE_URL", "").strip().rstrip("/"),
+        planner_model=os.getenv("SOORIN_PLANNER_MODEL", "CHANGE_ME_MODEL").strip(),
+        planner_api_key=os.getenv("SOORIN_PLANNER_API_KEY", "").strip(),
+        planner_timeout_seconds=_int("SOORIN_PLANNER_TIMEOUT_SECONDS", 120),
+        planner_max_tokens=_int("SOORIN_PLANNER_MAX_TOKENS", 2048),
+        planner_retry_max_tokens=_int("SOORIN_PLANNER_RETRY_MAX_TOKENS", 3072),
+        planner_temperature=_optional_float("SOORIN_PLANNER_TEMPERATURE"),
+        planner_top_p=_optional_float("SOORIN_PLANNER_TOP_P"),
+        planner_supports_temperature=_bool("SOORIN_PLANNER_SUPPORTS_TEMPERATURE", False),
+        planner_supports_top_p=_bool("SOORIN_PLANNER_SUPPORTS_TOP_P", False),
+        synthesizer_base_url=os.getenv("SOORIN_SYNTHESIZER_BASE_URL", "").strip().rstrip("/"),
+        synthesizer_model=os.getenv("SOORIN_SYNTHESIZER_MODEL", "CHANGE_ME_MODEL").strip(),
+        synthesizer_api_key=os.getenv("SOORIN_SYNTHESIZER_API_KEY", "").strip(),
+        synthesizer_timeout_seconds=_int("SOORIN_SYNTHESIZER_TIMEOUT_SECONDS", 360),
+        synthesizer_max_tokens=_int("SOORIN_SYNTHESIZER_MAX_TOKENS", 12288),
+        synthesizer_retry_max_tokens=_int("SOORIN_SYNTHESIZER_RETRY_MAX_TOKENS", 12288),
+        synthesizer_temperature=_optional_float("SOORIN_SYNTHESIZER_TEMPERATURE"),
+        synthesizer_top_p=_optional_float("SOORIN_SYNTHESIZER_TOP_P"),
+        synthesizer_supports_temperature=_bool("SOORIN_SYNTHESIZER_SUPPORTS_TEMPERATURE", False),
+        synthesizer_supports_top_p=_bool("SOORIN_SYNTHESIZER_SUPPORTS_TOP_P", False),
         llm_max_transient_retries=_int("SOORIN_LLM_MAX_TRANSIENT_RETRIES", 1),
         llm_retry_base_delay_seconds=_float("SOORIN_LLM_RETRY_BASE_DELAY_SECONDS", 0.25),
         llm_retry_max_delay_seconds=_float("SOORIN_LLM_RETRY_MAX_DELAY_SECONDS", 1.0),
@@ -687,11 +609,11 @@ def get_settings() -> Settings:
     settings.validate_product_paths()
     settings.validate_observability_configuration()
     logger.info(
-        "event=settings_loaded env_file_path=%s env_file_loaded=%s router_deployment=%s chat_deployment=%s product_base_url_configured=%s product_token_present=%s product_hwid_present=%s product_username_present=%s product_password_present=%s product_captcha_bypass_present=%s rag_enabled=%s rag_backend=%s rag_source_configured=%s rag_qdrant_mode=%s rag_qdrant_configured=%s",
+        "event=settings_loaded env_file_path=%s env_file_loaded=%s router_role=%s synthesizer_role=%s product_base_url_configured=%s product_token_present=%s product_hwid_present=%s product_username_present=%s product_password_present=%s product_captcha_bypass_present=%s rag_enabled=%s rag_backend=%s rag_source_configured=%s rag_qdrant_mode=%s rag_qdrant_configured=%s",
         ENV_PATH,
         env_file_loaded,
-        settings.intent_router_deployment,
-        settings.chat_deployment,
+        "router",
+        "synthesizer",
         bool(settings.product_api_base_url),
         bool(settings.product_api_token),
         bool(settings.product_hwid),

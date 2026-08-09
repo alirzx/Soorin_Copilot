@@ -22,16 +22,13 @@ def make_settings(**overrides: Any):
     values = {
         "llm_provider": "arvan",
         "llm_enabled": True,
-        "intent_router_deployment": "kimi",
-        "chat_deployment": "kimi",
         "planner_enabled": True,
-        "planner_deployment": "glm",
-        "kimi_base_url": "http://kimi.example.invalid",
-        "kimi_api_key": "kimi-key",
-        "glm_base_url": "http://glm.example.invalid",
-        "glm_api_key": "glm-key",
-        "gpt55_base_url": "http://gpt.example.invalid",
-        "gpt55_api_key": "gpt-key",
+        "router_base_url": "http://router.example.invalid",
+        "router_api_key": "router-key",
+        "planner_base_url": "http://planner.example.invalid",
+        "planner_api_key": "planner-key",
+        "synthesizer_base_url": "http://synthesizer.example.invalid",
+        "synthesizer_api_key": "synthesizer-key",
         "product_api_base_url": "http://product.invalid",
         "product_api_token": "bootstrap-token",
         "product_hwid": "test-hwid",
@@ -173,9 +170,9 @@ class UsageReportingTests(unittest.TestCase):
 
     def build_client(self, reporter: ProductUsageReporter, provider: Any, **overrides: Any) -> LLMClient:
         client = LLMClient(make_settings(**overrides), usage_recorder=reporter)
-        client.providers["kimi"] = provider  # type: ignore[assignment]
-        client.providers["glm"] = provider  # type: ignore[assignment]
-        client.providers["gpt55"] = provider  # type: ignore[assignment]
+        client.providers["router"] = provider  # type: ignore[assignment]
+        client.providers["planner"] = provider  # type: ignore[assignment]
+        client.providers["synthesizer"] = provider  # type: ignore[assignment]
         client.provider = provider  # type: ignore[assignment]
         return client
 
