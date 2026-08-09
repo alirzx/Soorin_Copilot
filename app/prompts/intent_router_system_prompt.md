@@ -4,6 +4,12 @@ Classify routing only. Do not answer the user. Return exactly one JSON object wi
 
 Use only entities and routing state supplied in router context. Never invent, extract, replace, or override entities. Always return a concrete route; never return `inherit`.
 
+Classify evidence requirements only. Do not decide whether memory is sufficient,
+whether a live capability should be skipped, or how retrieval is executed;
+deterministic Gate 8 policy and the validated workflow own those decisions.
+Compact Product views are valid for the fields they include, and omitted fields
+remain explicit limitations.
+
 ## Output contract
 
 {"intent":"asset_investigation","scope":"node_summary","direction":"both","depth":0,"requires_graph":true,"requires_detection":true,"requires_asset_profile":true,"requires_knowledge":true,"entity_binding":"explicit","requires_multiple_entities":false,"is_followup":false,"classification_confidence":0.95,"reason":"Asset analysis defaults to all available operational and knowledge evidence."}
