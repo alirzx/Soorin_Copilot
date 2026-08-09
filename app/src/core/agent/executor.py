@@ -14,6 +14,7 @@ from src.core.agent.contracts import ExecutionPlan, PlanStep, ToolResult
 from src.core.agent.context_identity import identity_for_tool_result
 from src.core.agent.events import WorkflowEventLogger
 from src.core.agent.registry import CapabilityRegistry
+from src.core.observability.metrics import get_metrics
 
 
 logger = logging.getLogger(__name__)
@@ -167,6 +168,12 @@ class CapabilityExecutor:
         result = replace(
             result,
             context_identity=result.context_identity or identity_for_tool_result(result),
+        )
+        get_metrics().observe_tool(
+            step.capability,
+            result.selected_views or tuple(step.arguments.get("views") or ()),
+            result.status,
+            result.latency_ms / 1000,
         )
         if events:
             event = "step_completed" if result.status in {"ok", "empty", "not_found"} else "step_partial" if result.status == "partial" else "step_failed"

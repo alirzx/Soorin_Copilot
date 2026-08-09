@@ -11,6 +11,7 @@ from typing import Any, Literal
 from src.core.agent.contracts import EvidenceFact, ExecutionPlan, PlanStep, TaskSpec, ToolResult
 from src.core.context.product_views import select_product_views
 from src.core.memory.long_term import MAX_MEMORY_STATEMENT_CHARS
+from src.core.observability.metrics import get_metrics
 
 
 logger = logging.getLogger(__name__)
@@ -386,7 +387,16 @@ def log_gap_plan(request_id: str, gap_plan: EvidenceGapPlan) -> None:
         sum(item.action == "live" for item in gap_plan.gaps),
         sum(item.action == "verify" for item in gap_plan.gaps),
     )
+    metrics = get_metrics()
+    decision_map = {
+        "memory_sufficient": "reuse",
+        "memory_sufficient_verification_required": "verify",
+        "contradictory_memory": "conflict",
+    }
+    for decision in gap_plan.decisions:
+        metrics.observe_memory_decision(decision_map.get(decision.decision, "live"))
     for gap in gap_plan.gaps:
+        metrics.observe_memory_action(gap.action, gap.requirement.capability)
         if gap.action == "skip":
             continue
         logger.info(

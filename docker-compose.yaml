@@ -171,6 +171,99 @@ services:
       start_period: 90s
       retries: 5
 
+  prometheus:
+    image: prom/prometheus:v3.5.0
+    container_name: soorin-copilot-prometheus
+    profiles: ["observability"]
+    restart: "${SOORIN_RESTART_POLICY:-unless-stopped}"
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=${SOORIN_OBSERVABILITY_RETENTION:-168h}
+      - --web.enable-lifecycle
+      - --enable-feature=expand-external-labels
+    environment:
+      SOORIN_OBSERVABILITY_ENVIRONMENT: "${SOORIN_OBSERVABILITY_ENVIRONMENT:-development}"
+    ports:
+      - "${SOORIN_OBSERVABILITY_PROMETHEUS_BIND_IP:-127.0.0.1}:${SOORIN_OBSERVABILITY_PROMETHEUS_PORT:-9090}:9090"
+    volumes:
+      - ./observability/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    secrets:
+      - copilot_metrics_api_key
+    networks:
+      - copilot-network
+    depends_on:
+      api:
+        condition: service_healthy
+
+  loki:
+    image: grafana/loki:3.5.3
+    container_name: soorin-copilot-loki
+    profiles: ["observability"]
+    restart: "${SOORIN_RESTART_POLICY:-unless-stopped}"
+    command:
+      - -config.file=/etc/loki/loki-config.yml
+      - -config.expand-env=true
+    environment:
+      SOORIN_OBSERVABILITY_RETENTION: "${SOORIN_OBSERVABILITY_RETENTION:-168h}"
+    ports:
+      - "${SOORIN_OBSERVABILITY_LOKI_BIND_IP:-127.0.0.1}:${SOORIN_OBSERVABILITY_LOKI_PORT:-3100}:3100"
+    volumes:
+      - ./observability/loki/loki-config.yml:/etc/loki/loki-config.yml:ro
+      - loki-data:/loki
+    networks:
+      - copilot-network
+
+  alloy:
+    image: grafana/alloy:v1.10.2
+    container_name: soorin-copilot-alloy
+    profiles: ["observability"]
+    restart: "${SOORIN_RESTART_POLICY:-unless-stopped}"
+    command:
+      - run
+      - /etc/alloy/config.alloy
+      - --storage.path=/var/lib/alloy
+    environment:
+      SOORIN_OBSERVABILITY_ENVIRONMENT: "${SOORIN_OBSERVABILITY_ENVIRONMENT:-development}"
+    volumes:
+      - ./observability/alloy/config.alloy:/etc/alloy/config.alloy:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks:
+      - copilot-network
+    depends_on:
+      - loki
+
+  grafana:
+    image: grafana/grafana:12.1.1
+    container_name: soorin-copilot-grafana
+    profiles: ["observability"]
+    restart: "${SOORIN_RESTART_POLICY:-unless-stopped}"
+    environment:
+      GF_SECURITY_ADMIN_USER: "${SOORIN_GRAFANA_ADMIN_USER:-admin}"
+      GF_SECURITY_ADMIN_PASSWORD: "${SOORIN_GRAFANA_ADMIN_PASSWORD:-CHANGE_ME}"
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    ports:
+      - "${SOORIN_OBSERVABILITY_GRAFANA_BIND_IP:-127.0.0.1}:${SOORIN_OBSERVABILITY_GRAFANA_PORT:-3000}:3000"
+    volumes:
+      - ./observability/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./observability/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    networks:
+      - copilot-network
+    depends_on:
+      - prometheus
+      - loki
+
 networks:
   copilot-network:
     driver: bridge
+
+volumes:
+  prometheus-data:
+  loki-data:
+  grafana-data:
+
+secrets:
+  copilot_metrics_api_key:
+    environment: SOORIN_COPILOT_API_KEY

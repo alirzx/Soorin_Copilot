@@ -36,6 +36,7 @@ from src.core.llm.token_estimator import TokenEstimator
 from src.core.memory.episodes import MemoryContextKey
 from src.core.memory.long_term import LongTermMemoryRecord
 from src.core.memory.routing_state import SessionRoutingState
+from src.core.observability.metrics import get_metrics
 
 
 logger = logging.getLogger(__name__)
@@ -63,6 +64,10 @@ class CopilotWorkflowNodes:
             )
             if self.settings.chat_store_history
             else []
+        )
+        get_metrics().observe_memory_retrieval(
+            "short_term",
+            "hit" if recent else "miss",
         )
         resolution = self.service.entity_resolver.resolve(
             state["message"].strip(),
@@ -257,6 +262,7 @@ class CopilotWorkflowNodes:
                 len(selection.entities),
                 selection.reason,
             )
+            get_metrics().observe_view(selection.capability, selection.views)
         for result in memory_results:
             logger.info(
                 "event=tool_skipped_from_memory request_id=%s capability=%s entity_count=%s reason=memory_reused_authoritative",

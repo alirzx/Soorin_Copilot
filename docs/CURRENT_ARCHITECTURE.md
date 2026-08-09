@@ -38,7 +38,7 @@ sequenceDiagram
     API->>Service: message, resolved request identity, optional ui_context
     Service->>Workflow: invoke request with runtime dependencies
     Workflow->>Entity: resolve explicit/UI/session entities
-    Workflow->>Router: classify with configured Kimi/GLM/GPT deployment
+    Workflow->>Router: classify with configured Router role
     Router->>Workflow: JSON route decision
     Workflow->>Workflow: validate and normalize task
     Workflow->>Planner: multi-step only; one structured proposal
@@ -93,7 +93,7 @@ Settings are loaded from `app/.env` if present, then from environment variables.
 Major groups:
 
 - API/UI: `API_HOST`, `API_PORT`, `API_RELOAD`, `SOORIN_API_BASE_URL`, `SOORIN_API_TIMEOUT_SECONDS`, `STREAMLIT_SERVER_PORT`.
-- LLM: selected router/chat deployments plus per-deployment Arvan base URL, model, API key, timeouts, token limits, sampling support, and conservative estimate multiplier.
+- LLM: independent Router, Planner, and Synthesizer role settings over one OpenAI-compatible Arvan transport, with per-role URL, model, API key, timeouts, token limits, sampling support, and conservative estimate multiplier.
 - Product API: base URL, topology path, profile path, detection path, login path, token, login credentials, captcha bypass, HWID, retry and timeout settings.
 - Graph: artifact paths, UI limits, API limits, retrieval limits, context limits, refresh policy, validation thresholds.
 - RAG: enabled flag, source root, backend, Qdrant mode/server URL/local path, collection, score threshold, BGE model/dimension/revision/cache/local-only policy, chunking and upsert limits.
@@ -103,6 +103,9 @@ Major groups:
   thread-state backend, local SQLite path, and reserved LangGraph checkpoint
   backend selection.
 - Observability: console/JSON terminal logs, bounded rotating UTF-8 file logs, summary/detailed human traces, TTY-aware color, and disabled-by-default evidence snapshots.
+- Optional operations observability: authenticated Prometheus `/metrics`, an
+  `observability` Compose profile for Prometheus/Loki/Alloy/Grafana, and a
+  provisioned low-cardinality operations dashboard. See `docs/OBSERVABILITY.md`.
 
 Validation currently enforces:
 
@@ -119,13 +122,7 @@ Validation currently enforces:
 
 Implemented in `app/src/config/llm_deployments.py`, `app/src/core/llm/client.py`, and `app/src/core/llm/providers/arvan.py`.
 
-The system supports three named OpenAI-compatible deployments through the existing adapter:
-
-- `kimi`, default model label `kimi-k3`.
-- `glm`, default model label `GLM-5.2`.
-- `gpt55`, default model label `GPT-5.5`.
-
-The LLM configuration is role-based: `SOORIN_ROUTER_*`, `SOORIN_PLANNER_*`, and `SOORIN_SYNTHESIZER_*` independently configure the semantic Router, optional Planner, and final Synthesizer. All roles use the shared OpenAI-compatible transport settings and the typed `LLMRoleConfig` contract. The current example intentionally uses `CHANGE_ME_MODEL` placeholders; real deployment URLs, models, and keys are supplied only through private runtime configuration.
+The LLM configuration is role-based: `SOORIN_ROUTER_*`, `SOORIN_PLANNER_*`, and `SOORIN_SYNTHESIZER_*` independently configure the semantic Router, optional Planner, and final Synthesizer. All roles use the shared OpenAI-compatible transport settings and the typed `LLMRoleConfig` contract. The intended next deployment is DeepSeek V4 Flash for all three roles, but exact provider endpoint/model values have not been guessed; the checked-in example uses `CHANGE_ME_MODEL` placeholders and private runtime configuration supplies approved values.
 
 The provider:
 
@@ -841,7 +838,7 @@ Current focused tests:
 - `test_context_routing.py`: semantic/fallback routing, entity authority, active single/pair follow-ups, graph scopes, UI authority, subnet formatting, topology UI helpers.
 - `test_detection_integration.py`: product JSON provider and detection/profile behavior.
 - `test_detection_phase12.py`: additional detection/profile/cache/context protections.
-- `test_llm_deployments.py`: multi-deployment settings and LLM health.
+- `test_llm_deployments.py`: independent role settings, transport semantics, and safe LLM health metadata.
 - `test_llm_retry.py`: transient retry and non-retry behavior.
 - `test_phase2_agent_workflow.py`: plan validation, planner JSON/repair boundaries, DAG execution, concurrency, cancellation, safe failures, raw payload preservation, EvidencePack/reviewer behavior, event safety, and typed workflow dispatch.
 
@@ -864,7 +861,7 @@ Implemented:
 
 - FastAPI chat and graph APIs.
 - Streamlit workspace with topology UI and streaming chat.
-- Provider-neutral LLM client with OpenAI-compatible Kimi/GLM/GPT deployment aliases.
+- Provider-neutral LLM client with independent Router/Planner/Synthesizer role configuration.
 - Semantic LLM router with deterministic validation and fallback.
 - Deterministic IPv4 entity authority.
 - Product auth/client for topology, detection, profile, and login.

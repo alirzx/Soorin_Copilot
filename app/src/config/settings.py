@@ -159,6 +159,8 @@ class Settings:
     log_file_level: str
     log_file_max_bytes: int
     log_file_backup_count: int
+    metrics_enabled: bool
+    metrics_path: str
     api_base_url: str
     api_timeout_seconds: int
     streamlit_server_port: int
@@ -425,6 +427,8 @@ class Settings:
             raise ValueError(
                 "SOORIN_EVIDENCE_SNAPSHOT_MODE must be none, metadata, summary, or redacted."
             )
+        if not self.metrics_path.startswith("/") or "{" in self.metrics_path or "}" in self.metrics_path:
+            raise ValueError("SOORIN_METRICS_PATH must be a static absolute API path.")
 
     def validate_local_persistence_configuration(self) -> None:
         """Validate only explicitly enabled local-development persistence."""
@@ -487,6 +491,8 @@ def get_settings() -> Settings:
         log_file_level=os.getenv("SOORIN_LOG_FILE_LEVEL", "INFO").strip().upper(),
         log_file_max_bytes=max(1024, _int("SOORIN_LOG_FILE_MAX_BYTES", 20971520)),
         log_file_backup_count=max(0, _int("SOORIN_LOG_FILE_BACKUP_COUNT", 10)),
+        metrics_enabled=_bool("SOORIN_METRICS_ENABLED", True),
+        metrics_path=os.getenv("SOORIN_METRICS_PATH", "/metrics").strip() or "/metrics",
         api_base_url=os.getenv("SOORIN_API_BASE_URL", "http://127.0.0.1:6998").strip().rstrip("/"),
         api_timeout_seconds=_int("SOORIN_API_TIMEOUT_SECONDS", 120),
         streamlit_server_port=_int("STREAMLIT_SERVER_PORT", 8503),
