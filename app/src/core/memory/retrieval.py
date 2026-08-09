@@ -18,6 +18,7 @@ from src.core.memory.long_term import (
     retrieval_document,
     utc_now,
 )
+from src.core.observability.metrics import get_metrics
 from src.core.memory.ports import LongTermMemoryStore
 from src.core.rag.embeddings import Embedder
 from src.core.rag.vector_store import VectorRecord, VectorSearchHit, VectorStore
@@ -193,6 +194,7 @@ class LongTermMemoryRetriever:
         request_id: str = "",
     ) -> LongTermMemorySelection:
         started = time.perf_counter()
+        exact_started = time.perf_counter()
         exact = self.store.list(
             user_id=user_id,
             entity_ids=entity_ids,
@@ -203,6 +205,11 @@ class LongTermMemoryRetriever:
             "event=memory_exact_search_completed request_id=%s status=ok candidate_count=%s",
             request_id,
             len(exact),
+        )
+        get_metrics().observe_memory_retrieval(
+            "exact",
+            "hit" if exact else "miss",
+            time.perf_counter() - exact_started,
         )
         candidates: dict[str, RetrievedLongTermMemory] = {}
         for memory in exact:
@@ -217,6 +224,7 @@ class LongTermMemoryRetriever:
         semantic_hits: list[VectorSearchHit] = []
         limitations: list[str] = []
         if self.semantic_index is not None:
+            semantic_started = time.perf_counter()
             try:
                 semantic_hits = self.semantic_index.search(
                     query,
@@ -243,6 +251,11 @@ class LongTermMemoryRetriever:
                     request_id,
                     len(semantic_hits),
                 )
+                get_metrics().observe_memory_retrieval(
+                    "semantic",
+                    "hit" if semantic_hits else "miss",
+                    time.perf_counter() - semantic_started,
+                )
             except Exception as exc:
                 limitations.append("semantic_memory_unavailable")
                 logger.warning(
@@ -250,6 +263,14 @@ class LongTermMemoryRetriever:
                     request_id,
                     type(exc).__name__,
                 )
+                get_metrics().observe_memory_retrieval(
+                    "semantic",
+                    "unavailable",
+                    time.perf_counter() - semantic_started,
+                )
+                get_metrics().observe_error("memory", type(exc).__name__)
+        else:
+            get_metrics().observe_memory_retrieval("semantic", "unavailable")
 
         ranked = sorted(
             candidates.values(),
@@ -263,6 +284,7 @@ class LongTermMemoryRetriever:
         )[: self.candidate_k]
         reranked_count = 0
         if self.reranker is not None and ranked:
+            rerank_started = time.perf_counter()
             try:
                 scores = self.reranker.rerank(
                     query,
@@ -284,6 +306,7 @@ class LongTermMemoryRetriever:
                     request_id,
                     reranked_count,
                 )
+                get_metrics().observe_rerank(time.perf_counter() - rerank_started)
             except Exception as exc:
                 limitations.append("memory_reranker_unavailable")
                 logger.warning(
@@ -291,6 +314,8 @@ class LongTermMemoryRetriever:
                     request_id,
                     type(exc).__name__,
                 )
+                get_metrics().observe_rerank(time.perf_counter() - rerank_started)
+                get_metrics().observe_error("memory", type(exc).__name__)
 
         selected: list[RetrievedLongTermMemory] = []
         used_tokens = 0

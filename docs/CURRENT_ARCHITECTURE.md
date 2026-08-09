@@ -103,6 +103,9 @@ Major groups:
   thread-state backend, local SQLite path, and reserved LangGraph checkpoint
   backend selection.
 - Observability: console/JSON terminal logs, bounded rotating UTF-8 file logs, summary/detailed human traces, TTY-aware color, and disabled-by-default evidence snapshots.
+- Optional operations observability: authenticated Prometheus `/metrics`, an
+  `observability` Compose profile for Prometheus/Loki/Alloy/Grafana, and a
+  provisioned low-cardinality operations dashboard. See `docs/OBSERVABILITY.md`.
 
 Validation currently enforces:
 

@@ -13,6 +13,7 @@ from src.core.llm.errors import LLMDisabledError, LLMError
 from src.core.llm.providers.arvan import ArvanProvider
 from src.core.llm.providers.base import LLMProviderResult, LLMStreamEvent
 from src.core.observability.llm_usage import LLMUsageCall, LLMUsageRecorder
+from src.core.observability.metrics import get_metrics
 
 
 logger = logging.getLogger(__name__)
@@ -342,24 +343,23 @@ class LLMClient:
         http_status: object = None,
         finish_reason: str | None = None,
     ) -> None:
-        if self.usage_recorder is None:
-            return
-        self.usage_recorder.record(
-            LLMUsageCall.from_usage(
-                request_id=request_id,
-                call_id=call_id,
-                trace_id=trace_id,
-                provider=provider,
-                deployment=deployment,
-                model=model,
-                purpose=purpose,
-                usage=usage,
-                latency_ms=latency_ms,
-                status=status,
-                http_status=http_status if isinstance(http_status, int) else None,
-                finish_reason=finish_reason,
-            )
+        call = LLMUsageCall.from_usage(
+            request_id=request_id,
+            call_id=call_id,
+            trace_id=trace_id,
+            provider=provider,
+            deployment=deployment,
+            model=model,
+            purpose=purpose,
+            usage=usage,
+            latency_ms=latency_ms,
+            status=status,
+            http_status=http_status if isinstance(http_status, int) else None,
+            finish_reason=finish_reason,
         )
+        get_metrics().observe_llm(call)
+        if self.usage_recorder is not None:
+            self.usage_recorder.record(call)
 
     def health(self) -> dict[str, object]:
         if not self.providers:

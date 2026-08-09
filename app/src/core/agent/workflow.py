@@ -13,6 +13,7 @@ from uuid import uuid4
 from src.core.agent.contracts import InvestigationState, TaskSpec
 from src.core.agent.events import WorkflowEventContext, WorkflowEventLogger
 from src.core.identity import RequestIdentity
+from src.core.observability.metrics import get_metrics
 
 
 logger = logging.getLogger(__name__)
@@ -252,6 +253,11 @@ class BoundedCopilotWorkflow:
                         error_type=type(retry_exc).__name__,
                         retryable=False,
                     )
+                    get_metrics().observe_stage(
+                        name,
+                        latency_ms / 1000,
+                        error=type(retry_exc).__name__,
+                    )
                     raise
             except Exception as exc:
                 latency_ms = int((time.perf_counter() - started) * 1000)
@@ -266,6 +272,11 @@ class BoundedCopilotWorkflow:
                     latency_ms=latency_ms,
                     error_type=type(exc).__name__,
                     retryable=False,
+                )
+                get_metrics().observe_stage(
+                    name,
+                    latency_ms / 1000,
+                    error=type(exc).__name__,
                 )
                 raise
             latency_ms = int((time.perf_counter() - started) * 1000)
@@ -304,6 +315,7 @@ class BoundedCopilotWorkflow:
                 output_summary=output_summary,
                 resumed=bool(state.get("resumed")),
             )
+            get_metrics().observe_stage(name, latency_ms / 1000)
             return update
 
         execute.__name__ = name
@@ -528,6 +540,7 @@ class BoundedCopilotWorkflow:
         node_runtime: WorkflowNodeRuntime | None = None,
         interrupt_on_clarification: bool = False,
     ) -> dict[str, Any]:
+        request_started = time.perf_counter()
         resolved_trace_id = trace_id or uuid4().hex[:16]
         identity = request_identity or RequestIdentity.resolve(
             session_id=session_id,
@@ -585,18 +598,31 @@ class BoundedCopilotWorkflow:
             runtime=self.runtime,
             status="running",
         )
-        if self.graph is None or self._state_graph_type is None:
-            final = self._run_deterministic(initial, node_runtime)
-        else:
-            final = self.graph.invoke(
-                initial,
-                config=config,
-                context=WorkflowRunContext(node_runtime, interrupt_on_clarification),
+        try:
+            if self.graph is None or self._state_graph_type is None:
+                final = self._run_deterministic(initial, node_runtime)
+            else:
+                final = self.graph.invoke(
+                    initial,
+                    config=config,
+                    context=WorkflowRunContext(node_runtime, interrupt_on_clarification),
+                )
+        except Exception:
+            get_metrics().observe_copilot(
+                "failed",
+                "unknown",
+                time.perf_counter() - request_started,
             )
+            raise
         response = final.get("final_response")
         if not isinstance(response, dict):
             if interrupt_on_clarification and final.get("workflow_status") == "clarification_required":
                 clarification = final.get("clarification") or {}
+                get_metrics().observe_copilot(
+                    "partial",
+                    str(getattr(final.get("task"), "workflow_mode", "unknown")),
+                    time.perf_counter() - request_started,
+                )
                 return {
                     "session_id": final.get("session_id", ""),
                     "answer": str(clarification.get("answer") or ""),
@@ -605,8 +631,14 @@ class BoundedCopilotWorkflow:
                     "_warnings": [str(clarification.get("code") or "clarification_required")],
                     "_interrupt": True,
                 }
+            get_metrics().observe_copilot(
+                "failed",
+                str(getattr(final.get("task"), "workflow_mode", "unknown")),
+                time.perf_counter() - request_started,
+            )
             raise RuntimeError("Workflow completed without a final response.")
         status = str(final.get("workflow_status") or "completed")
+        workflow_mode = str(getattr(final.get("task"), "workflow_mode", "unknown"))
         events.emit(
             "langgraph_workflow_completed" if status.startswith("completed") else "langgraph_workflow_partial",
             workflow_id=workflow_id,
@@ -618,6 +650,17 @@ class BoundedCopilotWorkflow:
             reason=final.get("limitation_reasons") or (),
         )
         self._render_workflow_trace(final)
+        metric_status = (
+            "completed" if status.startswith("completed") else
+            "cancelled" if status == "cancelled" else
+            "failed" if status == "failed" else
+            "partial"
+        )
+        get_metrics().observe_copilot(
+            metric_status,
+            workflow_mode,
+            time.perf_counter() - request_started,
+        )
         return response
 
     def _config(self, request_id: str) -> dict[str, Any]:

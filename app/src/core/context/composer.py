@@ -11,6 +11,7 @@ from src.config.settings import Settings, get_settings
 from src.core.context.models import CopilotContextPackage, approx_tokens
 from src.core.context.compaction import deduplicate_payloads
 from src.core.context.product_views import build_product_view, payload_inventory
+from src.core.observability.metrics import get_metrics
 
 
 logger = logging.getLogger(__name__)
@@ -320,6 +321,19 @@ class ContextComposer:
             sum(getattr(item, "raw_json_approx_tokens", 0) for item in [*package.asset_profiles, *package.detections]),
             approx_tokens(product_text),
             max(0, sum(getattr(item, "raw_json_approx_tokens", 0) for item in [*package.asset_profiles, *package.detections]) - approx_tokens(product_text)),
+        )
+        metrics = get_metrics()
+        metrics.observe_context("profile", approx_tokens(profile_text), approx_tokens(profile_text))
+        metrics.observe_context("detection", approx_tokens(detection_text), approx_tokens(detection_text))
+        metrics.observe_context("graph", approx_tokens(graph_text), approx_tokens(graph_text))
+        metrics.observe_context("knowledge", approx_tokens(knowledge_text), approx_tokens(knowledge_text))
+        metrics.observe_context(
+            "product",
+            sum(
+                getattr(item, "raw_json_approx_tokens", 0)
+                for item in [*package.asset_profiles, *package.detections]
+            ),
+            approx_tokens(product_text),
         )
         return text
 

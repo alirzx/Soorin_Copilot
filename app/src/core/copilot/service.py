@@ -42,6 +42,7 @@ from src.core.product_client import ProductApiClient
 from src.core.rag.service import KnowledgeSearchService
 from src.core.rag.qdrant_store import QdrantVectorStore
 from src.core.observability import EvidenceSnapshotWriter, ProductUsageReporter
+from src.core.observability.metrics import get_metrics
 
 
 logger = logging.getLogger(__name__)
@@ -739,6 +740,7 @@ class CopilotService:
         request_identity: RequestIdentity | None = None,
         stream_sink: Callable[[LLMStreamEvent], None] | None = None,
         ) -> dict[str, Any]:
+        request_started = time.perf_counter()
         identity = request_identity or RequestIdentity.resolve(
             session_id=session_id,
             request_id=request_id,
@@ -780,6 +782,11 @@ class CopilotService:
                 resolved_request_id,
                 session,
                 stream_sink is not None,
+            )
+            get_metrics().observe_copilot(
+                "completed",
+                "direct",
+                time.perf_counter() - request_started,
             )
             return {
                 "session_id": session,

@@ -16,6 +16,7 @@ pyarrow==24.0.0
 pillow==12.3.0
 
 psutil==7.2.2
+prometheus-client==0.22.1
 
 # Bounded agent workflow and knowledge retrieval foundations
 langchain-core==1.5.1
