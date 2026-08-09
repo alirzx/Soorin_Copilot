@@ -96,11 +96,10 @@ def fake_result(
 def make_settings(**overrides):
     values = {
         "llm_provider": "fake",
-        "intent_router_deployment": "glm",
-        "chat_deployment": "glm",
         "planner_enabled": False,
-        "planner_deployment": "glm",
-        "glm_model": "fake",
+        "router_model": "fake",
+        "synthesizer_model": "fake",
+        "planner_model": "fake",
         "copilot_human_trace_enabled": False,
         "intent_router_enabled": True,
         "intent_router_min_confidence": 0.65,
@@ -1149,11 +1148,13 @@ class LLMPrimaryRouterTests(unittest.TestCase):
 
     def test_router_uses_router_specific_generation_settings_and_retry_budget(self) -> None:
         settings = make_settings(
-            glm_router_temperature=0.0,
-            glm_router_top_p=0.1,
-            glm_router_max_tokens=77,
-            glm_router_retry_max_tokens=155,
-            glm_router_timeout_seconds=13,
+            router_temperature=0.0,
+            router_top_p=0.1,
+            router_max_tokens=77,
+            router_retry_max_tokens=155,
+            router_timeout_seconds=13,
+            router_supports_temperature=True,
+            router_supports_top_p=True,
         )
         llm = FakeLLMClient([
             fake_result("", finish_reason="length"),

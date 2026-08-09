@@ -46,7 +46,7 @@ def create_app() -> FastAPI:
             router_deployment.name,
             router_deployment.model,
             settings.planner_enabled,
-            settings.planner_deployment,
+            "planner",
             settings.deployment_for_purpose("planner").model,
             chat_deployment.name,
             chat_deployment.model,

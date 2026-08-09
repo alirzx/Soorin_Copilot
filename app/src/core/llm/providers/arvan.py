@@ -11,7 +11,7 @@ from typing import Any
 import requests
 from urllib3.exceptions import ProtocolError
 
-from src.config.llm_deployments import ArvanDeploymentConfig
+from src.config.llm_deployments import LLMRoleConfig
 from src.core.context.models import approx_tokens
 from src.core.llm.errors import LLMError
 from src.core.llm.providers.base import LLMProviderResult, LLMStreamEvent
@@ -38,7 +38,7 @@ def _usage_dict(value: Any) -> dict[str, Any]:
 class ArvanProvider:
     provider_name = "arvan"
 
-    def __init__(self, deployment: ArvanDeploymentConfig, *, enabled: bool = True) -> None:
+    def __init__(self, deployment: LLMRoleConfig, *, enabled: bool = True) -> None:
         self.deployment = deployment
         self.enabled = enabled
         logger.info(
