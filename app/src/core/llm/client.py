@@ -7,7 +7,7 @@ import random
 import time
 from collections.abc import Iterator
 
-from src.config.llm_deployments import ArvanDeploymentConfig, LLMRequestConfig
+from src.config.llm_deployments import LLMRequestConfig, LLMRoleConfig
 from src.config.settings import Settings
 from src.core.llm.errors import LLMDisabledError, LLMError
 from src.core.llm.providers.arvan import ArvanProvider
@@ -26,23 +26,17 @@ class LLMClient:
         self.usage_recorder = usage_recorder
         self.providers: dict[str, ArvanProvider] = {}
         if settings.llm_provider == "arvan":
-            selected_aliases = dict.fromkeys(
-                (
-                    settings.intent_router_deployment,
-                    settings.chat_deployment,
-                    *([settings.planner_deployment] if settings.planner_enabled else []),
-                )
-            )
-            for alias in selected_aliases:
-                deployment = settings.deployment(alias)
-                self.providers[alias] = ArvanProvider(
+            selected_roles = ("router", "synthesizer", *(["planner"] if settings.planner_enabled else []))
+            for role in selected_roles:
+                deployment = settings.role(role)
+                self.providers[role] = ArvanProvider(
                     deployment,
                     enabled=settings.llm_enabled,
                 )
-        self.provider = self.providers.get(settings.chat_deployment)
-        router = settings.deployment(settings.intent_router_deployment)
-        chat = settings.deployment(settings.chat_deployment)
-        planner = settings.deployment(settings.planner_deployment)
+        self.provider = self.providers.get("synthesizer")
+        router = settings.role("router")
+        chat = settings.role("synthesizer")
+        planner = settings.role("planner")
         logger.info(
             "event=provider_initialization provider=%s enabled=%s router_deployment=%s router_model=%s router_host=%s planner_enabled=%s planner_deployment=%s planner_model=%s planner_host=%s chat_deployment=%s chat_model=%s chat_host=%s ready=%s",
             settings.llm_provider,
@@ -63,7 +57,7 @@ class LLMClient:
     def validate_configuration(self) -> None:
         self.settings.validate_selected_llm_deployments()
 
-    def deployment_for_purpose(self, purpose: str) -> ArvanDeploymentConfig:
+    def deployment_for_purpose(self, purpose: str) -> LLMRoleConfig:
         return self.settings.deployment_for_purpose(purpose)
 
     def request_config(self, purpose: str) -> LLMRequestConfig:
@@ -363,7 +357,7 @@ class LLMClient:
 
     def health(self) -> dict[str, object]:
         if not self.providers:
-            chat = self.settings.deployment(self.settings.chat_deployment)
+            chat = self.settings.role("synthesizer")
             return {
                 "enabled": self.settings.llm_enabled,
                 "ready": False,
@@ -373,12 +367,12 @@ class LLMClient:
                 "reason": "provider_not_supported",
             }
 
-        router = self.providers[self.settings.intent_router_deployment].health()
-        chat = self.providers[self.settings.chat_deployment].health()
+        router = self.providers["router"].health()
+        chat = self.providers["synthesizer"].health()
         planner = (
-            self.providers[self.settings.planner_deployment].health()
+            self.providers["planner"].health()
             if self.settings.planner_enabled
-            else {"enabled": False, "ready": True, "deployment": self.settings.planner_deployment}
+            else {"enabled": False, "ready": True, "deployment": "planner"}
         )
         return {
             "enabled": self.settings.llm_enabled,

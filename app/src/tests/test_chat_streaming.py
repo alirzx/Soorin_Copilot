@@ -11,7 +11,7 @@ from typing import Any
 from unittest.mock import patch
 
 from src.api.routes import encode_sse_event
-from src.config.llm_deployments import ArvanDeploymentConfig
+from src.config.llm_deployments import LLMRoleConfig
 from src.config.settings import get_settings
 from src.core.copilot.service import CopilotService
 from src.core.llm.errors import LLMError
@@ -47,25 +47,21 @@ UNICODE_TEXT = (
 MOJIBAKE_MARKERS = ("\u00e2\u0080\u009c", "\u00e2\u0080\u0099", "\u00e2\u0080\u0094", "\u00e2\u0086\u0092")
 
 
-def deployment() -> ArvanDeploymentConfig:
-    return ArvanDeploymentConfig(
-        name="glm",
+def deployment() -> LLMRoleConfig:
+    return LLMRoleConfig(
+        name="synthesizer",
         base_url="https://stream.example.invalid/v1",
         chat_path="/chat/completions",
         model="fixture-chat-model",
         api_key="fixture-key",
         auth_scheme="apikey",
         connect_timeout_seconds=2,
-        maximum_completion_tokens=1024,
-        router_read_timeout_seconds=5,
-        router_max_tokens=128,
-        router_repair_max_tokens=256,
-        chat_read_timeout_seconds=20,
-        chat_max_tokens=512,
-        router_temperature=0.0,
-        router_top_p=0.1,
-        chat_temperature=0.2,
-        chat_top_p=0.9,
+        role_max_tokens=512,
+        maximum_completion_tokens=512,
+        timeout_seconds=20,
+        retry_max_tokens=512,
+        temperature=0.2,
+        top_p=0.9,
         supports_temperature=True,
         supports_top_p=True,
         provider_type="arvan",
@@ -75,9 +71,7 @@ def deployment() -> ArvanDeploymentConfig:
 def service_settings(**overrides: Any):
     values = {
         "llm_provider": "fake",
-        "intent_router_deployment": "glm",
-        "chat_deployment": "glm",
-        "glm_model": "fixture-chat-model",
+        "synthesizer_model": "fixture-chat-model",
         "copilot_human_trace_enabled": False,
         "intent_router_enabled": True,
         "intent_router_retry_enabled": False,

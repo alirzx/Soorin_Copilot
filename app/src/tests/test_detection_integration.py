@@ -38,11 +38,10 @@ from src.core.rag.models import KnowledgeChunk, KnowledgeSearchResult
 def make_settings(**overrides: Any):
     values = {
         "llm_provider": "fake",
-        "intent_router_deployment": "glm",
-        "chat_deployment": "glm",
         "planner_enabled": False,
-        "planner_deployment": "glm",
-        "glm_model": "fake-router",
+        "router_model": "fake-router",
+        "synthesizer_model": "fake-chat",
+        "planner_model": "fake-planner",
         "copilot_human_trace_enabled": False,
         "chat_store_history": False,
         "detection_cache_enabled": True,
@@ -874,7 +873,7 @@ class CopilotProductOrchestrationTests(unittest.TestCase):
 
     def test_final_synthesis_keeps_configured_chat_timeout_and_token_budget(self) -> None:
         route = self.single_route_json(graph=False, detection=True, profile=False)
-        settings = make_settings(glm_chat_timeout_seconds=287, glm_chat_max_tokens=321, glm_max_tokens=999)
+        settings = make_settings(synthesizer_timeout_seconds=287, synthesizer_max_tokens=321)
         llm = FakeLLMClient([llm_result(route), llm_result("grounded answer")])
         service = CopilotService(settings, llm, MemoryStore(max_messages=4))
         service.detection_provider = FakeProductContextProvider(

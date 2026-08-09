@@ -1,115 +1,82 @@
-"""Focused tests for named Arvan deployment configuration and transport."""
+"""Offline tests for independent role-based LLM configuration."""
 
 from __future__ import annotations
 
 import json
+import logging
 import os
 from pathlib import Path
 import unittest
 from unittest.mock import patch
 
-import requests
-
 import src.config.settings as settings_module
 from src.config.llm_deployments import normalize_chat_endpoint
 from src.config.settings import Settings, get_settings
-from src.core.context.entities import EntityResolver
-from src.core.context.intent import SemanticIntentRouter as GLMIntentRouter
+# Load the context package before the provider module to match application startup order.
+import src.core.context  # noqa: F401
 from src.core.llm.client import LLMClient
-from src.core.llm.errors import LLMError
-from src.core.memory.routing_state import SessionRoutingState
 
 
-KIMI_BASE_URL = "https://kimi.example.invalid/v1"
-GLM_BASE_URL = "https://glm.example.invalid/v1"
-GPT_BASE_URL = "https://gpt.example.invalid/v1"
-KIMI_ENDPOINT = f"{KIMI_BASE_URL}/chat/completions"
-GLM_ENDPOINT = f"{GLM_BASE_URL}/chat/completions"
-GPT_ENDPOINT = f"{GPT_BASE_URL}/chat/completions"
-KIMI_KEY = "fixture-kimi-key"
-GLM_KEY = "fixture-glm-key"
-GPT_KEY = "fixture-gpt-key"
+BASE_ENV = {
+    "SOORIN_LLM_ENABLED": "true",
+    "SOORIN_LLM_PROVIDER": "arvan",
+    "SOORIN_LLM_AUTH_SCHEME": "apikey",
+    "SOORIN_LLM_CHAT_PATH": "/chat/completions",
+    "SOORIN_LLM_CONNECT_TIMEOUT_SECONDS": "8",
+    "SOORIN_ROUTER_BASE_URL": "https://router.example.invalid/v1",
+    "SOORIN_ROUTER_MODEL": "CHANGE_ME_MODEL",
+    "SOORIN_ROUTER_API_KEY": "router-secret",
+    "SOORIN_ROUTER_TIMEOUT_SECONDS": "30",
+    "SOORIN_ROUTER_MAX_TOKENS": "924",
+    "SOORIN_ROUTER_RETRY_MAX_TOKENS": "1284",
+    "SOORIN_ROUTER_TEMPERATURE": "0.0",
+    "SOORIN_ROUTER_TOP_P": "0.1",
+    "SOORIN_ROUTER_SUPPORTS_TEMPERATURE": "true",
+    "SOORIN_ROUTER_SUPPORTS_TOP_P": "true",
+    "SOORIN_PLANNER_BASE_URL": "https://planner.example.invalid/v1",
+    "SOORIN_PLANNER_MODEL": "CHANGE_ME_MODEL",
+    "SOORIN_PLANNER_API_KEY": "planner-secret",
+    "SOORIN_PLANNER_TIMEOUT_SECONDS": "120",
+    "SOORIN_PLANNER_MAX_TOKENS": "2048",
+    "SOORIN_PLANNER_RETRY_MAX_TOKENS": "3072",
+    "SOORIN_PLANNER_TEMPERATURE": "0.1",
+    "SOORIN_PLANNER_TOP_P": "0.8",
+    "SOORIN_PLANNER_SUPPORTS_TEMPERATURE": "true",
+    "SOORIN_PLANNER_SUPPORTS_TOP_P": "true",
+    "SOORIN_SYNTHESIZER_BASE_URL": "https://synth.example.invalid/v1",
+    "SOORIN_SYNTHESIZER_MODEL": "CHANGE_ME_MODEL",
+    "SOORIN_SYNTHESIZER_API_KEY": "synth-secret",
+    "SOORIN_SYNTHESIZER_TIMEOUT_SECONDS": "360",
+    "SOORIN_SYNTHESIZER_MAX_TOKENS": "4096",
+    "SOORIN_SYNTHESIZER_RETRY_MAX_TOKENS": "4096",
+    "SOORIN_SYNTHESIZER_TEMPERATURE": "0.3",
+    "SOORIN_SYNTHESIZER_TOP_P": "0.9",
+    "SOORIN_SYNTHESIZER_SUPPORTS_TEMPERATURE": "false",
+    "SOORIN_SYNTHESIZER_SUPPORTS_TOP_P": "false",
+    "SOORIN_PLANNER_ENABLED": "true",
+    "SOORIN_PLANNER_REPAIR_ENABLED": "true",
+    "SOORIN_LLM_MAX_TRANSIENT_RETRIES": "0",
+}
 
 
 class FakeResponse:
-    def __init__(self, status_code: int = 200, payload: object | None = None, *, invalid_json: bool = False) -> None:
-        self.status_code = status_code
-        self.payload = payload
-        self.invalid_json = invalid_json
+    status_code = 200
 
-    def json(self) -> object:
-        if self.invalid_json:
-            raise ValueError("invalid JSON fixture")
-        return self.payload if self.payload is not None else {}
+    def __init__(self, model: str = "CHANGE_ME_MODEL") -> None:
+        self.model = model
 
-
-def response(
-    text: str = "ok",
-    *,
-    model: str = "fixture-model",
-    finish_reason: str | None = "stop",
-    usage: object | None = None,
-    reasoning: str | None = None,
-) -> FakeResponse:
-    message: dict[str, object] = {"content": text}
-    if reasoning is not None:
-        message["reasoning_content"] = reasoning
-    payload: dict[str, object] = {
-        "model": model,
-        "choices": [{"message": message, "finish_reason": finish_reason}],
-    }
-    if usage is not None:
-        payload["usage"] = usage
-    return FakeResponse(payload=payload)
+    def json(self) -> dict[str, object]:
+        return {
+            "model": self.model,
+            "choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 7, "completion_tokens": 3, "total_tokens": 10},
+        }
 
 
 def isolated_settings(**overrides: str) -> Settings:
-    environment = {
-        "SOORIN_LLM_ENABLED": "true",
-        "SOORIN_LLM_PROVIDER": "arvan",
-        "SOORIN_LLM_KIMI_BASE_URL": KIMI_BASE_URL,
-        "SOORIN_LLM_KIMI_CHAT_PATH": "/chat/completions",
-        "SOORIN_LLM_KIMI_MODEL": "kimi-k3",
-        "SOORIN_LLM_KIMI_API_KEY": KIMI_KEY,
-        "SOORIN_LLM_KIMI_AUTH_SCHEME": "apikey",
-        "SOORIN_LLM_KIMI_CONNECT_TIMEOUT_SECONDS": "8",
-        "SOORIN_LLM_KIMI_ROUTER_TIMEOUT_SECONDS": "30",
-        "SOORIN_LLM_KIMI_CHAT_TIMEOUT_SECONDS": "360",
-        "SOORIN_LLM_KIMI_MAX_TOKENS": "12288",
-        "SOORIN_LLM_KIMI_ROUTER_MAX_TOKENS": "924",
-        "SOORIN_LLM_KIMI_ROUTER_RETRY_MAX_TOKENS": "1284",
-        "SOORIN_LLM_KIMI_CHAT_MAX_TOKENS": "12288",
-        "SOORIN_LLM_KIMI_SUPPORTS_TEMPERATURE": "false",
-        "SOORIN_LLM_KIMI_SUPPORTS_TOP_P": "false",
-        "SOORIN_LLM_GLM_BASE_URL": GLM_BASE_URL,
-        "SOORIN_LLM_GLM_CHAT_PATH": "/chat/completions",
-        "SOORIN_LLM_GLM_MODEL": "GLM-5.2",
-        "SOORIN_LLM_GLM_API_KEY": GLM_KEY,
-        "SOORIN_LLM_GLM_AUTH_SCHEME": "apikey",
-        "SOORIN_LLM_GLM_CONNECT_TIMEOUT_SECONDS": "8",
-        "SOORIN_LLM_GLM_ROUTER_TIMEOUT_SECONDS": "15",
-        "SOORIN_LLM_GLM_CHAT_TIMEOUT_SECONDS": "300",
-        "SOORIN_LLM_GLM_MAX_TOKENS": "12288",
-        "SOORIN_LLM_GLM_ROUTER_MAX_TOKENS": "384",
-        "SOORIN_LLM_GLM_ROUTER_RETRY_MAX_TOKENS": "640",
-        "SOORIN_LLM_GLM_CHAT_MAX_TOKENS": "4096",
-        "SOORIN_LLM_GLM_ROUTER_TEMPERATURE": "0.0",
-        "SOORIN_LLM_GLM_ROUTER_TOP_P": "0.1",
-        "SOORIN_LLM_GLM_CHAT_TEMPERATURE": "0.2",
-        "SOORIN_LLM_GLM_CHAT_TOP_P": "0.9",
-        "SOORIN_LLM_GLM_SUPPORTS_TEMPERATURE": "true",
-        "SOORIN_LLM_GLM_SUPPORTS_TOP_P": "true",
-        "SOORIN_LLM_GPT55_BASE_URL": GPT_BASE_URL,
-        "SOORIN_LLM_GPT55_CHAT_PATH": "/chat/completions",
-        "SOORIN_LLM_GPT55_MODEL": "GPT-5.5",
-        "SOORIN_LLM_GPT55_API_KEY": GPT_KEY,
-        "SOORIN_LLM_GPT55_AUTH_SCHEME": "Bearer",
-        "SOORIN_LLM_MAX_TRANSIENT_RETRIES": "1",
-        "SOORIN_LLM_RETRY_BASE_DELAY_SECONDS": "0",
-        "SOORIN_LLM_RETRY_MAX_DELAY_SECONDS": "0",
-    }
+    environment = dict(BASE_ENV)
     environment.update(overrides)
-    missing_env = Path("/tmp/soorin-llm-deployment-tests-missing.env")
+    missing_env = Path("/tmp/soorin-role-config-tests-missing.env")
     with patch.dict(os.environ, environment, clear=True), patch.object(settings_module, "ENV_PATH", missing_env):
         get_settings.cache_clear()
         try:
@@ -118,456 +85,94 @@ def isolated_settings(**overrides: str) -> Settings:
             get_settings.cache_clear()
 
 
-class EndpointNormalizerTests(unittest.TestCase):
-    def test_glm_and_gpt_v1_base_urls_resolve_to_chat_completions(self) -> None:
-        self.assertEqual(normalize_chat_endpoint(GLM_BASE_URL, "/chat/completions"), GLM_ENDPOINT)
-        self.assertEqual(normalize_chat_endpoint(GPT_BASE_URL, "/chat/completions"), GPT_ENDPOINT)
-
-    def test_existing_chat_endpoint_is_idempotent(self) -> None:
-        self.assertEqual(normalize_chat_endpoint(GLM_ENDPOINT, "/chat/completions"), GLM_ENDPOINT)
-
-    def test_trailing_slashes_and_missing_leading_path_slash_are_normalized(self) -> None:
-        self.assertEqual(
-            normalize_chat_endpoint(f"{GLM_BASE_URL}/", "chat/completions"),
-            GLM_ENDPOINT,
-        )
-        self.assertEqual(
-            normalize_chat_endpoint(f"{GLM_ENDPOINT}/", "/chat/completions"),
-            GLM_ENDPOINT,
-        )
-
-    def test_empty_base_url_remains_empty_and_empty_path_uses_default(self) -> None:
-        self.assertEqual(normalize_chat_endpoint("", "/chat/completions"), "")
-        self.assertEqual(normalize_chat_endpoint(GLM_BASE_URL, ""), GLM_ENDPOINT)
-
-
-class DeploymentConfigurationTests(unittest.TestCase):
-    def test_absent_selectors_default_router_and_chat_to_kimi_and_planner_to_glm(self) -> None:
+class RoleConfigurationTests(unittest.TestCase):
+    def test_roles_resolve_independently_to_safe_placeholders(self) -> None:
         settings = isolated_settings()
 
-        self.assertEqual(settings.intent_router_deployment, "kimi")
-        self.assertEqual(settings.chat_deployment, "kimi")
-        self.assertFalse(settings.planner_enabled)
-        self.assertEqual(settings.planner_deployment, "glm")
-        self.assertEqual(settings.deployment("kimi").endpoint, KIMI_ENDPOINT)
-        self.assertEqual(settings.deployment("kimi").model, "kimi-k3")
-        self.assertEqual(settings.deployment("glm").model, "GLM-5.2")
+        self.assertEqual(settings.role("router").model, "CHANGE_ME_MODEL")
+        self.assertEqual(settings.role("planner").model, "CHANGE_ME_MODEL")
+        self.assertEqual(settings.role("synthesizer").model, "CHANGE_ME_MODEL")
+        self.assertEqual(settings.deployment_for_purpose("intent_router").name, "router")
+        self.assertEqual(settings.deployment_for_purpose("planner").name, "planner")
+        self.assertEqual(settings.deployment_for_purpose("chat").name, "synthesizer")
 
-    def test_both_selectors_can_use_gpt55(self) -> None:
+    def test_future_mixed_configuration_is_independent_per_role(self) -> None:
         settings = isolated_settings(
-            SOORIN_INTENT_ROUTER_DEPLOYMENT="gpt55",
-            SOORIN_CHAT_DEPLOYMENT="gpt55",
+            SOORIN_ROUTER_BASE_URL="https://r.example.invalid/v1",
+            SOORIN_ROUTER_MODEL="router-model",
+            SOORIN_ROUTER_API_KEY="router-key",
+            SOORIN_PLANNER_BASE_URL="https://p.example.invalid/v1",
+            SOORIN_PLANNER_MODEL="planner-model",
+            SOORIN_PLANNER_API_KEY="planner-key",
+            SOORIN_SYNTHESIZER_BASE_URL="https://s.example.invalid/v1",
+            SOORIN_SYNTHESIZER_MODEL="synth-model",
+            SOORIN_SYNTHESIZER_API_KEY="synth-key",
         )
 
-        self.assertEqual(settings.deployment_for_purpose("intent_router").name, "gpt55")
-        self.assertEqual(settings.deployment_for_purpose("chat").name, "gpt55")
+        self.assertEqual(settings.role("router").endpoint, "https://r.example.invalid/v1/chat/completions")
+        self.assertEqual(settings.role("planner").model, "planner-model")
+        self.assertEqual(settings.role("synthesizer").api_key, "synth-key")
 
-    def test_mixed_router_and_chat_selection_is_independent(self) -> None:
-        glm_router = isolated_settings(
-            SOORIN_INTENT_ROUTER_DEPLOYMENT="glm",
-            SOORIN_CHAT_DEPLOYMENT="gpt55",
-        )
-        gpt_router = isolated_settings(
-            SOORIN_INTENT_ROUTER_DEPLOYMENT="gpt55",
-            SOORIN_CHAT_DEPLOYMENT="glm",
+    def test_endpoint_normalization_is_shared(self) -> None:
+        self.assertEqual(
+            normalize_chat_endpoint("https://role.example.invalid/v1/", "chat/completions"),
+            "https://role.example.invalid/v1/chat/completions",
         )
 
-        self.assertEqual(glm_router.deployment_for_purpose("intent_router").name, "glm")
-        self.assertEqual(glm_router.deployment_for_purpose("chat").name, "gpt55")
-        self.assertEqual(gpt_router.deployment_for_purpose("intent_router").name, "gpt55")
-        self.assertEqual(gpt_router.deployment_for_purpose("chat").name, "glm")
-
-    def test_profiles_expose_base_url_chat_path_and_shared_normalized_endpoint(self) -> None:
-        settings = isolated_settings(
-            SOORIN_LLM_GLM_BASE_URL="https://glm-alias.example.invalid/v1/",
-            SOORIN_LLM_GLM_CHAT_PATH="chat/completions",
-        )
-        glm = settings.deployment("glm")
-        gpt = settings.deployment("gpt55")
-
-        self.assertEqual(glm.base_url, "https://glm-alias.example.invalid/v1")
-        self.assertEqual(glm.chat_path, "chat/completions")
-        self.assertEqual(glm.endpoint, normalize_chat_endpoint(glm.base_url, glm.chat_path))
-        self.assertEqual(gpt.endpoint, normalize_chat_endpoint(gpt.base_url, gpt.chat_path))
-
-    def test_invalid_alias_fails_with_safe_valid_alias_list(self) -> None:
-        with self.assertRaisesRegex(ValueError, r"Valid aliases: kimi, glm, gpt55") as raised:
-            isolated_settings(SOORIN_CHAT_DEPLOYMENT="unknown-secret-value")
-
-        self.assertNotIn(GLM_KEY, str(raised.exception))
-        self.assertNotIn(GPT_KEY, str(raised.exception))
-        self.assertNotIn(KIMI_KEY, str(raised.exception))
-
-    def test_missing_selected_kimi_configuration_has_clear_readiness_and_validation(self) -> None:
-        settings = isolated_settings(SOORIN_LLM_KIMI_BASE_URL="")
-        health = LLMClient(settings).health()
-
-        self.assertFalse(health["ready"])
-        self.assertEqual(health["router"]["deployment"], "kimi")  # type: ignore[index]
-        with self.assertRaisesRegex(ValueError, "not configured for: kimi"):
+    def test_missing_enabled_role_endpoint_fails_validation(self) -> None:
+        settings = isolated_settings(SOORIN_PLANNER_BASE_URL="")
+        with self.assertRaisesRegex(ValueError, "planner"):
             settings.validate_selected_llm_deployments()
 
-    def test_missing_selected_base_url_fails_during_startup_validation(self) -> None:
-        settings = isolated_settings(
-            SOORIN_INTENT_ROUTER_DEPLOYMENT="gpt55",
-            SOORIN_CHAT_DEPLOYMENT="gpt55",
-            SOORIN_LLM_GPT55_BASE_URL="",
-        )
-
-        with self.assertRaisesRegex(ValueError, "not configured for: gpt55"):
-            settings.validate_selected_llm_deployments()
-
-    def test_env_example_is_symmetric_secret_free_and_has_no_duplicates_or_obsolete_keys(self) -> None:
-        text = (settings_module.APP_DIR / ".env.example").read_text(encoding="utf-8")
-        keys: list[str] = []
-        values: dict[str, str] = {}
-        for line in text.splitlines():
-            if line.strip() and not line.lstrip().startswith("#") and "=" in line:
-                key, value = line.split("=", 1)
-                keys.append(key.strip())
-                values[key.strip()] = value.strip()
-
-        for name in (
-            "SOORIN_LLM_KIMI_BASE_URL",
-            "SOORIN_LLM_KIMI_API_KEY",
-            "SOORIN_LLM_GLM_BASE_URL",
-            "SOORIN_LLM_GLM_API_KEY",
-            "SOORIN_LLM_GPT55_BASE_URL",
-            "SOORIN_LLM_GPT55_API_KEY",
-        ):
-            self.assertEqual(values[name], "")
-        self.assertEqual(len(keys), len(set(keys)))
-        obsolete = (
-            "SOORIN_ARVAN_",
-            "SOORIN_LLM_GLM_ENDPOINT",
-            "SOORIN_LLM_GPT55_ENDPOINT",
-            "SOORIN_LLM_CONNECT_TIMEOUT_SECONDS",
-            "SOORIN_CHAT_TIMEOUT_SECONDS",
-            "SOORIN_CHAT_MAX_TOKENS",
-            "SOORIN_INTENT_ROUTER_TIMEOUT_SECONDS",
-            "SOORIN_INTENT_ROUTER_TEMPERATURE",
-            "SOORIN_INTENT_ROUTER_TOP_P",
-            "SOORIN_INTENT_ROUTER_MAX_TOKENS",
-            "SOORIN_INTENT_ROUTER_RETRY_MAX_TOKENS",
-        )
-        self.assertFalse(any(key.startswith(obsolete) for key in keys))
-
-    def test_runtime_settings_source_contains_no_obsolete_environment_names(self) -> None:
-        source = Path(settings_module.__file__).read_text(encoding="utf-8")
-        obsolete = (
-            "SOORIN_ARVAN_",
-            "SOORIN_LLM_GLM_ENDPOINT",
-            "SOORIN_LLM_GPT55_ENDPOINT",
-            "SOORIN_LLM_CONNECT_TIMEOUT_SECONDS",
-            "SOORIN_CHAT_TIMEOUT_SECONDS",
-            "SOORIN_CHAT_MAX_TOKENS",
-            "SOORIN_INTENT_ROUTER_TIMEOUT_SECONDS",
-            "SOORIN_INTENT_ROUTER_TEMPERATURE",
-            "SOORIN_INTENT_ROUTER_TOP_P",
-            "SOORIN_INTENT_ROUTER_MAX_TOKENS",
-            "SOORIN_INTENT_ROUTER_RETRY_MAX_TOKENS",
-        )
-        for name in obsolete:
-            self.assertNotIn(name, source)
-
-    def test_health_reports_selected_deployments_without_endpoints_or_credentials(self) -> None:
-        settings = isolated_settings(
-            SOORIN_INTENT_ROUTER_DEPLOYMENT="glm",
-            SOORIN_CHAT_DEPLOYMENT="gpt55",
-        )
-
-        health = LLMClient(settings).health()
-        serialized = json.dumps(health, sort_keys=True)
-
-        self.assertEqual(health["router"]["deployment"], "glm")  # type: ignore[index]
-        self.assertEqual(health["chat"]["deployment"], "gpt55")  # type: ignore[index]
-        self.assertNotIn(GLM_ENDPOINT, serialized)
-        self.assertNotIn(GPT_ENDPOINT, serialized)
-        self.assertNotIn(GLM_KEY, serialized)
-        self.assertNotIn(GPT_KEY, serialized)
-
-
-class DeploymentRequestTests(unittest.TestCase):
-    def setUp(self) -> None:
-        self.messages = [{"role": "user", "content": "hello"}]
-
-    @patch("src.core.llm.providers.arvan.requests.post")
-    def test_router_and_chat_use_independently_selected_endpoints_and_models(self, post) -> None:
-        settings = isolated_settings(
-            SOORIN_INTENT_ROUTER_DEPLOYMENT="glm",
-            SOORIN_CHAT_DEPLOYMENT="gpt55",
-            SOORIN_LLM_GPT55_CONNECT_TIMEOUT_SECONDS="11",
-            SOORIN_LLM_GPT55_CHAT_TIMEOUT_SECONDS="222",
-        )
+    def test_role_specific_transport_preserves_payload_and_auth_semantics(self) -> None:
+        settings = isolated_settings()
         client = LLMClient(settings)
-        post.side_effect = [response("{}"), response("answer")]
+        messages = [{"role": "user", "content": "hello"}]
 
-        router_result = client.chat(self.messages, purpose="intent_router", transient_retries=0)
-        chat_result = client.chat(self.messages, purpose="chat", transient_retries=0)
+        with patch("src.core.llm.providers.arvan.requests.post", side_effect=[FakeResponse()] * 3) as post:
+            client.chat(messages, purpose="intent_router", transient_retries=0)
+            client.chat(messages, purpose="planner", transient_retries=0)
+            client.chat(messages, purpose="chat", transient_retries=0)
 
-        self.assertEqual(post.call_args_list[0].args[0], GLM_ENDPOINT)
-        self.assertEqual(post.call_args_list[0].kwargs["json"]["model"], "GLM-5.2")
-        self.assertEqual(post.call_args_list[1].args[0], GPT_ENDPOINT)
-        self.assertEqual(post.call_args_list[1].kwargs["json"]["model"], "GPT-5.5")
-        self.assertEqual(post.call_args_list[0].kwargs["timeout"], (8, 15))
-        self.assertEqual(post.call_args_list[1].kwargs["timeout"], (11, 222))
-        self.assertEqual(router_result.deployment, "glm")
-        self.assertEqual(chat_result.deployment, "gpt55")
+        self.assertEqual(post.call_count, 3)
+        router_call, planner_call, synth_call = post.call_args_list
+        self.assertEqual(router_call.args[0], "https://router.example.invalid/v1/chat/completions")
+        self.assertEqual(planner_call.args[0], "https://planner.example.invalid/v1/chat/completions")
+        self.assertEqual(synth_call.args[0], "https://synth.example.invalid/v1/chat/completions")
+        self.assertEqual(router_call.kwargs["headers"]["Authorization"], "apikey router-secret")
+        self.assertEqual(planner_call.kwargs["headers"]["Authorization"], "apikey planner-secret")
+        self.assertEqual(synth_call.kwargs["headers"]["Authorization"], "apikey synth-secret")
+        self.assertEqual(router_call.kwargs["json"]["max_tokens"], 924)
+        self.assertEqual(planner_call.kwargs["json"]["max_tokens"], 2048)
+        self.assertEqual(synth_call.kwargs["json"]["max_tokens"], 4096)
+        self.assertEqual(router_call.kwargs["json"]["temperature"], 0.0)
+        self.assertEqual(planner_call.kwargs["json"]["top_p"], 0.8)
+        self.assertNotIn("temperature", synth_call.kwargs["json"])
+        self.assertNotIn("top_p", synth_call.kwargs["json"])
 
-    @patch("src.core.llm.providers.arvan.requests.post")
-    def test_inverse_mixed_selection_routes_gpt_router_and_glm_chat(self, post) -> None:
-        settings = isolated_settings(
-            SOORIN_INTENT_ROUTER_DEPLOYMENT="gpt55",
-            SOORIN_CHAT_DEPLOYMENT="glm",
-        )
-        client = LLMClient(settings)
-        post.side_effect = [response("{}"), response("answer")]
+    def test_keys_are_not_logged(self) -> None:
+        settings = isolated_settings()
+        with self.assertLogs("src.core.llm", level=logging.INFO) as captured:
+            with patch("src.core.llm.providers.arvan.requests.post", return_value=FakeResponse()):
+                LLMClient(settings).chat([{"role": "user", "content": "hello"}], purpose="chat", transient_retries=0)
+        serialized = "\n".join(captured.output)
+        self.assertNotIn("router-secret", serialized)
+        self.assertNotIn("planner-secret", serialized)
+        self.assertNotIn("synth-secret", serialized)
 
-        client.chat(self.messages, purpose="intent_router", transient_retries=0)
-        client.chat(self.messages, purpose="chat", transient_retries=0)
-
-        self.assertEqual(post.call_args_list[0].args[0], GPT_ENDPOINT)
-        self.assertEqual(post.call_args_list[1].args[0], GLM_ENDPOINT)
-
-    @patch("src.core.llm.providers.arvan.requests.post")
-    def test_router_repair_uses_router_deployment_and_repair_budget(self, post) -> None:
-        settings = isolated_settings(
-            SOORIN_INTENT_ROUTER_DEPLOYMENT="gpt55",
-            SOORIN_CHAT_DEPLOYMENT="glm",
-            SOORIN_LLM_GPT55_ROUTER_MAX_TOKENS="77",
-            SOORIN_LLM_GPT55_ROUTER_RETRY_MAX_TOKENS="155",
-        )
-        client = LLMClient(settings)
-        valid = json.dumps(
-            {
-                "intent": "asset_investigation",
-                "scope": "node_summary",
-                "direction": "both",
-                "depth": 0,
-                "requires_graph": True,
-                "requires_detection": False,
-                "requires_asset_profile": False,
-                "requires_multiple_entities": False,
-                "is_followup": False,
-                "classification_confidence": 0.9,
-                "reason": "fixture",
-            }
-        )
-        post.side_effect = [response("not json"), response(valid)]
-        entities = EntityResolver().resolve("Tell me about 192.0.2.10")
-
-        decision = GLMIntentRouter(settings, client).classify(
-            "Tell me about 192.0.2.10",
-            entities,
-            SessionRoutingState(),
-        )
-
-        self.assertFalse(decision.fallback_used)
-        self.assertEqual(decision.decision_source, "semantic_router_repair")
-        self.assertEqual([call.args[0] for call in post.call_args_list], [GPT_ENDPOINT, GPT_ENDPOINT])
-        self.assertEqual(post.call_args_list[0].kwargs["json"]["max_tokens"], 77)
-        self.assertEqual(post.call_args_list[1].kwargs["json"]["max_tokens"], 155)
-
-    @patch("src.core.llm.providers.arvan.requests.post")
-    def test_payload_authentication_and_optional_parameter_omission(self, post) -> None:
-        settings = isolated_settings(
-            SOORIN_INTENT_ROUTER_DEPLOYMENT="gpt55",
-            SOORIN_CHAT_DEPLOYMENT="gpt55",
-            SOORIN_LLM_GPT55_CHAT_MAX_TOKENS="987",
-            SOORIN_LLM_GPT55_CHAT_TEMPERATURE="0.4",
-            SOORIN_LLM_GPT55_CHAT_TOP_P="0.8",
-            SOORIN_LLM_GPT55_SUPPORTS_TEMPERATURE="false",
-            SOORIN_LLM_GPT55_SUPPORTS_TOP_P="false",
-        )
-        client = LLMClient(settings)
-        post.return_value = response("answer")
-
-        client.chat(self.messages, purpose="chat", transient_retries=0)
-
-        payload = post.call_args.kwargs["json"]
-        headers = post.call_args.kwargs["headers"]
-        self.assertEqual(payload["model"], "GPT-5.5")
-        self.assertEqual(payload["messages"], self.messages)
-        self.assertEqual(payload["max_tokens"], 987)
-        self.assertNotIn("temperature", payload)
-        self.assertNotIn("top_p", payload)
-        self.assertEqual(headers["Authorization"], f"Bearer {GPT_KEY}")
-
-    @patch("src.core.llm.providers.arvan.requests.post")
-    def test_glm_sampling_parameters_are_included_when_capabilities_are_enabled(self, post) -> None:
-        settings = isolated_settings(
-            SOORIN_CHAT_DEPLOYMENT="glm",
-            SOORIN_LLM_GLM_CHAT_TEMPERATURE="0.4",
-            SOORIN_LLM_GLM_CHAT_TOP_P="0.8",
-            SOORIN_LLM_GLM_SUPPORTS_TEMPERATURE="true",
-            SOORIN_LLM_GLM_SUPPORTS_TOP_P="true",
-        )
-        client = LLMClient(settings)
-        post.return_value = response("answer")
-
-        client.chat(self.messages, purpose="chat", transient_retries=0)
-
-        self.assertEqual(post.call_args.kwargs["json"]["temperature"], 0.4)
-        self.assertEqual(post.call_args.kwargs["json"]["top_p"], 0.8)
-
-    @patch("src.core.llm.providers.arvan.requests.post")
-    def test_logs_redact_credential_url_path_key_and_header(self, post) -> None:
-        secret_path = "secret-path-token"
-        secret_key = "fixture-log-secret-key"
-        base_url = f"https://safe.example.invalid/gateway/{secret_path}/v1"
-        endpoint = f"{base_url}/chat/completions"
-        settings = isolated_settings(
-            SOORIN_CHAT_DEPLOYMENT="gpt55",
-            SOORIN_LLM_GPT55_BASE_URL=base_url,
-            SOORIN_LLM_GPT55_API_KEY=secret_key,
-        )
-        post.return_value = response("answer")
-
-        with self.assertLogs("src.core.llm", level="INFO") as captured:
-            client = LLMClient(settings)
-            client.chat(self.messages, purpose="chat", transient_retries=0)
-
-        logs = "\n".join(captured.output)
-        self.assertIn("deployment=gpt55", logs)
-        self.assertIn("host=safe.example.invalid", logs)
-        self.assertNotIn(endpoint, logs)
-        self.assertNotIn(secret_path, logs)
-        self.assertNotIn(secret_key, logs)
-        self.assertNotIn("Authorization", logs)
-
-
-    @patch("src.core.llm.providers.arvan.requests.post")
-    def test_semantic_router_telemetry_uses_selected_gpt_and_glm_model_identity(self, post) -> None:
-        valid = json.dumps(
-            {
-                "intent": "asset_investigation",
-                "scope": "node_summary",
-                "direction": "both",
-                "depth": 0,
-                "requires_graph": True,
-                "requires_detection": False,
-                "requires_asset_profile": False,
-                "requires_multiple_entities": False,
-                "is_followup": False,
-                "classification_confidence": 0.9,
-                "reason": "fixture",
-            }
-        )
-        for deployment, expected_model in (
-            ("kimi", "kimi-k3"),
-            ("gpt55", "GPT-5.5"),
-            ("glm", "GLM-5.2"),
-        ):
-            with self.subTest(deployment=deployment):
-                post.reset_mock()
-                post.return_value = response(valid)
-                settings = isolated_settings(SOORIN_INTENT_ROUTER_DEPLOYMENT=deployment)
-                router = GLMIntentRouter(settings, LLMClient(settings))
-                entities = EntityResolver().resolve("Tell me about 192.0.2.10")
-                with self.assertLogs("src.core.context.intent", level="INFO") as logs:
-                    decision = router.classify("Tell me about 192.0.2.10", entities, SessionRoutingState())
-                rendered = "\n".join(logs.output)
-                self.assertEqual(decision.decision_source, "semantic_router")
-                self.assertIn(f"router_deployment={deployment}", rendered)
-                self.assertIn(f"router_model={expected_model}", rendered)
-                self.assertIn(f"router_engine={expected_model}", rendered)
-                self.assertIn("decision_source=semantic_router", rendered)
-
-
-class UsageAndErrorCompatibilityTests(unittest.TestCase):
-    def setUp(self) -> None:
-        self.client = LLMClient(isolated_settings())
-        self.messages = [{"role": "user", "content": "hello"}]
-
-    @patch("src.core.llm.providers.arvan.requests.post")
-    def test_usage_variants_content_and_reasoning_metadata_are_preserved_safely(self, post) -> None:
-        post.side_effect = [
-            response(
-                "content",
-                finish_reason="length",
-                usage={"prompt_tokens": 5, "completion_tokens": 9, "output_tokens": 0, "total_tokens": 14},
-                reasoning="hidden fixture reasoning",
-            ),
-            response("content", usage={"completion_tokens": 3}),
-            response("content"),
-        ]
-
-        first = self.client.chat(self.messages, transient_retries=0)
-        second = self.client.chat(self.messages, transient_retries=0)
-        third = self.client.chat(self.messages, transient_retries=0)
-
-        self.assertEqual(first.text, "content")
-        self.assertEqual(first.finish_reason, "length")
-        self.assertEqual(first.usage["completion_tokens"], 9)
-        self.assertEqual(first.usage["output_tokens"], 0)
-        self.assertTrue(first.reasoning_present)
-        self.assertFalse(first.reasoning_exposed)
-        self.assertNotIn("output_tokens", second.usage)
-        self.assertEqual(third.usage, {})
-
-    @patch("src.core.llm.providers.arvan.requests.post")
-    def test_request_completion_log_contains_safe_comparison_telemetry(self, post) -> None:
-        post.return_value = response(
-            "answer",
-            usage={"prompt_tokens": 5, "completion_tokens": 2, "total_tokens": 7},
-            reasoning="hidden fixture reasoning",
-        )
-
-        with self.assertLogs("src.core.llm.providers.arvan", level="INFO") as captured:
-            self.client.chat(self.messages, request_id="telemetry", transient_retries=0)
-
-        logs = "\n".join(captured.output)
-        for expected in (
-            "event=llm_request_complete",
-            "purpose=chat",
-            "deployment=kimi",
-            "provider=arvan",
-            "model=kimi-k3",
-            "status_code=200",
-            "latency_ms=",
-            "finish_reason=stop",
-            "prompt_tokens=5",
-            "completion_tokens=2",
-            "total_tokens=7",
-            "output_chars=6",
-            "reasoning_present=True",
-        ):
-            self.assertIn(expected, logs)
-        self.assertNotIn("hidden fixture reasoning", logs)
-
-    @patch("src.core.llm.providers.arvan.requests.post")
-    def test_http_error_statuses_remain_safe_and_do_not_cross_model_fallback(self, post) -> None:
-        for status_code in (401, 404, 429, 500):
-            with self.subTest(status_code=status_code):
-                post.reset_mock()
-                post.return_value = FakeResponse(status_code=status_code)
-                with self.assertRaises(LLMError) as raised:
-                    self.client.chat(self.messages, transient_retries=0)
-                self.assertEqual(raised.exception.details["status_code"], status_code)
-                self.assertEqual(raised.exception.details["deployment"], "kimi")
-                self.assertEqual(post.call_count, 1)
-
-    @patch("src.core.llm.providers.arvan.requests.post")
-    def test_timeout_malformed_json_empty_content_and_unsupported_parameter_error(self, post) -> None:
-        cases = [
-            (requests.exceptions.ReadTimeout(), "provider_transport_error"),
-            (FakeResponse(invalid_json=True), "provider_invalid_json"),
-            (response(""), "provider_empty_answer"),
-            (FakeResponse(status_code=400), "provider_http_error"),
-        ]
-        for side_effect, reason in cases:
-            with self.subTest(reason=reason):
-                post.reset_mock()
-                if isinstance(side_effect, Exception):
-                    post.side_effect = side_effect
-                    post.return_value = None
-                else:
-                    post.side_effect = None
-                    post.return_value = side_effect
-                with self.assertRaises(LLMError) as raised:
-                    self.client.chat(self.messages, transient_retries=0)
-                self.assertEqual(raised.exception.reason, reason)
-                self.assertEqual(post.call_count, 1)
+    def test_env_example_has_role_variables_and_no_obsolete_model_names(self) -> None:
+        text = (settings_module.APP_DIR.parent / ".env.example").read_text(encoding="utf-8")
+        self.assertIn("SOORIN_ROUTER_MODEL=CHANGE_ME_MODEL", text)
+        self.assertIn("SOORIN_PLANNER_MODEL=CHANGE_ME_MODEL", text)
+        self.assertIn("SOORIN_SYNTHESIZER_MODEL=CHANGE_ME_MODEL", text)
+        self.assertNotIn("SOORIN_LLM_KIMI_", text)
+        self.assertNotIn("SOORIN_LLM_GLM_", text)
+        self.assertNotIn("SOORIN_LLM_GPT55_", text)
+        self.assertNotIn("SOORIN_INTENT_ROUTER_DEPLOYMENT", text)
+        self.assertNotIn("SOORIN_CHAT_DEPLOYMENT", text)
+        self.assertNotIn("SOORIN_PLANNER_DEPLOYMENT", text)
+        self.assertEqual(text.count("https://"), 0)
+        self.assertEqual(len([line for line in text.splitlines() if line.strip() and not line.lstrip().startswith("#") and "=" in line]), len({line.split("=", 1)[0].strip() for line in text.splitlines() if line.strip() and not line.lstrip().startswith("#") and "=" in line}))
 
 
 if __name__ == "__main__":
