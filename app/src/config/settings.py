@@ -12,7 +12,9 @@ from src.config.llm_deployments import LLMRoleConfig
 
 
 APP_DIR = Path(__file__).resolve().parents[2]
-ENV_PATH = APP_DIR / ".env"
+PROJECT_ROOT = APP_DIR.parent
+ENV_PATH = PROJECT_ROOT / ".env"
+LEGACY_ENV_PATH = APP_DIR / ".env"
 logger = logging.getLogger(__name__)
 
 DEFAULT_RAG_EMBEDDING_MODEL = "BAAI/bge-base-en-v1.5"
@@ -477,6 +479,14 @@ class Settings:
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:
     env_file_loaded = _load_env_file(ENV_PATH)
+    if not env_file_loaded and LEGACY_ENV_PATH != ENV_PATH:
+        env_file_loaded = _load_env_file(LEGACY_ENV_PATH)
+        if env_file_loaded:
+            logger.warning(
+                "event=legacy_env_fallback path=%s root_env_path=%s",
+                LEGACY_ENV_PATH,
+                ENV_PATH,
+            )
     settings = Settings(
         api_host=os.getenv("API_HOST", "0.0.0.0"),
         api_port=_int("API_PORT", 6998),

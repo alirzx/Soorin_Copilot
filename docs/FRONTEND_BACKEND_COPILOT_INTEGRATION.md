@@ -908,7 +908,7 @@ assume conversation continuity across replicas.
 |---|---|---|---|
 | `SOORIN_COPILOT_API_KEY` | yes | (none) | Static Copilot API key for service-to-service auth |
 
-Set in `app/.env`:
+Set in the repository-root `.env`:
 
 ```ini
 SOORIN_COPILOT_API_KEY=your-generated-api-key
@@ -1002,7 +1002,7 @@ then include the `Authorization: Bearer <token>` header automatically.
 - `GET /health` intentionally excluded — used by load balancers, healthchecks,
   and monitoring without requiring the API key.
 - No user, tenant, or role scoping — this is a single shared static key.
-- The key is loaded from `app/.env` at settings initialization time.
+- The key is loaded from the repository-root `.env` at settings initialization time.
 - Changing the key requires a service restart.
 
 ## 30. Current limitations

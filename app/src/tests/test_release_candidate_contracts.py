@@ -53,8 +53,8 @@ def _snapshot_settings(root: Path, **overrides: object) -> SimpleNamespace:
 
 class EnvironmentAndRuntimeContractsTests(unittest.TestCase):
     def test_private_and_example_env_have_identical_structure(self) -> None:
-        private_path = ROOT / "app" / ".env"
-        example_path = ROOT / "app" / ".env.example"
+        private_path = ROOT / ".env"
+        example_path = ROOT / ".env.example"
         self.assertTrue(private_path.exists())
         private_schema = _env_schema(private_path)
         example_schema = _env_schema(example_path)
@@ -62,19 +62,20 @@ class EnvironmentAndRuntimeContractsTests(unittest.TestCase):
         keys = [value for kind, value in example_schema if kind == "key"]
         self.assertEqual(len(keys), len(set(keys)))
 
-    def test_private_and_example_compose_env_have_identical_structure(self) -> None:
-        private_schema = _env_schema(ROOT / "compose.env")
-        example_schema = _env_schema(ROOT / "compose.env.example")
-        self.assertEqual(private_schema, example_schema)
+    def test_legacy_split_env_files_are_absent(self) -> None:
+        self.assertFalse((ROOT / "app" / ".env").exists())
+        self.assertFalse((ROOT / "compose.env").exists())
 
     def test_compose_uses_fail_fast_host_binds_and_isolates_ui_secrets(self) -> None:
-        compose = (ROOT / "compose.yaml").read_text(encoding="utf-8")
+        compose = (ROOT / "docker-compose.yaml").read_text(encoding="utf-8")
         api, ui = compose.split("  ui:", 1)
-        self.assertIn("SOORIN_DATA_HOST_PATH", api)
-        self.assertIn("SOORIN_HF_CACHE_HOST_PATH", api)
+        self.assertIn("source: ./data", api)
+        self.assertIn("target: /workspace/data", api)
+        self.assertIn("SOORIN_RAG_QDRANT_PATH: /workspace/data/qdrant-local", api)
         self.assertIn("create_host_path: false", api)
         self.assertIn("read_only: false", api)
-        self.assertIn("SOORIN_DATA_HOST_PATH", ui)
+        self.assertIn("source: ./data", ui)
+        self.assertIn("target: /workspace/data", ui)
         self.assertIn("create_host_path: false", ui)
         self.assertIn("read_only: true", ui)
         self.assertNotIn("env_file:", ui)
@@ -93,10 +94,11 @@ class EnvironmentAndRuntimeContractsTests(unittest.TestCase):
         workflow = (ROOT / "app/src/core/agent/workflow.py").read_text(encoding="utf-8")
         settings = (ROOT / "app/src/config/settings.py").read_text(encoding="utf-8")
         requirements = (ROOT / "requirements.txt").read_text(encoding="utf-8")
-        env_example = (ROOT / "app/.env.example").read_text(encoding="utf-8")
+        env_example = (ROOT / ".env.example").read_text(encoding="utf-8")
         self.assertNotIn("SqliteSaver", workflow)
         self.assertNotIn("checkpointer=", workflow)
-        self.assertNotIn("LANGGRAPH_CHECKPOINT", settings + env_example)
+        self.assertIn("SOORIN_LANGGRAPH_CHECKPOINT_BACKEND", settings + env_example)
+        self.assertIn("SOORIN_LANGGRAPH_CHECKPOINT_BACKEND=none", env_example)
         self.assertNotIn("langgraph-checkpoint-sqlite", requirements)
         self.assertFalse((ROOT / "app/src/core/agent/checkpoints.py").exists())
 

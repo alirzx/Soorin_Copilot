@@ -88,7 +88,7 @@ Current API compatibility:
 
 Implemented in `app/src/config/settings.py`.
 
-Settings are loaded from `app/.env` if present, then from environment variables. The local `.env` file is intentionally not tracked. Sensitive values are represented in logs only as configured/not configured booleans.
+Settings are loaded from the repository-root `.env` if present, then from process environment variables. The local `.env` file is intentionally not tracked. Sensitive values are represented in logs only as configured/not configured booleans.
 
 Major groups:
 
@@ -822,7 +822,7 @@ Docker:
   - The host Hugging Face cache is bind-mounted read-only into the API only.
   - Long bind syntax uses `create_host_path: false`, so missing or mistyped host paths fail instead of creating empty storage.
 
-Local `app/.env` keeps repository-relative Graph and local Qdrant paths. Compose overrides only container-specific Qdrant, cache, log, and evidence paths. Host bind sources, image tag, restart policy, UID/GID, ports, and bind addresses are configured in untracked `compose.env`. The UI does not receive `app/.env`, the original source corpus, model cache, or backend credentials.
+The repository-root `.env` keeps application and deployment configuration, while Compose supplies only its existing container-specific runtime overrides. The UI does not receive the original source corpus, model cache, or backend credentials.
 
 Normal retrieval reads indexed Qdrant payloads and does not open original corpus files. `SOORIN_RAG_SOURCE_ROOT` is therefore an indexing-maintenance input, and the source corpus is not mounted during normal API/UI operation. Embedded Qdrant is opened only by the API process.
 
