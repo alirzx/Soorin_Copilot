@@ -137,6 +137,7 @@ class MemorySemanticIndex:
 
     def search(self, query: str, *, user_id: str, limit: int) -> list[VectorSearchHit]:
         vector = self.embedder.embed_query(query)
+        self.vector_store.ensure_collection()
         return self.vector_store.search(
             vector,
             top_k=max(1, int(limit)),
