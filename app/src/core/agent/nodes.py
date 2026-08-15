@@ -24,6 +24,7 @@ from src.core.agent.planner import PlannerError
 from src.core.agent.task_mapping import (
     compile_direct_plan,
     compile_supplemental_plan,
+    derive_request_constraints,
     evidence_mode_from_request,
     task_spec_from_route,
 )
@@ -33,13 +34,14 @@ from src.core.context.intent import (
     SECURITY_ANALYSIS_WORDS,
     resolution_from_materialized_decision,
 )
-from src.core.context.models import approx_tokens
+from src.core.context.models import RouteDecision, approx_tokens
 from src.core.context.synthesizer_prompt import SynthesizerPromptBuilder
 from src.core.copilot.fallback_answer import build_evidence_fallback_answer
 from src.core.llm.errors import LLMError
 from src.core.llm.providers.base import LLMProviderResult, LLMStreamEvent
 from src.core.llm.token_estimator import TokenEstimator
 from src.core.memory.episodes import MemoryContextKey
+from src.core.memory.store import extract_working_facts
 from src.core.memory.long_term import LongTermMemoryRecord
 from src.core.memory.routing_state import SessionRoutingState
 from src.core.observability.metrics import get_metrics
@@ -83,6 +85,17 @@ class CopilotWorkflowNodes:
             recent_messages=recent,
             request_id=state["request_id"],
         )
+        constraints = derive_request_constraints(state["message"])
+        pending_facts = extract_working_facts(state["message"]) if constraints.memory_write else ()
+        logger.info(
+            "event=request_constraints_resolved request_id=%s allow_live=%s require_current=%s memory_only=%s memory_write=%s reason_count=%s",
+            state["request_id"],
+            constraints.allow_live,
+            constraints.require_current,
+            constraints.memory_only,
+            constraints.memory_write,
+            len(constraints.reason_codes),
+        )
         retrieve_long_term = getattr(self.service, "retrieve_long_term_memory", None)
         long_term_selection = (
             retrieve_long_term(
@@ -98,6 +111,8 @@ class CopilotWorkflowNodes:
             "active_entity_state": routing_state,
             "recent_messages": recent,
             "long_term_memory_selection": long_term_selection,
+            "request_constraints": constraints,
+            "pending_working_facts": pending_facts,
             "next_edge": "route",
         }
         if (
@@ -117,6 +132,55 @@ class CopilotWorkflowNodes:
         entities = state["resolved_entities"]
         routing_state = state["active_entity_state"]
         recent = state.get("recent_messages") or []
+        constraints = state.get("request_constraints") or derive_request_constraints(state["message"])
+        if constraints.memory_only:
+            values = tuple(item.value for item in entities.entities)
+            source = entities.entities[0].source if entities.entities else ""
+            binding = (
+                "explicit" if source == "message" else
+                "ui" if source == "ui" else
+                "active_pair" if len(values) == 2 else
+                "active_single" if values else
+                "none"
+            )
+            route = RouteDecision(
+                use_graph=False,
+                use_detection=False,
+                use_asset_profile=False,
+                use_knowledge=False,
+                reason="deterministic_memory_fast_path",
+                entity_binding=binding,
+                requested_entity_binding=binding,
+                resolved_entity_binding=binding,
+                binding_source=source,
+                binding_available=bool(values),
+                binding_normalized=bool(values),
+                binding_normalization_reason=(
+                    "memory_request_preserves_resolved_entity" if values else None
+                ),
+                materialized_entity_count=len(values),
+                materialized_entities=values,
+                target_entity=entities.primary_entity,
+                target_entities=list(entities.entities),
+                followup_detected=bool(values),
+                intent="asset_investigation" if values else "general_knowledge",
+                scope="node_summary" if values else "none",
+                direction="both" if values else "none",
+                decision_source="deterministic_fallback",
+                semantic_router_called=False,
+            )
+            logger.info(
+                "event=memory_fast_path_selected request_id=%s router_bypassed=true entity_count=%s working_fact_count=%s",
+                state["request_id"],
+                len(values),
+                len(state.get("pending_working_facts") or ()),
+            )
+            return {
+                "routing_result": route,
+                "resolved_entities": entities,
+                "routing_fallback_used": False,
+                "next_edge": "validate_task",
+            }
         decision = self.service.intent_router.classify(
             state["message"].strip(),
             entities,
@@ -213,7 +277,11 @@ class CopilotWorkflowNodes:
                 "comparison_second_entity_required",
             )
         try:
-            task = task_spec_from_route(route, state["message"].strip())
+            task = task_spec_from_route(
+                route,
+                state["message"].strip(),
+                state.get("request_constraints"),
+            )
         except Exception as exc:
             return {
                 "workflow_status": "failed",
@@ -225,7 +293,7 @@ class CopilotWorkflowNodes:
             }
         planner_selected = (
             task.workflow_mode == "multi_step"
-            and task.evidence_mode == "normal"
+            and bool((state.get("request_constraints") or derive_request_constraints(state["message"])).allow_live)
             and self.settings.planner_enabled
         )
         requirements = self.evidence_requirement_policy.derive(task)
@@ -262,7 +330,7 @@ class CopilotWorkflowNodes:
         }
 
     def build_plan(self, state: InvestigationState) -> dict[str, Any]:
-        if state["task"].evidence_mode != "normal":
+        if not (state.get("request_constraints") or derive_request_constraints(state["message"])).allow_live:
             return {
                 "execution_plan": compile_direct_plan(state["task"]),
                 "planner_called": False,
@@ -539,7 +607,7 @@ class CopilotWorkflowNodes:
 
     def review_retrieval(self, state: InvestigationState) -> dict[str, Any]:
         allow = (
-            state["task"].evidence_mode == "normal"
+            bool((state.get("request_constraints") or derive_request_constraints(state["message"])).allow_live)
             and
             self.settings.agent_max_supplemental_retrievals > 0
             and int(state.get("supplemental_retrieval_count", 0)) < 1
@@ -554,7 +622,7 @@ class CopilotWorkflowNodes:
         return {"review_decision": decision, "evidence_pack": pack, "next_edge": next_edge}
 
     def supplemental_retrieval(self, state: InvestigationState) -> dict[str, Any]:
-        if state["task"].evidence_mode != "normal":
+        if not (state.get("request_constraints") or derive_request_constraints(state["message"])).allow_live:
             return {"next_edge": "build_evidence"}
         decision = state["review_decision"]
         if int(state.get("supplemental_retrieval_count", 0)) >= 1:
@@ -963,6 +1031,14 @@ class CopilotWorkflowNodes:
         results = state.get("tool_results") or []
         synthesis = state["synthesis_result"]
         context_key = state.get("memory_context_key") or MemoryContextKey.from_task(task)
+        pending_facts = tuple(state.get("pending_working_facts") or ())
+        if pending_facts:
+            self.service.memory_store.upsert_working_facts(
+                state["session_id"],
+                context_key,
+                pending_facts,
+                request_id=state["request_id"],
+            )
         if self.settings.chat_store_history:
             self.service.memory_store.record_turn(
                 state["session_id"],
@@ -1039,6 +1115,14 @@ class CopilotWorkflowNodes:
                 assistant_content=synthesis["answer"],
             )
         proposed_count = self._propose_long_term_candidates(state)
+        logger.info(
+            "event=memory_update_completed request_id=%s memory_write_count=%s tool_count=%s episode_transition=%s persistence_attempted=%s",
+            state["request_id"],
+            len(pending_facts),
+            len(results),
+            bool(getattr(state.get("conversation_snapshot"), "episode_transition", False)),
+            identity is not None,
+        )
         return {
             "active_entity_state": new_state,
             "memory_update_result": {

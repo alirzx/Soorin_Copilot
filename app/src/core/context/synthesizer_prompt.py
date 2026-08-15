@@ -165,6 +165,7 @@ class SynthesizerPromptBuilder:
         memory = SynthesizerMemoryState(
             working_available=bool(
                 getattr(memory_package, "working_summary", "")
+                or getattr(memory_package, "working_facts", ())
                 or getattr(memory_package, "relevant_turns", ())
                 or int(getattr(snapshot, "recent_message_count", 0) or 0)
             ),

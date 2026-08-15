@@ -117,6 +117,17 @@ class TaskSpec:
 
 
 @dataclass(frozen=True)
+class RequestConstraints:
+    """Deterministic request authority resolved before semantic routing."""
+
+    allow_live: bool = True
+    require_current: bool = False
+    memory_only: bool = False
+    memory_write: bool = False
+    reason_codes: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
 class PlanStep:
     id: str
     capability: str
@@ -275,6 +286,8 @@ class InvestigationState(TypedDict, total=False):
     resolved_entities: Any
     active_entity_state: Any
     recent_messages: list[dict[str, str]]
+    request_constraints: RequestConstraints
+    pending_working_facts: tuple[Any, ...]
     routing_result: Any
     plan_validation_result: dict[str, Any]
     capability_results: list[ToolResult]

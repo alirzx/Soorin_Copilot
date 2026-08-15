@@ -12,7 +12,11 @@ import pytest
 from src.api.auth import verify_api_key
 from src.api.main import create_app
 from src.api import local_simulation_routes as local_routes
-from src.api.schemas.local_simulation import LocalConversationCreateRequest, LocalUserCreateRequest
+from src.api.schemas.local_simulation import (
+    LocalConversationCreateRequest,
+    LocalLoginRequest,
+    LocalUserCreateRequest,
+)
 from src.config.settings import get_settings
 from src.core.memory.factory import LocalPersistenceAdapters
 from src.core.memory.persistence import LOCAL_SCHEMA_VERSION
@@ -21,10 +25,12 @@ from src.web.local_simulation import (
     LOCAL_CONVERSATION_KEY,
     LOCAL_MESSAGES_KEY,
     LOCAL_USER_KEY,
+    LOCAL_USERNAME_KEY,
     LocalSimulationApiClient,
     clear_local_ui_state,
     copilot_auth_headers,
 )
+from src.web import local_simulation_ui
 
 
 def enabled_settings(path: Path, **overrides):
@@ -67,7 +73,14 @@ def test_local_auth_defaults_and_test_user_creation_guard(monkeypatch, tmp_path:
     settings = enabled_settings(repository.database.path, local_test_user_creation_enabled=False)
     local_routes_ready(monkeypatch, repository, settings)
 
-    response = local_routes.create_user(LocalUserCreateRequest(), _auth=None)
+    response = local_routes.create_user(
+        LocalUserCreateRequest(
+            username="analyst",
+            password="correct horse battery staple",
+            confirm_password="correct horse battery staple",
+        ),
+        _auth=None,
+    )
 
     assert response.status == "creation_disabled"
 
@@ -79,6 +92,7 @@ def test_local_routes_remain_protected_by_existing_auth(monkeypatch, tmp_path: P
     for endpoint in (
         local_routes.list_users,
         local_routes.create_user,
+        local_routes.login,
         local_routes.list_conversations,
         local_routes.create_conversation,
         local_routes.get_conversation,
@@ -94,8 +108,27 @@ def test_local_users_conversations_messages_and_ownership(monkeypatch, tmp_path:
     settings = enabled_settings(repository.database.path)
     local_routes_ready(monkeypatch, repository, settings)
 
-    created_user = local_routes.create_user(LocalUserCreateRequest(), _auth=None)
+    created_user = local_routes.create_user(
+        LocalUserCreateRequest(
+            username="Analyst.One",
+            password="correct horse battery staple",
+            confirm_password="correct horse battery staple",
+        ),
+        _auth=None,
+    )
     user_id = created_user.user_id
+    assert created_user.username == "analyst.one"
+    authenticated = local_routes.login(
+        LocalLoginRequest(username="ANALYST.ONE", password="correct horse battery staple"),
+        _auth=None,
+    )
+    assert authenticated.user_id == user_id
+    with pytest.raises(Exception) as invalid_login:
+        local_routes.login(
+            LocalLoginRequest(username="analyst.one", password="wrong-password"),
+            _auth=None,
+        )
+    assert getattr(invalid_login.value, "status_code", None) == 401
     assert user_id in {item.user_id for item in local_routes.list_users(_auth=None).users}
 
     with pytest.raises(Exception) as missing_user:
@@ -128,8 +161,24 @@ def test_local_users_conversations_messages_and_ownership(monkeypatch, tmp_path:
         _auth=None,
     )
     assert [item.content for item in messages.messages] == ["question", "answer"]
+    second_user = local_routes.create_user(
+        LocalUserCreateRequest(
+            username="second.analyst",
+            password="second secure password",
+            confirm_password="second secure password",
+        ),
+        _auth=None,
+    )
+    assert local_routes.list_conversations(
+        x_user_id=second_user.user_id,
+        _auth=None,
+    ).conversations == []
     with pytest.raises(Exception) as forbidden:
-        local_routes.get_conversation(conversation.conversation_id, x_user_id="other-user", _auth=None)
+        local_routes.get_conversation(
+            conversation.conversation_id,
+            x_user_id=second_user.user_id,
+            _auth=None,
+        )
     assert getattr(forbidden.value, "status_code", None) == 404
     assert local_routes.delete_conversation(conversation.conversation_id, x_user_id=user_id, _auth=None).deleted is True
 
@@ -204,6 +253,7 @@ def test_gate3_database_migrates_to_stable_conversation_session(tmp_path: Path) 
 def test_local_ui_helpers_clear_state_and_send_both_auth_headers() -> None:
     state = {
         LOCAL_USER_KEY: "user-a",
+        LOCAL_USERNAME_KEY: "analyst",
         LOCAL_CONVERSATION_KEY: "conversation-a",
         LOCAL_MESSAGES_KEY: [{"content": "secret"}],
         "selected_copilot_ip": "192.0.2.10",
@@ -215,6 +265,16 @@ def test_local_ui_helpers_clear_state_and_send_both_auth_headers() -> None:
         "Authorization": "Bearer copilot-key",
         "Soorin_copilot_api_key": "copilot-key",
     }
+
+
+def test_local_ui_uses_login_signup_forms_without_generated_user_selection() -> None:
+    source = inspect.getsource(local_simulation_ui._login_page)
+
+    assert "local_simulation_login_form" in source
+    assert "local_simulation_signup_form" in source
+    assert 'type="password"' in source
+    assert "client.login" in source
+    assert "client.list_users" not in source
 
 
 def test_local_stream_request_uses_stable_identity_and_selected_ip(monkeypatch) -> None:
@@ -269,3 +329,39 @@ def test_local_stream_request_uses_stable_identity_and_selected_ip(monkeypatch) 
     assert captured["headers"]["Authorization"] == "Bearer key"
     assert captured["headers"]["Soorin_copilot_api_key"] == "key"
     assert captured["headers"]["X-User-ID"] == "user-a"
+
+
+def test_local_signup_hashes_password_and_rejects_duplicate_username(monkeypatch, tmp_path: Path) -> None:
+    repository = local_repository(tmp_path)
+    local_routes_ready(monkeypatch, repository, enabled_settings(repository.database.path))
+    password = "unique-local-password"
+
+    first = local_routes.create_user(
+        LocalUserCreateRequest(
+            username="soc_analyst",
+            password=password,
+            confirm_password=password,
+        ),
+        _auth=None,
+    )
+
+    encoded = repository.get_password_hash(user_id=first.user_id)
+    assert encoded and encoded.startswith("scrypt$v1$")
+    assert password not in encoded
+    with repository.database.connect() as connection:
+        row = connection.execute(
+            "SELECT username, password_hash FROM local_users WHERE user_id = ?",
+            (first.user_id,),
+        ).fetchone()
+    assert row["username"] == "soc_analyst"
+    assert password not in row["password_hash"]
+    with pytest.raises(Exception) as duplicate:
+        local_routes.create_user(
+            LocalUserCreateRequest(
+                username="SOC_ANALYST",
+                password=password,
+                confirm_password=password,
+            ),
+            _auth=None,
+        )
+    assert getattr(duplicate.value, "status_code", None) == 409

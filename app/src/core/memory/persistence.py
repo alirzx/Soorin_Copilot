@@ -8,12 +8,18 @@ from datetime import datetime, timezone
 from typing import Any
 
 from src.core.identity import RequestIdentity, normalize_identifier
-from src.core.memory.episodes import EpisodeRecord, MemoryContextKey, TurnReference, WorkingMemory
+from src.core.memory.episodes import (
+    EpisodeRecord,
+    MemoryContextKey,
+    TurnReference,
+    WorkingFact,
+    WorkingMemory,
+)
 from src.core.memory.routing_state import SessionRoutingState
 
 
-LOCAL_SCHEMA_VERSION = 4
-THREAD_STATE_SCHEMA_VERSION = 2
+LOCAL_SCHEMA_VERSION = 5
+THREAD_STATE_SCHEMA_VERSION = 3
 MAX_THREAD_STATE_BYTES = 16_384
 MAX_CHAT_CONTENT_CHARS = 100_000
 MAX_CONVERSATION_TITLE_CHARS = 256
@@ -64,9 +70,10 @@ class LocalChatMessage:
 
 @dataclass(frozen=True)
 class LocalUser:
-    """Minimal password-free local-development user record."""
+    """Local-development user identity; credential hashes never leave storage."""
 
     user_id: str
+    username: str
     created_at: str
 
 
@@ -163,7 +170,38 @@ def _working_memory_from_payload(value: Any, session_id: str) -> WorkingMemory |
         last_providers=_bounded_strings(value.get("last_providers", []), field_name="last_providers", maximum_items=8, maximum_chars=64),
         last_scope=_bounded_optional(value.get("last_scope"), field_name="last_scope") or "none",
         limitations=_bounded_strings(value.get("limitations", []), field_name="limitations", maximum_items=8, maximum_chars=200),
+        working_facts=_working_facts_from_payload(value.get("working_facts", [])),
     )
+
+
+def _working_facts_from_payload(value: Any) -> tuple[WorkingFact, ...]:
+    if not isinstance(value, list) or len(value) > 20:
+        raise LocalPersistenceSchemaError("Invalid persisted working facts.")
+    facts: list[WorkingFact] = []
+    for item in value:
+        if not isinstance(item, dict) or set(item) - {"key", "value", "fact_type", "created_at"}:
+            raise LocalPersistenceSchemaError("Invalid persisted working fact.")
+        facts.append(
+            WorkingFact(
+                key=_bounded_optional(item.get("key"), field_name="working fact key", maximum=64) or "",
+                value=_bounded_text(item.get("value"), maximum=300),
+                fact_type=_bounded_optional(item.get("fact_type"), field_name="working fact type", maximum=64) or "user_provided",
+                created_at=_bounded_text(item.get("created_at"), maximum=64),
+            )
+        )
+    return tuple(facts)
+
+
+def _working_facts_payload(value: tuple[WorkingFact, ...]) -> list[dict[str, str]]:
+    return [
+        {
+            "key": item.key,
+            "value": item.value,
+            "fact_type": item.fact_type,
+            "created_at": item.created_at,
+        }
+        for item in value
+    ]
 
 
 def _turn_references_from_payload(value: Any) -> tuple[TurnReference, ...]:
@@ -190,6 +228,13 @@ def _episode_payload(value: EpisodeRecord) -> dict[str, Any]:
         "created_at": value.created_at,
         "updated_at": value.updated_at,
         "compact_summary": value.compact_summary,
+        "working_facts": _working_facts_payload(value.working_facts),
+        "inferred_role": list(value.inferred_role),
+        "key_findings": list(value.key_findings),
+        "contradictions": list(value.contradictions),
+        "unresolved_questions": list(value.unresolved_questions),
+        "next_checks": list(value.next_checks),
+        "evidence_scope": list(value.evidence_scope),
         "limitations": list(value.limitations),
         "last_providers": list(value.last_providers),
         "last_scope": value.last_scope,
@@ -215,6 +260,13 @@ def _episodes_from_payload(value: Any, session_id: str) -> tuple[EpisodeRecord, 
                 created_at=_bounded_text(item.get("created_at"), maximum=64),
                 updated_at=_bounded_text(item.get("updated_at"), maximum=64),
                 compact_summary=_bounded_text(item.get("compact_summary"), maximum=4_000),
+                working_facts=_working_facts_from_payload(item.get("working_facts", [])),
+                inferred_role=_bounded_strings(item.get("inferred_role", []), field_name="inferred_role", maximum_items=8, maximum_chars=300),
+                key_findings=_bounded_strings(item.get("key_findings", []), field_name="key_findings", maximum_items=12, maximum_chars=300),
+                contradictions=_bounded_strings(item.get("contradictions", []), field_name="contradictions", maximum_items=8, maximum_chars=400),
+                unresolved_questions=_bounded_strings(item.get("unresolved_questions", []), field_name="unresolved_questions", maximum_items=8, maximum_chars=300),
+                next_checks=_bounded_strings(item.get("next_checks", []), field_name="next_checks", maximum_items=8, maximum_chars=300),
+                evidence_scope=_bounded_strings(item.get("evidence_scope", []), field_name="evidence_scope", maximum_items=8, maximum_chars=160),
                 limitations=_bounded_strings(item.get("limitations", []), field_name="limitations", maximum_items=8, maximum_chars=200),
                 last_providers=_bounded_strings(item.get("last_providers", []), field_name="last_providers", maximum_items=8, maximum_chars=64),
                 last_scope=_bounded_optional(item.get("last_scope"), field_name="last_scope") or "none",
@@ -343,6 +395,7 @@ class ThreadMemoryState:
                 "context_key": _context_key_payload(self.working_memory.context_key),
                 "episode_id": self.working_memory.episode_id,
                 "compact_summary": self.working_memory.compact_summary,
+                "working_facts": _working_facts_payload(self.working_memory.working_facts),
                 "last_providers": list(self.working_memory.last_providers),
                 "last_scope": self.working_memory.last_scope,
                 "limitations": list(self.working_memory.limitations),

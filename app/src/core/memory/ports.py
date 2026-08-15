@@ -23,11 +23,21 @@ from src.core.memory.long_term import (
 class ChatRepository(Protocol):
     """Product-owned transcript boundary; SQLite is local simulation only."""
 
-    def create_user(self, *, user_id: str | None = None) -> LocalUser: ...
+    def create_user(
+        self,
+        *,
+        username: str,
+        password_hash: str,
+        user_id: str | None = None,
+    ) -> LocalUser: ...
 
     def list_users(self, *, limit: int = 50) -> tuple[LocalUser, ...]: ...
 
     def get_user(self, *, user_id: str) -> LocalUser | None: ...
+
+    def get_user_by_username(self, *, username: str) -> LocalUser | None: ...
+
+    def get_password_hash(self, *, user_id: str) -> str | None: ...
 
     def create_conversation(
         self,

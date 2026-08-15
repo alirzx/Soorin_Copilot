@@ -18,6 +18,7 @@ from src.api.schemas.local_simulation import (
     LocalConversationsResponse,
     LocalDeleteResponse,
     LocalMessagesResponse,
+    LocalLoginRequest,
     LocalSimulationStatus,
     LocalUserCreateRequest,
     LocalUserResponse,
@@ -27,6 +28,8 @@ from src.config.settings import get_settings
 from src.core.identity import normalize_identifier
 from src.core.memory.factory import LocalPersistenceAdapters
 from src.core.memory.persistence import LocalPersistenceError, LocalPersistenceOwnershipError
+from src.core.memory.persistence import LocalPersistenceConflictError
+from src.core.memory.local_auth import hash_password, normalize_username, verify_password
 from src.core.memory.ports import ChatRepository
 
 
@@ -61,7 +64,11 @@ def _required_user_id(value: str | None) -> str:
 
 
 def _user_response(value) -> LocalUserResponse:
-    return LocalUserResponse(user_id=value.user_id, created_at=value.created_at)
+    return LocalUserResponse(
+        user_id=value.user_id,
+        username=value.username,
+        created_at=value.created_at,
+    )
 
 
 def _conversation_response(value) -> LocalConversationResponse:
@@ -96,7 +103,7 @@ def list_users(_auth: None = Depends(verify_api_key)) -> LocalUsersResponse | Lo
     "/users",
     response_model=LocalUserResponse | LocalSimulationStatus,
     summary="Create a local simulation user",
-    description="Local development only. Creates no password, token, or Product account.",
+    description="Local development only. Creates a password-hashed local identity, never a Product account.",
 )
 def create_user(
     request: LocalUserCreateRequest,
@@ -110,11 +117,44 @@ def create_user(
             status="creation_disabled",
             detail="Local test-user creation is disabled.",
         )
+    if request.password != request.confirm_password:
+        raise HTTPException(status_code=422, detail="Passwords do not match.")
     try:
-        user = repository.create_user(user_id=request.user_id)
-    except LocalPersistenceError as exc:
+        username = normalize_username(request.username)
+        user = repository.create_user(
+            username=username,
+            password_hash=hash_password(request.password),
+        )
+    except LocalPersistenceConflictError as exc:
+        raise HTTPException(status_code=409, detail="Username is already registered.") from exc
+    except (LocalPersistenceError, ValueError) as exc:
         raise HTTPException(status_code=422, detail="Invalid local user.") from exc
     logger.info("event=local_user_created user_ref=%s", _reference(user.user_id))
+    return _user_response(user)
+
+
+@router.post(
+    "/login",
+    response_model=LocalUserResponse | LocalSimulationStatus,
+    summary="Authenticate a local simulation user",
+    description="Local development only. Does not authenticate a Product account.",
+)
+def login(
+    request: LocalLoginRequest,
+    _auth: None = Depends(verify_api_key),
+) -> LocalUserResponse | LocalSimulationStatus:
+    repository = _repository()
+    if isinstance(repository, LocalSimulationStatus):
+        return repository
+    try:
+        user = repository.get_user_by_username(username=normalize_username(request.username))
+        encoded = repository.get_password_hash(user_id=user.user_id) if user else None
+    except (LocalPersistenceError, ValueError):
+        user = None
+        encoded = None
+    if user is None or encoded is None or not verify_password(request.password, encoded):
+        raise HTTPException(status_code=401, detail="Invalid username or password.")
+    logger.info("event=local_user_authenticated user_ref=%s", _reference(user.user_id))
     return _user_response(user)
 
 

@@ -15,6 +15,7 @@ from src.web.chat_stream import ChatStreamProtocolError, parse_sse_events
 
 logger = logging.getLogger(__name__)
 LOCAL_USER_KEY = "local_simulation_user_id"
+LOCAL_USERNAME_KEY = "local_simulation_username"
 LOCAL_CONVERSATION_KEY = "local_simulation_conversation"
 LOCAL_MESSAGES_KEY = "local_simulation_messages"
 LOCAL_PENDING_REQUEST_KEY = "local_simulation_pending_request_id"
@@ -23,6 +24,7 @@ LOCAL_DELETE_CONFIRMATION_KEY = "local_simulation_delete_confirmation"
 LOCAL_TRANSIENT_KEY = "local_simulation_transient_response"
 LOCAL_STATE_KEYS = (
     LOCAL_USER_KEY,
+    LOCAL_USERNAME_KEY,
     LOCAL_CONVERSATION_KEY,
     LOCAL_MESSAGES_KEY,
     LOCAL_PENDING_REQUEST_KEY,
@@ -52,7 +54,7 @@ def copilot_auth_headers(api_key: str) -> dict[str, str]:
 def clear_local_ui_state(state: Any, *, keep_user: bool = False) -> None:
     """Clear rerun-only state when logging out, switching users, or deleting a chat."""
     for key in LOCAL_STATE_KEYS:
-        if keep_user and key == LOCAL_USER_KEY:
+        if keep_user and key in {LOCAL_USER_KEY, LOCAL_USERNAME_KEY}:
             continue
         state.pop(key, None)
 
@@ -110,8 +112,17 @@ class LocalSimulationApiClient:
                 params=params,
                 timeout=self.timeout_seconds,
             )
-            response.raise_for_status()
+            if response.status_code >= 400:
+                try:
+                    detail = str((response.json() or {}).get("detail") or "")
+                except ValueError:
+                    detail = ""
+                raise LocalSimulationClientError(
+                    detail or "The local simulation request was rejected."
+                )
             payload = response.json()
+        except LocalSimulationClientError:
+            raise
         except requests.RequestException as exc:
             raise LocalSimulationClientError("The local simulation API is unavailable.") from exc
         except ValueError as exc:
@@ -125,8 +136,23 @@ class LocalSimulationApiClient:
     def list_users(self) -> list[dict[str, Any]]:
         return list(self._request("GET", "/local-simulation/users").get("users") or [])
 
-    def create_user(self) -> dict[str, Any]:
-        return self._request("POST", "/local-simulation/users", json_body={})
+    def create_user(self, username: str, password: str, confirm_password: str) -> dict[str, Any]:
+        return self._request(
+            "POST",
+            "/local-simulation/users",
+            json_body={
+                "username": username,
+                "password": password,
+                "confirm_password": confirm_password,
+            },
+        )
+
+    def login(self, username: str, password: str) -> dict[str, Any]:
+        return self._request(
+            "POST",
+            "/local-simulation/login",
+            json_body={"username": username, "password": password},
+        )
 
     def get_user(self, user_id: str) -> dict[str, Any]:
         return self._request("GET", f"/local-simulation/users/{user_id}")

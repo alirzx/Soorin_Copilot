@@ -39,8 +39,13 @@ CREATE TABLE IF NOT EXISTS schema_metadata (
 
 CREATE TABLE IF NOT EXISTS local_users (
     user_id TEXT PRIMARY KEY,
+    username TEXT,
+    password_hash TEXT,
     created_at TEXT NOT NULL
 );
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_local_users_username
+ON local_users(username COLLATE NOCASE) WHERE username IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS local_conversations (
     conversation_id TEXT PRIMARY KEY,
@@ -206,7 +211,7 @@ class LocalSQLiteDatabase:
                         "SELECT value FROM schema_metadata WHERE key = ?",
                         ("local_schema_version",),
                     ).fetchone()
-                    if row is not None and row["value"] in {"1", "2", "3"}:
+                    if row is not None and row["value"] in {"1", "2", "3", "4"}:
                         connection.execute("BEGIN IMMEDIATE")
                         try:
                             version = int(row["value"])
@@ -218,6 +223,9 @@ class LocalSQLiteDatabase:
                                 version = 3
                             if version == 3:
                                 self._upgrade_v3_to_v4(connection)
+                                version = 4
+                            if version == 4:
+                                self._upgrade_v4_to_v5(connection)
                             connection.commit()
                         except Exception:
                             connection.rollback()
@@ -359,6 +367,63 @@ class LocalSQLiteDatabase:
         )
         connection.execute(
             "UPDATE schema_metadata SET value = ? WHERE key = ?",
+            ("4", "local_schema_version"),
+        )
+
+    @staticmethod
+    def _upgrade_v4_to_v5(connection: sqlite3.Connection) -> None:
+        """Add local credentials and typed working/episode fact defaults."""
+        connection.execute(
+            "CREATE TABLE IF NOT EXISTS local_users ("
+            "user_id TEXT PRIMARY KEY, created_at TEXT NOT NULL)"
+        )
+        columns = {
+            row["name"] for row in connection.execute("PRAGMA table_info(local_users)")
+        }
+        if "username" not in columns:
+            connection.execute("ALTER TABLE local_users ADD COLUMN username TEXT")
+        if "password_hash" not in columns:
+            connection.execute("ALTER TABLE local_users ADD COLUMN password_hash TEXT")
+        connection.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_local_users_username "
+            "ON local_users(username COLLATE NOCASE) WHERE username IS NOT NULL"
+        )
+        tables = {
+            row["name"]
+            for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+        }
+        rows = (
+            connection.execute(
+                "SELECT thread_key, state_json, schema_version FROM local_thread_states"
+            ).fetchall()
+            if "local_thread_states" in tables
+            else ()
+        )
+        for row in rows:
+            if int(row["schema_version"]) >= THREAD_STATE_SCHEMA_VERSION:
+                continue
+            payload = json.loads(row["state_json"])
+            working = payload.get("working_memory")
+            if isinstance(working, dict):
+                working.setdefault("working_facts", [])
+            for episode in payload.get("recent_episodes", []):
+                if not isinstance(episode, dict):
+                    continue
+                for key in (
+                    "working_facts", "inferred_role", "key_findings", "contradictions",
+                    "unresolved_questions", "next_checks", "evidence_scope",
+                ):
+                    episode.setdefault(key, [])
+            connection.execute(
+                "UPDATE local_thread_states SET schema_version = ?, state_json = ? WHERE thread_key = ?",
+                (
+                    THREAD_STATE_SCHEMA_VERSION,
+                    json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+                    row["thread_key"],
+                ),
+            )
+        connection.execute(
+            "UPDATE schema_metadata SET value = ? WHERE key = ?",
             (str(LOCAL_SCHEMA_VERSION), "local_schema_version"),
         )
 
@@ -404,7 +469,11 @@ def _commit(row: sqlite3.Row) -> LocalRequestCommit:
 
 
 def _user(row: sqlite3.Row) -> LocalUser:
-    return LocalUser(user_id=row["user_id"], created_at=row["created_at"])
+    return LocalUser(
+        user_id=row["user_id"],
+        username=str(row["username"] or ""),
+        created_at=row["created_at"],
+    )
 
 
 class SQLiteChatRepository:
@@ -413,20 +482,31 @@ class SQLiteChatRepository:
     def __init__(self, database: LocalSQLiteDatabase) -> None:
         self.database = database
 
-    def create_user(self, *, user_id: str | None = None) -> LocalUser:
+    def create_user(
+        self,
+        *,
+        username: str,
+        password_hash: str,
+        user_id: str | None = None,
+    ) -> LocalUser:
         user = _identifier(user_id, "user_id") if user_id is not None else f"local-user-{uuid4().hex}"
+        normalized_username = _content(username, field_name="username", maximum=32)
+        encoded_password = _content(password_hash, field_name="password hash", maximum=512)
         now = utc_now()
         with self.database.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             try:
                 connection.execute(
-                    "INSERT OR IGNORE INTO local_users(user_id, created_at) VALUES (?, ?)",
-                    (user, now),
+                    "INSERT INTO local_users(user_id, username, password_hash, created_at) VALUES (?, ?, ?, ?)",
+                    (user, normalized_username, encoded_password, now),
                 )
                 row = connection.execute(
                     "SELECT * FROM local_users WHERE user_id = ?", (user,)
                 ).fetchone()
                 connection.commit()
+            except sqlite3.IntegrityError as exc:
+                connection.rollback()
+                raise LocalPersistenceConflictError("Local username already exists.") from exc
             except Exception:
                 connection.rollback()
                 raise
@@ -450,6 +530,24 @@ class SQLiteChatRepository:
                 "SELECT * FROM local_users WHERE user_id = ?", (user,)
             ).fetchone()
         return _user(row) if row is not None else None
+
+    def get_user_by_username(self, *, username: str) -> LocalUser | None:
+        normalized = _content(username, field_name="username", maximum=32)
+        with self.database.connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM local_users WHERE username = ? COLLATE NOCASE",
+                (normalized,),
+            ).fetchone()
+        return _user(row) if row is not None else None
+
+    def get_password_hash(self, *, user_id: str) -> str | None:
+        user = _identifier(user_id, "user_id")
+        with self.database.connect() as connection:
+            row = connection.execute(
+                "SELECT password_hash FROM local_users WHERE user_id = ?",
+                (user,),
+            ).fetchone()
+        return str(row["password_hash"]) if row is not None and row["password_hash"] else None
 
     @staticmethod
     def _assert_owner(
@@ -488,7 +586,8 @@ class SQLiteChatRepository:
             connection.execute("BEGIN IMMEDIATE")
             try:
                 connection.execute(
-                    "INSERT OR IGNORE INTO local_users(user_id, created_at) VALUES (?, ?)",
+                    "INSERT OR IGNORE INTO local_users(user_id, username, password_hash, created_at) "
+                    "VALUES (?, NULL, NULL, ?)",
                     (user, now),
                 )
                 existing = connection.execute(

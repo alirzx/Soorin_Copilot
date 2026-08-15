@@ -116,29 +116,11 @@ def test_memory_only_requests_compile_to_valid_zero_tool_direct_plan(user_text: 
     assert validated.steps == ()
 
 
-def test_memory_only_workflow_calls_router_and_synthesizer_but_no_live_tools_or_planner() -> None:
-    route = json.dumps(
-        {
-            "intent": "asset_investigation",
-            "scope": "node_summary",
-            "direction": "both",
-            "depth": 0,
-            "requires_graph": True,
-            "requires_detection": True,
-            "requires_asset_profile": True,
-            "requires_knowledge": True,
-            "entity_binding": "explicit",
-            "requires_multiple_entities": False,
-            "is_followup": True,
-            "classification_confidence": 0.99,
-            "reason": "Recall request for the supplied entity.",
-        }
-    )
-
+def test_memory_only_workflow_bypasses_router_and_calls_only_synthesizer() -> None:
     class OfflineLLM:
         def __init__(self) -> None:
             self.calls = []
-            self.responses = [route, "No active validated long-term memory is available for this asset."]
+            self.responses = ["No active validated long-term memory is available for this asset."]
 
         def chat(self, messages, **kwargs):
             self.calls.append({"messages": messages, **kwargs})
@@ -183,7 +165,7 @@ def test_memory_only_workflow_calls_router_and_synthesizer_but_no_live_tools_or_
     )
 
     assert response["answer"].startswith("No active validated long-term memory")
-    assert [call["purpose"] for call in llm.calls] == ["intent_router", "chat"]
+    assert [call["purpose"] for call in llm.calls] == ["chat"]
     final_system = llm.calls[-1]["messages"][0]["content"]
     assert '"evidence_mode":"memory_only"' in final_system
     assert "Users may legitimately narrow scope" in final_system
@@ -397,8 +379,8 @@ def test_delta_and_bounded_negative_rules_are_explicit_and_fail_closed() -> None
     assert not context.deterministic_delta_available
     assert "Use new/changed/appeared/disappeared only" in contract
     assert "not observed never means categorically absent" in contract
-    assert "Never convert bounded negative evidence into a categorical claim" in static
-    assert "compatible previous baseline" in static
+    assert "bounded omissions are not negative findings" in static
+    assert "compatible_baseline_unavailable" in contract
 
 
 def test_memory_recall_keeps_asset_episode_identity_but_general_topic_detaches() -> None:

@@ -14,6 +14,7 @@ class LocalSimulationStatus(BaseModel):
 
 class LocalUserResponse(BaseModel):
     user_id: str
+    username: str
     created_at: str
 
 
@@ -23,9 +24,16 @@ class LocalUsersResponse(BaseModel):
 
 
 class LocalUserCreateRequest(BaseModel):
-    """An optional opaque local identifier; no passwords or claims."""
+    """Local-development sign-up input; passwords are never returned."""
 
-    user_id: str | None = Field(default=None, max_length=128)
+    username: str = Field(min_length=3, max_length=32)
+    password: str = Field(min_length=8, max_length=128)
+    confirm_password: str = Field(min_length=8, max_length=128)
+
+
+class LocalLoginRequest(BaseModel):
+    username: str = Field(min_length=3, max_length=32)
+    password: str = Field(min_length=1, max_length=128)
 
 
 class LocalConversationCreateRequest(BaseModel):

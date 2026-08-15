@@ -7,7 +7,13 @@ from dataclasses import replace
 from typing import Any
 from uuid import uuid4
 
-from src.core.agent.contracts import EvidenceMode, ExecutionPlan, PlanStep, TaskSpec
+from src.core.agent.contracts import (
+    EvidenceMode,
+    ExecutionPlan,
+    PlanStep,
+    RequestConstraints,
+    TaskSpec,
+)
 from src.core.context.product_views import select_product_views
 
 
@@ -29,40 +35,94 @@ MEMORY_RECALL_REQUEST = re.compile(
     r"summari[sz]e\s+what\s+you\s+remember|continue\s+with\s+the\s+same\s+asset.*before\s+the\s+restart|"
     r"conversation\s+memory|episodic\s+memory|long[\s-]*term\s+memory|prior\s+investigations?|what(?:'s|\s+is)\s+my\s+name|"
     r"what\s+did\s+(?:i|we)\s+(?:tell|say)|what\s+was\s+the\s+previous\s+contradiction|"
-    r"from\s+(?:stored\s+context|our\s+previous\s+investigation))\b",
+    r"from\s+(?:stored\s+(?:context|conversation\s+context)|our\s+previous\s+investigation)|"
+    r"(?:investigation\s+tag|owner\s+(?:validation\s+)?status|identity\s+contradiction).{0,100}"
+    r"(?:do\s+we\s+have|did\s+we\s+establish|earlier|previously))\b",
     re.IGNORECASE,
 )
 
 NO_LIVE_EVIDENCE_REQUEST = re.compile(
     r"\b(?:before\s+making\s+any\s+live\s+provider\s+calls|without\s+refreshing|without\s+(?:fetching|calling|using)\s+"
     r"(?:any\s+)?(?:live\s+)?evidence|do\s+not\s+(?:use|call)\s+(?:live\s+)?(?:product|detection|graph|knowledge|evidence|providers?|refresh)|"
-    r"don't\s+use\s+live|do\s+not\s+refresh|don't\s+refresh|no\s+live\s+(?:provider|evidence|refresh)|memory\s+only)\b",
+    r"don't\s+use\s+live|do\s+not\s+refresh|don't\s+refresh|no\s+live\s+(?:provider|evidence|refresh)|"
+    r"without\s+(?:using\s+)?live\s+(?:sources?|data)|do\s+not\s+use\s+live\s+(?:sources?|data)|"
+    r"use\s+only\s+memory|using\s+only\s+stored\s+(?:conversation\s+)?context|memory\s+only)\b",
+    re.IGNORECASE,
+)
+
+MEMORY_WRITE_REQUEST = re.compile(
+    r"\b(?:remember|keep|retain|store)\b.{0,160}\b(?:for\s+(?:this|the)\s+(?:conversation|investigation)|"
+    r"in\s+(?:this|the)\s+(?:conversation|investigation)|my\s+name|tag|owner\s+validation|analyst\s+note|contradiction)\b",
+    re.IGNORECASE,
+)
+
+CURRENT_EVIDENCE_REQUEST = re.compile(
+    r"\b(?:fresh|current|currently|right\s+now|still\s+showing|verify\s+now|refresh|latest|live\s+(?:evidence|data|state))\b",
     re.IGNORECASE,
 )
 
 
+def derive_request_constraints(request: str) -> RequestConstraints:
+    """Resolve live-evidence and memory authority without an LLM."""
+    no_live = bool(NO_LIVE_EVIDENCE_REQUEST.search(request))
+    recall = bool(MEMORY_RECALL_REQUEST.search(request))
+    memory_write = bool(MEMORY_WRITE_REQUEST.search(request))
+    require_current = bool(CURRENT_EVIDENCE_REQUEST.search(request)) and not no_live
+    pure_memory_write = memory_write and not require_current and not re.search(
+        r"\b(?:check|verify|analy[sz]e|investigate|compare|show\s+(?:connections?|neighbors?|path))\b",
+        request,
+        re.IGNORECASE,
+    )
+    memory_only = recall or pure_memory_write
+    reasons: list[str] = []
+    if no_live:
+        reasons.append("explicit_no_live")
+    if recall:
+        reasons.append("deterministic_memory_recall")
+    if memory_write:
+        reasons.append("session_memory_write")
+    if require_current:
+        reasons.append("current_evidence_requested")
+    return RequestConstraints(
+        allow_live=not no_live and not memory_only,
+        require_current=require_current,
+        memory_only=memory_only,
+        memory_write=memory_write,
+        reason_codes=tuple(reasons),
+    )
+
+
 def evidence_mode_from_request(request: str) -> EvidenceMode:
     """Recognize explicit recall scope without delegating tool authority to the model."""
-    if MEMORY_RECALL_REQUEST.search(request):
+    constraints = derive_request_constraints(request)
+    if constraints.memory_only:
         return "memory_only"
-    if NO_LIVE_EVIDENCE_REQUEST.search(request):
+    if not constraints.allow_live:
         return "no_live_refresh"
+    if constraints.require_current:
+        return "current_verification"
     return "normal"
 
 
-def task_spec_from_route(route: Any, request: str) -> TaskSpec:
+def task_spec_from_route(
+    route: Any,
+    request: str,
+    constraints: RequestConstraints | None = None,
+) -> TaskSpec:
     request_lower = request.lower()
+    constraints = constraints or derive_request_constraints(request)
     evidence_mode = evidence_mode_from_request(request)
+    allow_capabilities = constraints.allow_live
     entities = tuple(dict.fromkeys(getattr(route, "materialized_entities", ()) or ()))
     if getattr(route, "scope", "none") == "multi_entity_comparison" and len(entities) != 2:
         raise ValueError("comparison_requires_two_distinct_entities")
     required_capabilities: list[str] = []
     optional_capabilities: list[str] = []
-    if evidence_mode == "normal" and getattr(route, "use_asset_profile", False):
+    if allow_capabilities and getattr(route, "use_asset_profile", False):
         required_capabilities.append("asset.get_profile")
-    if evidence_mode == "normal" and getattr(route, "use_detection", False):
+    if allow_capabilities and getattr(route, "use_detection", False):
         required_capabilities.append("asset.get_detection")
-    if evidence_mode == "normal" and getattr(route, "use_graph", False):
+    if allow_capabilities and getattr(route, "use_graph", False):
         scope = getattr(route, "scope", "none")
         graph_capability = {
             "node_summary": "graph.get_summary",
@@ -75,7 +135,7 @@ def task_spec_from_route(route: Any, request: str) -> TaskSpec:
             "path": "graph.find_path",
         }.get(scope, "graph.get_summary")
         required_capabilities.append(graph_capability)
-    if evidence_mode == "normal" and getattr(route, "use_knowledge", False):
+    if allow_capabilities and getattr(route, "use_knowledge", False):
         target = (
             required_capabilities
             if SOURCE_SPECIFIC_KNOWLEDGE.search(request)
@@ -97,7 +157,7 @@ def task_spec_from_route(route: Any, request: str) -> TaskSpec:
         entities=entities,
         required_capabilities=tuple(required_capabilities),
         optional_capabilities=tuple(optional_capabilities),
-        workflow_mode="direct" if evidence_mode == "memory_only" else "multi_step" if multi_step else "direct",
+        workflow_mode="direct" if not allow_capabilities else "multi_step" if multi_step else "direct",
         semantic_decision_source=str(getattr(route, "decision_source", "unknown")),
         requires_multiple_entities=bool(getattr(route, "requires_multiple_entities", False)),
         recommended_steps=min(4, max(1, len(capabilities))),
@@ -111,7 +171,7 @@ def task_spec_from_route(route: Any, request: str) -> TaskSpec:
         is_followup=bool(getattr(route, "followup_detected", False)),
         graph_depth=int(getattr(route, "depth", 0) or 0),
         relationship_mode=str(getattr(route, "relationship_mode", "none")),
-        temporal_mode="historical" if evidence_mode == "memory_only" else "current",
+        temporal_mode="historical" if evidence_mode in {"memory_only", "no_live_refresh"} else "current",
         evidence_mode=evidence_mode,
         response_depth=(
             "report"

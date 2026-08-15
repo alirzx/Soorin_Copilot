@@ -58,6 +58,10 @@ REFERENTIAL_ENTITY_PATTERNS: dict[str, re.Pattern[str]] = {
         r"from\s+(?:stored\s+context|our\s+previous\s+investigation)|(?:conversation|episodic)\s+memory|what(?:'s|\s+is)\s+my\s+name)\b",
         re.IGNORECASE,
     ),
+    "this_investigation": re.compile(
+        r"\b(?:for|in|from|continue)\s+(?:this|the\s+current|the\s+same)\s+investigation\b",
+        re.IGNORECASE,
+    ),
     "exhaustive_connection_followup": re.compile(
         r"\b(?:now\s+)?(?:show|list|give|enumerate)\b.{0,40}\b(?:all|every|full|complete)\b.{0,40}"
         r"\b(?:connections?|neighbors?|neighborhoods?|peers?|inbound|outbound|bidirectional)\b",

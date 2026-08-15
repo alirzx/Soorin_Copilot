@@ -16,6 +16,7 @@ from src.web.local_simulation import (
     LOCAL_PENDING_REQUEST_KEY,
     LOCAL_STREAMING_KEY,
     LOCAL_USER_KEY,
+    LOCAL_USERNAME_KEY,
     LocalConversation,
     LocalSimulationApiClient,
     LocalSimulationClientError,
@@ -49,49 +50,56 @@ def _login_page(client: LocalSimulationApiClient, settings: Settings) -> None:
     st.title("Soorin Copilot")
     st.caption("SOC/NOC/NDR investigation workspace")
     st.info("Local Development Simulation", icon="🧪")
-    st.write("Select a local test identity. No password, Product account, or production authorization is used.")
-    try:
-        users = client.list_users()
-    except LocalSimulationClientError as exc:
-        st.error(str(exc))
-        st.stop()
-    user_ids = [str(item.get("user_id") or "") for item in users if item.get("user_id")]
-    if user_ids:
-        selected = st.selectbox("Local user", user_ids, key="local_simulation_login_user")
-        if st.button("Sign in", type="primary", width="stretch"):
+    st.write("Sign in with a local development account. This does not use or change Product authentication.")
+    login_tab, signup_tab = st.tabs(["Login", "Sign Up"])
+    with login_tab:
+        with st.form("local_simulation_login_form", clear_on_submit=False):
+            username = st.text_input("Username", key="local_login_username")
+            password = st.text_input("Password", type="password", key="local_login_password")
+            submitted = st.form_submit_button("Login", type="primary", width="stretch")
+        if submitted:
             try:
-                client.get_user(selected)
+                user = client.login(username, password)
                 clear_local_ui_state(st.session_state)
-                st.session_state[LOCAL_USER_KEY] = selected
+                st.session_state[LOCAL_USER_KEY] = str(user["user_id"])
+                st.session_state[LOCAL_USERNAME_KEY] = str(user["username"])
                 logger.info("event=local_ui_login user_ref_set=true")
                 st.rerun()
             except LocalSimulationClientError as exc:
                 st.error(str(exc))
-    else:
-        st.warning("No local users exist yet.")
-    if settings.local_test_user_creation_enabled:
-        with st.expander("Create local test user"):
-            st.caption("Creates a local opaque identifier only. It does not create a Product user.")
-            if st.button("Create test user", width="stretch"):
+    with signup_tab:
+        if settings.local_test_user_creation_enabled:
+            with st.form("local_simulation_signup_form", clear_on_submit=False):
+                new_username = st.text_input("Username", key="local_signup_username")
+                new_password = st.text_input("Password", type="password", key="local_signup_password")
+                confirm_password = st.text_input(
+                    "Confirm password",
+                    type="password",
+                    key="local_signup_confirm_password",
+                )
+                create_submitted = st.form_submit_button("Create account", width="stretch")
+            if create_submitted:
                 try:
-                    user = client.create_user()
+                    user = client.create_user(new_username, new_password, confirm_password)
+                    clear_local_ui_state(st.session_state)
                     st.session_state[LOCAL_USER_KEY] = str(user["user_id"])
-                    logger.info("event=local_ui_login user_ref_set=true source=test_user_created")
+                    st.session_state[LOCAL_USERNAME_KEY] = str(user["username"])
+                    logger.info("event=local_ui_login user_ref_set=true source=signup")
                     st.rerun()
                 except LocalSimulationClientError as exc:
                     st.error(str(exc))
-    else:
-        st.caption("Test-user creation is disabled by configuration.")
+        else:
+            st.caption("Local account creation is disabled by configuration.")
     st.warning("Local simulation data is stored only in the configured development SQLite database. Do not use it as production identity or authorization.")
     st.stop()
 
 
-def _sidebar(client: LocalSimulationApiClient, user_id: str) -> None:
+def _sidebar(client: LocalSimulationApiClient, user_id: str, username: str) -> None:
     with st.sidebar:
         if LOGO_PATH.exists():
             st.image(str(LOGO_PATH), width="stretch")
         st.subheader("Local chatrooms")
-        st.caption(f"Signed in locally: `{user_id[:18]}`")
+        st.caption(f"Signed in locally: `{username}`")
         if st.button("New conversation", width="stretch"):
             try:
                 conversation = client.create_conversation(user_id, "Local investigation")
@@ -169,11 +177,16 @@ def run_local_simulation_workspace(settings: Settings) -> None:
     if not user_id:
         _login_page(client, settings)
     try:
-        client.get_user(str(user_id))
+        user = client.get_user(str(user_id))
+        st.session_state[LOCAL_USERNAME_KEY] = str(user.get("username") or "")
     except LocalSimulationClientError:
         clear_local_ui_state(st.session_state)
         _login_page(client, settings)
-    _sidebar(client, str(user_id))
+    _sidebar(
+        client,
+        str(user_id),
+        str(st.session_state.get(LOCAL_USERNAME_KEY) or "local user"),
+    )
     st.title("Soorin Copilot")
     st.caption("Local Development Simulation for SOC/NOC/NDR investigations")
     left, right = st.columns([0.42, 0.58], gap="large")

@@ -207,11 +207,18 @@ def test_invalid_path_fails_safely(tmp_path: Path) -> None:
         db.initialize()
 
 
-def test_schema_and_database_do_not_store_credentials(tmp_path: Path) -> None:
+def test_schema_stores_only_versioned_password_hashes(tmp_path: Path) -> None:
     db = database(tmp_path)
     repository = SQLiteChatRepository(db)
+    password = "correct horse battery staple"
+    from src.core.memory.local_auth import hash_password, verify_password
+
+    user = repository.create_user(
+        username="analyst",
+        password_hash=hash_password(password),
+    )
     repository.create_conversation(
-        user_id="user-a",
+        user_id=user.user_id,
         conversation_id="conversation-a",
         title="Local investigation",
     )
@@ -219,7 +226,10 @@ def test_schema_and_database_do_not_store_credentials(tmp_path: Path) -> None:
     content = db.path.read_bytes()
     assert b"api_key" not in content.lower()
     assert b"authorization" not in content.lower()
-    assert b"secret-token-value" not in content
+    assert password.encode("utf-8") not in content
+    encoded = repository.get_password_hash(user_id=user.user_id)
+    assert encoded and encoded.startswith("scrypt$v1$")
+    assert verify_password(password, encoded)
 
 
 def test_chat_repository_create_list_get_append_and_bounded_order(

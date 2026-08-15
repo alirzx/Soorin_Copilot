@@ -7,12 +7,16 @@ from types import SimpleNamespace
 
 from src.config.settings import get_settings
 from src.core.agent.nodes import CopilotWorkflowNodes
-from src.core.agent.task_mapping import compile_direct_plan, task_spec_from_route
+from src.core.agent.task_mapping import (
+    compile_direct_plan,
+    derive_request_constraints,
+    task_spec_from_route,
+)
 from src.core.context.entities import EntityResolver
 from src.core.context.models import EntityResolution, IntentDecision, ResolvedEntity
 from src.core.memory.episodes import MemoryContextKey
 from src.core.memory.routing_state import SessionRoutingState
-from src.core.memory.store import MemoryStore
+from src.core.memory.store import MemoryStore, extract_working_facts
 
 
 def _asset_route(entity: str = "192.168.30.115") -> SimpleNamespace:
@@ -183,3 +187,160 @@ def test_t4c_sticky_user_fact_survives_compaction_without_long_term_memory() -> 
     assert "[SOORIN VALIDATED LONG-TERM MEMORY]" not in rendered
     assert snapshot.memory_context is not None
     assert snapshot.memory_context.long_term_memories == ()
+
+
+def test_m1_explicit_investigation_facts_are_typed_and_use_no_tools() -> None:
+    message = (
+        "For this investigation only, remember: tag is ORION-115, owner validation is pending, "
+        "and identity contradiction is Windows XP SP3 fingerprint versus Chrome 150 / Windows NT 10.0 user-agent. "
+        "Keep these in this conversation only."
+    )
+    constraints = derive_request_constraints(message)
+    facts = {item.key: item.value for item in extract_working_facts(message)}
+    task = task_spec_from_route(_asset_route(), message, constraints)
+    resolution = EntityResolver().resolve(
+        message,
+        routing_state=SessionRoutingState(active_entities=("192.168.30.115",)),
+    )
+
+    assert constraints.memory_write and constraints.memory_only
+    assert constraints.allow_live is False
+    assert facts == {
+        "investigation_tag": "ORION-115",
+        "owner_validation": "pending",
+        "identity_contradiction": (
+            "Windows XP SP3 fingerprint versus Chrome 150 / Windows NT 10.0 user-agent"
+        ),
+    }
+    assert compile_direct_plan(task).steps == ()
+    assert [item.value for item in resolution.entities] == ["192.168.30.115"]
+
+
+def test_m2_deterministic_recall_bypasses_router_and_selects_working_facts() -> None:
+    message = (
+        "What investigation tag, owner validation status, and exact unresolved identity "
+        "contradiction do we have for this asset?"
+    )
+    entity = ResolvedEntity(type="ip", value="192.168.30.115", source="conversation")
+    resolution = EntityResolution(
+        status="resolved",
+        entities=[entity],
+        primary_entity=entity,
+        entity_mode="single",
+        candidate_count=1,
+        valid_entity_count=1,
+        reference_detected=True,
+    )
+    service = SimpleNamespace(
+        settings=get_settings(),
+        intent_router=SimpleNamespace(
+            classify=lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("router called"))
+        ),
+        fallback_router=SimpleNamespace(),
+    )
+    update = CopilotWorkflowNodes(service).route(
+        {
+            "message": message,
+            "resolved_entities": resolution,
+            "active_entity_state": SessionRoutingState(active_entities=(entity.value,)),
+            "recent_messages": [],
+            "ui_context": None,
+            "trace_id": "trace",
+            "request_id": "request",
+            "request_constraints": derive_request_constraints(message),
+        }
+    )
+
+    assert update["routing_result"].semantic_router_called is False
+    assert update["routing_result"].materialized_entities == (entity.value,)
+
+
+def test_m3_typed_working_facts_survive_durable_state_restore() -> None:
+    settings = get_settings()
+    key = MemoryContextKey(("192.168.30.115",), "asset_investigation", "none", "asset")
+    first = MemoryStore(20)
+    facts = extract_working_facts(
+        "Remember: tag is ORION-115 and owner validation is pending for this conversation."
+    )
+    first.upsert_working_facts("durable", key, facts)
+    first.record_turn("durable", "Remember these facts.", "Stored.", key, request_id="turn-1")
+    from src.core.identity import RequestIdentity
+    from src.core.memory.persistence import ThreadMemoryState
+
+    identity = RequestIdentity.resolve(
+        session_id="durable",
+        request_id="persist",
+        user_id="user-a",
+        conversation_id="conversation-a",
+    )
+    state = ThreadMemoryState.from_routing_state(
+        identity,
+        SessionRoutingState(active_entities=key.entities),
+        **first.durable_components("durable", turn_limit=4, episode_limit=4),
+    )
+    restored = ThreadMemoryState.from_payload(
+        state.to_payload(),
+        thread_key=state.thread_key,
+        user_id=state.user_id,
+        conversation_id=state.conversation_id,
+        session_id=state.session_id,
+        updated_at=state.updated_at,
+        revision=1,
+        schema_version=state.schema_version,
+    )
+    second = MemoryStore(20)
+    second.restore_durable_state(restored)
+    package = second.compose_memory_context(
+        "durable",
+        settings,
+        context_key=key,
+        active_entities=key.entities,
+    )
+
+    assert {item.key: item.value for item in package.working_facts} == {
+        "investigation_tag": "ORION-115",
+        "owner_validation": "pending for this conversation",
+    }
+
+
+def test_m4_current_reassessment_keeps_live_capabilities_and_historical_baseline() -> None:
+    message = "Check whether this asset is still showing the same identity contradiction."
+    constraints = derive_request_constraints(message)
+    task = task_spec_from_route(_asset_route(), message, constraints)
+
+    assert constraints.require_current and constraints.allow_live
+    assert task.evidence_mode == "current_verification"
+    assert task.required_capabilities
+    assert compile_direct_plan(task).steps
+
+
+def test_m5_current_task_with_name_write_is_not_memory_only() -> None:
+    message = (
+        "Check the current state of this asset and also remember that my name is "
+        "alira hshmi for this conversation."
+    )
+    constraints = derive_request_constraints(message)
+    facts = extract_working_facts(message)
+
+    assert constraints.require_current and constraints.allow_live
+    assert constraints.memory_write and not constraints.memory_only
+    assert [(item.key, item.value) for item in facts] == [("analyst_name", "alira hshmi")]
+
+
+def test_m6_working_facts_are_conversation_scoped() -> None:
+    key = MemoryContextKey(("192.168.30.115",), "asset_investigation", "none", "asset")
+    memory = MemoryStore(20)
+    memory.upsert_working_facts(
+        "conversation-a",
+        key,
+        extract_working_facts("Remember my name is alira hshmi for this conversation."),
+    )
+
+    other = memory.compose_memory_context(
+        "conversation-b",
+        get_settings(),
+        context_key=key,
+        active_entities=key.entities,
+    )
+
+    assert other.working_facts == ()

@@ -16,6 +16,16 @@ def _now() -> str:
 
 
 @dataclass(frozen=True)
+class WorkingFact:
+    """Bounded explicit user fact scoped to one conversation."""
+
+    key: str
+    value: str
+    fact_type: str = "user_provided"
+    created_at: str = field(default_factory=_now)
+
+
+@dataclass(frozen=True)
 class MemoryContextKey:
     """Stable investigation identity without using the literal user message."""
 
@@ -74,6 +84,13 @@ class EpisodeRecord:
     updated_at: str = field(default_factory=_now)
     compact_summary: str = ""
     supported_findings: tuple[str, ...] = ()
+    working_facts: tuple[WorkingFact, ...] = ()
+    inferred_role: tuple[str, ...] = ()
+    key_findings: tuple[str, ...] = ()
+    contradictions: tuple[str, ...] = ()
+    unresolved_questions: tuple[str, ...] = ()
+    next_checks: tuple[str, ...] = ()
+    evidence_scope: tuple[str, ...] = ()
     limitations: tuple[str, ...] = ()
     last_providers: tuple[str, ...] = ()
     last_scope: str = "none"
@@ -95,6 +112,7 @@ class WorkingMemory:
     last_providers: tuple[str, ...] = ()
     last_scope: str = "none"
     limitations: tuple[str, ...] = ()
+    working_facts: tuple[WorkingFact, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -127,6 +145,7 @@ class MemoryContextPackage:
     relevant_turns: tuple[RelevantTurn, ...] = ()
     episode_summaries: tuple[EpisodeRecord, ...] = ()
     long_term_memories: tuple[RetrievedLongTermMemory, ...] = ()
+    working_facts: tuple[WorkingFact, ...] = ()
     active_entities: tuple[str, ...] = ()
     estimated_tokens: int = 0
     omitted: tuple[str, ...] = ()
@@ -137,6 +156,15 @@ class MemoryContextPackage:
             item.memory.statement.strip().casefold()
             for item in self.long_term_memories
         }
+        if self.working_facts:
+            messages.append(
+                {
+                    "role": "system",
+                    "content": "[SOORIN WORKING FACTS]\n" + "\n".join(
+                        f"- {item.key}: {item.value}" for item in self.working_facts
+                    ),
+                }
+            )
         if self.working_summary and self.working_summary.strip().casefold() not in normalized_long_term:
             messages.append(
                 {
@@ -146,10 +174,16 @@ class MemoryContextPackage:
             )
         if self.episode_summaries:
             summaries = "\n".join(
-                episode.compact_summary
+                episode.compact_summary or "\n".join(
+                    (
+                        *(f"contradiction: {item}" for item in episode.contradictions),
+                        *(f"finding: {item}" for item in episode.key_findings),
+                        *(f"next_check: {item}" for item in episode.next_checks),
+                    )
+                )
                 for episode in self.episode_summaries
-                if episode.compact_summary
-                and episode.compact_summary.strip().casefold() not in normalized_long_term
+                if (episode.compact_summary or episode.contradictions or episode.key_findings)
+                and (episode.compact_summary or "").strip().casefold() not in normalized_long_term
             )
             if summaries:
                 messages.append(

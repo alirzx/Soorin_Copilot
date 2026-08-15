@@ -19,6 +19,7 @@ from src.core.memory.episodes import (
     MemoryRepository,
     RelevantTurn,
     TurnReference,
+    WorkingFact,
     WorkingMemory,
 )
 from src.core.memory.persistence import ThreadMemoryState
@@ -27,6 +28,48 @@ from src.core.memory.routing_state import SessionRoutingState
 
 
 logger = logging.getLogger(__name__)
+
+_WORKING_FACT_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    (
+        "analyst_name",
+        re.compile(
+            r"\b(?:my\s+name\s+is|call\s+me)\s+([A-Za-z][A-Za-z .'-]{0,63}?)(?=\s+for\s+(?:this|the)\s+(?:conversation|investigation)|[,.]|$)",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "investigation_tag",
+        re.compile(r"\b(?:investigation\s+)?tag\s+(?:is|=|:)\s*([A-Za-z0-9][A-Za-z0-9._-]{0,63})", re.IGNORECASE),
+    ),
+    (
+        "owner_validation",
+        re.compile(r"\bowner\s+(?:validation(?:\s+status)?|status)\s+(?:is|=|:)\s*([^,.;]{1,80})", re.IGNORECASE),
+    ),
+    (
+        "identity_contradiction",
+        re.compile(
+            r"\b(?:identity\s+)?contradiction\s+(?:is|=|:)\s*(.{1,300}?)(?=\.\s+(?:keep|remember)|,\s*(?:and\s+)?(?:keep|remember)|$)",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "analyst_note",
+        re.compile(r"\banalyst\s+note\s*(?:is|=|:)\s*(.{1,240}?)(?=\.|$)", re.IGNORECASE),
+    ),
+)
+
+
+def extract_working_facts(message: str) -> tuple[WorkingFact, ...]:
+    """Extract only explicit bounded session facts; never infer from model prose."""
+    facts: list[WorkingFact] = []
+    for key, pattern in _WORKING_FACT_PATTERNS:
+        match = pattern.search(message or "")
+        if not match:
+            continue
+        value = " ".join(match.group(1).strip().rstrip(".").split())
+        if value:
+            facts.append(WorkingFact(key=key, value=compact_preview(value, limit=300)))
+    return tuple(facts)
 
 
 @dataclass(frozen=True)
@@ -81,6 +124,36 @@ class MemoryStore:
         self._recorded_request_ids.pop(session_id, None)
         self._turns.pop(session_id, None)
         self.repository.clear_session(session_id)
+
+    def upsert_working_facts(
+        self,
+        session_id: str,
+        context_key: MemoryContextKey,
+        facts: tuple[WorkingFact, ...],
+        *,
+        request_id: str = "",
+    ) -> None:
+        """Persist bounded same-conversation facts without promoting them to LTM."""
+        if not facts:
+            return
+        working = self.repository.get_working(session_id)
+        if working is None:
+            working = WorkingMemory(
+                session_id=session_id,
+                context_key=context_key,
+                episode_id=EpisodeRecord.create(session_id, context_key).episode_id,
+            )
+        merged = {item.key: item for item in working.working_facts}
+        for fact in facts:
+            merged[fact.key] = fact
+        working.working_facts = tuple(merged.values())[-20:]
+        self.repository.set_working(working)
+        logger.info(
+            "event=working_facts_persisted request_id=%s write_count=%s working_fact_count=%s",
+            request_id,
+            len(facts),
+            len(working.working_facts),
+        )
 
     def record_turn(
         self,
@@ -416,9 +489,25 @@ class MemoryStore:
             relevant_turns=tuple(selected),
             episode_summaries=tuple(selected_episodes),
             long_term_memories=tuple(selected_long_term),
+            working_facts=tuple(
+                (self.repository.get_working(session_id) or WorkingMemory(
+                    session_id=session_id,
+                    context_key=context_key or MemoryContextKey(),
+                    episode_id="",
+                )).working_facts
+            ),
             active_entities=tuple(active_entities),
             estimated_tokens=max(0, used + used_long_term_tokens),
             omitted=tuple(dict.fromkeys(omitted)),
+        )
+        fact_tokens = sum(
+            approx_tokens(f"{item.key}: {item.value}") for item in package.working_facts
+        )
+        package = MemoryContextPackage(
+            **{
+                **package.__dict__,
+                "estimated_tokens": package.estimated_tokens + fact_tokens,
+            }
         )
         latency_ms = int((datetime.now(timezone.utc) - started).total_seconds() * 1000)
         logger.info(
@@ -430,9 +519,10 @@ class MemoryStore:
             latency_ms,
         )
         logger.info(
-            "event=memory_context_composed request_id=%s selected_turns=%s episode_count=%s long_term_count=%s estimated_tokens=%s omitted_count=%s",
+            "event=memory_context_composed request_id=%s selected_turns=%s working_fact_count=%s episode_count=%s long_term_count=%s estimated_tokens=%s omitted_count=%s",
             request_id,
             len(selected),
+            len(package.working_facts),
             len(selected_episodes),
             len(selected_long_term),
             package.estimated_tokens,
@@ -577,6 +667,7 @@ class MemoryStore:
                 context_key=context_key,
                 episode_id=episode.episode_id,
                 compact_summary=matching.compact_summary if matching else "",
+                working_facts=working.working_facts,
             )
         )
         logger.info(
@@ -634,6 +725,18 @@ class MemoryStore:
                 session_id=session_id,
                 context_key=working.context_key,
                 compact_summary=summary,
+                working_facts=working.working_facts,
+                inferred_role=tuple(payload.get("inferred_role", ())) if history else (),
+                key_findings=tuple(payload.get("key_findings", ())) if history else (),
+                contradictions=tuple(dict.fromkeys((
+                    *(payload.get("contradictions", ()) if history else ()),
+                    *(item.value for item in working.working_facts if item.key == "identity_contradiction"),
+                ))),
+                unresolved_questions=tuple(payload.get("unresolved_questions", ())) if history else (),
+                next_checks=tuple(payload.get("next_checks", ())) if history else (),
+                evidence_scope=tuple(
+                    f"{key}={value}" for key, value in (payload.get("evidence_scope", {}) if history else {}).items()
+                ),
                 limitations=working.limitations,
                 last_providers=working.last_providers,
                 last_scope=working.last_scope,

@@ -8,7 +8,11 @@ from types import SimpleNamespace
 
 from src.core.identity import RequestIdentity
 from src.core.memory.episodes import EpisodeRecord, MemoryContextKey, WorkingMemory
-from src.core.memory.persistence import LocalChatMessage, ThreadMemoryState
+from src.core.memory.persistence import (
+    THREAD_STATE_SCHEMA_VERSION,
+    LocalChatMessage,
+    ThreadMemoryState,
+)
 from src.core.memory.routing_state import SessionRoutingState
 from src.core.memory.sqlite import LocalSQLiteDatabase, SQLiteThreadStateStore
 from src.core.memory.store import MemoryStore
@@ -170,7 +174,7 @@ def test_sqlite_v2_thread_state_migrates_idempotently(tmp_path: Path) -> None:
     database.initialize()
     loaded = store.load(identity=request_identity)
     assert loaded is not None
-    assert loaded.schema_version == 2
+    assert loaded.schema_version == THREAD_STATE_SCHEMA_VERSION
     assert loaded.active_entities == ("192.0.2.2",)
     assert loaded.recent_turn_references == ()
 
