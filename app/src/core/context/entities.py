@@ -53,6 +53,11 @@ REFERENTIAL_ENTITY_PATTERNS: dict[str, re.Pattern[str]] = {
         r"\b(?:go\s+deeper|continue|continue\s+with\s+(?:this|the\s+same\s+asset)|now\s+show|analy[sz]e\s+further|expand\s+the\s+analysis)\b",
         re.IGNORECASE,
     ),
+    "memory_context_reference": re.compile(
+        r"\b(?:what\s+did\s+(?:i|we)\s+(?:tell|say)|what\s+was\s+the\s+previous\s+contradiction|"
+        r"from\s+(?:stored\s+context|our\s+previous\s+investigation)|(?:conversation|episodic)\s+memory|what(?:'s|\s+is)\s+my\s+name)\b",
+        re.IGNORECASE,
+    ),
     "exhaustive_connection_followup": re.compile(
         r"\b(?:now\s+)?(?:show|list|give|enumerate)\b.{0,40}\b(?:all|every|full|complete)\b.{0,40}"
         r"\b(?:connections?|neighbors?|neighborhoods?|peers?|inbound|outbound|bidirectional)\b",

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
@@ -596,26 +597,37 @@ class MemoryStore:
         history = self.get(session_id)
         summary = self._summaries.get(session_id, {}).get("text", "")
         if history:
-            payload = {
-                "context": working.context_key.identity,
-                "recent_user_requests": [
-                    compact_preview(item.get("content", ""), limit=160)
-                    for item in history
-                    if item.get("role") == "user"
-                ][-3:],
-                "last_assistant_summary": next(
-                    (
-                        compact_preview(item.get("content", ""), limit=280)
-                        for item in reversed(history)
-                        if item.get("role") == "assistant"
-                    ),
-                    "",
-                ),
+            payload = self._build_summary_payload(
+                history,
+                SessionRoutingState(active_entities=working.context_key.entities),
+                route=None,
+                graph_context=None,
+            )
+            payload["context"] = working.context_key.identity
+            payload["evidence_scope"] = {
+                "scope": working.last_scope,
+                "providers": list(working.last_providers),
             }
-            summary = json.dumps(payload, sort_keys=True, ensure_ascii=False)
-        max_chars = max(200, settings.conversation_summary_max_tokens * 4)
-        if len(summary) > max_chars:
-            summary = summary[: max_chars - 20] + "...[truncated]"
+            if summary:
+                try:
+                    prior_summary = json.loads(summary)
+                except (TypeError, ValueError):
+                    prior_summary = {}
+                if isinstance(prior_summary, dict):
+                    for key in (
+                        "sticky_user_facts",
+                        "contradictions",
+                        "inferred_role",
+                        "key_findings",
+                        "next_checks",
+                        "limitations",
+                    ):
+                        if prior_summary.get(key):
+                            payload[key] = prior_summary[key]
+            summary = self._serialize_summary_payload(
+                payload,
+                max_chars=max(200, settings.conversation_summary_max_tokens * 4),
+            )
         self.repository.add_episode(
             EpisodeRecord(
                 episode_id=working.episode_id,
@@ -667,10 +679,10 @@ class MemoryStore:
                     recent.append(item)
                     recent_keys.add(key)
         summary_payload = self._build_summary_payload(older, routing_state, route=route, graph_context=graph_context)
-        text = json.dumps(summary_payload, sort_keys=True)
-        max_chars = max(200, settings.conversation_summary_max_tokens * 4)
-        if len(text) > max_chars:
-            text = text[: max_chars - 20] + "...[truncated]"
+        text = self._serialize_summary_payload(
+            summary_payload,
+            max_chars=max(200, settings.conversation_summary_max_tokens * 4),
+        )
         self._summaries[session_id] = {
             "text": text,
             "summary_updated_at": datetime.now(timezone.utc).isoformat(),
@@ -697,6 +709,38 @@ class MemoryStore:
         return sum(approx_tokens(item.get("content", "")) for item in self.get(session_id))
 
     @staticmethod
+    def _serialize_summary_payload(payload: dict[str, Any], *, max_chars: int) -> str:
+        """Keep compact summaries valid while prioritizing recall-critical facts."""
+        text = json.dumps(payload, ensure_ascii=False)
+        if len(text) <= max_chars:
+            return text
+        compact: dict[str, Any] = {}
+        for key in (
+            "active_entities",
+            "sticky_user_facts",
+            "contradictions",
+            "inferred_role",
+            "key_findings",
+            "next_checks",
+            "limitations",
+            "evidence_scope",
+        ):
+            value = payload.get(key)
+            if isinstance(value, list):
+                compact[key] = [compact_preview(str(item), limit=100) for item in value[:2]]
+            elif value:
+                compact[key] = value
+        text = json.dumps(compact, ensure_ascii=False)
+        return text if len(text) <= max_chars else json.dumps(
+            {
+                "active_entities": compact.get("active_entities", []),
+                "sticky_user_facts": compact.get("sticky_user_facts", []),
+                "contradictions": compact.get("contradictions", []),
+            },
+            ensure_ascii=False,
+        )
+
+    @staticmethod
     def _build_summary_payload(
         older: list[dict[str, str]],
         routing_state: SessionRoutingState,
@@ -709,6 +753,34 @@ class MemoryStore:
             for item in older
             if item.get("role") == "user"
         ][-5:]
+        sticky_user_facts = [
+            compact_preview(item.get("content", ""), limit=180)
+            for item in older
+            if item.get("role") == "user"
+            and re.search(r"\b(?:remember\s+my|my\s+name\s+is)\b", item.get("content", ""), re.IGNORECASE)
+        ][-3:]
+        assistant_sentences = [
+            sentence.strip()
+            for item in older
+            if item.get("role") == "assistant"
+            for sentence in re.split(r"(?<=[.!?])\s+|\n+", str(item.get("content") or ""))
+            if sentence.strip()
+        ]
+
+        def matching(*terms: str, limit: int = 3) -> list[str]:
+            return list(
+                dict.fromkeys(
+                    compact_preview(sentence, limit=220)
+                    for sentence in assistant_sentences
+                    if any(term in sentence.casefold() for term in terms)
+                )
+            )[:limit]
+
+        contradictions = matching("contradict", "conflict", " vs ")
+        inferred_role = matching("role", "fingerprint", "classified", "classification", limit=2)
+        next_checks = matching("next check", "verify", "confirm", "investigate", limit=3)
+        limitations = matching("unavailable", "not observed", "limited", "truncated", "unknown", limit=3)
+        key_findings = list(dict.fromkeys(compact_preview(item, limit=220) for item in assistant_sentences))[-4:]
         known_findings: list[str] = []
         if graph_context:
             if graph_context.get("relationship_mode") == "direct":
@@ -743,10 +815,17 @@ class MemoryStore:
             }
         return {
             "active_entities": list(routing_state.active_entities) or ([routing_state.active_ip] if routing_state.active_ip else []),
+            "sticky_user_facts": sticky_user_facts,
+            "contradictions": contradictions,
+            "inferred_role": inferred_role,
+            "key_findings": key_findings[:5],
+            "next_checks": next_checks,
+            "evidence_scope": previous_route,
+            "limitations": limitations,
             "investigation_topic": previous_route.get("intent") or routing_state.previous_intent or "",
             "known_findings": known_findings[:5],
             "previous_routes": [previous_route] if previous_route else [],
             "older_user_requests": older_user_messages,
-            "unresolved_questions": [],
+            "unresolved_questions": [item for item in older_user_messages if "?" in item][-3:],
             "user_constraints": [],
         }

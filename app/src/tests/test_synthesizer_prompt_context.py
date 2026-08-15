@@ -186,7 +186,7 @@ def test_memory_only_workflow_calls_router_and_synthesizer_but_no_live_tools_or_
     assert [call["purpose"] for call in llm.calls] == ["intent_router", "chat"]
     final_system = llm.calls[-1]["messages"][0]["content"]
     assert '"evidence_mode":"memory_only"' in final_system
-    assert "Legitimate user scope controls" in final_system
+    assert "Users may legitimately narrow scope" in final_system
 
 
 def test_prompt_builder_selects_stable_relevant_modules_and_message_order() -> None:

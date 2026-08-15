@@ -27,13 +27,15 @@ SOURCE_SPECIFIC_KNOWLEDGE = re.compile(
 MEMORY_RECALL_REQUEST = re.compile(
     r"\b(?:which\s+asset.*remember|what\s+(?:do\s+you\s+)?(?:know|remember).*(?:prior|memory|before\s+the\s+restart)|"
     r"summari[sz]e\s+what\s+you\s+remember|continue\s+with\s+the\s+same\s+asset.*before\s+the\s+restart|"
-    r"conversation\s+memory|episodic\s+memory|long[\s-]*term\s+memory|prior\s+investigations?)\b",
+    r"conversation\s+memory|episodic\s+memory|long[\s-]*term\s+memory|prior\s+investigations?|what(?:'s|\s+is)\s+my\s+name|"
+    r"what\s+did\s+(?:i|we)\s+(?:tell|say)|what\s+was\s+the\s+previous\s+contradiction|"
+    r"from\s+(?:stored\s+context|our\s+previous\s+investigation))\b",
     re.IGNORECASE,
 )
 
 NO_LIVE_EVIDENCE_REQUEST = re.compile(
-    r"\b(?:before\s+making\s+any\s+live\s+provider\s+calls|without\s+(?:refreshing|fetching|calling|using)\s+"
-    r"(?:any\s+)?(?:live\s+)?evidence|without\s+refreshing\s+any\s+evidence|do\s+not\s+use\s+live|"
+    r"\b(?:before\s+making\s+any\s+live\s+provider\s+calls|without\s+refreshing|without\s+(?:fetching|calling|using)\s+"
+    r"(?:any\s+)?(?:live\s+)?evidence|do\s+not\s+(?:use|call)\s+(?:live\s+)?(?:product|detection|graph|knowledge|evidence|providers?|refresh)|"
     r"don't\s+use\s+live|do\s+not\s+refresh|don't\s+refresh|no\s+live\s+(?:provider|evidence|refresh)|memory\s+only)\b",
     re.IGNORECASE,
 )
@@ -41,11 +43,7 @@ NO_LIVE_EVIDENCE_REQUEST = re.compile(
 
 def evidence_mode_from_request(request: str) -> EvidenceMode:
     """Recognize explicit recall scope without delegating tool authority to the model."""
-    if MEMORY_RECALL_REQUEST.search(request) and (
-        NO_LIVE_EVIDENCE_REQUEST.search(request)
-        or "remember" in request.casefold()
-        or "memory" in request.casefold()
-    ):
+    if MEMORY_RECALL_REQUEST.search(request):
         return "memory_only"
     if NO_LIVE_EVIDENCE_REQUEST.search(request):
         return "no_live_refresh"

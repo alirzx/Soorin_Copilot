@@ -21,7 +21,12 @@ from src.core.agent.evidence_policy import (
 from src.core.agent.evidence import apply_context_inclusion, context_package_from_evidence
 from src.core.agent.plan_validator import PlanValidationError
 from src.core.agent.planner import PlannerError
-from src.core.agent.task_mapping import compile_direct_plan, compile_supplemental_plan, task_spec_from_route
+from src.core.agent.task_mapping import (
+    compile_direct_plan,
+    compile_supplemental_plan,
+    evidence_mode_from_request,
+    task_spec_from_route,
+)
 from src.core.agent.specialists import AssetInvestigationSpecialist, GraphAnalysisSpecialist
 from src.core.context import ContextComposer, normalize_intent_route
 from src.core.context.intent import (
@@ -144,6 +149,37 @@ class CopilotWorkflowNodes:
         else:
             route_entities = resolution_from_materialized_decision(decision, entities)
             route = normalize_intent_route(decision, route_entities)
+        evidence_mode = evidence_mode_from_request(state["message"])
+        if (
+            evidence_mode in {"memory_only", "no_live_refresh"}
+            and route_entities.status != "resolved"
+            and entities.status == "resolved"
+            and entities.entities
+            and not entities.reference_suppressed
+        ):
+            # A valid deterministic entity must survive an inapplicable router binding.
+            route_entities = entities
+            values = tuple(item.value for item in entities.entities)
+            source = entities.entities[0].source
+            binding = {
+                "message": "explicit",
+                "ui": "ui",
+                "conversation": "active_pair" if len(values) == 2 else "active_single",
+            }[source]
+            route = replace(
+                route,
+                entity_binding=binding,
+                resolved_entity_binding=binding,
+                binding_source=source,
+                binding_available=True,
+                binding_normalized=True,
+                binding_normalization_reason="memory_request_preserves_resolved_entity",
+                materialized_entity_count=len(values),
+                materialized_entities=values,
+                target_entity=entities.primary_entity,
+                target_entities=list(entities.entities),
+                followup_detected=True,
+            )
         if SECURITY_ANALYSIS_WORDS.search(state["message"]) and "security_or_anomaly" not in route.matched_signals:
             route = replace(route, matched_signals=[*route.matched_signals, "security_or_anomaly"])
         return {
@@ -187,7 +223,11 @@ class CopilotWorkflowNodes:
                 },
                 "next_edge": "safe_failure",
             }
-        planner_selected = task.workflow_mode == "multi_step" and self.settings.planner_enabled
+        planner_selected = (
+            task.workflow_mode == "multi_step"
+            and task.evidence_mode == "normal"
+            and self.settings.planner_enabled
+        )
         requirements = self.evidence_requirement_policy.derive(task)
         selection = state.get("long_term_memory_selection")
         memories = tuple(getattr(selection, "memories", ()) or ())
@@ -222,6 +262,12 @@ class CopilotWorkflowNodes:
         }
 
     def build_plan(self, state: InvestigationState) -> dict[str, Any]:
+        if state["task"].evidence_mode != "normal":
+            return {
+                "execution_plan": compile_direct_plan(state["task"]),
+                "planner_called": False,
+                "next_edge": "validate_plan",
+            }
         registry, _validator, _executor = self.service._capability_runtime_snapshot()
         try:
             plan = self.service.planner.plan(
@@ -493,6 +539,8 @@ class CopilotWorkflowNodes:
 
     def review_retrieval(self, state: InvestigationState) -> dict[str, Any]:
         allow = (
+            state["task"].evidence_mode == "normal"
+            and
             self.settings.agent_max_supplemental_retrievals > 0
             and int(state.get("supplemental_retrieval_count", 0)) < 1
         )
@@ -506,6 +554,8 @@ class CopilotWorkflowNodes:
         return {"review_decision": decision, "evidence_pack": pack, "next_edge": next_edge}
 
     def supplemental_retrieval(self, state: InvestigationState) -> dict[str, Any]:
+        if state["task"].evidence_mode != "normal":
+            return {"next_edge": "build_evidence"}
         decision = state["review_decision"]
         if int(state.get("supplemental_retrieval_count", 0)) >= 1:
             return {"next_edge": "build_evidence"}
