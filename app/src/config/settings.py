@@ -642,7 +642,10 @@ def get_settings() -> Settings:
             "none",
             {"none", "sqlite"},
         ),
-        system_prompt_path=os.getenv("SOORIN_SYSTEM_PROMPT_PATH", "app/prompts/system_prompt.md").strip(),
+        system_prompt_path=os.getenv(
+            "SOORIN_SYSTEM_PROMPT_PATH",
+            "app/prompts/synthesizer_static_prompt.md",
+        ).strip(),
         product_api_base_url=os.getenv("SOORIN_PRODUCT_API_BASE_URL", "").strip().rstrip("/"),
         product_topology_path=os.getenv("SOORIN_PRODUCT_TOPOLOGY_PATH", "/zeek/connections/unique-ip-pairs").strip(),
         product_asset_detection_path=os.getenv("SOORIN_PRODUCT_ASSET_DETECTION_PATH", "/asset-detection/test/{ip}").strip(),

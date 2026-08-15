@@ -13,6 +13,9 @@ ToolStatus = Literal["ok", "empty", "not_configured", "unavailable", "invalid", 
 Completeness = Literal["complete", "partial", "unknown"]
 ReviewOutcome = Literal["sufficient", "answer_with_limitations", "missing_required_evidence", "safe_failure"]
 WorkflowMode = Literal["direct", "multi_step"]
+TemporalMode = Literal["current", "historical", "mixed", "compare_previous_current"]
+EvidenceMode = Literal["normal", "memory_only", "no_live_refresh", "current_verification", "verify_if_stale"]
+ResponseDepth = Literal["brief", "standard", "deep", "report"]
 StepRequirement = Literal["required", "optional"]
 PlanSource = Literal["deterministic", "llm", "deterministic_fallback"]
 WorkflowStatus = Literal[
@@ -103,6 +106,9 @@ class TaskSpec:
     is_followup: bool = False
     graph_depth: int = 0
     relationship_mode: str = "none"
+    temporal_mode: TemporalMode = "current"
+    evidence_mode: EvidenceMode = "normal"
+    response_depth: ResponseDepth = "standard"
 
     @property
     def max_steps(self) -> int:
@@ -274,6 +280,9 @@ class InvestigationState(TypedDict, total=False):
     capability_results: list[ToolResult]
     supplemental_retrieval_state: dict[str, Any]
     composed_context: str
+    synthesizer_task_context: Any
+    synthesizer_dynamic_prompt: str
+    synthesizer_module_names: tuple[str, ...]
     model_messages: list[dict[str, str]]
     conversation_snapshot: Any
     memory_context_key: Any

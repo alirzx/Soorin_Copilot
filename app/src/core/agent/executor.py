@@ -108,19 +108,58 @@ class CapabilityExecutor:
                 for step in runnable:
                     if events:
                         events.emit("step_scheduled", plan_id=plan.plan_id, step_id=step.id, capability=step.capability)
-                    futures.append((step, pool.submit(self._execute_step, step, base_payload or {}, events, plan.plan_id)))
+                    timed_out = threading.Event()
+                    futures.append((
+                        step,
+                        timed_out,
+                        pool.submit(
+                            self._execute_step,
+                            step,
+                            base_payload or {},
+                            events,
+                            plan.plan_id,
+                            timed_out,
+                        ),
+                    ))
 
-                for step, future in futures:
+                for step, timed_out, future in futures:
                     spec = self.registry.get(step.capability)
                     remaining = max(0.1, self.total_timeout_seconds - (time.monotonic() - started))
+                    wait_started = time.monotonic()
                     try:
                         result = future.result(timeout=min(spec.timeout_seconds, remaining))
                     except TimeoutError:
+                        timed_out.set()
                         future.cancel()
                         abandoned_running_work = True
-                        result = self._failure(step, "unavailable", "capability_timeout", "Capability execution timed out.")
+                        elapsed_ms = max(1, int((time.monotonic() - wait_started) * 1000))
+                        result = replace(
+                            self._failure(step, "unavailable", "capability_timeout", "Capability execution timed out."),
+                            latency_ms=elapsed_ms,
+                            provider=spec.concurrency_group,
+                            evidence_type=spec.evidence_type,
+                        )
+                        result = replace(
+                            result,
+                            context_identity=identity_for_tool_result(result),
+                        )
+                        get_metrics().observe_tool(
+                            step.capability,
+                            tuple(step.arguments.get("views") or ()),
+                            result.status,
+                            result.latency_ms / 1000,
+                        )
                         if events:
-                            events.emit("step_failed", plan_id=plan.plan_id, step_id=step.id, capability=step.capability, status=result.status, safe_error_code=result.safe_error_code)
+                            events.emit(
+                                "step_failed",
+                                plan_id=plan.plan_id,
+                                step_id=step.id,
+                                capability=step.capability,
+                                provider=result.provider,
+                                status=result.status,
+                                latency_ms=result.latency_ms,
+                                safe_error_code=result.safe_error_code,
+                            )
                     results.append(result)
                     results_by_step[step.id] = result
                     completed_ids.add(step.id)
@@ -135,6 +174,7 @@ class CapabilityExecutor:
         base_payload: dict[str, Any],
         events: WorkflowEventLogger | None,
         plan_id: str,
+        timed_out: threading.Event,
     ) -> ToolResult:
         spec = self.registry.get(step.capability)
         payload = {**step.arguments, **base_payload}
@@ -169,13 +209,14 @@ class CapabilityExecutor:
             result,
             context_identity=result.context_identity or identity_for_tool_result(result),
         )
-        get_metrics().observe_tool(
-            step.capability,
-            result.selected_views or tuple(step.arguments.get("views") or ()),
-            result.status,
-            result.latency_ms / 1000,
-        )
-        if events:
+        if not timed_out.is_set():
+            get_metrics().observe_tool(
+                step.capability,
+                result.selected_views or tuple(step.arguments.get("views") or ()),
+                result.status,
+                result.latency_ms / 1000,
+            )
+        if events and not timed_out.is_set():
             event = "step_completed" if result.status in {"ok", "empty", "not_found"} else "step_partial" if result.status == "partial" else "step_failed"
             events.emit(
                 event,

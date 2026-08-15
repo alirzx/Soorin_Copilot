@@ -29,6 +29,7 @@ from src.core.context.intent import (
     resolution_from_materialized_decision,
 )
 from src.core.context.models import approx_tokens
+from src.core.context.synthesizer_prompt import SynthesizerPromptBuilder
 from src.core.copilot.fallback_answer import build_evidence_fallback_answer
 from src.core.llm.errors import LLMError
 from src.core.llm.providers.base import LLMProviderResult, LLMStreamEvent
@@ -51,6 +52,7 @@ class CopilotWorkflowNodes:
         self.settings = service.settings
         self.stream_sink = stream_sink
         self.context_composer = ContextComposer(self.settings)
+        self.synthesizer_prompt_builder = SynthesizerPromptBuilder()
         self.evidence_requirement_policy = EvidenceRequirementPolicy()
         self.memory_sufficiency_gate = MemorySufficiencyGate()
 
@@ -580,6 +582,20 @@ class CopilotWorkflowNodes:
             else None
         )
         history = list(snapshot.messages if snapshot else [])
+        preliminary_task_context = self.synthesizer_prompt_builder.build_context(
+            task,
+            tuple(state.get("tool_results") or ()),
+            snapshot=snapshot,
+            long_term_selection=long_term_selection,
+            review=state.get("review_decision"),
+        )
+        preliminary_prompt = self.synthesizer_prompt_builder.render_messages(
+            static_core=self.service.system_prompt,
+            context=preliminary_task_context,
+            dynamic_evidence="",
+            history=history,
+            user_message=state["message"],
+        )
         deployment = self.settings.deployment_for_purpose("chat")
         request = deployment.request_config("chat")
         estimator = TokenEstimator(
@@ -588,11 +604,7 @@ class CopilotWorkflowNodes:
             multiplier=self.settings.llm_token_estimate_multiplier,
         )
         output_reservation = estimator.output_reservation(task.detail_level, request.max_tokens)
-        base_messages = [
-            {"role": "system", "content": self.service.system_prompt},
-            *history,
-            {"role": "user", "content": state["message"].strip()},
-        ]
+        base_messages = list(preliminary_prompt.messages)
         base_estimate = estimator.estimate_messages(base_messages)
         dynamic_context = self.context_composer.compose(
             package,
@@ -615,10 +627,21 @@ class CopilotWorkflowNodes:
                 (state.get("supplemental_retrieval_state") or {}).get("history") or ()
             ),
         )
-        messages = [{"role": "system", "content": self.service.system_prompt}]
-        if dynamic_context:
-            messages.append({"role": "system", "content": dynamic_context})
-        messages.extend([*history, {"role": "user", "content": state["message"].strip()}])
+        task_context = self.synthesizer_prompt_builder.build_context(
+            task,
+            tuple(results),
+            snapshot=snapshot,
+            long_term_selection=long_term_selection,
+            review=state.get("review_decision"),
+        )
+        rendered_prompt = self.synthesizer_prompt_builder.render_messages(
+            static_core=self.service.system_prompt,
+            context=task_context,
+            dynamic_evidence=dynamic_context,
+            history=history,
+            user_message=state["message"],
+        )
+        messages = list(rendered_prompt.messages)
         estimate = estimator.estimate_messages(messages)
         budget = estimator.window_budget(
             estimate.calibrated_tokens,
@@ -647,12 +670,35 @@ class CopilotWorkflowNodes:
             output_reservation,
             budget.remaining_usable_tokens,
         )
+        service_logger.info(
+            "event=synth_prompt_rendered request_id=%s synth_prompt_version=%s "
+            "static_prompt_chars=%s static_prompt_estimated_tokens=%s "
+            "dynamic_prompt_chars=%s dynamic_prompt_estimated_tokens=%s "
+            "selected_module_names=%s temporal_mode=%s evidence_mode=%s response_depth=%s "
+            "ltm_active_count=%s ltm_candidate_count=%s baseline_available=%s",
+            state["request_id"],
+            self.synthesizer_prompt_builder.version,
+            len(self.service.system_prompt),
+            approx_tokens(self.service.system_prompt),
+            len(rendered_prompt.dynamic_prompt),
+            approx_tokens(rendered_prompt.dynamic_prompt),
+            ",".join(rendered_prompt.selected_module_names),
+            task_context.temporal_mode,
+            task_context.evidence_mode,
+            task_context.response_depth,
+            task_context.memory.ltm_active_count,
+            task_context.memory.ltm_candidate_count,
+            task_context.memory.compatible_previous_baseline_available,
+        )
         return {
             "tool_results": results,
             "capability_results": results,
             "evidence_pack": pack,
             "composed_context": dynamic_context,
             "model_messages": messages,
+            "synthesizer_task_context": task_context,
+            "synthesizer_dynamic_prompt": rendered_prompt.dynamic_prompt,
+            "synthesizer_module_names": rendered_prompt.selected_module_names,
             "conversation_snapshot": snapshot,
             "synthesis_request": {
                 "max_tokens": output_reservation,

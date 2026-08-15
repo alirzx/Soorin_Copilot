@@ -34,13 +34,15 @@ class MemoryContextKey:
             "asset_comparison"
             if task.intent == "graph_relationships" and relationship == "compare"
             else "asset_investigation"
-            if task.intent in {"asset_investigation", "graph_neighbors", "graph_followup"}
+            if task.intent in {"asset_investigation", "graph_neighbors", "graph_followup", "memory_recall"}
             else "general"
             if task.intent in {"general_knowledge", "general_conversation", "unclear"}
             else task.intent
         )
         scope = (
-            "topology"
+            "asset"
+            if topic == "asset_investigation"
+            else "topology"
             if task.scope in {"node_summary", "one_hop", "two_hop", "full_neighbors"}
             else task.scope or "none"
         )

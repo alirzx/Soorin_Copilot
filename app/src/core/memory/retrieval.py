@@ -62,7 +62,11 @@ class LazyCrossEncoderReranker:
             raise RuntimeError("memory_reranker_not_configured")
         from sentence_transformers import CrossEncoder
 
-        self._model = CrossEncoder(self.model_name, local_files_only=True)
+        self._model = CrossEncoder(
+            self.model_name,
+            device="cpu",
+            local_files_only=True,
+        )
         return self._model
 
     def rerank(self, query: str, documents: Sequence[str]) -> list[float]:
@@ -153,6 +157,9 @@ class LongTermMemorySelection:
     semantic_candidate_count: int = 0
     reranked_count: int = 0
     estimated_tokens: int = 0
+    candidate_record_count: int = 0
+    active_record_count: int = 0
+    selected_count: int = 0
     limitations: tuple[str, ...] = ()
 
 
@@ -348,6 +355,8 @@ class LongTermMemoryRetriever:
             semantic_candidate_count=len(semantic_hits),
             reranked_count=reranked_count,
             estimated_tokens=used_tokens,
+            active_record_count=len(exact),
+            selected_count=len(selected),
             limitations=tuple(dict.fromkeys(limitations)),
         )
 

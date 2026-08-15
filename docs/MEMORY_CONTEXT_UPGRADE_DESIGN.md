@@ -118,8 +118,10 @@ not authenticate a user or authorize a caller-supplied session ID.
 
 ## 3. Current context construction and token pressure
 
-The final model receives the global system prompt, optional dynamic evidence
-context, bounded history, and the current user message. The token estimator uses
+The final model receives the compact static Synthesizer core, a deterministic
+typed runtime task/memory/evidence contract, optional dynamic evidence context,
+bounded history, and the current user message. `ChatPromptTemplate` composes
+these messages without adding another model call. The token estimator uses
 deployment/model labels, an estimate multiplier, output reservation, and a hard
 window guard. History is dropped before current evidence when needed.
 

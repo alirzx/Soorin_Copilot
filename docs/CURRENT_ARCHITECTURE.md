@@ -603,7 +603,7 @@ current-versus-historical observations remain distinct. Compatible delta context
 requires an entity/view/schema-matched complete baseline already accessible in
 current memory; otherwise the compact current view is sent.
 
-Final synthesis receives the global system prompt, a compact reviewed EvidencePack summary, dynamic context reconstructed from EvidencePack provider results, bounded conversation history, and the current user request. No old provider loop or raw provider side channel can add current evidence outside that boundary. If retrieval review, context review, or required graph-context budgeting produces a safe-failure condition, the final LLM is not called. Streaming and non-streaming requests share this same orchestration and differ only in final model transport.
+Final synthesis receives the compact static Synthesizer policy core plus a deterministic typed task contract rendered with LangChain `ChatPromptTemplate`, dynamic context reconstructed from reviewed EvidencePack provider results, bounded conversation/episodic/validated-long-term memory, and the current user request. Module selection is deterministic and adds no model call. The legacy `app/prompts/system_prompt.md` remains byte-stable and selectable as a rollback/compatibility prompt. No old provider loop or raw provider side channel can add current evidence outside that boundary. If retrieval review, context review, or required graph-context budgeting produces a safe-failure condition, the final LLM is not called. Streaming and non-streaming requests share this same orchestration and differ only in final model transport.
 
 Budget controls:
 
