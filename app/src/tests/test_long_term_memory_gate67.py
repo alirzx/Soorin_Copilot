@@ -21,6 +21,8 @@ from src.core.memory.persistence import (
     LOCAL_SCHEMA_VERSION,
     LocalPersistenceConflictError,
     LocalPersistenceOwnershipError,
+    LocalPersistenceQuotaError,
+    MemoryStoragePolicy,
 )
 from src.core.memory.retrieval import (
     LazyCrossEncoderReranker,
@@ -278,6 +280,74 @@ def test_sqlite_v4_migration_and_lifecycle(sqlite_store, tmp_path: Path) -> None
         ).fetchone()
     assert version == str(LOCAL_SCHEMA_VERSION)
     assert table is not None
+
+
+def test_exact_candidate_writes_are_idempotent_and_scope_safe(sqlite_store) -> None:
+    first = candidate()
+    replay = candidate()
+
+    stored_first = sqlite_store.put(memory=first)
+    stored_replay = sqlite_store.put(memory=replay)
+
+    assert stored_replay.memory_id == stored_first.memory_id
+    assert stored_replay.idempotency_fingerprint == stored_first.idempotency_fingerprint
+    assert len(sqlite_store.list(user_id="user-a", statuses=("candidate",))) == 1
+
+    changed = sqlite_store.put(memory=candidate(statement="Changed validated evidence."))
+    other_entity = sqlite_store.put(memory=candidate(entity="192.0.2.11"))
+    other_user = sqlite_store.put(memory=candidate(user="user-b"))
+    assert len({stored_first.memory_id, changed.memory_id, other_entity.memory_id}) == 3
+    assert other_user.memory_id != stored_first.memory_id
+
+
+def test_invalidated_candidate_does_not_block_a_later_equivalent_write(sqlite_store) -> None:
+    first = sqlite_store.put(memory=candidate())
+    sqlite_store.invalidate(
+        user_id=first.user_id,
+        memory_id=first.memory_id,
+        expected_revision=first.revision,
+    )
+
+    replacement = sqlite_store.put(memory=candidate())
+
+    assert replacement.memory_id != first.memory_id
+    assert len(sqlite_store.list(user_id="user-a", statuses=("candidate",))) == 1
+
+
+def test_long_term_quotas_evict_candidates_but_preserve_authoritative_records(
+    tmp_path: Path,
+) -> None:
+    database = LocalSQLiteDatabase(tmp_path / "bounded-memory.sqlite3")
+    database.initialize()
+    store = SQLiteLongTermMemoryStore(
+        database,
+        MemoryStoragePolicy(
+            max_candidate_long_term_per_user=1,
+            max_active_long_term_per_user=1,
+        ),
+    )
+    first = store.put(memory=candidate(statement="First candidate."))
+    second = store.put(memory=candidate(statement="Second candidate."))
+    assert store.get(user_id="user-a", memory_id=first.memory_id) is None
+    assert store.get(user_id="user-a", memory_id=second.memory_id) == second
+
+    promoted = MemoryPromotionPolicy.promote(
+        second,
+        epistemic_status="analyst_confirmed",
+        confidence=1.0,
+        provenance_category="analyst",
+    )
+    store.update(memory=promoted, expected_revision=second.revision)
+    another = store.put(memory=candidate(statement="Third candidate."))
+    another_promoted = MemoryPromotionPolicy.promote(
+        another,
+        epistemic_status="analyst_confirmed",
+        confidence=1.0,
+        provenance_category="analyst",
+    )
+    with pytest.raises(LocalPersistenceQuotaError):
+        store.update(memory=another_promoted, expected_revision=another.revision)
+    assert store.get(user_id="user-a", memory_id=promoted.memory_id) == promoted
 
 
 def test_atomic_index_and_canonical_survives_index_failure(sqlite_store) -> None:

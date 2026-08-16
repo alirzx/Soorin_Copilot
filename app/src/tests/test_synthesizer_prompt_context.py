@@ -19,6 +19,7 @@ from src.core.agent.contracts import (
     CapabilitySpec,
     ExecutionPlan,
     PlanStep,
+    RequestConstraints,
     RetryPolicy,
     TaskSpec,
     ToolResult,
@@ -381,6 +382,44 @@ def test_delta_and_bounded_negative_rules_are_explicit_and_fail_closed() -> None
     assert "not observed never means categorically absent" in contract
     assert "bounded omissions are not negative findings" in static
     assert "compatible_baseline_unavailable" in contract
+
+
+def test_mixed_current_memory_write_contract_is_grounded_in_execution_facts() -> None:
+    task = _task(
+        request="Check its current state and remember that my name is X.",
+        required_capabilities=("asset.get_profile", "asset.get_detection"),
+        evidence_mode="current_verification",
+    )
+    results = (
+        ToolResult(
+            "ok", task.entities, "asset.get_profile", "2026-08-16T10:00:00+00:00",
+            "current", "complete", provider="asset_profile", context_included=True,
+        ),
+        ToolResult(
+            "ok", task.entities, "asset.get_detection", "2026-08-16T10:00:01+00:00",
+            "current", "complete", provider="detection", context_included=True,
+        ),
+    )
+    builder = SynthesizerPromptBuilder()
+    context = builder.build_context(
+        task,
+        results,
+        request_constraints=RequestConstraints(
+            allow_live=True,
+            require_current=True,
+            memory_write=True,
+        ),
+        accepted_working_fact_count=1,
+    )
+    contract, modules = builder.render_contract(context)
+
+    assert context.execution.live_retrieval_performed
+    assert context.execution.capability_call_count == 2
+    assert context.execution.successful_current_evidence_count == 2
+    assert "execution.current_retrieval_completed" in modules
+    assert "execution.working_memory_write" in modules
+    assert "Never claim that live retrieval was prohibited" in contract
+    assert "do not discuss long-term-memory availability" in contract
 
 
 def test_memory_recall_keeps_asset_episode_identity_but_general_topic_detaches() -> None:

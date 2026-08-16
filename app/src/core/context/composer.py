@@ -9,7 +9,12 @@ from typing import Any
 
 from src.config.settings import Settings, get_settings
 from src.core.context.models import CopilotContextPackage, approx_tokens
-from src.core.context.compaction import deduplicate_payloads
+from src.core.context.compaction import (
+    CurrentEvidenceProjection,
+    HistoricalBaselineProjection,
+    build_delta_context,
+    deduplicate_payloads,
+)
 from src.core.context.product_views import build_product_view, payload_inventory
 from src.core.observability.metrics import get_metrics
 
@@ -72,6 +77,7 @@ class ContextComposer:
             "detection": "",
             "graph": "",
             "knowledge": "",
+            "delta": "",
             "fusion": "",
         }
         self.last_inclusion: dict[str, tuple[bool, str | None]] = {}
@@ -82,6 +88,8 @@ class ContextComposer:
         self.last_recomposition_attempted = False
         self.required_context_missing_reason: str | None = None
         self._product_projection_stats: dict[str, tuple[int, int]] = {}
+        self.last_delta_contexts: tuple[dict[str, Any], ...] = ()
+        self.last_delta_skip_reason: str | None = None
 
     def compose(
         self,
@@ -90,12 +98,16 @@ class ContextComposer:
         request_id: str = "",
         base_input_tokens: int = 0,
         reserved_output_tokens: int | None = None,
+        current_projections: tuple[CurrentEvidenceProjection, ...] = (),
+        historical_baselines: tuple[HistoricalBaselineProjection, ...] = (),
     ) -> str:
         return self._compose_product_first(
             package,
             request_id=request_id,
             base_input_tokens=base_input_tokens,
             reserved_output_tokens=reserved_output_tokens,
+            current_projections=current_projections,
+            historical_baselines=historical_baselines,
         )
 
     def _compose_product_first(
@@ -105,6 +117,8 @@ class ContextComposer:
         request_id: str,
         base_input_tokens: int,
         reserved_output_tokens: int | None,
+        current_projections: tuple[CurrentEvidenceProjection, ...],
+        historical_baselines: tuple[HistoricalBaselineProjection, ...],
     ) -> str:
         """Allocate complete Product evidence before bounded Graph and Knowledge context."""
         self._product_projection_stats = {}
@@ -183,7 +197,13 @@ class ContextComposer:
             self.required_context_missing = True
             self.required_context_missing_reason = "required_product_projections_exceed_context"
 
-        used_tokens = product_required_tokens
+        delta_text = self._compose_delta_context(
+            current_projections,
+            historical_baselines,
+            request_id=request_id,
+            token_budget=min(1200, max(0, max_dynamic_tokens - product_required_tokens)),
+        )
+        used_tokens = product_required_tokens + approx_tokens(delta_text)
         included_graphs: list[tuple[str, CopilotContextPackage, str]] = []
         for index, graph_result in enumerate(package.graph_results):
             identity = str(graph_result.context.get("context_identity") or f"graph:{index}")
@@ -247,6 +267,7 @@ class ContextComposer:
                     current_manifest,
                     profile_text,
                     detection_text,
+                    delta_text,
                     "\n\n".join(item[2] for item in included_graphs),
                     knowledge_text,
                 )
@@ -283,7 +304,8 @@ class ContextComposer:
             "detection": detection_text,
             "graph": graph_text,
             "knowledge": knowledge_text,
-            "fusion": "",
+            "delta": delta_text,
+            "fusion": delta_text,
         }
         self.last_budget["total_dynamic_tokens"] = approx_tokens(text)
         logger.info(
@@ -312,10 +334,6 @@ class ContextComposer:
             approx_tokens(knowledge_text),
         )
         logger.info(
-            "event=delta_context_skipped request_id=%s reason=baseline_not_supplied_to_composer",
-            request_id,
-        )
-        logger.info(
             "event=context_compaction_completed request_id=%s raw_estimated_tokens=%s compacted_tokens=%s token_savings_estimate=%s",
             request_id,
             sum(getattr(item, "raw_json_approx_tokens", 0) for item in [*package.asset_profiles, *package.detections]),
@@ -336,6 +354,104 @@ class ContextComposer:
             approx_tokens(product_text),
         )
         return text
+
+    def _compose_delta_context(
+        self,
+        current: tuple[CurrentEvidenceProjection, ...],
+        baselines: tuple[HistoricalBaselineProjection, ...],
+        *,
+        request_id: str,
+        token_budget: int,
+    ) -> str:
+        """Build only exact compatible Product-view deltas and preserve provenance."""
+        self.last_delta_contexts = ()
+        self.last_delta_skip_reason = None
+        reason = "current_projection_unavailable"
+        payloads: list[dict[str, Any]] = []
+        if current and not baselines:
+            reason = "baseline_absent"
+        for projection in current:
+            candidates = [item for item in baselines if item.owner_id == projection.owner_id]
+            if not candidates:
+                reason = "baseline_owner_mismatch" if baselines else reason
+                continue
+            candidates = [
+                item
+                for item in candidates
+                if item.accessible
+                and item.authoritative
+                and item.status == "active"
+                and item.freshness not in {"expired", "inactive"}
+                and item.complete
+            ]
+            if not candidates:
+                reason = "baseline_not_authoritative_or_accessible"
+                continue
+            same_capability = [item for item in candidates if item.capability == projection.capability]
+            if not same_capability:
+                reason = "baseline_capability_mismatch"
+                continue
+            same_entity = [item for item in same_capability if item.entity == projection.entity]
+            if not same_entity:
+                reason = "baseline_entity_mismatch"
+                continue
+            same_view = [item for item in same_entity if item.view == projection.view]
+            if not same_view:
+                reason = "baseline_view_mismatch"
+                continue
+            compatible = [
+                item for item in same_view if item.schema_version == projection.schema_version
+            ]
+            if not compatible:
+                reason = "baseline_schema_mismatch"
+                continue
+            baseline = max(compatible, key=lambda item: (item.observed_at, item.memory_id))
+            delta = build_delta_context(
+                projection.payload,
+                baseline=baseline.payload,
+                current_identity=projection.identity,
+                baseline_identity=baseline.identity,
+                schema_version=projection.schema_version,
+                baseline_schema_version=baseline.schema_version,
+                baseline_accessible=True,
+                current_complete=projection.complete,
+            )
+            if not delta.created:
+                reason = delta.reason
+                continue
+            payloads.append({
+                "entity": projection.entity,
+                "capability": projection.capability,
+                "view": projection.view,
+                "schema_version": projection.schema_version,
+                "baseline": {
+                    "memory_id": baseline.memory_id,
+                    "observed_at": baseline.observed_at,
+                    "provenance": baseline.provenance,
+                },
+                "current_retrieved_at": projection.retrieved_at,
+                "delta": delta.payload,
+            })
+        while payloads:
+            text = "[SOORIN_DELTA_CONTEXT_JSON]\n" + json.dumps(
+                {"comparisons": payloads},
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            ) + "\n[/SOORIN_DELTA_CONTEXT_JSON]"
+            if approx_tokens(text) <= max(0, token_budget):
+                self.last_delta_contexts = tuple(payloads)
+                logger.info(
+                    "event=delta_context_used request_id=%s comparison_count=%s",
+                    request_id,
+                    len(payloads),
+                )
+                return text
+            payloads.pop()
+            reason = "delta_context_budget_exceeded"
+        self.last_delta_skip_reason = reason
+        logger.info("event=delta_context_skipped request_id=%s reason=%s", request_id, reason)
+        return ""
 
     @staticmethod
     def graph_context_cap(context: dict[str, Any]) -> int:

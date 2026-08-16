@@ -7,7 +7,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from src.core.identity import RequestIdentity
-from src.core.memory.episodes import EpisodeRecord, MemoryContextKey, WorkingMemory
+from src.core.memory.episodes import EpisodeRecord, MemoryContextKey, WorkingFact, WorkingMemory
 from src.core.memory.persistence import (
     THREAD_STATE_SCHEMA_VERSION,
     LocalChatMessage,
@@ -42,6 +42,18 @@ def settings(**overrides):
 
 def context(ip: str, topic: str = "asset_investigation") -> MemoryContextKey:
     return MemoryContextKey((ip,), topic, "none", "topology")
+
+
+def test_working_fact_retention_limit_preserves_newest_facts() -> None:
+    memory = MemoryStore(10, max_working_facts=2)
+    facts = tuple(
+        WorkingFact(key=f"key-{index}", value=f"value-{index}")
+        for index in range(3)
+    )
+    memory.upsert_working_facts("session-a", context("192.0.2.10"), facts)
+    working = memory.repository.get_working("session-a")
+    assert working is not None
+    assert [fact.key for fact in working.working_facts] == ["key-1", "key-2"]
 
 
 def identity(user: str = "user-a", conversation: str = "conversation-a") -> RequestIdentity:

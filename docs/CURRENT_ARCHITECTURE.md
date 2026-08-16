@@ -901,6 +901,32 @@ Deferred or not implemented:
 
 ## 22. Remaining Risks and Next Step
 
+## 21A. Memory/workflow stabilization invariants
+
+The current request path distinguishes explicit historical recall from current
+verification. Current language wins unless the user explicitly requests no live
+refresh. Identity contradictions require only the Product profile and detection
+capabilities by default; Graph and Knowledge remain opt-in by task relevance.
+
+The deterministic Reviewer separates non-material caveats from material evidence
+failures. The Synthesizer receives an execution-state contract and cannot describe
+a successful live retrieval as unavailable or skipped. Accepted same-conversation
+facts are described as context, not as storage mechanics.
+
+Current-versus-historical comparison is performed before synthesis. Only complete
+Product view projections with identical owner, entity, capability, view, and schema
+may form a delta, and the historical side must be active, accessible, authoritative,
+and unexpired. Candidate memory never becomes a baseline. The delta retains both
+timestamps and baseline provenance; otherwise composition uses full current evidence
+and records an explicit skip reason.
+
+Local SQLite schema v6 adds deterministic LTM write fingerprints. A partial unique
+index applies only to live candidate/active records, so invalidated or superseded
+history does not block later evidence. `MemoryStoragePolicy` enforces owner-scoped
+chat/LTM limits: newest messages are retained, conversations with durable thread
+state are protected, candidate overflow may evict the oldest candidate, and active
+authoritative memory is never deleted to make room.
+
 Remaining risks:
 
 - There is no durable workflow checkpointing; in-flight work cannot resume after a process restart.

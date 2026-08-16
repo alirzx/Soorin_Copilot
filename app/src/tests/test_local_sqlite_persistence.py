@@ -21,7 +21,9 @@ from src.core.memory.persistence import (
     LocalPersistenceConflictError,
     LocalPersistenceError,
     LocalPersistenceOwnershipError,
+    LocalPersistenceQuotaError,
     LocalPersistenceSchemaError,
+    MemoryStoragePolicy,
 )
 from src.core.memory.routing_state import (
     SessionRoutingState,
@@ -277,6 +279,56 @@ def test_chat_repository_create_list_get_append_and_bounded_order(
     )
     assert [item.content for item in messages] == ["second", "third"]
     assert [item.position for item in messages] == [2, 3]
+
+
+def test_chat_storage_policy_bounds_messages_and_evicts_oldest_unprotected_conversation(
+    tmp_path: Path,
+) -> None:
+    db = database(tmp_path)
+    repository = SQLiteChatRepository(
+        db,
+        MemoryStoragePolicy(
+            max_conversations_per_user=2,
+            max_messages_per_conversation=2,
+        ),
+    )
+    for conversation in ("conversation-a", "conversation-b"):
+        repository.create_conversation(user_id="user-a", conversation_id=conversation)
+    for index in range(3):
+        repository.append(
+            user_id="user-a",
+            conversation_id="conversation-b",
+            request_id=f"request-{index}",
+            role="user",
+            content=f"message-{index}",
+        )
+    assert [item.content for item in repository.recent(
+        user_id="user-a", conversation_id="conversation-b", limit=10
+    )] == ["message-1", "message-2"]
+
+    repository.create_conversation(user_id="user-a", conversation_id="conversation-c")
+    assert repository.get_conversation(
+        user_id="user-a", conversation_id="conversation-a"
+    ) is None
+    assert {item.conversation_id for item in repository.list_conversations(user_id="user-a")} == {
+        "conversation-b", "conversation-c"
+    }
+
+
+def test_conversation_quota_preserves_records_with_durable_thread_state(tmp_path: Path) -> None:
+    db = database(tmp_path)
+    repository = SQLiteChatRepository(
+        db,
+        MemoryStoragePolicy(max_conversations_per_user=1),
+    )
+    repository.create_conversation(user_id="user-a", conversation_id="conversation-a")
+    with db.connect() as connection:
+        connection.execute(
+            "INSERT INTO local_thread_states(thread_key,user_id,conversation_id,session_id,revision,schema_version,state_json,updated_at) "
+            "VALUES ('thread-a','user-a','conversation-a','session-a',1,3,'{}','2026-08-16T00:00:00+00:00')"
+        )
+    with pytest.raises(LocalPersistenceQuotaError):
+        repository.create_conversation(user_id="user-a", conversation_id="conversation-b")
 
 
 def test_chat_repository_owner_and_conversation_isolation(tmp_path: Path) -> None:

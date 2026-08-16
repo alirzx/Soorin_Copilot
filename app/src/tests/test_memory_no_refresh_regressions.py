@@ -5,9 +5,12 @@ from __future__ import annotations
 from dataclasses import replace
 from types import SimpleNamespace
 
+import pytest
+
 from src.config.settings import get_settings
 from src.core.agent.nodes import CopilotWorkflowNodes
 from src.core.agent.task_mapping import (
+    classify_historical_recall,
     compile_direct_plan,
     derive_request_constraints,
     task_spec_from_route,
@@ -344,3 +347,87 @@ def test_m6_working_facts_are_conversation_scoped() -> None:
     )
 
     assert other.working_facts == ()
+
+
+@pytest.mark.parametrize(
+    ("message", "classification"),
+    (
+        ("What have we concluded so far about this asset?", "historical_summary"),
+        ("What do you remember from this investigation?", "explicit_memory"),
+        ("What did we establish about the owner validation?", "historical_summary"),
+        ("Give me the previous findings from this investigation.", "historical_summary"),
+        ("What do we know so far about the identity contradiction?", "historical_summary"),
+    ),
+)
+def test_natural_historical_recall_paraphrases_are_memory_only(
+    message: str,
+    classification: str,
+) -> None:
+    constraints = derive_request_constraints(message)
+
+    assert classify_historical_recall(message) == classification
+    assert constraints.memory_only
+    assert not constraints.allow_live
+    assert not constraints.require_current
+    assert compile_direct_plan(task_spec_from_route(_asset_route(), message, constraints)).steps == ()
+
+
+@pytest.mark.parametrize(
+    "message",
+    (
+        "What have we concluded so far, and what is the current state?",
+        "What do you remember, and verify it again now?",
+        "Recheck the latest identity contradiction from our previous findings.",
+        "Is this asset still showing the same identity contradiction?",
+    ),
+)
+def test_explicit_current_semantics_override_historical_recall(message: str) -> None:
+    constraints = derive_request_constraints(message)
+
+    assert constraints.require_current
+    assert constraints.allow_live
+    assert not constraints.memory_only
+
+
+@pytest.mark.parametrize(
+    "message",
+    (
+        "What is this asset?",
+        "What do we know about asset 192.168.30.115?",
+        "Analyze this asset's identity.",
+    ),
+)
+def test_ordinary_asset_questions_do_not_become_memory_only(message: str) -> None:
+    constraints = derive_request_constraints(message)
+
+    assert classify_historical_recall(message) == "none"
+    assert constraints.allow_live
+    assert not constraints.memory_only
+
+
+def test_current_identity_contradiction_uses_minimum_product_evidence() -> None:
+    message = "Is this asset still showing the same identity contradiction?"
+    task = task_spec_from_route(_asset_route(), message)
+    plan = compile_direct_plan(task)
+
+    assert task.required_capabilities == ("asset.get_profile", "asset.get_detection")
+    assert task.optional_capabilities == ()
+    assert task.workflow_mode == "direct"
+    assert [step.capability for step in plan.steps] == [
+        "asset.get_profile",
+        "asset.get_detection",
+    ]
+
+
+def test_identity_contradiction_preserves_explicit_topology_and_knowledge_needs() -> None:
+    message = (
+        "Verify the current identity contradiction using topology and explain why with runbook background."
+    )
+    task = task_spec_from_route(_asset_route(), message)
+
+    assert task.required_capabilities == (
+        "asset.get_profile",
+        "asset.get_detection",
+        "graph.get_summary",
+    )
+    assert task.optional_capabilities == ("knowledge.search",)

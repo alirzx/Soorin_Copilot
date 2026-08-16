@@ -252,6 +252,11 @@ class Settings:
     local_test_user_creation_enabled: bool
     thread_state_backend: str
     local_sqlite_path: str
+    local_max_conversations_per_user: int
+    local_max_messages_per_conversation: int
+    memory_working_fact_retention_limit: int
+    memory_max_active_records_per_user: int
+    memory_max_candidate_records_per_user: int
     langgraph_checkpoint_backend: str
     system_prompt_path: str
     product_api_base_url: str
@@ -637,6 +642,21 @@ def get_settings() -> Settings:
             "SOORIN_LOCAL_SQLITE_PATH",
             "data/runtime/copilot-local.sqlite3",
         ).strip(),
+        local_max_conversations_per_user=max(
+            1, _int("SOORIN_LOCAL_MAX_CONVERSATIONS_PER_USER", 100)
+        ),
+        local_max_messages_per_conversation=max(
+            1, _int("SOORIN_LOCAL_MAX_MESSAGES_PER_CONVERSATION", 200)
+        ),
+        memory_working_fact_retention_limit=max(
+            1, _int("SOORIN_MEMORY_WORKING_FACT_RETENTION_LIMIT", 20)
+        ),
+        memory_max_active_records_per_user=max(
+            1, _int("SOORIN_MEMORY_MAX_ACTIVE_RECORDS_PER_USER", 500)
+        ),
+        memory_max_candidate_records_per_user=max(
+            1, _int("SOORIN_MEMORY_MAX_CANDIDATE_RECORDS_PER_USER", 250)
+        ),
         langgraph_checkpoint_backend=_choice(
             "SOORIN_LANGGRAPH_CHECKPOINT_BACKEND",
             "none",

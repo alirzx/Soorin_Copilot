@@ -86,6 +86,7 @@ class ToolResult:
     usable_fact_count: int = 0
     projection_truncated: bool = False
     projection_omitted_count: int = 0
+    projection_schema_version: str = ""
 
 
 @dataclass(frozen=True)
@@ -191,6 +192,8 @@ class ReviewDecision:
     supplemental_allowed: bool = False
     next_capability: str | None = None
     next_arguments: dict[str, Any] | None = None
+    caveats: tuple[str, ...] = ()
+    material_limitations: tuple[str, ...] = ()
 
 
 SpecialistStatus = Literal["completed", "completed_with_limitations", "skipped", "failed"]

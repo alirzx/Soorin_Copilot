@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 from dataclasses import replace
 
@@ -16,8 +17,12 @@ from src.core.memory.long_term import (
 from src.core.memory.persistence import (
     LocalPersistenceConflictError,
     LocalPersistenceOwnershipError,
+    LocalPersistenceQuotaError,
+    MemoryStoragePolicy,
 )
 from src.core.memory.sqlite import LocalSQLiteDatabase, _identifier
+
+logger = logging.getLogger(__name__)
 
 
 _COLUMNS = """
@@ -25,6 +30,7 @@ memory_id, user_id, memory_type, statement, epistemic_status, confidence,
 source_request_id, source_conversation_id, evidence_refs_json,
 provenance_category, valid_from, valid_until, created_at, updated_at,
 revision, status, index_status, supersedes_memory_id
+, idempotency_fingerprint
 """
 
 
@@ -49,14 +55,62 @@ def _record(row: sqlite3.Row, entity_ids: tuple[str, ...]) -> LongTermMemoryReco
         status=row["status"],
         index_status=row["index_status"],
         supersedes_memory_id=row["supersedes_memory_id"],
+        idempotency_fingerprint=row["idempotency_fingerprint"] or "",
     )
 
 
 class SQLiteLongTermMemoryStore:
     """Canonical local store with ownership and optimistic-revision checks."""
 
-    def __init__(self, database: LocalSQLiteDatabase) -> None:
+    def __init__(
+        self,
+        database: LocalSQLiteDatabase,
+        policy: MemoryStoragePolicy | None = None,
+    ) -> None:
         self.database = database
+        self.policy = policy or MemoryStoragePolicy()
+
+    def _enforce_admission_quota(
+        self,
+        connection: sqlite3.Connection,
+        memory: LongTermMemoryRecord,
+    ) -> None:
+        if memory.status == "candidate":
+            count = int(connection.execute(
+                "SELECT COUNT(*) AS count FROM local_long_term_memories "
+                "WHERE user_id = ? AND status = 'candidate'",
+                (memory.user_id,),
+            ).fetchone()["count"])
+            if count >= self.policy.max_candidate_long_term_per_user:
+                oldest = connection.execute(
+                    "SELECT memory_id FROM local_long_term_memories "
+                    "WHERE user_id = ? AND status = 'candidate' "
+                    "ORDER BY updated_at ASC, memory_id ASC LIMIT 1",
+                    (memory.user_id,),
+                ).fetchone()
+                if oldest is not None:
+                    connection.execute(
+                        "DELETE FROM local_long_term_memories WHERE memory_id = ?",
+                        (oldest["memory_id"],),
+                    )
+                    logger.info(
+                        "event=long_term_candidate_quota_eviction user_ref_set=true limit=%s",
+                        self.policy.max_candidate_long_term_per_user,
+                    )
+        elif memory.status == "active":
+            count = int(connection.execute(
+                "SELECT COUNT(*) AS count FROM local_long_term_memories "
+                "WHERE user_id = ? AND status = 'active'",
+                (memory.user_id,),
+            ).fetchone()["count"])
+            if count >= self.policy.max_active_long_term_per_user:
+                logger.warning(
+                    "event=long_term_active_quota_rejected user_ref_set=true limit=%s",
+                    self.policy.max_active_long_term_per_user,
+                )
+                raise LocalPersistenceQuotaError(
+                    "Active long-term memory quota is full; authoritative records were preserved."
+                )
 
     @staticmethod
     def _entities(connection: sqlite3.Connection, memory_id: str) -> tuple[str, ...]:
@@ -103,6 +157,7 @@ class SQLiteLongTermMemoryStore:
             memory.status,
             memory.index_status,
             memory.supersedes_memory_id,
+            memory.idempotency_fingerprint,
         )
 
     def get(self, *, user_id: str, memory_id: str) -> LongTermMemoryRecord | None:
@@ -127,8 +182,26 @@ class SQLiteLongTermMemoryStore:
                     "INSERT OR IGNORE INTO local_users(user_id, created_at) VALUES (?, ?)",
                     (memory.user_id, memory.created_at),
                 )
+                equivalent = connection.execute(
+                    f"SELECT {_COLUMNS} FROM local_long_term_memories "
+                    "WHERE user_id = ? AND idempotency_fingerprint = ? "
+                    "AND status IN ('candidate', 'active') ORDER BY updated_at DESC LIMIT 1",
+                    (memory.user_id, memory.idempotency_fingerprint),
+                ).fetchone()
+                if equivalent is not None:
+                    existing = _record(
+                        equivalent,
+                        self._entities(connection, equivalent["memory_id"]),
+                    )
+                    connection.commit()
+                    logger.info(
+                        "event=long_term_memory_write_deduplicated user_ref_set=true status=%s",
+                        existing.status,
+                    )
+                    return existing
+                self._enforce_admission_quota(connection, memory)
                 connection.execute(
-                    f"INSERT INTO local_long_term_memories({_COLUMNS}) VALUES ({','.join('?' for _ in range(18))})",
+                    f"INSERT INTO local_long_term_memories({_COLUMNS}) VALUES ({','.join('?' for _ in range(19))})",
                     self._values(memory),
                 )
                 self._write_entities(connection, memory.memory_id, memory.entity_ids)
@@ -155,11 +228,13 @@ class SQLiteLongTermMemoryStore:
             connection.execute("BEGIN IMMEDIATE")
             try:
                 row = connection.execute(
-                    "SELECT user_id FROM local_long_term_memories WHERE memory_id = ?",
+                    "SELECT user_id, status FROM local_long_term_memories WHERE memory_id = ?",
                     (memory.memory_id,),
                 ).fetchone()
                 if row is None or row["user_id"] != memory.user_id:
                     raise LocalPersistenceOwnershipError("Long-term memory ownership validation failed.")
+                if row["status"] != "active" and memory.status == "active":
+                    self._enforce_admission_quota(connection, memory)
                 cursor = connection.execute(
                     f"UPDATE local_long_term_memories SET {assignments} "
                     "WHERE memory_id = ? AND user_id = ? AND revision = ?",
@@ -273,8 +348,9 @@ class SQLiteLongTermMemoryStore:
                     "INSERT OR IGNORE INTO local_users(user_id, created_at) VALUES (?, ?)",
                     (replacement.user_id, replacement.created_at),
                 )
+                self._enforce_admission_quota(connection, replacement)
                 connection.execute(
-                    f"INSERT INTO local_long_term_memories({_COLUMNS}) VALUES ({','.join('?' for _ in range(18))})",
+                    f"INSERT INTO local_long_term_memories({_COLUMNS}) VALUES ({','.join('?' for _ in range(19))})",
                     self._values(replacement),
                 )
                 self._write_entities(connection, replacement.memory_id, replacement.entity_ids)

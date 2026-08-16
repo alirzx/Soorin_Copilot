@@ -221,6 +221,7 @@ def _provider_result(
         usable_fact_count=evidence_view.usable_fact_count if evidence_view else int(payload is not None),
         projection_truncated=evidence_view.truncated if evidence_view else False,
         projection_omitted_count=evidence_view.projection_omitted_count if evidence_view else 0,
+        projection_schema_version=evidence_view.schema_version if evidence_view else "",
     )
 
 

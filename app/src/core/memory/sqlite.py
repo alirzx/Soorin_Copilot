@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 from contextlib import contextmanager
 from dataclasses import replace
@@ -24,11 +25,15 @@ from src.core.memory.persistence import (
     LocalPersistenceConflictError,
     LocalPersistenceError,
     LocalPersistenceOwnershipError,
+    LocalPersistenceQuotaError,
     LocalPersistenceSchemaError,
+    MemoryStoragePolicy,
     LocalRequestCommit,
     LocalUser,
     utc_now,
 )
+
+logger = logging.getLogger(__name__)
 
 
 _SCHEMA_SQL = """
@@ -120,7 +125,8 @@ CREATE TABLE IF NOT EXISTS local_long_term_memories (
     revision INTEGER NOT NULL CHECK (revision > 0),
     status TEXT NOT NULL,
     index_status TEXT NOT NULL,
-    supersedes_memory_id TEXT
+    supersedes_memory_id TEXT,
+    idempotency_fingerprint TEXT
 );
 
 CREATE TABLE IF NOT EXISTS local_long_term_memory_entities (
@@ -137,6 +143,10 @@ ON local_long_term_memories(user_id, memory_type, epistemic_status, status);
 
 CREATE INDEX IF NOT EXISTS idx_local_long_term_memory_entity
 ON local_long_term_memory_entities(entity_id, memory_id);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_local_long_term_memory_live_fingerprint
+ON local_long_term_memories(user_id, idempotency_fingerprint)
+WHERE idempotency_fingerprint IS NOT NULL AND status IN ('candidate', 'active');
 """
 
 
@@ -211,7 +221,7 @@ class LocalSQLiteDatabase:
                         "SELECT value FROM schema_metadata WHERE key = ?",
                         ("local_schema_version",),
                     ).fetchone()
-                    if row is not None and row["value"] in {"1", "2", "3", "4"}:
+                    if row is not None and row["value"] in {"1", "2", "3", "4", "5"}:
                         connection.execute("BEGIN IMMEDIATE")
                         try:
                             version = int(row["value"])
@@ -226,6 +236,9 @@ class LocalSQLiteDatabase:
                                 version = 4
                             if version == 4:
                                 self._upgrade_v4_to_v5(connection)
+                                version = 5
+                            if version == 5:
+                                self._upgrade_v5_to_v6(connection)
                             connection.commit()
                         except Exception:
                             connection.rollback()
@@ -427,6 +440,27 @@ class LocalSQLiteDatabase:
             (str(LOCAL_SCHEMA_VERSION), "local_schema_version"),
         )
 
+    @staticmethod
+    def _upgrade_v5_to_v6(connection: sqlite3.Connection) -> None:
+        """Add nullable exact-write fingerprints without rewriting legacy records."""
+        columns = {
+            row["name"]
+            for row in connection.execute("PRAGMA table_info(local_long_term_memories)")
+        }
+        if "idempotency_fingerprint" not in columns:
+            connection.execute(
+                "ALTER TABLE local_long_term_memories ADD COLUMN idempotency_fingerprint TEXT"
+            )
+        connection.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_local_long_term_memory_live_fingerprint "
+            "ON local_long_term_memories(user_id, idempotency_fingerprint) "
+            "WHERE idempotency_fingerprint IS NOT NULL AND status IN ('candidate', 'active')"
+        )
+        connection.execute(
+            "UPDATE schema_metadata SET value = ? WHERE key = ?",
+            (str(LOCAL_SCHEMA_VERSION), "local_schema_version"),
+        )
+
     def foreign_keys_enabled(self) -> bool:
         with self.connect() as connection:
             row = connection.execute("PRAGMA foreign_keys").fetchone()
@@ -479,8 +513,13 @@ def _user(row: sqlite3.Row) -> LocalUser:
 class SQLiteChatRepository:
     """Owner-scoped local transcript adapter for future UI simulation."""
 
-    def __init__(self, database: LocalSQLiteDatabase) -> None:
+    def __init__(
+        self,
+        database: LocalSQLiteDatabase,
+        policy: MemoryStoragePolicy | None = None,
+    ) -> None:
         self.database = database
+        self.policy = policy or MemoryStoragePolicy()
 
     def create_user(
         self,
@@ -599,6 +638,35 @@ class SQLiteChatRepository:
                         "Local conversation ownership validation failed."
                     )
                 if existing is None:
+                    count = connection.execute(
+                        "SELECT COUNT(*) AS count FROM local_conversations WHERE user_id = ?",
+                        (user,),
+                    ).fetchone()["count"]
+                    if int(count) >= self.policy.max_conversations_per_user:
+                        evictable = connection.execute(
+                            "SELECT c.conversation_id FROM local_conversations c "
+                            "WHERE c.user_id = ? AND NOT EXISTS ("
+                            "SELECT 1 FROM local_thread_states t "
+                            "WHERE t.user_id = c.user_id AND t.conversation_id = c.conversation_id) "
+                            "ORDER BY c.updated_at ASC, c.conversation_id ASC LIMIT 1",
+                            (user,),
+                        ).fetchone()
+                        if evictable is None:
+                            logger.warning(
+                                "event=local_conversation_quota_rejected user_ref_set=true limit=%s",
+                                self.policy.max_conversations_per_user,
+                            )
+                            raise LocalPersistenceQuotaError(
+                                "Conversation quota is full and all records carry durable thread state."
+                            )
+                        connection.execute(
+                            "DELETE FROM local_conversations WHERE conversation_id = ?",
+                            (evictable["conversation_id"],),
+                        )
+                        logger.info(
+                            "event=local_conversation_quota_eviction user_ref_set=true limit=%s",
+                            self.policy.max_conversations_per_user,
+                        )
                     connection.execute(
                         """
                         INSERT INTO local_conversations(
@@ -781,6 +849,24 @@ class SQLiteChatRepository:
                     "UPDATE local_conversations SET updated_at = ? WHERE conversation_id = ?",
                     (now, conversation),
                 )
+                pruned = connection.execute(
+                    "DELETE FROM local_messages WHERE message_id IN ("
+                    "SELECT message_id FROM local_messages WHERE conversation_id = ? "
+                    "ORDER BY position DESC LIMIT -1 OFFSET ?)",
+                    (conversation, self.policy.max_messages_per_conversation),
+                )
+                connection.execute(
+                    "DELETE FROM local_request_commits WHERE conversation_id = ? "
+                    "AND request_id NOT IN (SELECT request_id FROM local_messages "
+                    "WHERE conversation_id = ?)",
+                    (conversation, conversation),
+                )
+                if pruned.rowcount:
+                    logger.info(
+                        "event=local_message_retention_pruned conversation_ref_set=true count=%s limit=%s",
+                        pruned.rowcount,
+                        self.policy.max_messages_per_conversation,
+                    )
                 connection.commit()
                 return message
             except Exception:

@@ -3,13 +3,17 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import json
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import patch
 
+import pytest
+
 from src.config.settings import get_settings
 from src.core.agent.contracts import ExecutionPlan, PlanStep, TaskSpec, ToolResult
 from src.core.agent.nodes import CopilotWorkflowNodes
+from src.core.agent.reviewer import EvidenceReviewer
 from src.core.agent.evidence_policy import (
     EvidenceRequirementPolicy,
     MemorySufficiencyGate,
@@ -20,6 +24,14 @@ from src.core.agent.evidence_policy import (
     structured_memory_statement,
 )
 from src.core.context.compaction import build_delta_context, deduplicate_payloads
+from src.core.context.compaction import (
+    HistoricalBaselineProjection,
+    current_evidence_projections,
+    historical_baseline_projections,
+)
+from src.core.context.composer import ContextComposer
+from src.core.context.entities import EntityResolver
+from src.core.context.models import CopilotContextPackage
 from src.core.context.product_views import build_product_view, payload_inventory, select_product_views
 from src.core.memory.long_term import LongTermMemoryRecord, MemoryPromotionPolicy, RetrievedLongTermMemory
 from src.core.identity import RequestIdentity
@@ -456,3 +468,166 @@ def test_offline_context_efficiency_matrix_uses_expected_minimum_views() -> None
             assert projected.token_estimate == payload_inventory(payload).approx_tokens
         else:
             assert projected.token_estimate < payload_inventory(payload).approx_tokens
+
+
+def test_reviewer_keeps_normal_caveats_without_limiting_success() -> None:
+    task = _task("Check the current identity.", ("asset.get_profile",))
+    result = ToolResult(
+        status="ok",
+        entities=(IP,),
+        source_capability="asset.get_profile",
+        retrieved_at="2026-08-16T00:00:00+00:00",
+        freshness="current",
+        completeness="complete",
+        limitations=("Product evidence is point-in-time.",),
+        context_included=True,
+        context_representation="projected",
+        source_payload_complete=True,
+        projection_usable=True,
+    )
+
+    decision = EvidenceReviewer().review(task, [result])
+
+    assert decision.outcome == "sufficient"
+    assert decision.caveats == ("Product evidence is point-in-time.",)
+    assert decision.material_limitations == ()
+
+
+def test_reviewer_required_provider_failure_is_material() -> None:
+    task = _task("Check the current identity.", ("asset.get_profile",))
+    result = ToolResult(
+        status="unavailable",
+        entities=(IP,),
+        source_capability="asset.get_profile",
+        retrieved_at="2026-08-16T00:00:00+00:00",
+        freshness="unknown",
+        completeness="unknown",
+    )
+
+    decision = EvidenceReviewer().review(task, [result])
+
+    assert decision.outcome == "safe_failure"
+    assert decision.material_limitations
+
+
+def _structured_baseline(
+    *,
+    entity: str = IP,
+    view: str = "overview",
+    schema_version: str = "product-view-v1",
+    freshness: str = "historical",
+    candidate: bool = False,
+) -> RetrievedLongTermMemory:
+    statement = json.dumps({
+        "source_capability": "asset.get_profile",
+        "entities": [entity],
+        "evidence_classes": ["asset_identity", "asset_role"],
+        "selected_views": [view],
+        "schema_version": schema_version,
+        "completeness": "complete",
+        "projection_complete": True,
+        "evidence": {
+            "provider": "asset_profile",
+            "views": {view: {"role": "server", "risk": 4}},
+        },
+    }, separators=(",", ":"), sort_keys=True)
+    record = LongTermMemoryRecord.candidate(
+        memory_type="validated_finding",
+        user_id="user_test",
+        entity_ids=(entity,),
+        statement=statement,
+        source_request_id="baseline-request",
+        source_conversation_id="baseline-conversation",
+    )
+    if not candidate:
+        record = MemoryPromotionPolicy.promote(
+            record,
+            epistemic_status="analyst_confirmed",
+            confidence=1.0,
+            provenance_category="analyst",
+        )
+    return RetrievedLongTermMemory(record, 1.0, "exact_entity", freshness)  # type: ignore[arg-type]
+
+
+def _current_profile_projection() -> tuple[Any, ...]:
+    result = ToolResult(
+        status="ok",
+        entities=(IP,),
+        source_capability="asset.get_profile",
+        retrieved_at="2026-08-16T00:00:00+00:00",
+        freshness="current",
+        completeness="complete",
+        selected_views=("overview",),
+        view_payload={
+            "provider": "asset_profile",
+            "views": {"overview": {"role": "server", "risk": 7}},
+        },
+        projection_schema_version="product-view-v1",
+        projection_usable=True,
+        source_payload_complete=True,
+    )
+    return current_evidence_projections((result,), owner_id="user_test")
+
+
+def test_production_composer_uses_only_compatible_authoritative_baseline() -> None:
+    current = _current_profile_projection()
+    baselines = historical_baseline_projections((_structured_baseline(),))
+    composer = ContextComposer(get_settings())
+    text = composer.compose(
+        CopilotContextPackage(entities=EntityResolver().resolve(IP)),
+        current_projections=current,
+        historical_baselines=baselines,
+        request_id="delta-compatible",
+    )
+
+    assert "[SOORIN_DELTA_CONTEXT_JSON]" in text
+    assert composer.last_delta_contexts
+    assert composer.last_delta_contexts[0]["delta"]["changed"] == {"risk": 7}
+    assert composer.last_delta_contexts[0]["baseline"]["provenance"] == "analyst"
+    task = _task(
+        "Is this asset still showing the same identity contradiction?",
+        ("asset.get_profile", "asset.get_detection"),
+    )
+    assert task.required_capabilities
+
+
+@pytest.mark.parametrize(
+    ("change", "expected_reason"),
+    (
+        ({"entity": "192.0.2.99"}, "baseline_entity_mismatch"),
+        ({"view": "identity"}, "baseline_view_mismatch"),
+        ({"schema_version": "product-view-v0"}, "baseline_schema_mismatch"),
+        ({"authoritative": False, "status": "candidate"}, "baseline_not_authoritative_or_accessible"),
+        ({"freshness": "expired"}, "baseline_not_authoritative_or_accessible"),
+        ({"accessible": False}, "baseline_not_authoritative_or_accessible"),
+    ),
+)
+def test_production_composer_fails_closed_for_incompatible_baseline(
+    change: dict[str, Any],
+    expected_reason: str,
+) -> None:
+    baseline = historical_baseline_projections((_structured_baseline(),))[0]
+    baseline = replace(baseline, **change)
+    composer = ContextComposer(get_settings())
+    text = composer.compose(
+        CopilotContextPackage(entities=EntityResolver().resolve(IP)),
+        current_projections=_current_profile_projection(),
+        historical_baselines=(baseline,),
+        request_id="delta-incompatible",
+    )
+
+    assert "[SOORIN_DELTA_CONTEXT_JSON]" not in text
+    assert composer.last_delta_contexts == ()
+    assert composer.last_delta_skip_reason == expected_reason
+
+
+def test_candidate_ltm_never_becomes_authoritative_delta_baseline() -> None:
+    baseline = historical_baseline_projections((_structured_baseline(candidate=True),))[0]
+    assert not baseline.authoritative
+    composer = ContextComposer(get_settings())
+    composer.compose(
+        CopilotContextPackage(entities=EntityResolver().resolve(IP)),
+        current_projections=_current_profile_projection(),
+        historical_baselines=(baseline,),
+    )
+    assert composer.last_delta_skip_reason == "baseline_not_authoritative_or_accessible"

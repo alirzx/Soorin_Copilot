@@ -377,8 +377,9 @@ class LongTermMemoryCoordinator:
             raise ValueError("Only explicit candidate records can use create_candidate")
         stored = self.store.put(memory=memory)
         logger.info(
-            "event=long_term_memory_candidate_created memory_type=%s status=candidate",
+            "event=long_term_memory_candidate_write memory_type=%s status=candidate deduplicated=%s",
             memory.memory_type,
+            stored.memory_id != memory.memory_id,
         )
         return stored
 

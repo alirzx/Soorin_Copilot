@@ -38,6 +38,7 @@ settings = get_settings()
 memory_store = MemoryStore(
     settings.conversation_max_messages,
     max_episodes=settings.memory_episode_retention_limit,
+    max_working_facts=settings.memory_working_fact_retention_limit,
 )
 routing_state_store = SessionRoutingStateStore()
 product_client = get_product_api_client()

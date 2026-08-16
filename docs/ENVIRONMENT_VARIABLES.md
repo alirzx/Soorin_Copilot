@@ -868,6 +868,33 @@ Secrets such as API keys, passwords, Product tokens, captcha bypass values, and 
 
 `SOORIN_LOCAL_SQLITE_PATH` is the filesystem location of the local development SQLite database used by local chat simulation, thread state, and development memory adapters where enabled. The parent directory must be writable; changing it selects a different local persistence database. It contains development state and should live under ignored/persistent runtime data rather than source control.
 
+### `SOORIN_LOCAL_MAX_CONVERSATIONS_PER_USER`
+
+Positive owner-scoped local conversation limit. The default is `100`. At capacity,
+the oldest conversation without durable thread state is removed; if every record is
+protected, creation fails safely.
+
+### `SOORIN_LOCAL_MAX_MESSAGES_PER_CONVERSATION`
+
+Positive stored transcript-message limit per local conversation. The default is
+`200`; successful appends prune only the oldest messages and retain the newest.
+
+### `SOORIN_MEMORY_WORKING_FACT_RETENTION_LIMIT`
+
+Positive same-conversation working-fact limit. The default is `20`. Deterministic
+key replacement occurs before retaining the newest bounded set.
+
+### `SOORIN_MEMORY_MAX_ACTIVE_RECORDS_PER_USER`
+
+Positive active LTM limit per owner. The default is `500`. Admission beyond the
+limit is rejected; existing authoritative records are never deleted automatically.
+
+### `SOORIN_MEMORY_MAX_CANDIDATE_RECORDS_PER_USER`
+
+Positive candidate LTM limit per owner. The default is `250`. A genuinely new
+candidate at capacity evicts the oldest candidate only; exact retries deduplicate
+before quota enforcement.
+
 ### `SOORIN_LANGGRAPH_CHECKPOINT_BACKEND`
 
 `SOORIN_LANGGRAPH_CHECKPOINT_BACKEND` selects the configured LangGraph checkpoint backend. The current safe/implemented runtime behavior uses `none`; architecture documentation notes that SQLite checkpointing remains deliberately deferred because full `InvestigationState` is not yet checkpoint-safe. A configured `sqlite` value may currently log deferral rather than enabling resume. `(double-check exact accepted values and current deferral behavior against workflow initialization code)`

@@ -11,6 +11,7 @@ from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 
 from src.core.agent.contracts import (
     EvidenceMode,
+    RequestConstraints,
     ResponseDepth,
     ReviewDecision,
     TaskSpec,
@@ -46,6 +47,17 @@ class SynthesizerProviderState:
 
 
 @dataclass(frozen=True)
+class SynthesizerExecutionState:
+    current_retrieval_requested: bool = False
+    live_retrieval_performed: bool = False
+    capability_call_count: int = 0
+    successful_current_evidence_count: int = 0
+    current_evidence_timestamps: tuple[str, ...] = ()
+    memory_write_requested: bool = False
+    accepted_working_fact_count: int = 0
+
+
+@dataclass(frozen=True)
 class SynthesizerTaskContext:
     task_category: str
     intent: str
@@ -53,6 +65,7 @@ class SynthesizerTaskContext:
     temporal_mode: TemporalMode
     evidence_mode: EvidenceMode
     response_depth: ResponseDepth
+    execution: SynthesizerExecutionState
     memory: SynthesizerMemoryState
     profile: SynthesizerProviderState
     detection: SynthesizerProviderState
@@ -117,6 +130,16 @@ MEMORY_MODULES = {
     "historical_memory_only": "The supplied context is historical memory only; do not imply it is current without verification.",
 }
 
+EXECUTION_MODULES = {
+    "current_retrieval_completed": (
+        "Current/live retrieval was performed and returned usable current evidence for this request. "
+        "Never claim that live retrieval was prohibited, unavailable, skipped, or impossible; describe only any provider-specific gap that the contract reports."
+    ),
+    "working_memory_write": (
+        "The request contains accepted conversation working facts. Describe them naturally when relevant and do not discuss long-term-memory availability or storage-provider mechanics unless the user asked about them."
+    ),
+}
+
 ANALYSIS_MODULES = {
     "threat": "Separate observed threat indicators from inference and hypothesis.",
     "defender_ir": "Prioritize defensible investigation implications and bounded next checks.",
@@ -156,6 +179,9 @@ class SynthesizerPromptBuilder:
         snapshot: Any = None,
         long_term_selection: Any = None,
         review: ReviewDecision | None = None,
+        request_constraints: RequestConstraints | None = None,
+        accepted_working_fact_count: int = 0,
+        delta_contexts: tuple[dict[str, Any], ...] = (),
     ) -> SynthesizerTaskContext:
         memory_package = getattr(snapshot, "memory_context", None)
         selected_count = max(
@@ -175,7 +201,7 @@ class SynthesizerPromptBuilder:
             ltm_active_count=int(getattr(long_term_selection, "active_record_count", 0) or 0),
             ltm_selected_count=selected_count,
             historical_only=task.evidence_mode == "memory_only",
-            compatible_previous_baseline_available=False,
+            compatible_previous_baseline_available=bool(delta_contexts),
         )
         provider_states = {
             "profile": self._provider_state(results, "asset.get_profile"),
@@ -183,6 +209,30 @@ class SynthesizerPromptBuilder:
             "graph": self._provider_state(results, "graph."),
             "knowledge": self._provider_state(results, "knowledge.search"),
         }
+        live_results = tuple(item for item in results if item.provider != "long_term_memory")
+        successful_current = tuple(
+            item
+            for item in live_results
+            if item.status in {"ok", "partial"} and item.freshness == "current"
+        )
+        constraints = request_constraints or RequestConstraints(
+            require_current=task.evidence_mode == "current_verification"
+        )
+        execution = SynthesizerExecutionState(
+            current_retrieval_requested=bool(constraints.require_current),
+            live_retrieval_performed=bool(live_results),
+            capability_call_count=len(live_results),
+            successful_current_evidence_count=len(successful_current),
+            current_evidence_timestamps=tuple(
+                dict.fromkeys(
+                    str(item.valid_at or item.retrieved_at)
+                    for item in successful_current
+                    if item.valid_at or item.retrieved_at
+                )
+            )[:8],
+            memory_write_requested=bool(constraints.memory_write),
+            accepted_working_fact_count=max(0, int(accepted_working_fact_count)),
+        )
         limitations = tuple(
             dict.fromkeys(
                 [
@@ -200,15 +250,19 @@ class SynthesizerPromptBuilder:
             temporal_mode=task.temporal_mode,
             evidence_mode=task.evidence_mode,
             response_depth=self._response_depth(task),
+            execution=execution,
             memory=memory,
             profile=provider_states["profile"],
             detection=provider_states["detection"],
             graph=provider_states["graph"],
             knowledge=provider_states["knowledge"],
             contradiction_count=contradiction_count,
-            # TODO: Populate only from a validated deterministic baseline/delta source.
-            current_vs_historical_relationship="compatible_baseline_unavailable",
-            deterministic_delta_available=False,
+            current_vs_historical_relationship=(
+                "compatible_deterministic_delta_supplied"
+                if delta_contexts
+                else "compatible_baseline_unavailable"
+            ),
+            deterministic_delta_available=bool(delta_contexts),
             selected_analytical_lenses=self._analytical_lenses(task),
             limitations=limitations,
             output_constraints=(
@@ -223,6 +277,16 @@ class SynthesizerPromptBuilder:
         modules: list[tuple[str, str]] = [(f"task.{context.task_category}", TASK_MODULES[context.task_category])]
         modules.append((f"temporal.{context.temporal_mode}", TEMPORAL_MODULES[context.temporal_mode]))
         modules.append((f"evidence_mode.{context.evidence_mode}", EVIDENCE_MODE_MODULES[context.evidence_mode]))
+        if (
+            context.execution.current_retrieval_requested
+            and context.execution.live_retrieval_performed
+            and context.execution.successful_current_evidence_count > 0
+        ):
+            modules.append(
+                ("execution.current_retrieval_completed", EXECUTION_MODULES["current_retrieval_completed"])
+            )
+        if context.execution.memory_write_requested and context.execution.accepted_working_fact_count:
+            modules.append(("execution.working_memory_write", EXECUTION_MODULES["working_memory_write"]))
         for name, state in (
             ("profile", context.profile),
             ("detection", context.detection),
@@ -258,6 +322,7 @@ class SynthesizerPromptBuilder:
             "temporal_mode": context.temporal_mode,
             "evidence_mode": context.evidence_mode,
             "response_depth": context.response_depth,
+            "execution": context.execution.__dict__,
             "memory": context.memory.__dict__,
             "providers": {
                 "profile": context.profile.__dict__,

@@ -97,8 +97,10 @@ class MemoryStore:
         repository: MemoryRepository | None = None,
         *,
         max_episodes: int = 20,
+        max_working_facts: int = 20,
     ) -> None:
         self.max_messages = max(0, max_messages)
+        self.max_working_facts = max(1, int(max_working_facts))
         self._history: dict[str, list[dict[str, str]]] = {}
         self._latest_completed_turns: dict[str, list[dict[str, str]]] = {}
         self._summaries: dict[str, dict[str, Any]] = {}
@@ -146,7 +148,7 @@ class MemoryStore:
         merged = {item.key: item for item in working.working_facts}
         for fact in facts:
             merged[fact.key] = fact
-        working.working_facts = tuple(merged.values())[-20:]
+        working.working_facts = tuple(merged.values())[-self.max_working_facts :]
         self.repository.set_working(working)
         logger.info(
             "event=working_facts_persisted request_id=%s write_count=%s working_fact_count=%s",

@@ -7,7 +7,7 @@ from dataclasses import dataclass
 
 from src.config.settings import Settings
 from src.core.memory.ports import ChatRepository, LongTermMemoryStore, ThreadStateStore
-from src.core.memory.persistence import LocalPersistenceError
+from src.core.memory.persistence import LocalPersistenceError, MemoryStoragePolicy
 from src.core.memory.sqlite import (
     LocalSQLiteDatabase,
     SQLiteChatRepository,
@@ -56,10 +56,16 @@ def build_local_persistence(settings: Settings) -> LocalPersistenceAdapters:
         thread_enabled,
         long_term_enabled,
     )
+    policy = MemoryStoragePolicy(
+        max_conversations_per_user=settings.local_max_conversations_per_user,
+        max_messages_per_conversation=settings.local_max_messages_per_conversation,
+        max_active_long_term_per_user=settings.memory_max_active_records_per_user,
+        max_candidate_long_term_per_user=settings.memory_max_candidate_records_per_user,
+    )
     return LocalPersistenceAdapters(
-        chat_repository=SQLiteChatRepository(database) if chat_enabled else None,
+        chat_repository=SQLiteChatRepository(database, policy) if chat_enabled else None,
         thread_state_store=SQLiteThreadStateStore(database) if thread_enabled else None,
         long_term_memory_store=(
-            SQLiteLongTermMemoryStore(database) if long_term_enabled else None
+            SQLiteLongTermMemoryStore(database, policy) if long_term_enabled else None
         ),
     )

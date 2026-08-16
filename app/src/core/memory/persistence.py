@@ -18,7 +18,7 @@ from src.core.memory.episodes import (
 from src.core.memory.routing_state import SessionRoutingState
 
 
-LOCAL_SCHEMA_VERSION = 5
+LOCAL_SCHEMA_VERSION = 6
 THREAD_STATE_SCHEMA_VERSION = 3
 MAX_THREAD_STATE_BYTES = 16_384
 MAX_CHAT_CONTENT_CHARS = 100_000
@@ -44,6 +44,25 @@ class LocalPersistenceConflictError(LocalPersistenceError):
 
 class LocalPersistenceSchemaError(LocalPersistenceError):
     """Stored data uses an incompatible or malformed schema."""
+
+
+class LocalPersistenceQuotaError(LocalPersistenceError):
+    """A bounded local store cannot safely admit another protected record."""
+
+
+@dataclass(frozen=True)
+class MemoryStoragePolicy:
+    """Portable owner-scoped storage bounds enforced by persistence adapters."""
+
+    max_conversations_per_user: int = 100
+    max_messages_per_conversation: int = 200
+    max_active_long_term_per_user: int = 500
+    max_candidate_long_term_per_user: int = 250
+
+    def __post_init__(self) -> None:
+        for name, value in self.__dict__.items():
+            if not isinstance(value, int) or value < 1:
+                raise ValueError(f"{name} must be a positive integer")
 
 
 @dataclass(frozen=True)

@@ -31,6 +31,134 @@ class DeltaContext:
     fingerprint: str
 
 
+@dataclass(frozen=True)
+class CurrentEvidenceProjection:
+    owner_id: str
+    entity: str
+    capability: str
+    view: str
+    schema_version: str
+    payload: dict[str, Any]
+    retrieved_at: str
+    complete: bool = True
+
+    @property
+    def identity(self) -> str:
+        return f"{self.entity}:{self.capability}:{self.view}"
+
+
+@dataclass(frozen=True)
+class HistoricalBaselineProjection:
+    owner_id: str
+    entity: str
+    capability: str
+    view: str
+    schema_version: str
+    payload: dict[str, Any]
+    memory_id: str
+    provenance: str
+    observed_at: str
+    status: str
+    freshness: str
+    authoritative: bool
+    accessible: bool = True
+    complete: bool = True
+
+    @property
+    def identity(self) -> str:
+        return f"{self.entity}:{self.capability}:{self.view}"
+
+
+def current_evidence_projections(
+    results: tuple[Any, ...],
+    *,
+    owner_id: str,
+) -> tuple[CurrentEvidenceProjection, ...]:
+    """Project complete current Product views without importing agent contracts."""
+    projections: list[CurrentEvidenceProjection] = []
+    for result in results:
+        if (
+            getattr(result, "source_capability", "") not in {"asset.get_profile", "asset.get_detection"}
+            or getattr(result, "status", "") != "ok"
+            or getattr(result, "completeness", "") != "complete"
+            or bool(getattr(result, "truncated", False))
+            or bool(getattr(result, "projection_truncated", False))
+            or len(getattr(result, "entities", ())) != 1
+        ):
+            continue
+        evidence = getattr(result, "view_payload", None)
+        views = evidence.get("views") if isinstance(evidence, dict) else None
+        schema_version = str(getattr(result, "projection_schema_version", "") or "")
+        if not isinstance(views, dict) or not schema_version:
+            continue
+        for view in tuple(getattr(result, "selected_views", ()) or ()):
+            payload = views.get(view)
+            if isinstance(payload, dict):
+                projections.append(CurrentEvidenceProjection(
+                    owner_id=owner_id,
+                    entity=result.entities[0],
+                    capability=result.source_capability,
+                    view=str(view),
+                    schema_version=schema_version,
+                    payload=payload,
+                    retrieved_at=str(getattr(result, "valid_at", None) or result.retrieved_at),
+                ))
+    return tuple(projections)
+
+
+def historical_baseline_projections(
+    memories: tuple[Any, ...],
+) -> tuple[HistoricalBaselineProjection, ...]:
+    """Parse only bounded structured Product-view memories; malformed prose fails closed."""
+    projections: list[HistoricalBaselineProjection] = []
+    for retrieved in memories:
+        memory = getattr(retrieved, "memory", None)
+        if memory is None:
+            continue
+        try:
+            statement = json.loads(memory.statement)
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(statement, dict):
+            continue
+        capability = str(statement.get("source_capability") or "")
+        entities = tuple(statement.get("entities") or ())
+        evidence = statement.get("evidence")
+        views = evidence.get("views") if isinstance(evidence, dict) else None
+        schema_version = str(statement.get("schema_version") or "")
+        selected_views = tuple(statement.get("selected_views") or ())
+        if (
+            capability not in {"asset.get_profile", "asset.get_detection"}
+            or len(entities) != 1
+            or not isinstance(views, dict)
+            or not schema_version
+        ):
+            continue
+        for view in selected_views:
+            payload = views.get(view)
+            if not isinstance(payload, dict):
+                continue
+            projections.append(HistoricalBaselineProjection(
+                owner_id=memory.user_id,
+                entity=str(entities[0]),
+                capability=capability,
+                view=str(view),
+                schema_version=schema_version,
+                payload=payload,
+                memory_id=memory.memory_id,
+                provenance=memory.provenance_category,
+                observed_at=memory.valid_from,
+                status=memory.status,
+                freshness=str(getattr(retrieved, "freshness", "inactive")),
+                authoritative=bool(memory.authoritative),
+                complete=(
+                    statement.get("completeness") == "complete"
+                    and bool(statement.get("projection_complete"))
+                ),
+            ))
+    return tuple(projections)
+
+
 def fingerprint(payload: Any) -> str:
     serialized = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(serialized.encode("utf-8")).hexdigest()

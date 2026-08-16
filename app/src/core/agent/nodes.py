@@ -35,6 +35,10 @@ from src.core.context.intent import (
     resolution_from_materialized_decision,
 )
 from src.core.context.models import RouteDecision, approx_tokens
+from src.core.context.compaction import (
+    current_evidence_projections,
+    historical_baseline_projections,
+)
 from src.core.context.synthesizer_prompt import SynthesizerPromptBuilder
 from src.core.copilot.fallback_answer import build_evidence_fallback_answer
 from src.core.llm.errors import LLMError
@@ -618,6 +622,13 @@ class CopilotWorkflowNodes:
             allow_supplemental=allow,
         )
         pack = self.service.evidence_reviewer.with_review(state["evidence_pack"], decision)
+        logger.info(
+            "event=evidence_review_classified request_id=%s outcome=%s caveat_count=%s material_limitation_count=%s",
+            state["request_id"],
+            decision.outcome,
+            len(decision.caveats),
+            len(decision.material_limitations),
+        )
         next_edge = "supplemental" if decision.supplemental_allowed and allow else "compose"
         return {"review_decision": decision, "evidence_pack": pack, "next_edge": next_edge}
 
@@ -706,6 +717,8 @@ class CopilotWorkflowNodes:
             snapshot=snapshot,
             long_term_selection=long_term_selection,
             review=state.get("review_decision"),
+            request_constraints=state.get("request_constraints"),
+            accepted_working_fact_count=len(state.get("pending_working_facts") or ()),
         )
         preliminary_prompt = self.synthesizer_prompt_builder.render_messages(
             static_core=self.service.system_prompt,
@@ -724,11 +737,19 @@ class CopilotWorkflowNodes:
         output_reservation = estimator.output_reservation(task.detail_level, request.max_tokens)
         base_messages = list(preliminary_prompt.messages)
         base_estimate = estimator.estimate_messages(base_messages)
+        identity = state.get("request_identity")
+        current_projections = current_evidence_projections(
+            tuple(state.get("tool_results") or ()),
+            owner_id=str(getattr(identity, "user_id", "") or ""),
+        )
+        historical_baselines = historical_baseline_projections(long_term_memories)
         dynamic_context = self.context_composer.compose(
             package,
             request_id=state["request_id"],
             base_input_tokens=base_estimate.calibrated_tokens,
             reserved_output_tokens=output_reservation,
+            current_projections=current_projections,
+            historical_baselines=historical_baselines,
         )
         results = apply_context_inclusion(
             list(state.get("tool_results") or []),
@@ -751,6 +772,9 @@ class CopilotWorkflowNodes:
             snapshot=snapshot,
             long_term_selection=long_term_selection,
             review=state.get("review_decision"),
+            request_constraints=state.get("request_constraints"),
+            accepted_working_fact_count=len(state.get("pending_working_facts") or ()),
+            delta_contexts=self.context_composer.last_delta_contexts,
         )
         rendered_prompt = self.synthesizer_prompt_builder.render_messages(
             static_core=self.service.system_prompt,

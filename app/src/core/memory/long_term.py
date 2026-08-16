@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
+import hashlib
+import json
 import re
 from typing import Literal, get_args
 from uuid import uuid4
@@ -99,6 +101,7 @@ class LongTermMemoryRecord:
     status: MemoryStatus = "candidate"
     index_status: IndexStatus = "not_indexed"
     supersedes_memory_id: str | None = None
+    idempotency_fingerprint: str = ""
 
     def __post_init__(self) -> None:
         now = utc_now()
@@ -162,6 +165,25 @@ class LongTermMemoryRecord:
             raise ValueError("valid_until must be later than valid_from")
         if self.status == "active" and self.epistemic_status not in AUTHORITATIVE_EPISTEMIC | {"historical"}:
             raise ValueError("Active memory requires authoritative or historical epistemic status")
+        fingerprint_payload = {
+            "user_id": self.user_id,
+            "memory_type": self.memory_type,
+            "entity_ids": sorted(self.entity_ids),
+            "statement": self.statement,
+            "evidence_refs": sorted(self.evidence_refs),
+        }
+        expected_fingerprint = hashlib.sha256(
+            json.dumps(
+                fingerprint_payload,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        supplied = str(self.idempotency_fingerprint or "").strip().lower()
+        if supplied and supplied != expected_fingerprint:
+            raise ValueError("Long-term memory idempotency fingerprint is invalid")
+        object.__setattr__(self, "idempotency_fingerprint", expected_fingerprint)
 
     @classmethod
     def candidate(

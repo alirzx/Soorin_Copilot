@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import replace
-from typing import Any
+from typing import Any, Literal
 from uuid import uuid4
 
 from src.core.agent.contracts import (
@@ -30,14 +30,23 @@ SOURCE_SPECIFIC_KNOWLEDGE = re.compile(
     re.IGNORECASE,
 )
 
-MEMORY_RECALL_REQUEST = re.compile(
+EXPLICIT_MEMORY_RECALL_REQUEST = re.compile(
     r"\b(?:which\s+asset.*remember|what\s+(?:do\s+you\s+)?(?:know|remember).*(?:prior|memory|before\s+the\s+restart)|"
     r"summari[sz]e\s+what\s+you\s+remember|continue\s+with\s+the\s+same\s+asset.*before\s+the\s+restart|"
     r"conversation\s+memory|episodic\s+memory|long[\s-]*term\s+memory|prior\s+investigations?|what(?:'s|\s+is)\s+my\s+name|"
+    r"what\s+(?:do|did)\s+you\s+remember|what\s+you\s+remember|do\s+you\s+remember|"
     r"what\s+did\s+(?:i|we)\s+(?:tell|say)|what\s+was\s+the\s+previous\s+contradiction|"
     r"from\s+(?:stored\s+(?:context|conversation\s+context)|our\s+previous\s+investigation)|"
     r"(?:investigation\s+tag|owner\s+(?:validation\s+)?status|identity\s+contradiction).{0,100}"
     r"(?:do\s+we\s+have|did\s+we\s+establish|earlier|previously))\b",
+    re.IGNORECASE,
+)
+
+HISTORICAL_SUMMARY_REQUEST = re.compile(
+    r"\b(?:what\s+have\s+we\s+(?:concluded|established|found|learned)|"
+    r"what\s+did\s+we\s+(?:conclude|establish|find|learn)|"
+    r"what\s+do\s+we\s+know\s+so\s+far|(?:investigation|findings?|conclusions?)\s+so\s+far|"
+    r"historical\s+summary|previous\s+findings?|earlier\s+(?:findings?|conclusions?))\b",
     re.IGNORECASE,
 )
 
@@ -57,15 +66,49 @@ MEMORY_WRITE_REQUEST = re.compile(
 )
 
 CURRENT_EVIDENCE_REQUEST = re.compile(
-    r"\b(?:fresh|current|currently|right\s+now|still\s+showing|verify\s+now|refresh|latest|live\s+(?:evidence|data|state))\b",
+    r"\b(?:fresh|current|currently|now|right\s+now|still|verify\s+(?:now|again)|recheck|refresh|latest|"
+    r"live\s+(?:evidence|data|state))\b",
     re.IGNORECASE,
 )
+
+IDENTITY_CONTRADICTION_REQUEST = re.compile(
+    r"\b(?:identity|role|classification|fingerprint)\b.{0,100}\b(?:contradiction|conflict|mismatch|inconsisten(?:cy|t))\b|"
+    r"\b(?:contradiction|conflict|mismatch|inconsisten(?:cy|t))\b.{0,100}\b(?:identity|role|classification|fingerprint)\b",
+    re.IGNORECASE,
+)
+
+TOPOLOGY_EVIDENCE_REQUEST = re.compile(
+    r"\b(?:graph|topology|connections?|neighbors?|relationships?|paths?|communications?|network\s+behavior)\b",
+    re.IGNORECASE,
+)
+
+KNOWLEDGE_EVIDENCE_REQUEST = re.compile(
+    r"\b(?:why|explain|explanation|background|runbook|playbook|guidance|procedure|mitre|nist|hardening)\b",
+    re.IGNORECASE,
+)
+
+PREVIOUS_CURRENT_COMPARISON_REQUEST = re.compile(
+    r"\b(?:same|changed|different|still|previous(?:ly)?|earlier|compared\s+(?:with|to)|since)\b",
+    re.IGNORECASE,
+)
+
+RecallClassification = Literal["none", "explicit_memory", "historical_summary"]
+
+
+def classify_historical_recall(request: str) -> RecallClassification:
+    """Classify only clear historical-memory intent; ordinary asset questions remain live."""
+    if EXPLICIT_MEMORY_RECALL_REQUEST.search(request):
+        return "explicit_memory"
+    if HISTORICAL_SUMMARY_REQUEST.search(request):
+        return "historical_summary"
+    return "none"
 
 
 def derive_request_constraints(request: str) -> RequestConstraints:
     """Resolve live-evidence and memory authority without an LLM."""
     no_live = bool(NO_LIVE_EVIDENCE_REQUEST.search(request))
-    recall = bool(MEMORY_RECALL_REQUEST.search(request))
+    recall_classification = classify_historical_recall(request)
+    recall = recall_classification != "none"
     memory_write = bool(MEMORY_WRITE_REQUEST.search(request))
     require_current = bool(CURRENT_EVIDENCE_REQUEST.search(request)) and not no_live
     pure_memory_write = memory_write and not require_current and not re.search(
@@ -73,12 +116,12 @@ def derive_request_constraints(request: str) -> RequestConstraints:
         request,
         re.IGNORECASE,
     )
-    memory_only = recall or pure_memory_write
+    memory_only = (recall and not require_current) or pure_memory_write
     reasons: list[str] = []
     if no_live:
         reasons.append("explicit_no_live")
     if recall:
-        reasons.append("deterministic_memory_recall")
+        reasons.append(f"deterministic_memory_recall:{recall_classification}")
     if memory_write:
         reasons.append("session_memory_write")
     if require_current:
@@ -118,11 +161,23 @@ def task_spec_from_route(
         raise ValueError("comparison_requires_two_distinct_entities")
     required_capabilities: list[str] = []
     optional_capabilities: list[str] = []
-    if allow_capabilities and getattr(route, "use_asset_profile", False):
+    identity_contradiction = bool(IDENTITY_CONTRADICTION_REQUEST.search(request))
+    use_profile = bool(getattr(route, "use_asset_profile", False))
+    use_detection = bool(getattr(route, "use_detection", False))
+    use_graph = bool(getattr(route, "use_graph", False))
+    use_knowledge = bool(getattr(route, "use_knowledge", False))
+    if allow_capabilities and identity_contradiction:
+        # Identity contradictions require the two current evidence families that
+        # can establish identity and its conflicting classification signals.
+        use_profile = True
+        use_detection = True
+        use_graph = use_graph and bool(TOPOLOGY_EVIDENCE_REQUEST.search(request))
+        use_knowledge = use_knowledge and bool(KNOWLEDGE_EVIDENCE_REQUEST.search(request))
+    if allow_capabilities and use_profile:
         required_capabilities.append("asset.get_profile")
-    if allow_capabilities and getattr(route, "use_detection", False):
+    if allow_capabilities and use_detection:
         required_capabilities.append("asset.get_detection")
-    if allow_capabilities and getattr(route, "use_graph", False):
+    if allow_capabilities and use_graph:
         scope = getattr(route, "scope", "none")
         graph_capability = {
             "node_summary": "graph.get_summary",
@@ -135,7 +190,7 @@ def task_spec_from_route(
             "path": "graph.find_path",
         }.get(scope, "graph.get_summary")
         required_capabilities.append(graph_capability)
-    if allow_capabilities and getattr(route, "use_knowledge", False):
+    if allow_capabilities and use_knowledge:
         target = (
             required_capabilities
             if SOURCE_SPECIFIC_KNOWLEDGE.search(request)
@@ -144,7 +199,12 @@ def task_spec_from_route(
         target.append("knowledge.search")
     capabilities = (*required_capabilities, *optional_capabilities)
     signals = set(getattr(route, "matched_signals", ()) or ())
-    multi_step = (
+    focused_identity_verification = (
+        identity_contradiction
+        and set(capabilities) <= {"asset.get_profile", "asset.get_detection"}
+        and not MULTI_STEP_WORDING.search(request)
+    )
+    multi_step = not focused_identity_verification and (
         len(capabilities) >= 3
         or "security_or_anomaly" in signals
         or bool(MULTI_STEP_WORDING.search(request))
@@ -171,7 +231,13 @@ def task_spec_from_route(
         is_followup=bool(getattr(route, "followup_detected", False)),
         graph_depth=int(getattr(route, "depth", 0) or 0),
         relationship_mode=str(getattr(route, "relationship_mode", "none")),
-        temporal_mode="historical" if evidence_mode in {"memory_only", "no_live_refresh"} else "current",
+        temporal_mode=(
+            "historical"
+            if evidence_mode in {"memory_only", "no_live_refresh"}
+            else "compare_previous_current"
+            if evidence_mode == "current_verification" and PREVIOUS_CURRENT_COMPARISON_REQUEST.search(request)
+            else "current"
+        ),
         evidence_mode=evidence_mode,
         response_depth=(
             "report"

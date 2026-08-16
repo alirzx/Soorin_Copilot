@@ -474,6 +474,29 @@ and must never be the only copy of a fact.
 
 ## 20. Implemented migration gates
 
+### Current E1-E7 stabilization slice
+
+The production composer now uses the Gate 4 delta utility end to end. Typed current
+Product projections are compared only with authoritative historical LTM projections
+that match owner, entity, capability, selected view, completeness, and projection
+schema. Candidate, stale, inaccessible, mismatched, or incomplete records fail
+closed; current evidence remains required for volatile verification.
+
+Canonical candidate writes are idempotent by a deterministic fingerprint over
+owner, memory type, normalized entity set, exact structured statement, and stable
+evidence references. SQLite schema v6 stores that fingerprint and enforces uniqueness
+for live candidate/active records. The fingerprint intentionally excludes request
+and conversation IDs so a retried or cross-conversation replay does not multiply
+the same owner-scoped fact; changed evidence creates a distinct candidate.
+
+`MemoryStoragePolicy` supplies adapter-neutral positive bounds. Current local defaults
+are 100 conversations per user, 200 messages per conversation, 20 working facts per
+conversation, 500 active LTM records per user, and 250 candidate records per user.
+Chat cleanup retains the newest records and will not evict a conversation carrying
+durable thread state. Candidate pressure evicts only the oldest candidate. Active
+authority pressure rejects admission and preserves existing authoritative records.
+These local bounds do not replace the future Product retention/legal-hold contract.
+
 Gate 2 added optional `conversation_id` and `request_id`, bounded
 `X-User-ID` metadata, a resolved request/thread identity contract, and the four
 storage ports. The legacy `session_id` path remains active.
