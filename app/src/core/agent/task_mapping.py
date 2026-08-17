@@ -37,6 +37,9 @@ EXPLICIT_MEMORY_RECALL_REQUEST = re.compile(
     r"what\s+(?:do|did)\s+you\s+remember|what\s+you\s+remember|do\s+you\s+remember|"
     r"what\s+did\s+(?:i|we)\s+(?:tell|say)|what\s+was\s+the\s+previous\s+contradiction|"
     r"from\s+(?:stored\s+(?:context|conversation\s+context)|our\s+previous\s+investigation)|"
+    r"what\s+(?:investigation\s+)?state\s+(?:(?:did\s+)?you\s+)?retain(?:ed)?|"
+    r"what\s+was\s+retained\s+after\s+(?:login|sign(?:ed|ing)\s+back\s+in|restart)|"
+    r"what\s+did\s+we\s+discuss|remind\s+me\s+what\s+we\s+knew|retained\s+investigation\s+state|"
     r"(?:investigation\s+tag|owner\s+(?:validation\s+)?status|identity\s+contradiction).{0,100}"
     r"(?:do\s+we\s+have|did\s+we\s+establish|earlier|previously))\b",
     re.IGNORECASE,
@@ -52,10 +55,14 @@ HISTORICAL_SUMMARY_REQUEST = re.compile(
 
 NO_LIVE_EVIDENCE_REQUEST = re.compile(
     r"\b(?:before\s+making\s+any\s+live\s+provider\s+calls|without\s+refreshing|without\s+(?:fetching|calling|using)\s+"
-    r"(?:any\s+)?(?:live\s+)?evidence|do\s+not\s+(?:use|call)\s+(?:live\s+)?(?:product|detection|graph|knowledge|evidence|providers?|refresh)|"
+    r"(?:any\s+)?(?:live\s+)?evidence|without\s+(?:performing\s+)?(?:any\s+)?live\s+(?:lookup|check|retrieval)|"
+    r"without\s+checking\s+(?:any\s+)?current\s+(?:status|state|systems?)|"
+    r"do\s+not\s+retrieve\b|"
+    r"do\s+not\s+(?:use|call|retrieve|check|look\s+up)\s+(?:any\s+)?(?:current\s+|live\s+)?(?:product|detection|graph|knowledge|evidence|providers?|refresh|systems?|status|state|data|lookup)|"
     r"don't\s+use\s+live|do\s+not\s+refresh|don't\s+refresh|no\s+live\s+(?:provider|evidence|refresh)|"
     r"without\s+(?:using\s+)?live\s+(?:sources?|data)|do\s+not\s+use\s+live\s+(?:sources?|data)|"
-    r"use\s+only\s+memory|using\s+only\s+stored\s+(?:conversation\s+)?context|memory\s+only)\b",
+    r"use\s+only\s+memory|using\s+only\s+stored\s+(?:conversation\s+)?context|memory\s+only|"
+    r"based\s+only\s+on\s+what\s+we\s+(?:discussed|knew|established)|historical\s+only)\b",
     re.IGNORECASE,
 )
 
@@ -68,6 +75,12 @@ MEMORY_WRITE_REQUEST = re.compile(
 CURRENT_EVIDENCE_REQUEST = re.compile(
     r"\b(?:fresh|current|currently|now|right\s+now|still|verify\s+(?:now|again)|recheck|refresh|latest|"
     r"live\s+(?:evidence|data|state))\b",
+    re.IGNORECASE,
+)
+
+NO_LIVE_HISTORICAL_REQUEST = re.compile(
+    r"\b(?:memory\s+only|use\s+only\s+memory|historical\s+only|based\s+only\s+on\s+what\s+we\s+"
+    r"(?:discussed|knew|established)|stored\s+(?:context|memory)|previous\s+investigation|retained\s+state)\b",
     re.IGNORECASE,
 )
 
@@ -116,7 +129,13 @@ def derive_request_constraints(request: str) -> RequestConstraints:
         request,
         re.IGNORECASE,
     )
-    memory_only = (recall and not require_current) or pure_memory_write
+    memory_only = (
+        (
+            recall
+            or bool(no_live and NO_LIVE_HISTORICAL_REQUEST.search(request))
+        )
+        and not require_current
+    ) or pure_memory_write
     reasons: list[str] = []
     if no_live:
         reasons.append("explicit_no_live")

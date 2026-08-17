@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Protocol
+from typing import Literal, Protocol
 from uuid import uuid4
 
 from src.core.agent.contracts import TaskSpec
@@ -22,7 +22,15 @@ class WorkingFact:
     key: str
     value: str
     fact_type: str = "user_provided"
+    scope: Literal["conversation", "entity"] = "conversation"
+    entity_ids: tuple[str, ...] = ()
     created_at: str = field(default_factory=_now)
+
+    def __post_init__(self) -> None:
+        if self.scope not in {"conversation", "entity"}:
+            raise ValueError("Unsupported working fact scope")
+        if self.scope == "entity" and not self.entity_ids:
+            raise ValueError("Entity-scoped working facts require an entity binding")
 
 
 @dataclass(frozen=True)
@@ -160,8 +168,13 @@ class MemoryContextPackage:
             messages.append(
                 {
                     "role": "system",
-                    "content": "[SOORIN WORKING FACTS]\n" + "\n".join(
-                        f"- {item.key}: {item.value}" for item in self.working_facts
+                    "content": (
+                        "[SOORIN ANALYST/USER-PROVIDED WORKING FACTS]\n"
+                        "These are conversation assertions, not independently verified operational evidence.\n"
+                    ) + "\n".join(
+                        f"- scope={item.scope}; entities={','.join(item.entity_ids) or 'conversation'}; "
+                        f"{item.key}: {item.value}"
+                        for item in self.working_facts
                     ),
                 }
             )
@@ -189,7 +202,11 @@ class MemoryContextPackage:
                 messages.append(
                     {
                         "role": "system",
-                        "content": f"[SOORIN RELEVANT EPISODES]\n{summaries}",
+                        "content": (
+                            "[SOORIN HISTORICAL EPISODIC SUMMARIES]\n"
+                            "These summaries are historical continuity, not fresh operational verification.\n"
+                            f"{summaries}"
+                        ),
                     }
                 )
         if self.long_term_memories:

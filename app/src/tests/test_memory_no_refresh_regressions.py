@@ -350,6 +350,105 @@ def test_m6_working_facts_are_conversation_scoped() -> None:
 
 
 @pytest.mark.parametrize(
+    "message",
+    (
+        "Without performing any live lookup, what do you remember from this investigation?",
+        "Without checking any current status, use only stored context from our previous investigation.",
+        "Do not retrieve live data; tell me what investigation state you retained.",
+        "Historical only: remind me what we knew about this asset.",
+        "Based only on what we discussed, what did we conclude?",
+    ),
+)
+def test_no_live_negation_wins_over_embedded_current_trigger_words(message: str) -> None:
+    constraints = derive_request_constraints(message)
+    assert not constraints.allow_live
+    assert not constraints.require_current
+    assert constraints.memory_only
+
+
+def test_retained_state_recall_bypasses_router_and_resolves_active_asset() -> None:
+    message = "Tell me what investigation state you retained after I signed back in."
+    active = SessionRoutingState(active_entities=("192.168.30.115",))
+    resolution = EntityResolver().resolve(message, routing_state=active)
+    constraints = derive_request_constraints(message)
+
+    assert classify_historical_recall(message) == "explicit_memory"
+    assert constraints.memory_only
+    assert [item.value for item in resolution.entities] == ["192.168.30.115"]
+    assert resolution.reference_detected
+
+
+def test_asset_scoped_working_facts_do_not_leak_when_switching_assets() -> None:
+    settings = get_settings()
+    memory = MemoryStore(20)
+    asset_a = MemoryContextKey(("192.168.30.115",), "asset_investigation", "none", "asset")
+    asset_b = MemoryContextKey(("192.168.30.116",), "asset_investigation", "none", "asset")
+    facts = tuple(
+        replace(fact, scope="entity", entity_ids=asset_a.entities)
+        for fact in extract_working_facts(
+            "Remember: tag is ORION-115 and owner validation is pending for this conversation."
+        )
+    )
+    memory.upsert_working_facts("scoped", asset_a, facts)
+
+    a_context = memory.compose_memory_context(
+        "scoped", settings, context_key=asset_a, active_entities=asset_a.entities
+    )
+    b_context = memory.compose_memory_context(
+        "scoped", settings, context_key=asset_b, active_entities=asset_b.entities
+    )
+
+    assert {item.key for item in a_context.working_facts} == {
+        "investigation_tag", "owner_validation"
+    }
+    assert b_context.working_facts == ()
+
+
+def test_asset_switch_archives_a_and_broad_historical_recall_reuses_a_context() -> None:
+    settings = replace(
+        get_settings(),
+        conversation_summary_enabled=True,
+        conversation_summary_trigger_tokens=1,
+        memory_episode_context_limit=2,
+    )
+    memory = MemoryStore(20)
+    asset_a = MemoryContextKey(("192.168.30.115",), "asset_investigation", "none", "asset")
+    asset_b = MemoryContextKey(("192.168.30.116",), "asset_investigation", "none", "asset")
+    memory.prepare_for_model("episodes", settings, SessionRoutingState(), context_key=asset_a)
+    memory.record_turn(
+        "episodes",
+        "Analyze A.",
+        "Profile conclusion for A and Detection conclusion for A.",
+        asset_a,
+        request_id="a-1",
+    )
+    memory.upsert_working_facts(
+        "episodes",
+        asset_a,
+        tuple(
+            replace(fact, scope="entity", entity_ids=asset_a.entities)
+            for fact in extract_working_facts("Remember tag is ORION-115 for this conversation.")
+        ),
+    )
+    switched = memory.prepare_for_model(
+        "episodes", settings, SessionRoutingState(active_entities=asset_b.entities), context_key=asset_b
+    )
+    assert switched.episode_transition
+
+    recalled = memory.prepare_for_model(
+        "episodes", settings, SessionRoutingState(active_entities=asset_b.entities), context_key=asset_a
+    )
+    assert recalled.memory_context is not None
+    rendered = "\n".join(item["content"] for item in recalled.messages)
+    assert "ORION-115" in rendered
+    assert "Profile conclusion for A" in rendered
+    assert all(
+        not set(item.entity_ids).intersection(asset_b.entities)
+        for item in recalled.memory_context.working_facts
+    )
+
+
+@pytest.mark.parametrize(
     ("message", "classification"),
     (
         ("What have we concluded so far about this asset?", "historical_summary"),

@@ -55,7 +55,13 @@ REFERENTIAL_ENTITY_PATTERNS: dict[str, re.Pattern[str]] = {
     ),
     "memory_context_reference": re.compile(
         r"\b(?:what\s+did\s+(?:i|we)\s+(?:tell|say)|what\s+was\s+the\s+previous\s+contradiction|"
-        r"from\s+(?:stored\s+context|our\s+previous\s+investigation)|(?:conversation|episodic)\s+memory|what(?:'s|\s+is)\s+my\s+name)\b",
+        r"from\s+(?:stored\s+context|our\s+previous\s+investigation)|(?:conversation|episodic)\s+memory|what(?:'s|\s+is)\s+my\s+name|"
+        r"(?:investigation\s+)?state\s+(?:you\s+)?retained|retained\s+(?:investigation\s+)?state|"
+        r"what\s+was\s+retained\s+after\s+(?:login|restart|sign(?:ed|ing)\s+back\s+in))\b",
+        re.IGNORECASE,
+    ),
+    "active_asset_reference": re.compile(
+        r"\b(?:current|active|previous|retained)\s+(?:asset|host|ip)\b",
         re.IGNORECASE,
     ),
     "this_investigation": re.compile(

@@ -123,8 +123,8 @@ EVIDENCE_MODULES = {
 }
 
 MEMORY_MODULES = {
-    "working": "Working memory is current conversation continuity, not independently verified operational evidence.",
-    "episodic": "Episodic memory is a bounded summary of a prior related investigation episode.",
+    "working": "Working memory contains analyst/user-provided conversation assertions. Label them accordingly; never call them observed operational facts unless current Product evidence independently verifies them.",
+    "episodic": "Episodic memory is a bounded historical summary of a prior related investigation. Never present it as fresh/current evidence.",
     "ltm_available": "Only selected active validated long-term memory is authoritative durable memory; current compatible evidence outranks it.",
     "no_active_ltm": "No active validated long-term memory was selected. Candidate records, if counted, are not authoritative and must not be presented as validated memory.",
     "historical_memory_only": "The supplied context is historical memory only; do not imply it is current without verification.",
@@ -270,6 +270,9 @@ class SynthesizerPromptBuilder:
                 "Do not repeat the same evidence across sections.",
                 "Use bounded negative language: not observed never means categorically absent.",
                 "Use new/changed/appeared/disappeared only when a supplied deterministic compatible-baseline delta supports it.",
+                "Do not claim that a contradiction strengthened or resolved unless current evidence verifies every relevant side.",
+                "Do not infer compromise, intent, beaconing, scanning, attribution, causality, or exact risk drivers from counts or scores alone.",
+                "Generic Knowledge/RAG background cannot prove an asset-specific operational fact.",
             ),
         )
 

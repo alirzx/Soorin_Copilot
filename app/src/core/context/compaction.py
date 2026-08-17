@@ -61,6 +61,9 @@ class HistoricalBaselineProjection:
     status: str
     freshness: str
     authoritative: bool
+    memory_type: str = "validated_finding"
+    evidence_classes: tuple[str, ...] = ()
+    unresolved_conflict: bool = False
     accessible: bool = True
     complete: bool = True
 
@@ -151,6 +154,9 @@ def historical_baseline_projections(
                 status=memory.status,
                 freshness=str(getattr(retrieved, "freshness", "inactive")),
                 authoritative=bool(memory.authoritative),
+                memory_type=memory.memory_type,
+                evidence_classes=tuple(statement.get("evidence_classes") or ()),
+                unresolved_conflict=bool(memory.has_unresolved_conflict),
                 complete=(
                     statement.get("completeness") == "complete"
                     and bool(statement.get("projection_complete"))

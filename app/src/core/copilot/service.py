@@ -169,6 +169,15 @@ class CopilotService:
             self.long_term_memory_coordinator = LongTermMemoryCoordinator(
                 self.long_term_memory_store,
                 semantic_index,
+                auto_promotion_enabled=getattr(
+                    settings, "memory_auto_promotion_enabled", True
+                ),
+                policy_version=getattr(
+                    settings, "memory_promotion_policy_version", "ltm-promotion-v1"
+                ),
+                active_validity_seconds=getattr(
+                    settings, "memory_active_validity_seconds", 86_400
+                ),
             )
         self._capability_runtime_lock = RLock()
         self.capability_registry = build_capability_registry(

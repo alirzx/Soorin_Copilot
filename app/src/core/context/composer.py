@@ -373,37 +373,68 @@ class ContextComposer:
         for projection in current:
             candidates = [item for item in baselines if item.owner_id == projection.owner_id]
             if not candidates:
-                reason = "baseline_owner_mismatch" if baselines else reason
+                reason = "wrong_owner" if baselines else reason
+                continue
+            status_eligible = [item for item in candidates if item.status == "active"]
+            if not status_eligible:
+                statuses = {item.status for item in candidates}
+                reason = (
+                    "candidate_only" if statuses == {"candidate"} else
+                    "superseded" if "superseded" in statuses else
+                    "invalidated" if "invalidated" in statuses else
+                    "inactive"
+                )
+                continue
+            candidates = status_eligible
+            if any(item.unresolved_conflict for item in candidates):
+                reason = "unresolved_conflict"
+                continue
+            type_eligible = [
+                item
+                for item in candidates
+                if item.memory_type in {"validated_finding", "approved_asset_fact"}
+            ]
+            if not type_eligible:
+                reason = "wrong_memory_type"
+                continue
+            candidates = type_eligible
+            if not any(item.evidence_classes for item in candidates):
+                reason = "wrong_evidence_class"
                 continue
             candidates = [
                 item
                 for item in candidates
                 if item.accessible
                 and item.authoritative
-                and item.status == "active"
                 and item.freshness not in {"expired", "inactive"}
                 and item.complete
             ]
             if not candidates:
-                reason = "baseline_not_authoritative_or_accessible"
+                reason = (
+                    "stale"
+                    if any(item.freshness in {"expired", "inactive"} for item in type_eligible)
+                    else "incomplete_baseline"
+                    if any(not item.complete for item in type_eligible)
+                    else "inactive"
+                )
                 continue
             same_capability = [item for item in candidates if item.capability == projection.capability]
             if not same_capability:
-                reason = "baseline_capability_mismatch"
+                reason = "wrong_capability"
                 continue
             same_entity = [item for item in same_capability if item.entity == projection.entity]
             if not same_entity:
-                reason = "baseline_entity_mismatch"
+                reason = "wrong_entity"
                 continue
             same_view = [item for item in same_entity if item.view == projection.view]
             if not same_view:
-                reason = "baseline_view_mismatch"
+                reason = "wrong_view"
                 continue
             compatible = [
                 item for item in same_view if item.schema_version == projection.schema_version
             ]
             if not compatible:
-                reason = "baseline_schema_mismatch"
+                reason = "wrong_schema"
                 continue
             baseline = max(compatible, key=lambda item: (item.observed_at, item.memory_id))
             delta = build_delta_context(
