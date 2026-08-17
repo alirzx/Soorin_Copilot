@@ -766,7 +766,7 @@ Secrets such as API keys, passwords, Product tokens, captcha bypass values, and 
 
 ### `SOORIN_SYSTEM_PROMPT_PATH`
 
-`SOORIN_SYSTEM_PROMPT_PATH` points to the filesystem Markdown file containing the static final-Synthesizer policy core. The default is `app/prompts/synthesizer_static_prompt.md`; deterministic typed task modules are composed with it at request time. The legacy `app/prompts/system_prompt.md` remains available as an explicit rollback path and as the compatibility fallback when the configured static prompt is missing or empty. Changing this path does not alter deterministic Router, PlanValidator, EvidenceReviewer, or provider authority.
+`SOORIN_SYSTEM_PROMPT_PATH` points to the filesystem Markdown file containing the static final-Synthesizer policy core. The default is `app/prompts/synthesizer/synthesizer_static_prompt.md`; deterministic typed task modules are composed with it at request time. The legacy `app/prompts/system_prompt.md` remains available as an explicit rollback path and as the compatibility fallback when the configured static prompt is missing or empty. Changing this path does not alter deterministic Router, PlanValidator, EvidenceReviewer, or provider authority.
 
 ---
 

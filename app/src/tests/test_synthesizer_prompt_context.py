@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import shutil
 import sys
 import time
 from dataclasses import replace
@@ -28,7 +29,8 @@ from src.core.agent.executor import CapabilityExecutor
 from src.core.agent.plan_validator import PlanValidator
 from src.core.agent.registry import CapabilityRegistry
 from src.core.agent.task_mapping import compile_direct_plan, task_spec_from_route
-from src.core.context.synthesizer_prompt import SynthesizerPromptBuilder
+import src.core.context.synthesizer_prompt as synthesizer_prompt_module
+from src.core.context.synthesizer_prompt import PromptModuleRegistry, SynthesizerPromptBuilder
 from src.core.copilot.service import CopilotService
 from src.core.llm.providers.base import LLMProviderResult
 from src.core.memory.retrieval import LongTermMemorySelection
@@ -75,14 +77,14 @@ def _route(*, entities: tuple[str, ...] = ()) -> SimpleNamespace:
 def test_new_static_prompt_is_default_and_legacy_is_byte_stable(monkeypatch, tmp_path: Path) -> None:
     legacy = Path("app/prompts/system_prompt.md").read_bytes()
     assert hashlib.sha256(legacy).hexdigest() == LEGACY_PROMPT_SHA256
-    assert Path("app/prompts/synthesizer_static_prompt.md").read_text(encoding="utf-8").strip()
+    assert Path("app/prompts/synthesizer/synthesizer_static_prompt.md").read_text(encoding="utf-8").strip()
 
     monkeypatch.setattr(settings_module, "ENV_PATH", tmp_path / "missing.env")
     monkeypatch.setattr(settings_module, "LEGACY_ENV_PATH", tmp_path / "missing-legacy.env")
     monkeypatch.delenv("SOORIN_SYSTEM_PROMPT_PATH", raising=False)
     settings_module.get_settings.cache_clear()
     try:
-        assert settings_module.get_settings().system_prompt_path == "app/prompts/synthesizer_static_prompt.md"
+        assert settings_module.get_settings().system_prompt_path == "app/prompts/synthesizer/synthesizer_static_prompt.md"
     finally:
         settings_module.get_settings.cache_clear()
 
@@ -147,7 +149,7 @@ def test_memory_only_workflow_bypasses_router_and_calls_only_synthesizer() -> No
 
     configured = replace(
         settings_module.get_settings(),
-        system_prompt_path="app/prompts/synthesizer_static_prompt.md",
+        system_prompt_path="app/prompts/synthesizer/synthesizer_static_prompt.md",
         llm_usage_reporting_enabled=False,
         planner_enabled=True,
         long_term_memory_enabled=False,
@@ -208,6 +210,62 @@ def test_prompt_builder_selects_stable_relevant_modules_and_message_order() -> N
         "EVIDENCE\n"
         "[END UNTRUSTED EVIDENCE CONTEXT]"
     )
+
+
+def test_grouped_prompt_registry_loads_required_sections_and_rejects_duplicate_headers() -> None:
+    registry = PromptModuleRegistry()
+
+    assert "resolved entity binding" in registry.get("tasks", "asset_investigation")
+    with pytest.raises(ValueError, match="duplicate"):
+        PromptModuleRegistry._parse(Path("duplicate.md"), "# current\nA\n# current\nB")
+
+
+def test_grouped_prompt_registry_rejects_missing_required_section(tmp_path: Path) -> None:
+    module_dir = tmp_path / "synthesizer"
+    shutil.copytree("app/prompts/synthesizer", module_dir)
+    (module_dir / "tasks.md").write_text("# asset_investigation\nOnly one section.\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="synthesizer_prompt_module_missing:tasks"):
+        PromptModuleRegistry(module_dir)
+
+
+def test_prompt_builder_selects_externalized_modules_for_current_execution() -> None:
+    builder = SynthesizerPromptBuilder()
+    task = _task(
+        request="Re-check current classification against the previously validated state.",
+        required_capabilities=("asset.get_detection",),
+        evidence_mode="current_verification",
+        temporal_mode="compare_previous_current",
+    )
+    result = ToolResult("ok", task.entities, "asset.get_detection", "now", "current", "complete")
+    context = builder.build_context(task, (result,), delta_contexts=({"delta": {}},))
+    contract, modules = builder.render_contract(context)
+
+    assert "execution.current_retrieval_completed" in modules
+    assert "execution.baseline_available" in modules
+    assert "temporal.compare_previous_current" in modules
+    assert not hasattr(synthesizer_prompt_module, "TASK_MODULES")
+    assert "Live retrieval actually occurred" in contract
+    assert "Hide internal orchestration" in contract
+
+
+def test_rendered_contract_uses_internal_term_hiding_and_historical_modules() -> None:
+    builder = SynthesizerPromptBuilder()
+    context = builder.build_context(
+        _task(
+            intent="memory_recall",
+            required_capabilities=(),
+            evidence_mode="memory_only",
+            temporal_mode="historical",
+        ),
+        (),
+    )
+    contract, modules = builder.render_contract(context)
+
+    assert "task.memory_recall" in modules
+    assert "temporal.historical" in modules
+    assert "memory.historical_memory_only" in modules
+    assert "ordinary user-facing responses" in contract
 
 
 def test_no_live_refresh_preserves_underlying_task_identity() -> None:
@@ -374,13 +432,13 @@ def test_delta_and_bounded_negative_rules_are_explicit_and_fail_closed() -> None
     builder = SynthesizerPromptBuilder()
     context = builder.build_context(_task(), ())
     contract, _ = builder.render_contract(context)
-    static = Path("app/prompts/synthesizer_static_prompt.md").read_text(encoding="utf-8")
+    static = Path("app/prompts/synthesizer/synthesizer_static_prompt.md").read_text(encoding="utf-8")
 
     assert context.current_vs_historical_relationship == "compatible_baseline_unavailable"
     assert not context.deterministic_delta_available
     assert "Use new/changed/appeared/disappeared only" in contract
     assert "not observed never means categorically absent" in contract
-    assert "bounded omissions are not negative findings" in static
+    assert "omissions/truncation are not negative findings" in static
     assert "compatible_baseline_unavailable" in contract
 
 

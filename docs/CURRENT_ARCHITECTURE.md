@@ -977,3 +977,29 @@ targets, not deployed components. A PostgreSQL adapter must preserve Product-own
 tenant authorization, atomic lifecycle/audit writes, optimistic revisions, unique
 active logical keys, and bounded retention. Redis/read replicas may accelerate
 reads but cannot establish authority or execute lifecycle transitions.
+
+## 21C. Synthesizer prompt architecture
+
+The final Synthesizer uses a small static policy core at
+`app/prompts/synthesizer/synthesizer_static_prompt.md`, plus deterministic
+Markdown modules in the same directory. `SynthesizerPromptBuilder` remains the
+typed selector and renderer: it derives module IDs from validated task,
+temporal/evidence mode, execution truth, provider status, memory state, analysis
+lenses, and response depth; `PromptModuleRegistry` loads and validates grouped
+sections once. The runtime JSON contract and selected module IDs remain logged;
+prompt contents are not logged.
+
+Grouped files are `tasks.md`, `temporal.md`, `evidence_modes.md`,
+`execution.md`, `evidence.md`, `memory.md`, `analysis.md`, `response.md`, and
+`output_constraints.md`. The static core defines identity, scope, authority,
+provenance, injection resistance, isolation, temporal/epistemic discipline, and
+natural user-facing terminology. Dynamic modules add only task-specific rules.
+Router and Planner prompts remain separate and unchanged. `system_prompt.md` is
+still a byte-stable legacy rollback/compatibility fallback, not the normal Synth
+prompt path.
+
+Execution truth outranks the requested boundary in generated descriptions: when a
+bug or partial failure caused live retrieval, the dynamic execution contract says
+what actually ran and does not allow a claim that no lookup occurred. Current
+requirements always retain their live capability; active historical LTM can only
+be context/baseline for them.

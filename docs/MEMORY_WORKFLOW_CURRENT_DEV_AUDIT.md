@@ -245,7 +245,7 @@ runner preserves the same bounded node contract when LangGraph is unavailable.
 ### Final Synthesizer
 
 - **Purpose:** turn the reviewed, budgeted context into the requested answer.
-- **Prompt:** `app/prompts/synthesizer_static_prompt.md` plus the deterministic
+- **Prompt:** `app/prompts/synthesizer/synthesizer_static_prompt.md` plus the deterministic
   runtime contract built by `context/synthesizer_prompt.py`; current prompt
   builder version is `synth-context-v1`.
 - **Authority:** wording and bounded analysis only. It cannot create evidence or
@@ -900,3 +900,21 @@ candidates; active overflow fails closed. Lifecycle controls are
 `SOORIN_MEMORY_AUTO_PROMOTION_ENABLED`,
 `SOORIN_MEMORY_PROMOTION_POLICY_VERSION`, and
 `SOORIN_MEMORY_ACTIVE_VALIDITY_SECONDS`.
+
+### Prompt-contract stabilization update
+
+The normal Synth path is now a static core at
+`app/prompts/synthesizer/synthesizer_static_prompt.md` plus validated grouped
+Markdown modules selected by `SynthesizerPromptBuilder` (`synth-context-v2`).
+Python retains typed state, deterministic selection, runtime JSON, and module-ID
+observability; it no longer owns prompt-prose dictionaries. The registry fails
+clearly for missing or duplicate required sections. Router and Planner prompts
+remain separate. `app/prompts/system_prompt.md` remains a tested legacy rollback
+fallback and was not removed.
+
+Current evidence requirements take precedence over historical wording in Gate 8:
+active historical memory is baseline/context only and cannot skip a required
+current Profile, Detection, or Graph capability. Historical exact retrieval may
+select complementary authoritative Profile and Detection records. The runtime
+contract states actual retrieval/partial/baseline/write execution truth, and
+ordinary answers suppress internal memory, tool, and storage terminology.

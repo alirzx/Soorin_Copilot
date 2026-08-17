@@ -676,7 +676,7 @@ def get_settings() -> Settings:
         ),
         system_prompt_path=os.getenv(
             "SOORIN_SYSTEM_PROMPT_PATH",
-            "app/prompts/synthesizer_static_prompt.md",
+            "app/prompts/synthesizer/synthesizer_static_prompt.md",
         ).strip(),
         product_api_base_url=os.getenv("SOORIN_PRODUCT_API_BASE_URL", "").strip().rstrip("/"),
         product_topology_path=os.getenv("SOORIN_PRODUCT_TOPOLOGY_PATH", "/zeek/connections/unique-ip-pairs").strip(),

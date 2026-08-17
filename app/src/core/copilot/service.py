@@ -215,6 +215,7 @@ class CopilotService:
         identity: RequestIdentity,
         message: str,
         entity_ids: tuple[str, ...],
+        required_evidence_classes: tuple[str, ...] = (),
     ) -> LongTermMemorySelection:
         """Retrieve owner-scoped context without influencing route or tool selection."""
         if self.long_term_memory_retriever is None or not identity.user_id:
@@ -227,6 +228,7 @@ class CopilotService:
                 query=query,
                 user_id=identity.user_id,
                 entity_ids=entity_ids,
+                required_evidence_classes=required_evidence_classes,
                 request_id=identity.request_id,
             )
             if self.long_term_memory_store is None:

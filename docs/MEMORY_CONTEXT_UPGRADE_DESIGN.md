@@ -612,6 +612,35 @@ are newest/relevance bounded; candidate quota may remove the oldest candidate;
 active quota rejects admission rather than deleting authority. The active validity
 window is configured independently from retention.
 
+## 22. Prompt contract and temporal execution boundary
+
+The Synthesizer prompt is intentionally split without moving authority into
+Markdown. `SynthesizerPromptBuilder` owns typed state construction and
+deterministic module selection; `PromptModuleRegistry` owns only cached,
+validated grouped Markdown content. The static core covers lasting safety and
+authority rules. Task, temporal, evidence-mode, execution, provider, memory,
+analysis, response-depth, and output-constraint modules are selected only when
+their typed runtime state applies.
+
+The execution contract records whether current retrieval was requested and
+performed, the count of successful current evidence, partial current state,
+baseline availability, and accepted working-fact writes. The Synth must describe
+what actually executed even when it differs from a requested no-live boundary.
+This is a presentation integrity rule, not a substitute for deterministic routing
+and Gate 8 enforcement.
+
+For a current requirement, historical LTM is never a satisfier: it may provide a
+historical baseline only. Historical exact recall may select complementary active
+Profile and Detection records required by the question, ahead of semantic ranking,
+within existing selection/token bounds. Recalling an archived asset while another
+asset is active reads that history without changing the active episode.
+
+The user-facing prompt hides internal terms such as LTM status, Gate 8, ToolResult,
+Qdrant, and storage backend unless the user asks for architecture/debugging. It
+uses provenance-aware natural language instead. Router and Planner retain their
+separate prompts. The old `app/prompts/system_prompt.md` is intentionally retained
+as a tested rollback fallback; it is not the default Synth core.
+
 ## Appendix A. Disposition of the removed OpenCode guide
 
 `PROJECT_ANALYSIS_AND_OPENCODE_GUIDE.md` was removed during this audit. Its

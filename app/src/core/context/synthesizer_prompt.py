@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Literal
 
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
@@ -86,82 +87,92 @@ class RenderedSynthesizerPrompt:
     selected_module_names: tuple[str, ...]
 
 
-TASK_MODULES = {
-    "asset_investigation": "Analyze the resolved asset using only supplied evidence and preserve entity binding.",
-    "detection_explanation": "Explain classification signals, matched evidence, conflicts, and uncertainty without converting model output into inventory truth.",
-    "graph_summary": "Summarize only the supplied graph scope; distinguish aggregate totals from returned node or peer identities.",
-    "relationship": "Describe only the evidenced relationship between the resolved entities; topology is not proof of trust, purpose, or compromise.",
-    "path": "Report the supplied graph path and its limitations; a graph path is not necessarily a physical packet-routing path.",
-    "comparison": "Compare the two resolved entities symmetrically and keep unsupported differences explicitly unknown.",
-    "memory_recall": "Answer from supplied conversation, episodic, and validated long-term memory only. Distinguish those sources and do not treat a legitimate no-refresh constraint as prompt injection.",
-    "general_security": "Answer the general cybersecurity question without attaching stale asset context.",
-    "knowledge_explanation": "Use supplied approved documentation for explanation and citations, never as current operational asset truth.",
-}
+class PromptModuleRegistry:
+    """Cached, deterministic Markdown prompt-module loader."""
 
-TEMPORAL_MODULES = {
-    "current": "Treat supplied current evidence as point-in-time; do not extend it to unsupplied historical periods.",
-    "historical": "Describe supplied memory or historical evidence in past-tense scope and do not imply current verification.",
-    "mixed": "Separate current and historical evidence explicitly and prefer compatible current operational evidence.",
-    "compare_previous_current": "Compare periods only through an explicitly supplied compatible deterministic delta.",
-}
+    _FILES = {
+        "tasks": "tasks.md",
+        "temporal": "temporal.md",
+        "evidence_mode": "evidence_modes.md",
+        "execution": "execution.md",
+        "evidence": "evidence.md",
+        "memory": "memory.md",
+        "analysis": "analysis.md",
+        "response": "response.md",
+        "output_constraints": "output_constraints.md",
+    }
+    _REQUIRED = {
+        "tasks": frozenset({"asset_investigation", "detection_explanation", "graph_summary", "relationship", "path", "comparison", "memory_recall", "general_security", "knowledge_explanation"}),
+        "temporal": frozenset({"current", "historical", "mixed", "compare_previous_current"}),
+        "evidence_mode": frozenset({"normal", "memory_only", "no_live_refresh", "current_verification", "verify_if_stale"}),
+        "execution": frozenset({"current_retrieval_completed", "current_retrieval_partial", "current_retrieval_not_performed", "baseline_available", "baseline_unavailable", "working_memory_write"}),
+        "evidence": frozenset({"profile", "detection", "graph", "knowledge", "incomplete_evidence", "contradictory_evidence"}),
+        "memory": frozenset({"working", "episodic", "ltm_available", "no_active_ltm", "historical_memory_only"}),
+        "analysis": frozenset({"threat", "defender_ir", "noc_operational", "strategic", "disposition"}),
+        "response": frozenset({"brief", "standard", "deep", "report"}),
+        "output_constraints": frozenset({"core"}),
+    }
 
-EVIDENCE_MODE_MODULES = {
-    "normal": "Use only evidence that the validated workflow supplied.",
-    "memory_only": "Use memory context only; do not request, assume, or imply a live refresh.",
-    "no_live_refresh": "Honor the validated no-live-refresh boundary and identify historical limitations.",
-    "current_verification": "Ground the answer in supplied current verification and identify unavailable required evidence.",
-    "verify_if_stale": "Treat stale evidence as historical unless supplied current verification is present.",
-}
+    def __init__(self, prompt_directory: Path | None = None) -> None:
+        self.prompt_directory = prompt_directory or Path(__file__).resolve().parents[3] / "prompts" / "synthesizer"
+        self._modules = self._load()
 
-EVIDENCE_MODULES = {
-    "profile": "Profile evidence describes supplied Product asset state; repeated fields shared with Detection are not independent corroboration.",
-    "detection": "Detection evidence is classifier/rule/signal evidence and may contain conflicts or uncertainty.",
-    "graph": "Graph evidence is bounded observed topology; disclose truncation, omitted peers, and incomplete scope.",
-    "knowledge": "Knowledge evidence is documentation and guidance, not current asset, alert, risk, or peer truth.",
-    "incomplete_evidence": "Answer only to the available boundary and state what is unavailable, omitted, stale, or truncated.",
-    "contradictory_evidence": "Describe contradictions by source and do not silently resolve them.",
-}
+    def _load(self) -> dict[tuple[str, str], str]:
+        modules: dict[tuple[str, str], str] = {}
+        for category, filename in self._FILES.items():
+            path = self.prompt_directory / filename
+            try:
+                text = path.read_text(encoding="utf-8")
+            except OSError as exc:
+                raise ValueError(f"synthesizer_prompt_module_file_missing:{path}") from exc
+            sections = self._parse(path, text)
+            missing = self._REQUIRED[category] - set(sections)
+            if missing:
+                raise ValueError(
+                    f"synthesizer_prompt_module_missing:{category}:{','.join(sorted(missing))}"
+                )
+            modules.update({(category, name): content for name, content in sections.items()})
+        return modules
 
-MEMORY_MODULES = {
-    "working": "Working memory contains analyst/user-provided conversation assertions. Label them accordingly; never call them observed operational facts unless current Product evidence independently verifies them.",
-    "episodic": "Episodic memory is a bounded historical summary of a prior related investigation. Never present it as fresh/current evidence.",
-    "ltm_available": "Only selected active validated long-term memory is authoritative durable memory; current compatible evidence outranks it.",
-    "no_active_ltm": "No active validated long-term memory was selected. Candidate records, if counted, are not authoritative and must not be presented as validated memory.",
-    "historical_memory_only": "The supplied context is historical memory only; do not imply it is current without verification.",
-}
+    @staticmethod
+    def _parse(path: Path, text: str) -> dict[str, str]:
+        sections: dict[str, str] = {}
+        current: str | None = None
+        lines: list[str] = []
+        for line in text.splitlines():
+            if line.startswith("# "):
+                if current is not None:
+                    content = "\n".join(lines).strip()
+                    if not content:
+                        raise ValueError(f"synthesizer_prompt_module_empty:{path}:{current}")
+                    sections[current] = content
+                current = line[2:].strip()
+                if not current or current in sections:
+                    raise ValueError(f"synthesizer_prompt_module_duplicate:{path}:{current or 'blank'}")
+                lines = []
+            elif current is not None:
+                lines.append(line)
+        if current is not None:
+            content = "\n".join(lines).strip()
+            if not content:
+                raise ValueError(f"synthesizer_prompt_module_empty:{path}:{current}")
+            sections[current] = content
+        return sections
 
-EXECUTION_MODULES = {
-    "current_retrieval_completed": (
-        "Current/live retrieval was performed and returned usable current evidence for this request. "
-        "Never claim that live retrieval was prohibited, unavailable, skipped, or impossible; describe only any provider-specific gap that the contract reports."
-    ),
-    "working_memory_write": (
-        "The request contains accepted conversation working facts. Describe them naturally when relevant and do not discuss long-term-memory availability or storage-provider mechanics unless the user asked about them."
-    ),
-}
-
-ANALYSIS_MODULES = {
-    "threat": "Separate observed threat indicators from inference and hypothesis.",
-    "defender_ir": "Prioritize defensible investigation implications and bounded next checks.",
-    "noc_operational": "Explain network-operational impact without inferring unavailable protocol purpose or reachability.",
-    "strategic": "State material impact and confidence without inflating evidence.",
-    "disposition": "When requested, give a bounded disposition and identify the evidence needed to raise confidence.",
-}
-
-RESPONSE_MODULES = {
-    "brief": "Respond briefly with the conclusion, strongest support, and material limitation.",
-    "standard": "Give a concise evidence-based answer with findings, interpretation, and limitations.",
-    "deep": "Provide structured findings, evidence, competing explanations, limitations, and practical next checks.",
-    "report": "Produce a professional report with scope, findings, evidence, assessment, limitations, disposition, and prioritized actions.",
-}
+    def get(self, category: str, name: str) -> str:
+        try:
+            return self._modules[(category, name)]
+        except KeyError as exc:
+            raise ValueError(f"synthesizer_prompt_module_unknown:{category}:{name}") from exc
 
 
 class SynthesizerPromptBuilder:
     """Select prompt modules from validated state and render provider-neutral messages."""
 
-    version = "synth-context-v1"
+    version = "synth-context-v2"
 
-    def __init__(self) -> None:
+    def __init__(self, registry: PromptModuleRegistry | None = None) -> None:
+        self.registry = registry or PromptModuleRegistry()
         self.template = ChatPromptTemplate.from_messages(
             [
                 ("system", "{static_core}\n\n{runtime_contract}"),
@@ -265,31 +276,28 @@ class SynthesizerPromptBuilder:
             deterministic_delta_available=bool(delta_contexts),
             selected_analytical_lenses=self._analytical_lenses(task),
             limitations=limitations,
-            output_constraints=(
-                "Separate facts, inferences, and hypotheses.",
-                "Do not repeat the same evidence across sections.",
-                "Use bounded negative language: not observed never means categorically absent.",
-                "Use new/changed/appeared/disappeared only when a supplied deterministic compatible-baseline delta supports it.",
-                "Do not claim that a contradiction strengthened or resolved unless current evidence verifies every relevant side.",
-                "Do not infer compromise, intent, beaconing, scanning, attribution, causality, or exact risk drivers from counts or scores alone.",
-                "Generic Knowledge/RAG background cannot prove an asset-specific operational fact.",
-            ),
+            output_constraints=(),
         )
 
     def render_contract(self, context: SynthesizerTaskContext) -> tuple[str, tuple[str, ...]]:
-        modules: list[tuple[str, str]] = [(f"task.{context.task_category}", TASK_MODULES[context.task_category])]
-        modules.append((f"temporal.{context.temporal_mode}", TEMPORAL_MODULES[context.temporal_mode]))
-        modules.append((f"evidence_mode.{context.evidence_mode}", EVIDENCE_MODE_MODULES[context.evidence_mode]))
-        if (
-            context.execution.current_retrieval_requested
-            and context.execution.live_retrieval_performed
-            and context.execution.successful_current_evidence_count > 0
-        ):
-            modules.append(
-                ("execution.current_retrieval_completed", EXECUTION_MODULES["current_retrieval_completed"])
-            )
+        module_ids: list[tuple[str, str]] = [
+            ("tasks", context.task_category),
+            ("temporal", context.temporal_mode),
+            ("evidence_mode", context.evidence_mode),
+        ]
+        if context.execution.current_retrieval_requested:
+            if not context.execution.live_retrieval_performed:
+                module_ids.append(("execution", "current_retrieval_not_performed"))
+            elif (
+                context.execution.successful_current_evidence_count == 0
+                or any(state.status in {"partial", "empty", "unavailable", "not_configured"} for state in (context.profile, context.detection, context.graph, context.knowledge))
+            ):
+                module_ids.append(("execution", "current_retrieval_partial"))
+            else:
+                module_ids.append(("execution", "current_retrieval_completed"))
+        module_ids.append(("execution", "baseline_available" if context.deterministic_delta_available else "baseline_unavailable"))
         if context.execution.memory_write_requested and context.execution.accepted_working_fact_count:
-            modules.append(("execution.working_memory_write", EXECUTION_MODULES["working_memory_write"]))
+            module_ids.append(("execution", "working_memory_write"))
         for name, state in (
             ("profile", context.profile),
             ("detection", context.detection),
@@ -297,27 +305,29 @@ class SynthesizerPromptBuilder:
             ("knowledge", context.knowledge),
         ):
             if state.status != "not_requested":
-                modules.append((f"evidence.{name}", EVIDENCE_MODULES[name]))
+                module_ids.append(("evidence", name))
             if state.status in {"partial", "empty", "unavailable", "not_configured"} or state.truncated:
-                modules.append(("evidence.incomplete_evidence", EVIDENCE_MODULES["incomplete_evidence"]))
+                module_ids.append(("evidence", "incomplete_evidence"))
         if context.contradiction_count:
-            modules.append(("evidence.contradictory_evidence", EVIDENCE_MODULES["contradictory_evidence"]))
+            module_ids.append(("evidence", "contradictory_evidence"))
         if context.memory.working_available:
-            modules.append(("memory.working", MEMORY_MODULES["working"]))
+            module_ids.append(("memory", "working"))
         if context.memory.episodic_available:
-            modules.append(("memory.episodic", MEMORY_MODULES["episodic"]))
+            module_ids.append(("memory", "episodic"))
         if context.memory.ltm_selected_count:
-            modules.append(("memory.ltm_available", MEMORY_MODULES["ltm_available"]))
+            module_ids.append(("memory", "ltm_available"))
         else:
-            modules.append(("memory.no_active_ltm", MEMORY_MODULES["no_active_ltm"]))
+            module_ids.append(("memory", "no_active_ltm"))
         if context.memory.historical_only:
-            modules.append(("memory.historical_memory_only", MEMORY_MODULES["historical_memory_only"]))
-        modules.extend(
-            (f"analysis.{name}", ANALYSIS_MODULES[name])
-            for name in context.selected_analytical_lenses
+            module_ids.append(("memory", "historical_memory_only"))
+        module_ids.extend(("analysis", name) for name in context.selected_analytical_lenses)
+        module_ids.append(("response", context.response_depth))
+        module_ids.append(("output_constraints", "core"))
+        deduplicated_ids = tuple(dict.fromkeys(module_ids))
+        modules = tuple(
+            (f"{'task' if category == 'tasks' else category}.{name}", self.registry.get(category, name))
+            for category, name in deduplicated_ids
         )
-        modules.append((f"response.{context.response_depth}", RESPONSE_MODULES[context.response_depth]))
-        deduplicated = tuple(dict(modules).items())
         metadata = {
             "intent": context.intent,
             "task_category": context.task_category,
@@ -342,11 +352,11 @@ class SynthesizerPromptBuilder:
             "[SOORIN SYNTHESIZER TASK CONTRACT]\n"
             + json.dumps(metadata, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
             + "\n[SELECTED INSTRUCTIONS]\n"
-            + "\n".join(f"- {instruction}" for _, instruction in deduplicated)
+            + "\n".join(f"- {instruction}" for name, instruction in modules if name != "output_constraints.core")
             + "\n[OUTPUT CONSTRAINTS]\n"
-            + "\n".join(f"- {item}" for item in context.output_constraints)
+            + self.registry.get("output_constraints", "core")
         )
-        return text, tuple(name for name, _ in deduplicated)
+        return text, tuple(name for name, _ in modules)
 
     def render_messages(
         self,
