@@ -943,3 +943,37 @@ evidence authority; after that, introduce an Organization Intelligence Plane tha
 remains subordinate to live Product and Graph evidence. Neo4j, GraphRAG, Planner
 expansion, MCP/vendor tools, bulk enrichment, and side-effecting actions remain
 separate deferred capabilities.
+
+## 21B. Typed memory lifecycle (current working tree)
+
+The roadmap paragraph above is retained as history; Gate 8 and the local typed-LTM
+lifecycle are now implemented. The authority hierarchy is raw turns → scoped
+working facts → historical episodes → non-authoritative candidates → active typed
+LTM. Only the last layer can satisfy an evidence requirement, and only after
+canonical owner, entity, evidence class, capability/view/schema, completeness,
+freshness, and conflict validation.
+
+Safe structured Product profile/detection facts can move from candidate to active
+under a deterministic, versioned policy. Unsupported, stale, incomplete,
+contradictory, analyst-authored, hypothesis, and investigation-outcome records do
+not auto-promote. Exact replay is idempotent. Changed values share a logical key:
+the canonical transaction either supersedes the previous value or preserves a
+material conflict and blocks that logical fact from retrieval. Invalidation,
+rejection, expiry, confirmation, conflict, and supersession are audited without
+copying raw provider payloads.
+
+Current-verification requests still require live Product evidence. A historical
+baseline is used only when it is active and exactly compatible with the current
+owner/entity/capability/view/schema projection; otherwise the composer records a
+specific skip reason and emits no delta. No-live negations remain hard constraints.
+Working facts are filtered by conversation/entity scope, and episodes and generic
+Knowledge/RAG passages are labelled historical/contextual rather than operational
+truth.
+
+SQLite schema v7 is the canonical local/test implementation and survives restart.
+Qdrant, when enabled, stores only a recall projection; every hit is canonically
+reloaded. Production PostgreSQL, Redis, and read-replica topology remain design
+targets, not deployed components. A PostgreSQL adapter must preserve Product-owned
+tenant authorization, atomic lifecycle/audit writes, optimistic revisions, unique
+active logical keys, and bounded retention. Redis/read replicas may accelerate
+reads but cannot establish authority or execute lifecycle transitions.

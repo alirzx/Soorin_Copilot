@@ -844,6 +844,28 @@ Secrets such as API keys, passwords, Product tokens, captcha bypass values, and 
 
 `SOORIN_MEMORY_CONTEXT_LONG_TERM_TOKEN_BUDGET` caps the portion of final memory context reserved for validated typed long-term memory records. Increasing it permits more/longer historical organizational memory to reach synthesis but competes with other context; decreasing it keeps long-term memory concise. It does not alter retrieval authority or permit memory to replace volatile live evidence.
 
+### `SOORIN_MEMORY_AUTO_PROMOTION_ENABLED`
+
+Enables the deterministic candidate evaluation path. The default is `true`, but it
+has no effect while `SOORIN_LONG_TERM_MEMORY_ENABLED=false`. Automatic promotion is
+limited to the versioned safe structured Product profile/detection allow-list;
+analyst statements, hypotheses, incomplete/stale evidence, unsafe classes, and
+contradictions do not become active automatically.
+
+### `SOORIN_MEMORY_PROMOTION_POLICY_VERSION`
+
+Identifies the deterministic policy recorded on each lifecycle decision and audit
+event. The default is `ltm-promotion-v1`. Change this only with a reviewed policy
+and regression tests; it is an audit/version label, not a free-form prompt.
+
+### `SOORIN_MEMORY_ACTIVE_VALIDITY_SECONDS`
+
+Sets the validity window applied to automatically promoted operational records,
+measured from the structured Product observation time. The default is `86400`
+(24 hours), with settings validation constraining it to 60–2,592,000 seconds.
+Elapsed validity removes operational authority; it is independent from storage
+retention and does not delete audit history.
+
 ---
 
 ## Local Persistence and State

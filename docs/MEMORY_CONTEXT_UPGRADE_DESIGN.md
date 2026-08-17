@@ -556,6 +556,62 @@ revision, lifecycle/index status, provenance, exact structured search, and
 non-fatal unavailable/conflict classification; endpoint paths remain a Product
 contract decision.
 
+## 21. Candidate-to-active lifecycle contract
+
+The current local implementation completes this design slice with five distinct
+authority levels: raw turns, scoped working facts, historical episodes, durable
+candidates, and active typed LTM. Candidates are never synthesis authority and
+never satisfy Gate 8. Active records are usable only while canonical, fresh,
+conflict-free, owner/entity compatible, and structurally compatible with the
+requested evidence.
+
+| Candidate condition | Deterministic decision |
+| --- | --- |
+| Complete/current structured Product profile or detection evidence in the safe allow-list | Auto-promote |
+| Exact repetition of an active value | Confirm/idempotently reuse active record |
+| Safe changed value for the same logical key | Atomically supersede prior active value |
+| Material contradiction | Keep candidate for review and block the conflicting active logical fact |
+| Analyst-authored durable statement | Require explicit review |
+| Hypothesis or investigation outcome | Require explicit review |
+| Unsupported capability/evidence class, stale, incomplete, or malformed evidence | Keep candidate or reject according to the versioned reason code |
+
+The idempotency fingerprint identifies exact content; the logical memory key
+identifies an owner/entity/type/capability/evidence/view/schema slot across value
+changes. The canonical transaction revalidates revision, ownership, binding,
+fingerprint, and logical key immediately before transition. It writes the lifecycle
+event in the same transaction. The active logical-key uniqueness constraint and
+`BEGIN IMMEDIATE` serialization make sequential and concurrent replays idempotent.
+Explicit invalidation and elapsed validity remove authority; a later exact replay
+may create a fresh candidate after the expired record is transitioned.
+
+The compact audit records action, status transition, reason code, policy version,
+owner/entity bindings, source request, evidence references, fingerprint, and
+logical key. It deliberately excludes raw provider payloads and model prompts.
+
+Retrieval is recall-then-validate: exact SQLite lookup and optional Qdrant semantic
+search produce bounded candidates; canonical reload applies ownership, lifecycle,
+authority, freshness, conflict, and entity checks. Gate 8 additionally validates
+evidence class. Delta composition additionally requires exact capability, selected
+views, schema, and completeness compatibility. A failed check emits a precise skip
+reason and current Product evidence remains authoritative.
+
+### Production topology contract
+
+SQLite schema v7 is local/test only. The production system should place canonical
+records and lifecycle audit in Product-owned PostgreSQL under tenant authorization.
+PostgreSQL must provide atomic promotion/supersession/audit, optimistic revisions,
+a one-active-per-logical-key constraint, bounded indexed queries, and retention/
+legal-hold policy. Qdrant remains a rebuildable semantic index. Optional Redis may
+cache non-authoritative projections, and optional read replicas may serve bounded
+recall, but either must canonically validate against a sufficiently current source
+before use and neither may process writes or promotion decisions. These production
+components are not implemented or deployed in this repository change.
+
+Operational retention remains bounded at every layer. Working facts and episodes
+are newest/relevance bounded; candidate quota may remove the oldest candidate;
+active quota rejects admission rather than deleting authority. The active validity
+window is configured independently from retention.
+
 ## Appendix A. Disposition of the removed OpenCode guide
 
 `PROJECT_ANALYSIS_AND_OPENCODE_GUIDE.md` was removed during this audit. Its

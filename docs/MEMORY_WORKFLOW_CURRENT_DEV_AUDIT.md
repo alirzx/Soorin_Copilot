@@ -848,3 +848,55 @@ platform. Its strongest properties are deterministic authority, fail-closed
 evidence selection, bounded execution, and separation of conversation context
 from authoritative LTM. The safest next change is the narrow typed baseline/delta
 integration described above.
+
+## 21. 2026-08-16 lifecycle completion addendum
+
+This addendum supersedes the earlier Gate 6/7 and delta classifications in this
+audit. In the current working tree, typed LTM has a complete local candidate-to-
+active lifecycle and current-verification delta composition is implemented.
+
+The memory hierarchy is explicit: bounded raw turns support immediate continuity;
+typed working facts are conversation- or entity-scoped analyst/user assertions;
+bounded episodes are historical investigation summaries; candidate LTM is durable
+but non-authoritative; and active LTM is the only durable layer that can satisfy
+Gate 8. None of the first four layers establishes current operational truth.
+
+Candidate creation remains deterministic from structured `ToolResult` evidence.
+The versioned policy automatically promotes only complete, current Product
+profile/detection statements from the small allow-list of safe identity, role,
+protocol, and detection-classification evidence. Analyst statements, hypotheses,
+investigation outcomes, incomplete/stale evidence, unsupported capabilities,
+unsafe evidence classes, and contradictions remain candidates for review or are
+rejected. Model prose cannot approve itself.
+
+An exact fingerprint provides retry idempotency; a separate logical key identifies
+the owner/entity/fact slot across changed values. Promotion runs in one canonical
+transaction: it records the decision, confirms an exact value, supersedes a prior
+compatible active value, or preserves both sides of a material conflict while
+marking the prior active record unusable. Rejection, invalidation, expiry,
+supersession, and confirmation write compact lifecycle audit events. Expired exact
+replays first expire the old authority and then admit a fresh candidate. Active
+quota pressure preserves existing authority and leaves the new record candidate.
+
+Retrieval uses exact/semantic recall only to find IDs, then reloads canonical
+records and rejects candidate, superseded, invalidated, expired, wrong-owner,
+wrong-entity, wrong-type/evidence, incomplete, or unresolved-conflict records.
+Gate 8 and delta composition apply the same fail-closed rules. A baseline must be
+active, current, complete, and exactly compatible in owner, entity, capability,
+selected views, and schema. Current Product evidence remains authoritative;
+episodes, working facts, and generic Knowledge/RAG text cannot establish asset
+state.
+
+SQLite schema v7 is the local development implementation. Production should use
+PostgreSQL as canonical Product-owned storage with tenant authorization,
+transactions, optimistic revisions, one-active-per-logical-key enforcement, and
+the same compact audit contract. Qdrant is a disposable retrieval index, not
+authority. Redis caching and read replicas are optional future scale optimizations
+only; neither may decide promotion or serve unvalidated authority. No PostgreSQL
+adapter, Redis tier, or read replica was deployed by this change.
+
+Retention remains bounded and owner scoped. Candidate pressure may evict only
+candidates; active overflow fails closed. Lifecycle controls are
+`SOORIN_MEMORY_AUTO_PROMOTION_ENABLED`,
+`SOORIN_MEMORY_PROMOTION_POLICY_VERSION`, and
+`SOORIN_MEMORY_ACTIVE_VALIDITY_SECONDS`.
