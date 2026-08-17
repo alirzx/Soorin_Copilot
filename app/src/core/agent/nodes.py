@@ -91,6 +91,16 @@ class CopilotWorkflowNodes:
         )
         constraints = derive_request_constraints(state["message"])
         pending_facts = extract_working_facts(state["message"]) if constraints.memory_write else ()
+        resolved_values = tuple(item.value for item in resolution.entities)
+        pending_facts = tuple(
+            replace(
+                fact,
+                scope="conversation" if fact.key == "analyst_name" else "entity",
+                entity_ids=() if fact.key == "analyst_name" else resolved_values,
+            )
+            for fact in pending_facts
+            if fact.key == "analyst_name" or resolved_values
+        )
         logger.info(
             "event=request_constraints_resolved request_id=%s allow_live=%s require_current=%s memory_only=%s memory_write=%s reason_count=%s",
             state["request_id"],
@@ -174,7 +184,7 @@ class CopilotWorkflowNodes:
                 semantic_router_called=False,
             )
             logger.info(
-                "event=memory_fast_path_selected request_id=%s router_bypassed=true entity_count=%s working_fact_count=%s",
+                "event=memory_fast_path_selected request_id=%s router_bypassed=true entity_count=%s pending_working_fact_count=%s",
                 state["request_id"],
                 len(values),
                 len(state.get("pending_working_facts") or ()),
@@ -1181,7 +1191,7 @@ class CopilotWorkflowNodes:
             if statement is None:
                 continue
             try:
-                coordinator.create_candidate(LongTermMemoryRecord.candidate(
+                candidate = LongTermMemoryRecord.candidate(
                     memory_type="validated_finding",
                     user_id=identity.user_id,
                     entity_ids=result.entities,
@@ -1189,8 +1199,22 @@ class CopilotWorkflowNodes:
                     source_request_id=identity.request_id,
                     source_conversation_id=identity.thread_key,
                     evidence_refs=refs,
-                    provenance_category="investigation",
-                ))
+                    provenance_category=(
+                        "product"
+                        if result.source_capability in {"asset.get_profile", "asset.get_detection"}
+                        else "investigation"
+                    ),
+                )
+                if hasattr(coordinator, "process_candidate"):
+                    lifecycle = coordinator.process_candidate(candidate, result)
+                    promotion_action = lifecycle.decision.action
+                    promotion_reason = lifecycle.decision.reason_code
+                    final_status = lifecycle.memory.status
+                else:
+                    stored = coordinator.create_candidate(candidate)
+                    promotion_action = "keep_candidate"
+                    promotion_reason = "coordinator_lifecycle_not_available"
+                    final_status = stored.status
             except (RuntimeError, ValueError, OSError) as exc:
                 logger.warning(
                     "event=long_term_memory_candidate_failed request_id=%s capability=%s error_type=%s",
@@ -1201,10 +1225,14 @@ class CopilotWorkflowNodes:
                 continue
             created += 1
             logger.info(
-                "event=long_term_memory_candidate_proposed request_id=%s capability=%s evidence_class_count=%s",
+                "event=long_term_memory_candidate_processed request_id=%s capability=%s "
+                "evidence_class_count=%s promotion_action=%s promotion_reason=%s final_status=%s",
                 state["request_id"],
                 result.source_capability,
                 sum(ref.startswith("evidence_class_") for ref in refs),
+                promotion_action,
+                promotion_reason,
+                final_status,
             )
         return created
 

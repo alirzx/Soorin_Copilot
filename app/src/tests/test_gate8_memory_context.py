@@ -594,12 +594,20 @@ def test_production_composer_uses_only_compatible_authoritative_baseline() -> No
 @pytest.mark.parametrize(
     ("change", "expected_reason"),
     (
-        ({"entity": "192.0.2.99"}, "baseline_entity_mismatch"),
-        ({"view": "identity"}, "baseline_view_mismatch"),
-        ({"schema_version": "product-view-v0"}, "baseline_schema_mismatch"),
-        ({"authoritative": False, "status": "candidate"}, "baseline_not_authoritative_or_accessible"),
-        ({"freshness": "expired"}, "baseline_not_authoritative_or_accessible"),
-        ({"accessible": False}, "baseline_not_authoritative_or_accessible"),
+        ({"entity": "192.0.2.99"}, "wrong_entity"),
+        ({"view": "identity"}, "wrong_view"),
+        ({"schema_version": "product-view-v0"}, "wrong_schema"),
+        ({"authoritative": False, "status": "candidate"}, "candidate_only"),
+        ({"authoritative": False, "status": "superseded"}, "superseded"),
+        ({"authoritative": False, "status": "invalidated"}, "invalidated"),
+        ({"freshness": "expired"}, "stale"),
+        ({"accessible": False}, "inactive"),
+        ({"owner_id": "different-user"}, "wrong_owner"),
+        ({"capability": "asset.get_detection"}, "wrong_capability"),
+        ({"memory_type": "investigation_outcome"}, "wrong_memory_type"),
+        ({"evidence_classes": ()}, "wrong_evidence_class"),
+        ({"unresolved_conflict": True}, "unresolved_conflict"),
+        ({"complete": False}, "incomplete_baseline"),
     ),
 )
 def test_production_composer_fails_closed_for_incompatible_baseline(
@@ -630,4 +638,4 @@ def test_candidate_ltm_never_becomes_authoritative_delta_baseline() -> None:
         current_projections=_current_profile_projection(),
         historical_baselines=(baseline,),
     )
-    assert composer.last_delta_skip_reason == "baseline_not_authoritative_or_accessible"
+    assert composer.last_delta_skip_reason == "candidate_only"

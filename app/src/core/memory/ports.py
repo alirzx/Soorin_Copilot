@@ -15,8 +15,11 @@ from src.core.memory.persistence import (
 from src.core.memory.long_term import (
     EpistemicStatus,
     LongTermMemoryRecord,
+    MemoryLifecycleAuditEvent,
+    MemoryLifecycleResult,
     MemoryStatus,
     MemoryType,
+    PromotionDecision,
 )
 
 
@@ -149,6 +152,22 @@ class LongTermMemoryStore(Protocol):
         expected_revision: int,
     ) -> LongTermMemoryRecord: ...
 
+    def apply_promotion(
+        self,
+        *,
+        candidate: LongTermMemoryRecord,
+        decision: PromotionDecision,
+        actor: str = "system",
+    ) -> MemoryLifecycleResult: ...
+
+    def list_audit_events(
+        self,
+        *,
+        user_id: str,
+        memory_id: str | None = None,
+        limit: int = 100,
+    ) -> tuple[MemoryLifecycleAuditEvent, ...]: ...
+
     def list(
         self,
         *,
@@ -161,6 +180,14 @@ class LongTermMemoryStore(Protocol):
     ) -> tuple[LongTermMemoryRecord, ...]: ...
 
     def invalidate(
+        self,
+        *,
+        user_id: str,
+        memory_id: str,
+        expected_revision: int,
+    ) -> LongTermMemoryRecord: ...
+
+    def expire(
         self,
         *,
         user_id: str,

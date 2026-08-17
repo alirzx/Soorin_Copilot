@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 import hashlib
 import json
 import re
-from typing import Literal, get_args
+from typing import Any, Literal, get_args
 from uuid import uuid4
 
 from src.core.context.models import approx_tokens, compact_preview
@@ -29,9 +29,23 @@ EpistemicStatus = Literal[
     "historical",
     "unconfirmed",
 ]
-MemoryStatus = Literal["candidate", "active", "invalidated", "superseded"]
+MemoryStatus = Literal["candidate", "active", "invalidated", "superseded", "rejected", "expired"]
 IndexStatus = Literal["synced", "pending", "stale", "failed", "not_indexed"]
 FreshnessStatus = Literal["current", "historical", "expired", "inactive"]
+PromotionAction = Literal["auto_promote", "keep_candidate", "requires_review", "reject"]
+LifecycleAction = Literal[
+    "candidate_created",
+    "candidate_deduplicated",
+    "promotion_evaluated",
+    "promoted",
+    "confirmed",
+    "kept_candidate",
+    "review_required",
+    "rejected",
+    "superseded",
+    "invalidated",
+    "expired",
+]
 
 MEMORY_TYPES = frozenset(get_args(MemoryType))
 EPISTEMIC_STATUSES = frozenset(get_args(EpistemicStatus))
@@ -46,6 +60,14 @@ SECRET_PATTERN = re.compile(
     r"(?i)(?:authorization\s*:|bearer\s+[a-z0-9._-]{16,}|"
     r"api[_ -]?key\s*[=:]\s*\S+|password\s*[=:]\s*\S+)"
 )
+PROMOTION_POLICY_VERSION = "ltm-promotion-v1"
+AUTO_PROMOTION_CAPABILITIES = frozenset({"asset.get_profile", "asset.get_detection"})
+AUTO_PROMOTION_EVIDENCE_CLASSES = frozenset({
+    "asset_identity",
+    "asset_role",
+    "asset_identity_protocols",
+    "detection_classification",
+})
 
 
 def utc_now() -> str:
@@ -80,6 +102,91 @@ def _bounded_identifiers(values: tuple[str, ...], field_name: str, maximum: int)
     return tuple(normalized)
 
 
+def _structured_statement(statement: str) -> dict[str, Any] | None:
+    try:
+        payload = json.loads(statement)
+    except (TypeError, ValueError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def logical_memory_key_for(
+    *,
+    user_id: str,
+    entity_ids: tuple[str, ...],
+    memory_type: MemoryType,
+    statement: str,
+    evidence_refs: tuple[str, ...],
+) -> str:
+    """Identify one operational fact family independently of its current value."""
+    structured = _structured_statement(statement)
+    payload = structured or {}
+    evidence_classes = tuple(sorted(
+        str(item)
+        for item in payload.get("evidence_classes", ())
+        if str(item).strip()
+    )) or tuple(sorted(
+        ref.removeprefix("evidence_class_")
+        for ref in evidence_refs
+        if ref.startswith("evidence_class_")
+    ))
+    identity = {
+        "user_id": user_id,
+        "entity_ids": sorted(entity_ids),
+        "memory_type": memory_type,
+        "capability": str(payload.get("source_capability") or ""),
+        "evidence_classes": evidence_classes,
+        "views": sorted(str(item) for item in payload.get("selected_views", ())),
+        "schema_version": str(payload.get("schema_version") or ""),
+        "fact_identity": "" if structured else hashlib.sha256(statement.encode("utf-8")).hexdigest(),
+    }
+    return hashlib.sha256(
+        json.dumps(identity, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
+@dataclass(frozen=True)
+class PromotionDecision:
+    action: PromotionAction
+    reason_code: str
+    reason: str
+    confidence: float = 0.0
+    quality_score: float = 0.0
+    evidence_refs: tuple[str, ...] = ()
+    policy_version: str = PROMOTION_POLICY_VERSION
+    epistemic_status: EpistemicStatus = "candidate"
+    provenance_category: str = "investigation"
+
+
+@dataclass(frozen=True)
+class MemoryLifecycleAuditEvent:
+    event_id: str
+    memory_id: str
+    logical_memory_key: str
+    idempotency_fingerprint: str
+    user_id: str
+    entity_ids: tuple[str, ...]
+    source_request_id: str
+    action: LifecycleAction
+    from_status: str
+    to_status: str
+    reason_code: str
+    policy_version: str
+    evidence_refs: tuple[str, ...]
+    actor: str
+    created_at: str
+
+
+@dataclass(frozen=True)
+class MemoryLifecycleResult:
+    memory: "LongTermMemoryRecord"
+    decision: PromotionDecision
+    previous_memory: "LongTermMemoryRecord | None" = None
+    deduplicated: bool = False
+    superseded_count: int = 0
+    conflict_count: int = 0
+
+
 @dataclass(frozen=True)
 class LongTermMemoryRecord:
     memory_id: str
@@ -102,6 +209,9 @@ class LongTermMemoryRecord:
     index_status: IndexStatus = "not_indexed"
     supersedes_memory_id: str | None = None
     idempotency_fingerprint: str = ""
+    logical_memory_key: str = ""
+    has_unresolved_conflict: bool = False
+    policy_version: str = PROMOTION_POLICY_VERSION
 
     def __post_init__(self) -> None:
         now = utc_now()
@@ -184,6 +294,22 @@ class LongTermMemoryRecord:
         if supplied and supplied != expected_fingerprint:
             raise ValueError("Long-term memory idempotency fingerprint is invalid")
         object.__setattr__(self, "idempotency_fingerprint", expected_fingerprint)
+        expected_logical_key = logical_memory_key_for(
+            user_id=self.user_id,
+            entity_ids=self.entity_ids,
+            memory_type=self.memory_type,
+            statement=self.statement,
+            evidence_refs=self.evidence_refs,
+        )
+        supplied_key = str(self.logical_memory_key or "").strip().lower()
+        if supplied_key and supplied_key != expected_logical_key:
+            raise ValueError("Long-term memory logical key is invalid")
+        object.__setattr__(self, "logical_memory_key", expected_logical_key)
+        object.__setattr__(self, "has_unresolved_conflict", bool(self.has_unresolved_conflict))
+        policy_version = str(self.policy_version or PROMOTION_POLICY_VERSION).strip()
+        if not policy_version or len(policy_version) > 64:
+            raise ValueError("Long-term memory policy version is invalid")
+        object.__setattr__(self, "policy_version", policy_version)
 
     @classmethod
     def candidate(
@@ -230,6 +356,73 @@ class LongTermMemoryRecord:
 
 class MemoryPromotionPolicy:
     """Deterministic authority transitions; no model output can approve itself."""
+
+    @staticmethod
+    def evaluate_candidate_for_promotion(
+        candidate: LongTermMemoryRecord,
+        evidence: Any,
+        *,
+        enabled: bool = True,
+        policy_version: str = PROMOTION_POLICY_VERSION,
+    ) -> PromotionDecision:
+        refs = tuple(candidate.evidence_refs)
+        base = {
+            "evidence_refs": refs,
+            "policy_version": policy_version,
+        }
+        if candidate.status != "candidate" or candidate.epistemic_status != "candidate":
+            return PromotionDecision("reject", "candidate_status_ineligible", "Record is not an eligible candidate.", **base)
+        if not candidate.user_id or len(candidate.entity_ids) != 1:
+            return PromotionDecision("reject", "owner_or_entity_invalid", "Exact owner and single-entity scope are required.", **base)
+        statement = _structured_statement(candidate.statement)
+        if statement is None:
+            action: PromotionAction = "requires_review" if candidate.provenance_category == "analyst" else "reject"
+            return PromotionDecision(action, "structured_evidence_required", "Automatic authority requires structured evidence.", **base)
+        if candidate.memory_type in {"hypothesis_resolution", "investigation_outcome"}:
+            return PromotionDecision("requires_review", "memory_type_requires_review", "This memory type requires explicit review.", **base)
+        if candidate.provenance_category == "analyst":
+            return PromotionDecision("requires_review", "analyst_confirmation_required", "Analyst-provided notes are not operational evidence.", **base)
+        if not enabled:
+            return PromotionDecision("keep_candidate", "auto_promotion_disabled", "Automatic promotion is disabled.", **base)
+        capability = str(statement.get("source_capability") or "")
+        evidence_classes = frozenset(str(item) for item in statement.get("evidence_classes", ()))
+        views = tuple(str(item) for item in statement.get("selected_views", ()))
+        schema_version = str(statement.get("schema_version") or "")
+        if capability not in AUTO_PROMOTION_CAPABILITIES:
+            return PromotionDecision("keep_candidate", "source_not_auto_promotable", "The source capability is not auto-promotable.", **base)
+        if not evidence_classes or not evidence_classes.issubset(AUTO_PROMOTION_EVIDENCE_CLASSES):
+            return PromotionDecision("requires_review", "evidence_class_requires_review", "The evidence class is not safe for automatic authority.", **base)
+        if not views or not schema_version or statement.get("completeness") != "complete" or not statement.get("projection_complete"):
+            return PromotionDecision("keep_candidate", "projection_incomplete", "A complete compatible projection is required.", **base)
+        if (
+            getattr(evidence, "source_capability", "") != capability
+            or tuple(getattr(evidence, "entities", ())) != candidate.entity_ids
+            or getattr(evidence, "status", "") != "ok"
+            or getattr(evidence, "completeness", "") != "complete"
+            or getattr(evidence, "freshness", "") != "current"
+            or bool(getattr(evidence, "truncated", False))
+            or bool(getattr(evidence, "projection_truncated", False))
+            or not bool(getattr(evidence, "source_payload_complete", False))
+            or not bool(getattr(evidence, "projection_usable", False))
+            or tuple(getattr(evidence, "selected_views", ())) != views
+            or str(getattr(evidence, "projection_schema_version", "")) != schema_version
+            or getattr(evidence, "view_payload", None) != statement.get("evidence")
+        ):
+            return PromotionDecision("keep_candidate", "validated_tool_result_required", "Validated complete ToolResult evidence is required.", **base)
+        if tuple(getattr(evidence, "contradictions", ())):
+            return PromotionDecision("requires_review", "unresolved_material_conflict", "Material contradictions require review.", **base)
+        if not str(getattr(evidence, "retrieved_at", "") or getattr(evidence, "valid_at", "")):
+            return PromotionDecision("keep_candidate", "freshness_metadata_required", "Freshness metadata is required.", **base)
+        return PromotionDecision(
+            "auto_promote",
+            "validated_product_fact",
+            "Complete Product-backed structured fact is eligible for automatic promotion.",
+            confidence=0.95,
+            quality_score=1.0,
+            epistemic_status="source_validated",
+            provenance_category="product",
+            **base,
+        )
 
     @staticmethod
     def promote(

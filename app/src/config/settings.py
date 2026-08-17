@@ -247,6 +247,9 @@ class Settings:
     memory_rerank_model: str
     memory_rerank_timeout_seconds: float
     memory_context_long_term_token_budget: int
+    memory_auto_promotion_enabled: bool
+    memory_promotion_policy_version: str
+    memory_active_validity_seconds: int
     local_product_simulation_enabled: bool
     streamlit_auth_backend: str
     local_test_user_creation_enabled: bool
@@ -619,6 +622,15 @@ def get_settings() -> Settings:
         ),
         memory_context_long_term_token_budget=max(
             0, _int("SOORIN_MEMORY_CONTEXT_LONG_TERM_TOKEN_BUDGET", 500)
+        ),
+        memory_auto_promotion_enabled=_bool(
+            "SOORIN_MEMORY_AUTO_PROMOTION_ENABLED", True
+        ),
+        memory_promotion_policy_version=os.getenv(
+            "SOORIN_MEMORY_PROMOTION_POLICY_VERSION", "ltm-promotion-v1"
+        ).strip() or "ltm-promotion-v1",
+        memory_active_validity_seconds=max(
+            60, min(2_592_000, _int("SOORIN_MEMORY_ACTIVE_VALIDITY_SECONDS", 86_400))
         ),
         local_product_simulation_enabled=_bool(
             "SOORIN_LOCAL_PRODUCT_SIMULATION_ENABLED",

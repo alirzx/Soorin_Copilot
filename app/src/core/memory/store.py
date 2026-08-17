@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from typing import Any
 
@@ -145,9 +145,22 @@ class MemoryStore:
                 context_key=context_key,
                 episode_id=EpisodeRecord.create(session_id, context_key).episode_id,
             )
-        merged = {item.key: item for item in working.working_facts}
+        merged = {
+            (item.key, item.scope, item.entity_ids): item
+            for item in working.working_facts
+        }
         for fact in facts:
-            merged[fact.key] = fact
+            if (
+                fact.key != "analyst_name"
+                and fact.scope == "conversation"
+                and context_key.entities
+            ):
+                fact = replace(
+                    fact,
+                    scope="entity",
+                    entity_ids=context_key.entities,
+                )
+            merged[(fact.key, fact.scope, fact.entity_ids)] = fact
         working.working_facts = tuple(merged.values())[-self.max_working_facts :]
         self.repository.set_working(working)
         logger.info(
@@ -492,11 +505,16 @@ class MemoryStore:
             episode_summaries=tuple(selected_episodes),
             long_term_memories=tuple(selected_long_term),
             working_facts=tuple(
-                (self.repository.get_working(session_id) or WorkingMemory(
+                item
+                for item in (self.repository.get_working(session_id) or WorkingMemory(
                     session_id=session_id,
                     context_key=context_key or MemoryContextKey(),
                     episode_id="",
                 )).working_facts
+                if item.scope == "conversation"
+                or context_key is None
+                or not item.entity_ids
+                or bool(set(item.entity_ids).intersection(context_key.entities))
             ),
             active_entities=tuple(active_entities),
             estimated_tokens=max(0, used + used_long_term_tokens),
@@ -721,18 +739,25 @@ class MemoryStore:
                 payload,
                 max_chars=max(200, settings.conversation_summary_max_tokens * 4),
             )
+        episode_facts = tuple(
+            item
+            for item in working.working_facts
+            if item.scope == "conversation"
+            or not item.entity_ids
+            or bool(set(item.entity_ids).intersection(working.context_key.entities))
+        )
         self.repository.add_episode(
             EpisodeRecord(
                 episode_id=working.episode_id,
                 session_id=session_id,
                 context_key=working.context_key,
                 compact_summary=summary,
-                working_facts=working.working_facts,
+                working_facts=episode_facts,
                 inferred_role=tuple(payload.get("inferred_role", ())) if history else (),
                 key_findings=tuple(payload.get("key_findings", ())) if history else (),
                 contradictions=tuple(dict.fromkeys((
                     *(payload.get("contradictions", ()) if history else ()),
-                    *(item.value for item in working.working_facts if item.key == "identity_contradiction"),
+                    *(item.value for item in episode_facts if item.key == "identity_contradiction"),
                 ))),
                 unresolved_questions=tuple(payload.get("unresolved_questions", ())) if history else (),
                 next_checks=tuple(payload.get("next_checks", ())) if history else (),

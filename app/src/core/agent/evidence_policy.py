@@ -245,7 +245,11 @@ class MemorySufficiencyGate:
         ]
         if not entity_bound:
             return MemorySufficiencyDecision(requirement, "live_evidence_required", "memory_entity_mismatch")
-        covered = [item for item in entity_bound if self._covers(item.memory, requirement.evidence_class)]
+        covered = [
+            item
+            for item in entity_bound
+            if self._covers(item.memory, requirement.evidence_class, requirement.capability)
+        ]
         if not covered:
             return MemorySufficiencyDecision(requirement, "live_evidence_required", "memory_partial")
         authoritative = [
@@ -263,7 +267,7 @@ class MemorySufficiencyGate:
             ref == "contradiction" or ref.startswith("contradicts_")
             for item in authoritative
             for ref in item.memory.evidence_refs
-        )
+        ) or any(item.memory.has_unresolved_conflict for item in authoritative)
         if explicit_conflict:
             return MemorySufficiencyDecision(requirement, "contradictory_memory", "memory_conflict_live_refresh", memory_ids)
         if requirement.exhaustive and not all("complete" in item.memory.evidence_refs for item in authoritative):
@@ -280,9 +284,26 @@ class MemorySufficiencyGate:
         reason = "memory_reused_historical" if requirement.freshness_class == "historical" else "memory_reused_authoritative"
         return MemorySufficiencyDecision(requirement, "memory_sufficient", reason, memory_ids)
 
-    def _covers(self, memory: Any, evidence_class: str) -> bool:
+    def _covers(self, memory: Any, evidence_class: str, capability: str) -> bool:
         explicit = f"evidence_class_{evidence_class}"
-        return explicit in memory.evidence_refs
+        if explicit not in memory.evidence_refs:
+            return False
+        if memory.epistemic_status == "analyst_confirmed":
+            return True
+        try:
+            statement = json.loads(memory.statement)
+        except (TypeError, ValueError):
+            return False
+        if not isinstance(statement, dict):
+            return False
+        return (
+            evidence_class in tuple(statement.get("evidence_classes") or ())
+            and statement.get("source_capability") == capability
+            and bool(statement.get("selected_views"))
+            and bool(statement.get("schema_version"))
+            and statement.get("completeness") == "complete"
+            and bool(statement.get("projection_complete"))
+        )
 
 
 class ViewSelector:

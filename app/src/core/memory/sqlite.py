@@ -126,7 +126,10 @@ CREATE TABLE IF NOT EXISTS local_long_term_memories (
     status TEXT NOT NULL,
     index_status TEXT NOT NULL,
     supersedes_memory_id TEXT,
-    idempotency_fingerprint TEXT
+    idempotency_fingerprint TEXT,
+    logical_memory_key TEXT,
+    has_unresolved_conflict INTEGER NOT NULL DEFAULT 0,
+    policy_version TEXT NOT NULL DEFAULT 'ltm-promotion-v1'
 );
 
 CREATE TABLE IF NOT EXISTS local_long_term_memory_entities (
@@ -147,6 +150,37 @@ ON local_long_term_memory_entities(entity_id, memory_id);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_local_long_term_memory_live_fingerprint
 ON local_long_term_memories(user_id, idempotency_fingerprint)
 WHERE idempotency_fingerprint IS NOT NULL AND status IN ('candidate', 'active');
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_local_long_term_memory_active_logical_key
+ON local_long_term_memories(user_id, logical_memory_key)
+WHERE logical_memory_key IS NOT NULL AND status = 'active';
+
+CREATE INDEX IF NOT EXISTS idx_local_long_term_memory_logical_lookup
+ON local_long_term_memories(user_id, logical_memory_key, status, updated_at DESC);
+
+CREATE TABLE IF NOT EXISTS local_long_term_memory_audit (
+    event_id TEXT PRIMARY KEY,
+    memory_id TEXT NOT NULL,
+    logical_memory_key TEXT NOT NULL,
+    idempotency_fingerprint TEXT NOT NULL,
+    user_id TEXT NOT NULL,
+    entity_ids_json TEXT NOT NULL,
+    source_request_id TEXT NOT NULL,
+    action TEXT NOT NULL,
+    from_status TEXT NOT NULL,
+    to_status TEXT NOT NULL,
+    reason_code TEXT NOT NULL,
+    policy_version TEXT NOT NULL,
+    evidence_refs_json TEXT NOT NULL,
+    actor TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_local_long_term_memory_audit_owner_time
+ON local_long_term_memory_audit(user_id, created_at DESC, event_id);
+
+CREATE INDEX IF NOT EXISTS idx_local_long_term_memory_audit_memory_time
+ON local_long_term_memory_audit(memory_id, created_at DESC, event_id);
 """
 
 
@@ -221,7 +255,7 @@ class LocalSQLiteDatabase:
                         "SELECT value FROM schema_metadata WHERE key = ?",
                         ("local_schema_version",),
                     ).fetchone()
-                    if row is not None and row["value"] in {"1", "2", "3", "4", "5"}:
+                    if row is not None and row["value"] in {"1", "2", "3", "4", "5", "6"}:
                         connection.execute("BEGIN IMMEDIATE")
                         try:
                             version = int(row["value"])
@@ -239,6 +273,9 @@ class LocalSQLiteDatabase:
                                 version = 5
                             if version == 5:
                                 self._upgrade_v5_to_v6(connection)
+                                version = 6
+                            if version == 6:
+                                self._upgrade_v6_to_v7(connection)
                             connection.commit()
                         except Exception:
                             connection.rollback()
@@ -437,7 +474,7 @@ class LocalSQLiteDatabase:
             )
         connection.execute(
             "UPDATE schema_metadata SET value = ? WHERE key = ?",
-            (str(LOCAL_SCHEMA_VERSION), "local_schema_version"),
+            ("5", "local_schema_version"),
         )
 
     @staticmethod
@@ -455,6 +492,64 @@ class LocalSQLiteDatabase:
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_local_long_term_memory_live_fingerprint "
             "ON local_long_term_memories(user_id, idempotency_fingerprint) "
             "WHERE idempotency_fingerprint IS NOT NULL AND status IN ('candidate', 'active')"
+        )
+        connection.execute(
+            "UPDATE schema_metadata SET value = ? WHERE key = ?",
+            ("6", "local_schema_version"),
+        )
+
+    @staticmethod
+    def _upgrade_v6_to_v7(connection: sqlite3.Connection) -> None:
+        """Add logical lifecycle identity and compact transactional audit events."""
+        columns = {
+            row["name"]
+            for row in connection.execute("PRAGMA table_info(local_long_term_memories)")
+        }
+        additions = {
+            "logical_memory_key": "TEXT",
+            "has_unresolved_conflict": "INTEGER NOT NULL DEFAULT 0",
+            "policy_version": "TEXT NOT NULL DEFAULT 'ltm-promotion-v1'",
+        }
+        for name, declaration in additions.items():
+            if name not in columns:
+                connection.execute(
+                    f"ALTER TABLE local_long_term_memories ADD COLUMN {name} {declaration}"
+                )
+        connection.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_local_long_term_memory_active_logical_key "
+            "ON local_long_term_memories(user_id, logical_memory_key) "
+            "WHERE logical_memory_key IS NOT NULL AND status = 'active'"
+        )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_local_long_term_memory_logical_lookup "
+            "ON local_long_term_memories(user_id, logical_memory_key, status, updated_at DESC)"
+        )
+        connection.execute(
+            """CREATE TABLE IF NOT EXISTS local_long_term_memory_audit (
+                event_id TEXT PRIMARY KEY,
+                memory_id TEXT NOT NULL,
+                logical_memory_key TEXT NOT NULL,
+                idempotency_fingerprint TEXT NOT NULL,
+                user_id TEXT NOT NULL,
+                entity_ids_json TEXT NOT NULL,
+                source_request_id TEXT NOT NULL,
+                action TEXT NOT NULL,
+                from_status TEXT NOT NULL,
+                to_status TEXT NOT NULL,
+                reason_code TEXT NOT NULL,
+                policy_version TEXT NOT NULL,
+                evidence_refs_json TEXT NOT NULL,
+                actor TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )"""
+        )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_local_long_term_memory_audit_owner_time "
+            "ON local_long_term_memory_audit(user_id, created_at DESC, event_id)"
+        )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_local_long_term_memory_audit_memory_time "
+            "ON local_long_term_memory_audit(memory_id, created_at DESC, event_id)"
         )
         connection.execute(
             "UPDATE schema_metadata SET value = ? WHERE key = ?",

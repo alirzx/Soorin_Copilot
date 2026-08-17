@@ -8,12 +8,15 @@ from queue import Queue
 from threading import Thread
 import time
 from dataclasses import dataclass, replace
+from datetime import datetime, timedelta, timezone
 from typing import Protocol, Sequence
 
 from src.core.memory.long_term import (
     AUTHORITATIVE_EPISTEMIC,
     LongTermMemoryRecord,
+    MemoryLifecycleResult,
     MemoryPromotionPolicy,
+    PromotionDecision,
     RetrievedLongTermMemory,
     retrieval_document,
     utc_now,
@@ -186,12 +189,20 @@ class LongTermMemoryRetriever:
         self.reranker = reranker
 
     @staticmethod
-    def _eligible(memory: LongTermMemoryRecord) -> bool:
-        return (
-            memory.status == "active"
-            and memory.epistemic_status in AUTHORITATIVE_EPISTEMIC | {"historical"}
-            and memory.freshness() not in {"expired", "inactive"}
-        )
+    def _eligibility_reason(memory: LongTermMemoryRecord) -> str:
+        if memory.status != "active":
+            return memory.status
+        if memory.epistemic_status not in AUTHORITATIVE_EPISTEMIC | {"historical"}:
+            return "authority_insufficient"
+        if memory.has_unresolved_conflict:
+            return "unresolved_conflict"
+        if memory.freshness() in {"expired", "inactive"}:
+            return "stale"
+        return "eligible"
+
+    @classmethod
+    def _eligible(cls, memory: LongTermMemoryRecord) -> bool:
+        return cls._eligibility_reason(memory) == "eligible"
 
     def retrieve(
         self,
@@ -220,6 +231,7 @@ class LongTermMemoryRetriever:
             time.perf_counter() - exact_started,
         )
         candidates: dict[str, RetrievedLongTermMemory] = {}
+        rejected_reasons: list[str] = []
         for memory in exact:
             if self._eligible(memory):
                 candidates[memory.memory_id] = RetrievedLongTermMemory(
@@ -228,6 +240,8 @@ class LongTermMemoryRetriever:
                     retrieval_reason="exact_entity",
                     freshness=memory.freshness(),
                 )
+            else:
+                rejected_reasons.append(self._eligibility_reason(memory))
 
         semantic_hits: list[VectorSearchHit] = []
         limitations: list[str] = []
@@ -245,6 +259,8 @@ class LongTermMemoryRetriever:
                         continue
                     memory = self.store.get(user_id=user_id, memory_id=memory_id)
                     if memory is None or not self._eligible(memory):
+                        if memory is not None:
+                            rejected_reasons.append(self._eligibility_reason(memory))
                         continue
                     if entity_ids and memory.entity_ids and not set(entity_ids).intersection(memory.entity_ids):
                         continue
@@ -348,6 +364,18 @@ class LongTermMemoryRetriever:
             int((time.perf_counter() - started) * 1000),
             ",".join(sorted({item.memory.memory_type for item in selected})) or "none",
         )
+        if rejected_reasons:
+            logger.info(
+                "event=active_ltm_rejected request_id=%s rejected_count=%s reasons=%s",
+                request_id,
+                len(rejected_reasons),
+                ",".join(sorted(set(rejected_reasons))),
+            )
+        logger.info(
+            "event=active_ltm_selected request_id=%s selected_count=%s",
+            request_id,
+            len(selected),
+        )
         return LongTermMemorySelection(
             status="ok" if selected else "empty",
             memories=tuple(selected),
@@ -368,9 +396,16 @@ class LongTermMemoryCoordinator:
         self,
         store: LongTermMemoryStore,
         semantic_index: MemorySemanticIndex | None,
+        *,
+        auto_promotion_enabled: bool = True,
+        policy_version: str = "ltm-promotion-v1",
+        active_validity_seconds: int = 86_400,
     ) -> None:
         self.store = store
         self.semantic_index = semantic_index
+        self.auto_promotion_enabled = bool(auto_promotion_enabled)
+        self.policy_version = str(policy_version or "ltm-promotion-v1")
+        self.active_validity_seconds = max(60, int(active_validity_seconds))
 
     def create_candidate(self, memory: LongTermMemoryRecord) -> LongTermMemoryRecord:
         if memory.status != "candidate" or memory.epistemic_status != "candidate":
@@ -382,6 +417,80 @@ class LongTermMemoryCoordinator:
             stored.memory_id != memory.memory_id,
         )
         return stored
+
+    def process_candidate(
+        self,
+        memory: LongTermMemoryRecord,
+        evidence: object,
+    ) -> MemoryLifecycleResult:
+        """Persist, evaluate, and atomically apply one deterministic lifecycle decision."""
+        observed_at = str(
+            getattr(evidence, "valid_at", "")
+            or getattr(evidence, "retrieved_at", "")
+            or memory.valid_from
+        )
+        try:
+            observed = datetime.fromisoformat(observed_at.replace("Z", "+00:00"))
+            if observed.tzinfo is None:
+                observed = observed.replace(tzinfo=timezone.utc)
+            memory = replace(
+                memory,
+                valid_from=observed.astimezone(timezone.utc).isoformat(),
+                valid_until=(
+                    observed.astimezone(timezone.utc)
+                    + timedelta(seconds=self.active_validity_seconds)
+                ).isoformat(),
+            )
+        except ValueError:
+            pass
+        stored = self.create_candidate(memory)
+        if stored.status == "active":
+            decision = PromotionDecision(
+                action="auto_promote",
+                reason_code="exact_active_replay",
+                reason="Equivalent active canonical memory already exists.",
+                confidence=stored.confidence,
+                quality_score=1.0,
+                evidence_refs=stored.evidence_refs,
+                policy_version=self.policy_version,
+                epistemic_status=stored.epistemic_status,
+                provenance_category=stored.provenance_category,
+            )
+            return MemoryLifecycleResult(stored, decision, deduplicated=True)
+        decision = MemoryPromotionPolicy.evaluate_candidate_for_promotion(
+            stored,
+            evidence,
+            enabled=self.auto_promotion_enabled,
+            policy_version=self.policy_version,
+        )
+        logger.info(
+            "event=long_term_memory_promotion_decision action=%s reason=%s policy_version=%s",
+            decision.action,
+            decision.reason_code,
+            decision.policy_version,
+        )
+        result = self.store.apply_promotion(
+            candidate=stored,
+            decision=decision,
+            actor="system",
+        )
+        previous = result.previous_memory
+        if previous is not None and previous.status in {"superseded", "invalidated", "expired"}:
+            previous = self._index_canonical(previous)
+        current = result.memory
+        if current.status == "active":
+            current = self._index_canonical(current)
+        logger.info(
+            "event=long_term_memory_lifecycle_applied action=%s reason=%s status=%s "
+            "deduplicated=%s superseded_count=%s conflict_count=%s",
+            decision.action,
+            decision.reason_code,
+            current.status,
+            result.deduplicated,
+            result.superseded_count,
+            result.conflict_count,
+        )
+        return replace(result, memory=current, previous_memory=previous)
 
     def promote(
         self,
@@ -451,6 +560,22 @@ class LongTermMemoryCoordinator:
         )
         result = self._index_canonical(memory)
         logger.info("event=long_term_memory_invalidated status=%s", result.status)
+        return result
+
+    def expire(
+        self,
+        *,
+        user_id: str,
+        memory_id: str,
+        expected_revision: int,
+    ) -> LongTermMemoryRecord:
+        memory = self.store.expire(
+            user_id=user_id,
+            memory_id=memory_id,
+            expected_revision=expected_revision,
+        )
+        result = self._index_canonical(memory)
+        logger.info("event=long_term_memory_expired status=%s", result.status)
         return result
 
     def supersede(

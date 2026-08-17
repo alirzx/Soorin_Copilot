@@ -18,7 +18,7 @@ from src.core.memory.episodes import (
 from src.core.memory.routing_state import SessionRoutingState
 
 
-LOCAL_SCHEMA_VERSION = 6
+LOCAL_SCHEMA_VERSION = 7
 THREAD_STATE_SCHEMA_VERSION = 3
 MAX_THREAD_STATE_BYTES = 16_384
 MAX_CHAT_CONTENT_CHARS = 100_000
@@ -198,25 +198,34 @@ def _working_facts_from_payload(value: Any) -> tuple[WorkingFact, ...]:
         raise LocalPersistenceSchemaError("Invalid persisted working facts.")
     facts: list[WorkingFact] = []
     for item in value:
-        if not isinstance(item, dict) or set(item) - {"key", "value", "fact_type", "created_at"}:
+        if not isinstance(item, dict) or set(item) - {"key", "value", "fact_type", "scope", "entity_ids", "created_at"}:
             raise LocalPersistenceSchemaError("Invalid persisted working fact.")
         facts.append(
             WorkingFact(
                 key=_bounded_optional(item.get("key"), field_name="working fact key", maximum=64) or "",
                 value=_bounded_text(item.get("value"), maximum=300),
                 fact_type=_bounded_optional(item.get("fact_type"), field_name="working fact type", maximum=64) or "user_provided",
+                scope=_bounded_optional(item.get("scope"), field_name="working fact scope", maximum=32) or "conversation",
+                entity_ids=_bounded_strings(
+                    item.get("entity_ids", []),
+                    field_name="working fact entity ids",
+                    maximum_items=2,
+                    maximum_chars=64,
+                ),
                 created_at=_bounded_text(item.get("created_at"), maximum=64),
             )
         )
     return tuple(facts)
 
 
-def _working_facts_payload(value: tuple[WorkingFact, ...]) -> list[dict[str, str]]:
+def _working_facts_payload(value: tuple[WorkingFact, ...]) -> list[dict[str, Any]]:
     return [
         {
             "key": item.key,
             "value": item.value,
             "fact_type": item.fact_type,
+            "scope": item.scope,
+            "entity_ids": list(item.entity_ids),
             "created_at": item.created_at,
         }
         for item in value

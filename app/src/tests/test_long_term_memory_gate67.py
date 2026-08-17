@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import math
+import json
 import sqlite3
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -17,6 +19,7 @@ from src.core.memory.long_term import (
     RetrievedLongTermMemory,
     retrieval_document,
 )
+from src.core.agent.contracts import ToolResult
 from src.core.memory.persistence import (
     LOCAL_SCHEMA_VERSION,
     LocalPersistenceConflictError,
@@ -73,6 +76,58 @@ def active(**kwargs) -> LongTermMemoryRecord:
         epistemic_status="analyst_confirmed",
         confidence=0.95,
         provenance_category="analyst",
+    )
+
+
+def structured_candidate(
+    *,
+    user: str = "user-a",
+    entity: str = "192.0.2.10",
+    role: str = "server",
+    provenance: str = "product",
+    memory_type: str = "validated_finding",
+) -> LongTermMemoryRecord:
+    statement = json.dumps({
+        "source_capability": "asset.get_profile",
+        "entities": [entity],
+        "evidence_classes": ["asset_role"],
+        "selected_views": ["overview"],
+        "schema_version": "product-view-v1",
+        "completeness": "complete",
+        "projection_complete": True,
+        "evidence": {"views": {"overview": {"role": role}}},
+    }, sort_keys=True, separators=(",", ":"))
+    return LongTermMemoryRecord.candidate(
+        memory_type=memory_type,
+        user_id=user,
+        entity_ids=(entity,),
+        statement=statement,
+        source_request_id=f"request-{role}",
+        source_conversation_id="conversation-a",
+        evidence_refs=("evidence_class_asset_role", "complete"),
+        provenance_category=provenance,
+    )
+
+
+def product_evidence(
+    *,
+    entity: str = "192.0.2.10",
+    role: str = "server",
+    contradictions=(),
+) -> ToolResult:
+    return ToolResult(
+        status="ok",
+        entities=(entity,),
+        source_capability="asset.get_profile",
+        retrieved_at="2026-08-16T00:00:00+00:00",
+        freshness="current",
+        completeness="complete",
+        contradictions=tuple(contradictions),
+        selected_views=("overview",),
+        view_payload={"views": {"overview": {"role": role}}},
+        projection_schema_version="product-view-v1",
+        source_payload_complete=True,
+        projection_usable=True,
     )
 
 
@@ -348,6 +403,303 @@ def test_long_term_quotas_evict_candidates_but_preserve_authoritative_records(
     with pytest.raises(LocalPersistenceQuotaError):
         store.update(memory=another_promoted, expected_revision=another.revision)
     assert store.get(user_id="user-a", memory_id=promoted.memory_id) == promoted
+
+
+def test_safe_structured_candidate_auto_promotes_and_audits(sqlite_store) -> None:
+    coordinator = LongTermMemoryCoordinator(sqlite_store, None)
+    result = coordinator.process_candidate(structured_candidate(), product_evidence())
+
+    assert result.decision.action == "auto_promote"
+    assert result.memory.status == "active"
+    assert result.memory.authoritative
+    assert result.memory.logical_memory_key
+    actions = {
+        event.action
+        for event in sqlite_store.list_audit_events(
+            user_id="user-a", memory_id=result.memory.memory_id
+        )
+    }
+    assert {"candidate_created", "promotion_evaluated", "promoted"} <= actions
+
+
+@pytest.mark.parametrize(
+    ("memory", "expected_action"),
+    (
+        (structured_candidate(provenance="analyst"), "requires_review"),
+        (structured_candidate(memory_type="hypothesis_resolution"), "requires_review"),
+    ),
+)
+def test_unsafe_or_analyst_candidates_never_auto_promote(
+    sqlite_store,
+    memory: LongTermMemoryRecord,
+    expected_action: str,
+) -> None:
+    result = LongTermMemoryCoordinator(sqlite_store, None).process_candidate(
+        memory, product_evidence()
+    )
+    assert result.decision.action == expected_action
+    assert result.memory.status == "candidate"
+    assert not result.memory.authoritative
+
+
+def test_newer_same_value_confirms_without_duplicate_active(sqlite_store) -> None:
+    coordinator = LongTermMemoryCoordinator(sqlite_store, None)
+    first = coordinator.process_candidate(structured_candidate(), product_evidence())
+    replay_with_new_reference = replace(
+        structured_candidate(),
+        evidence_refs=("evidence_class_asset_role", "complete", "validation-2"),
+        idempotency_fingerprint="",
+    )
+    second = coordinator.process_candidate(replay_with_new_reference, product_evidence())
+
+    assert second.deduplicated
+    assert second.memory.memory_id == first.memory.memory_id
+    assert len(sqlite_store.list(user_id="user-a", statuses=("active",))) == 1
+
+
+def test_newer_safe_changed_value_supersedes_active_atomically(sqlite_store) -> None:
+    coordinator = LongTermMemoryCoordinator(sqlite_store, None)
+    first = coordinator.process_candidate(structured_candidate(role="server"), product_evidence())
+    second = coordinator.process_candidate(
+        structured_candidate(role="domain_controller"),
+        product_evidence(role="domain_controller"),
+    )
+
+    assert first.memory.logical_memory_key == second.memory.logical_memory_key
+    assert second.memory.status == "active"
+    assert second.memory.supersedes_memory_id == first.memory.memory_id
+    assert second.superseded_count == 1
+    assert sqlite_store.get(user_id="user-a", memory_id=first.memory.memory_id).status == "superseded"
+    assert len(sqlite_store.list(user_id="user-a", statuses=("active",))) == 1
+
+
+def test_unresolved_conflict_keeps_candidate_and_blocks_old_active(sqlite_store) -> None:
+    coordinator = LongTermMemoryCoordinator(sqlite_store, None)
+    active_result = coordinator.process_candidate(structured_candidate(role="server"), product_evidence())
+    conflict = coordinator.process_candidate(
+        structured_candidate(role="domain_controller"),
+        product_evidence(role="domain_controller", contradictions=("role_conflict",)),
+    )
+
+    assert conflict.decision.reason_code == "unresolved_material_conflict"
+    assert conflict.memory.status == "candidate"
+    assert conflict.conflict_count == 1
+    old = sqlite_store.get(user_id="user-a", memory_id=active_result.memory.memory_id)
+    assert old is not None and old.has_unresolved_conflict
+    selection = LongTermMemoryRetriever(
+        sqlite_store, None, candidate_k=5, top_k=5, min_score=0.0
+    ).retrieve(query="role", user_id="user-a", entity_ids=("192.0.2.10",))
+    assert selection.memories == ()
+
+
+def test_promotion_replay_is_transactionally_idempotent(sqlite_store) -> None:
+    memory = sqlite_store.put(memory=structured_candidate())
+    decision = MemoryPromotionPolicy.evaluate_candidate_for_promotion(
+        memory, product_evidence()
+    )
+    first = sqlite_store.apply_promotion(candidate=memory, decision=decision)
+    second = sqlite_store.apply_promotion(candidate=memory, decision=decision)
+    assert first.memory.memory_id == second.memory.memory_id
+    assert second.deduplicated
+    assert len(sqlite_store.list(user_id="user-a", statuses=("active",))) == 1
+
+
+def test_concurrent_equivalent_promotion_cannot_create_duplicate_active(sqlite_store) -> None:
+    memory = sqlite_store.put(memory=structured_candidate())
+    decision = MemoryPromotionPolicy.evaluate_candidate_for_promotion(
+        memory, product_evidence()
+    )
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = tuple(pool.map(
+            lambda _: sqlite_store.apply_promotion(candidate=memory, decision=decision),
+            range(2),
+        ))
+    assert {item.memory.memory_id for item in results} == {memory.memory_id}
+    assert len(sqlite_store.list(user_id="user-a", statuses=("active",))) == 1
+
+
+def test_rejected_candidate_has_compact_audit_event(sqlite_store) -> None:
+    memory = LongTermMemoryRecord.candidate(
+        memory_type="validated_finding",
+        user_id="user-a",
+        entity_ids=("192.0.2.10",),
+        statement="unstructured assistant interpretation",
+        source_request_id="request-reject",
+        source_conversation_id="conversation-a",
+        provenance_category="investigation",
+    )
+    stored = sqlite_store.put(memory=memory)
+    decision = MemoryPromotionPolicy.evaluate_candidate_for_promotion(
+        stored, product_evidence()
+    )
+    result = sqlite_store.apply_promotion(candidate=stored, decision=decision)
+    assert result.memory.status == "rejected"
+    events = sqlite_store.list_audit_events(user_id="user-a", memory_id=memory.memory_id)
+    assert any(event.action == "rejected" for event in events)
+    assert all(event.evidence_refs == () for event in events)
+
+
+def test_v6_to_v7_migration_preserves_legacy_ltm_rows(tmp_path: Path) -> None:
+    path = tmp_path / "v6-memory.sqlite3"
+    connection = sqlite3.connect(path)
+    connection.executescript(
+        """
+        CREATE TABLE schema_metadata(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+        INSERT INTO schema_metadata VALUES ('local_schema_version', '6');
+        CREATE TABLE local_users(
+            user_id TEXT PRIMARY KEY, username TEXT, password_hash TEXT, created_at TEXT NOT NULL
+        );
+        CREATE TABLE local_long_term_memories(
+            memory_id TEXT PRIMARY KEY, user_id TEXT NOT NULL, memory_type TEXT NOT NULL,
+            statement TEXT NOT NULL, epistemic_status TEXT NOT NULL, confidence REAL NOT NULL,
+            source_request_id TEXT NOT NULL, source_conversation_id TEXT NOT NULL,
+            evidence_refs_json TEXT NOT NULL, provenance_category TEXT NOT NULL,
+            valid_from TEXT NOT NULL, valid_until TEXT, created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL, revision INTEGER NOT NULL, status TEXT NOT NULL,
+            index_status TEXT NOT NULL, supersedes_memory_id TEXT,
+            idempotency_fingerprint TEXT
+        );
+        CREATE TABLE local_long_term_memory_entities(
+            memory_id TEXT NOT NULL, entity_id TEXT NOT NULL,
+            PRIMARY KEY(memory_id, entity_id)
+        );
+        """
+    )
+    legacy = structured_candidate()
+    connection.execute(
+        "INSERT INTO local_users VALUES (?,NULL,NULL,?)",
+        (legacy.user_id, legacy.created_at),
+    )
+    connection.execute(
+        "INSERT INTO local_long_term_memories VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (
+            legacy.memory_id, legacy.user_id, legacy.memory_type, legacy.statement,
+            legacy.epistemic_status, legacy.confidence, legacy.source_request_id,
+            legacy.source_conversation_id, json.dumps(legacy.evidence_refs),
+            legacy.provenance_category, legacy.valid_from, legacy.valid_until,
+            legacy.created_at, legacy.updated_at, legacy.revision, legacy.status,
+            legacy.index_status, legacy.supersedes_memory_id, legacy.idempotency_fingerprint,
+        ),
+    )
+    connection.execute(
+        "INSERT INTO local_long_term_memory_entities VALUES (?,?)",
+        (legacy.memory_id, legacy.entity_ids[0]),
+    )
+    connection.commit()
+    connection.close()
+
+    database = LocalSQLiteDatabase(path)
+    database.initialize()
+    restored = SQLiteLongTermMemoryStore(database).get(
+        user_id=legacy.user_id, memory_id=legacy.memory_id
+    )
+    assert restored is not None
+    assert restored.logical_memory_key == legacy.logical_memory_key
+    with database.connect() as migrated:
+        assert migrated.execute(
+            "SELECT value FROM schema_metadata WHERE key='local_schema_version'"
+        ).fetchone()[0] == str(LOCAL_SCHEMA_VERSION)
+        assert migrated.execute(
+            "SELECT name FROM sqlite_master WHERE name='local_long_term_memory_audit'"
+        ).fetchone() is not None
+
+
+def test_active_ltm_survives_restart_crosses_conversations_but_not_users(
+    tmp_path: Path,
+) -> None:
+    database = LocalSQLiteDatabase(tmp_path / "restart-ltm.sqlite3")
+    database.initialize()
+    first_store = SQLiteLongTermMemoryStore(database)
+    promoted = LongTermMemoryCoordinator(first_store, None).process_candidate(
+        structured_candidate(), product_evidence()
+    ).memory
+
+    reopened = LocalSQLiteDatabase(database.path)
+    reopened.initialize()
+    retriever = LongTermMemoryRetriever(
+        SQLiteLongTermMemoryStore(reopened), None, candidate_k=5, top_k=5, min_score=0.0
+    )
+    same_owner_new_conversation = retriever.retrieve(
+        query="validated role in a new conversation",
+        user_id="user-a",
+        entity_ids=("192.0.2.10",),
+    )
+    different_owner = retriever.retrieve(
+        query="validated role",
+        user_id="user-b",
+        entity_ids=("192.0.2.10",),
+    )
+    assert [item.memory.memory_id for item in same_owner_new_conversation.memories] == [
+        promoted.memory_id
+    ]
+    assert different_owner.memories == ()
+
+
+def test_auto_promotion_at_active_quota_keeps_candidate_and_audits_reason(
+    tmp_path: Path,
+) -> None:
+    database = LocalSQLiteDatabase(tmp_path / "active-quota.sqlite3")
+    database.initialize()
+    store = SQLiteLongTermMemoryStore(
+        database,
+        MemoryStoragePolicy(max_active_long_term_per_user=1),
+    )
+    coordinator = LongTermMemoryCoordinator(store, None)
+    first = coordinator.process_candidate(structured_candidate(), product_evidence())
+    second = coordinator.process_candidate(
+        structured_candidate(entity="192.0.2.11"),
+        product_evidence(entity="192.0.2.11"),
+    )
+    assert first.memory.status == "active"
+    assert second.memory.status == "candidate"
+    assert second.decision.reason_code == "active_memory_quota_full"
+    assert any(
+        event.reason_code == "active_memory_quota_full"
+        for event in store.list_audit_events(
+            user_id="user-a", memory_id=second.memory.memory_id
+        )
+    )
+
+
+def test_expiration_is_audited_and_removes_operational_authority(sqlite_store) -> None:
+    active_memory = LongTermMemoryCoordinator(sqlite_store, None).process_candidate(
+        structured_candidate(), product_evidence()
+    ).memory
+    expired = sqlite_store.expire(
+        user_id=active_memory.user_id,
+        memory_id=active_memory.memory_id,
+        expected_revision=active_memory.revision,
+    )
+    assert expired.status == "expired"
+    assert not expired.authoritative
+    assert sqlite_store.list(user_id="user-a", statuses=("active",)) == ()
+    assert any(
+        event.action == "expired"
+        for event in sqlite_store.list_audit_events(
+            user_id="user-a", memory_id=expired.memory_id
+        )
+    )
+
+
+def test_expired_exact_replay_creates_a_fresh_candidate(sqlite_store) -> None:
+    stale = replace(
+        active(),
+        valid_from="2025-01-01T00:00:00+00:00",
+        valid_until="2025-01-02T00:00:00+00:00",
+    )
+    sqlite_store.put(memory=stale)
+
+    replay = sqlite_store.put(memory=candidate())
+
+    assert replay.memory_id != stale.memory_id
+    assert replay.status == "candidate"
+    assert sqlite_store.get(user_id="user-a", memory_id=stale.memory_id).status == "expired"
+    assert any(
+        event.reason_code == "validity_elapsed_on_replay"
+        for event in sqlite_store.list_audit_events(
+            user_id="user-a", memory_id=stale.memory_id
+        )
+    )
 
 
 def test_atomic_index_and_canonical_survives_index_failure(sqlite_store) -> None:
