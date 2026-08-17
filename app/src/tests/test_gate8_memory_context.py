@@ -128,6 +128,31 @@ def test_memory_gate_applies_six_checks_and_current_refresh_policy() -> None:
     assert current_decision.decision == "memory_sufficient_verification_required"
 
 
+@pytest.mark.parametrize("capability, evidence_ref", (
+    ("asset.get_detection", "evidence_class_detection_classification"),
+    ("asset.get_profile", "evidence_class_asset_identity"),
+))
+def test_current_comparison_never_skips_live_requirement_for_historical_memory(
+    capability: str,
+    evidence_ref: str,
+) -> None:
+    task = replace(
+        _task(
+            "Re-check the current state and compare it with the previously validated state.",
+            (capability,),
+        ),
+        evidence_mode="current_verification",
+    )
+    requirements = EvidenceRequirementPolicy().derive(task)
+    decision = MemorySufficiencyGate()._evaluate_one(
+        requirements.requirements[0],
+        (_memory(evidence_refs=(evidence_ref, "complete")),),
+    )
+
+    assert requirements.requirements[0].freshness_class == "current_verification"
+    assert decision.decision == "memory_sufficient_verification_required"
+
+
 def test_promoted_matching_memory_satisfies_but_missing_or_wrong_entity_does_not() -> None:
     requirements = EvidenceRequirementPolicy().derive(
         _task("What was its approved role?", ("asset.get_profile",))

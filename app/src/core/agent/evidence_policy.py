@@ -34,7 +34,7 @@ VOLATILE_EVIDENCE = frozenset({
     "detection_cluster", "detection_raw_behavior", "graph_summary", "graph_neighbors",
     "graph_relationship", "graph_path",
 })
-HISTORICAL_WORDS = frozenset({"previously", "historical", "formerly", "was", "past"})
+HISTORICAL_WORDS = frozenset({"previously", "historical", "formerly", "was", "past", "last"})
 
 
 @dataclass(frozen=True)
@@ -210,9 +210,13 @@ class EvidenceRequirementPolicy:
                 classes = (graph_class,) if graph_class else ()
             for evidence_class in classes:
                 freshness = (
-                    "historical" if historical else
-                    "current_verification" if evidence_class in VOLATILE_EVIDENCE else
-                    "revision_based"
+                    "current_verification"
+                    if task.evidence_mode == "current_verification"
+                    else "historical"
+                    if historical or task.evidence_mode in {"memory_only", "no_live_refresh"}
+                    else "current_verification"
+                    if evidence_class in VOLATILE_EVIDENCE
+                    else "revision_based"
                 )
                 requirements.append(EvidenceRequirement(
                     evidence_class=evidence_class,  # type: ignore[arg-type]

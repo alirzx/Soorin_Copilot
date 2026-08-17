@@ -13,6 +13,7 @@ from src.core.agent.task_mapping import (
     classify_historical_recall,
     compile_direct_plan,
     derive_request_constraints,
+    historical_evidence_classes_for_request,
     task_spec_from_route,
 )
 from src.core.context.entities import EntityResolver
@@ -67,6 +68,66 @@ def test_t4_no_live_reassessment_preserves_asset_investigation_and_has_zero_live
     assert compile_direct_plan(task).steps == ()
 
 
+@pytest.mark.parametrize(
+    "message",
+    (
+        "What was the last validated role of this asset?",
+        "What had we concluded from our previous investigation?",
+        "Based on what we already knew, summarize this historical finding.",
+    ),
+)
+def test_historical_phrases_are_memory_recall_without_current_refresh(message: str) -> None:
+    constraints = derive_request_constraints(message)
+
+    assert constraints.require_current is False
+    assert constraints.allow_live is False
+    assert constraints.memory_only is True
+
+
+@pytest.mark.parametrize(
+    "message",
+    (
+        "Without checking current information, summarize the asset.",
+        "Do not look anything up; use what we already know.",
+        "Don't refresh this investigation.",
+    ),
+)
+def test_no_live_phrases_override_embedded_current_words(message: str) -> None:
+    constraints = derive_request_constraints(message)
+
+    assert constraints.allow_live is False
+    assert constraints.require_current is False
+
+
+def test_simple_memory_write_defaults_to_no_live() -> None:
+    constraints = derive_request_constraints("Remember that the owner validation is pending.")
+
+    assert constraints.memory_write
+    assert constraints.memory_only
+    assert not constraints.allow_live
+
+
+def test_historical_identity_and_classification_request_has_complementary_classes() -> None:
+    assert historical_evidence_classes_for_request(
+        "What were the last validated identity and classification of this asset?"
+    ) == ("asset_identity", "asset_role", "detection_classification")
+
+
+@pytest.mark.parametrize(
+    "message",
+    (
+        "What did we discuss about our assets?",
+        "What do you remember from our network analysis?",
+        "Tell me about all the assets we analyzed.",
+    ),
+)
+def test_broad_operational_history_is_memory_recall_not_domain_refusal(message: str) -> None:
+    constraints = derive_request_constraints(message)
+
+    assert constraints.memory_only
+    assert not constraints.allow_live
+
+
 def test_memory_only_same_asset_keeps_the_active_episode() -> None:
     settings = get_settings()
     memory = MemoryStore(20)
@@ -92,6 +153,31 @@ def test_memory_only_same_asset_keeps_the_active_episode() -> None:
     assert recall_key == asset_key
     assert not snapshot.episode_transition
     assert memory.repository.get_working("episode").episode_id == episode_id  # type: ignore[union-attr]
+
+
+def test_historical_other_asset_recall_does_not_activate_or_transition_episode() -> None:
+    settings = get_settings()
+    memory = MemoryStore(20)
+    active_key = MemoryContextKey(("192.168.30.115",), "asset_investigation", "none", "asset")
+    recalled_key = MemoryContextKey(("192.168.30.116",), "asset_investigation", "none", "asset")
+    memory.prepare_for_model(
+        "episode-other",
+        settings,
+        SessionRoutingState(active_entities=active_key.entities),
+        context_key=active_key,
+    )
+    episode_id = memory.repository.get_working("episode-other").episode_id  # type: ignore[union-attr]
+
+    snapshot = memory.prepare_for_model(
+        "episode-other",
+        settings,
+        SessionRoutingState(active_entities=active_key.entities),
+        context_key=recalled_key,
+        activate_context=False,
+    )
+
+    assert not snapshot.episode_transition
+    assert memory.repository.get_working("episode-other").episode_id == episode_id  # type: ignore[union-attr]
 
 
 def test_router_none_cannot_erase_resolved_entity_for_memory_only_request() -> None:

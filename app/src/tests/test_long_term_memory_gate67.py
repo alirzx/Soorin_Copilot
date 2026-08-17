@@ -56,6 +56,7 @@ def candidate(
     entity: str = "192.0.2.10",
     statement: str = "This asset is an approved vulnerability scanner.",
     memory_type: str = "validated_finding",
+    evidence_refs: tuple[str, ...] = ("finding-7",),
 ) -> LongTermMemoryRecord:
     return LongTermMemoryRecord.candidate(
         memory_type=memory_type,
@@ -64,7 +65,7 @@ def candidate(
         statement=statement,
         source_request_id="req-1",
         source_conversation_id="conv-1",
-        evidence_refs=("finding-7",),
+        evidence_refs=evidence_refs,
         confidence=0.4,
     )
 
@@ -610,7 +611,9 @@ def test_active_ltm_survives_restart_crosses_conversations_but_not_users(
     database = LocalSQLiteDatabase(tmp_path / "restart-ltm.sqlite3")
     database.initialize()
     first_store = SQLiteLongTermMemoryStore(database)
-    promoted = LongTermMemoryCoordinator(first_store, None).process_candidate(
+    promoted = LongTermMemoryCoordinator(
+        first_store, None, active_validity_seconds=7 * 24 * 60 * 60
+    ).process_candidate(
         structured_candidate(), product_evidence()
     ).memory
 
@@ -761,6 +764,32 @@ def test_exact_semantic_dedup_user_scope_and_cross_conversation(sqlite_store) ->
     assert vectors.last_filters == {"user_id": "user-a", "status": "active"}
     assert all(item.memory.user_id == "user-a" for item in result.memories)
     assert embedder.query_calls == 1
+
+
+def test_exact_historical_retrieval_preserves_complementary_required_classes(sqlite_store) -> None:
+    profile = active(
+        statement="Previously validated identity is server.",
+        evidence_refs=("evidence_class_asset_identity", "complete"),
+    )
+    detection = active(
+        statement="Previously validated classification is server.",
+        evidence_refs=("evidence_class_detection_classification", "complete"),
+    )
+    sqlite_store.put(memory=profile)
+    sqlite_store.put(memory=detection)
+    selection = LongTermMemoryRetriever(
+        sqlite_store, None, candidate_k=5, top_k=2, min_score=0.0, context_token_budget=1000
+    ).retrieve(
+        query="What was the last validated identity and classification?",
+        user_id="user-a",
+        entity_ids=("192.0.2.10",),
+        required_evidence_classes=("asset_identity", "detection_classification"),
+    )
+
+    assert {item.memory.memory_id for item in selection.memories} == {
+        profile.memory_id,
+        detection.memory_id,
+    }
 
 
 def test_reranker_is_bounded_and_failure_falls_back(sqlite_store) -> None:

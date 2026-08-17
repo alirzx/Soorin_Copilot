@@ -210,6 +210,7 @@ class LongTermMemoryRetriever:
         query: str,
         user_id: str,
         entity_ids: tuple[str, ...] = (),
+        required_evidence_classes: tuple[str, ...] = (),
         request_id: str = "",
     ) -> LongTermMemorySelection:
         started = time.perf_counter()
@@ -343,7 +344,23 @@ class LongTermMemoryRetriever:
 
         selected: list[RetrievedLongTermMemory] = []
         used_tokens = 0
-        for item in ranked:
+        prioritized: list[RetrievedLongTermMemory] = []
+        for evidence_class in dict.fromkeys(required_evidence_classes):
+            required_ref = f"evidence_class_{evidence_class}"
+            match = next(
+                (
+                    item for item in ranked
+                    if item.retrieval_reason == "exact_entity"
+                    and required_ref in item.memory.evidence_refs
+                    and item not in prioritized
+                ),
+                None,
+            )
+            if match is not None:
+                prioritized.append(match)
+        for item in (*prioritized, *ranked):
+            if item in selected:
+                continue
             if len(selected) >= self.top_k:
                 break
             if used_tokens + item.estimated_tokens > self.context_token_budget:

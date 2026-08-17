@@ -49,16 +49,21 @@ HISTORICAL_SUMMARY_REQUEST = re.compile(
     r"\b(?:what\s+have\s+we\s+(?:concluded|established|found|learned)|"
     r"what\s+did\s+we\s+(?:conclude|establish|find|learn)|"
     r"what\s+do\s+we\s+know\s+so\s+far|(?:investigation|findings?|conclusions?)\s+so\s+far|"
-    r"historical\s+summary|previous\s+findings?|earlier\s+(?:findings?|conclusions?))\b",
+    r"historical\s+(?:summary|finding)|previous(?:ly)?\s+(?:validated|established|findings?|conclusions?)|"
+    r"last\s+validated|what\s+did\s+we\s+(?:know|conclude)\s+about|"
+    r"based\s+on\s+what\s+we\s+already\s+knew|from\s+our\s+previous\s+investigation|"
+    r"(?:tell\s+me\s+about|what\s+do\s+you\s+remember\s+from)\s+(?:all\s+)?(?:the\s+)?"
+    r"(?:assets?|network\s+analysis|investigations?))\b",
     re.IGNORECASE,
 )
 
 NO_LIVE_EVIDENCE_REQUEST = re.compile(
-    r"\b(?:before\s+making\s+any\s+live\s+provider\s+calls|without\s+refreshing|without\s+(?:fetching|calling|using)\s+"
-    r"(?:any\s+)?(?:live\s+)?evidence|without\s+(?:performing\s+)?(?:any\s+)?live\s+(?:lookup|check|retrieval)|"
-    r"without\s+checking\s+(?:any\s+)?current\s+(?:status|state|systems?)|"
-    r"do\s+not\s+retrieve\b|"
-    r"do\s+not\s+(?:use|call|retrieve|check|look\s+up)\s+(?:any\s+)?(?:current\s+|live\s+)?(?:product|detection|graph|knowledge|evidence|providers?|refresh|systems?|status|state|data|lookup)|"
+    r"\b(?:before\s+making\s+any\s+live\s+provider\s+calls|without\s+refreshing|"
+    r"without\s+(?:fetching|calling|using)\s+(?:any\s+)?(?:live\s+)?evidence|"
+    r"without\s+(?:performing\s+)?(?:any\s+)?live\s+(?:lookup|check|retrieval)|"
+    r"without\s+checking\s+(?:any\s+)?current\s+(?:information|status|state|systems?)|"
+    r"do\s+not\s+(?:retrieve|look\s+anything\s+up)\b|"
+    r"do\s+not\s+(?:use|call|retrieve|check|look\s+up)\s+(?:anything|any\s+)?(?:current\s+|live\s+)?(?:product|detection|graph|knowledge|evidence|providers?|refresh|systems?|status|state|data|lookup)?|"
     r"don't\s+use\s+live|do\s+not\s+refresh|don't\s+refresh|no\s+live\s+(?:provider|evidence|refresh)|"
     r"without\s+(?:using\s+)?live\s+(?:sources?|data)|do\s+not\s+use\s+live\s+(?:sources?|data)|"
     r"use\s+only\s+memory|using\s+only\s+stored\s+(?:conversation\s+)?context|memory\s+only|"
@@ -67,6 +72,7 @@ NO_LIVE_EVIDENCE_REQUEST = re.compile(
 )
 
 MEMORY_WRITE_REQUEST = re.compile(
+    r"\b(?:remember\s+that|note\s+that|keep\s+in\s+mind|for\s+this\s+investigation\s+remember)\b|"
     r"\b(?:remember|keep|retain|store)\b.{0,160}\b(?:for\s+(?:this|the)\s+(?:conversation|investigation)|"
     r"in\s+(?:this|the)\s+(?:conversation|investigation)|my\s+name|tag|owner\s+validation|analyst\s+note|contradiction)\b",
     re.IGNORECASE,
@@ -115,6 +121,19 @@ def classify_historical_recall(request: str) -> RecallClassification:
     if HISTORICAL_SUMMARY_REQUEST.search(request):
         return "historical_summary"
     return "none"
+
+
+def historical_evidence_classes_for_request(request: str) -> tuple[str, ...]:
+    """Return complementary exact LTM classes only for deterministic historical recall."""
+    if classify_historical_recall(request) == "none":
+        return ()
+    text = request.casefold()
+    classes: list[str] = []
+    if any(word in text for word in ("identity", "role", "profile", "asset")):
+        classes.extend(("asset_identity", "asset_role"))
+    if any(word in text for word in ("classification", "detection", "classifier")):
+        classes.append("detection_classification")
+    return tuple(dict.fromkeys(classes))
 
 
 def derive_request_constraints(request: str) -> RequestConstraints:

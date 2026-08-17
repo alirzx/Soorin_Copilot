@@ -275,10 +275,11 @@ class MemoryStore:
         context_key: MemoryContextKey | None = None,
         request_id: str = "",
         long_term_memories: tuple[RetrievedLongTermMemory, ...] = (),
+        activate_context: bool = True,
     ) -> ConversationSnapshot:
         transitioned = False
         previous_episode_summary_included = False
-        if context_key is not None:
+        if context_key is not None and activate_context:
             transitioned, previous_episode_summary_included = self._activate_context(
                 session_id,
                 context_key,
