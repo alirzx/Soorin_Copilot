@@ -2,6 +2,15 @@
 
 Audit date: 2026-08-05.
 
+> **2026-08-17 production-integration addendum:** this document describes the
+> repository architecture, not a deployed Product-memory integration. The
+> source-backed separation of latest tagged/main behavior, current `dev`, and
+> the proposed Product/PostgreSQL memory boundary is in
+> [FRONTEND_BACKEND_COPILOT_INTEGRATION.md](FRONTEND_BACKEND_COPILOT_INTEGRATION.md).
+> In particular, current `dev` does not validate Product JWTs and `X-User-ID`
+> remains untrusted metadata; its SQLite transcript, user, and chatroom records
+> are local simulation only.
+
 This document describes the implemented repository state. It distinguishes working behavior from partial foundations, placeholders, and deferred work. It should be updated after architecture-changing code changes.
 
 ## 1. Architecture Principles

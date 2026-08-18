@@ -1,10 +1,12 @@
 # Soorin Copilot Memory and Workflow Audit: Current `dev`
 
-**Audit date:** 2026-08-15
+**Audit date:** 2026-08-15 (production-integration addendum: 2026-08-17)
 
 **Branch:** `dev`
 
-**Audited HEAD:** `a2d3f2502c780fc052e3dd4670d4804a3cd88239` (`fix(memory): harden recall persistence and local auth`)
+**Original audited HEAD:** `a2d3f2502c780fc052e3dd4670d4804a3cd88239` (`fix(memory): harden recall persistence and local auth`)
+
+**Current integration-audit HEAD:** `4a61b8400f59426243f6024ec60b30580b7c396b` (`refactor: router-planner dynamic system prompts tuning`)
 
 **Audit mode:** static repository, configuration, tests, and Git-history inspection only
 
@@ -14,6 +16,14 @@
 > the audited starting commit. The E1-E7 changes completed in the current working
 > tree supersede the former delta-path P0 and the related “partially implemented”
 > statements. Focused offline tests were run; no external services were used.
+
+> **2026-08-17 integration boundary:** local SQLite demonstrates the Copilot
+> persistence ports but is not Product production persistence. Product owns
+> users, chatrooms, and messages. Current Copilot code does not authenticate a
+> Product JWT, and `X-User-ID` is not trusted identity. The required target
+> Product/PostgreSQL adapters, identity boundary, and canonical/vector split are
+> documented in
+> [FRONTEND_BACKEND_COPILOT_INTEGRATION.md](FRONTEND_BACKEND_COPILOT_INTEGRATION.md).
 
 ## Stabilization result (current working tree)
 

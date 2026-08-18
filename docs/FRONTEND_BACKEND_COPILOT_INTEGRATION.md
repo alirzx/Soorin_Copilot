@@ -1,1103 +1,251 @@
 # Soorin Copilot Frontend and Backend Integration Contract
 
-Audit baseline: `dev` at `f9a62c6` plus the verified Gate 3 working tree on
-2026-08-05.
+**Production integration audit:** 2026-08-17
+**Method:** static source, local Git history, schemas, and offline-test collection only. No services, Product APIs, models, Qdrant, Docker, or network calls were started. Code is authoritative.
 
-This document separates **current verified behavior** from **production
-recommendations**. Current behavior was verified from route and service source,
-Pydantic schemas, tests, configuration, the Streamlit client, and the documented
-Product chatroom/message flow. No service or external provider was started.
+## Status legend
 
-## 1. Purpose and audience
+| Label | Meaning |
+| --- | --- |
+| **Implemented** | Present in the named code path. |
+| **Local only** | Intended solely for the opt-in SQLite/Streamlit simulation. |
+| **Proposed** | Required design for Product production integration; not an implemented endpoint or schema. |
 
-This is the integration contract for Product frontend, Product backend,
-security, QA, and Copilot maintainers. It answers four practical questions:
+## 1. Git baseline and the three states
 
-1. Which Copilot endpoint does the Product browser call directly?
-2. What exact JSON and streaming frames exist today?
-3. Which identity, authorization, session, timeout, and persistence duties do
-   not belong to the Copilot runtime?
-4. Which Graph and Product endpoints are public helpers versus internal data
-   providers?
+| State | Revision | What it represents |
+| --- | --- | --- |
+| **CURRENT DEPLOYED MAIN / TAG** | `main` / `origin/main`: `1a02d522` (`prompts: tune router and planner for DeepSeek`); latest local release tag: annotated `copilot_release_3.2.1` at `eff75ed94` (`refactor(deploy): unify portable production deployment`) | The tag is an ancestor of `main`; repository history does not identify the exact commit deployed to Product after that tag. Treat the tag as the last identifiable release and `main` as the latest untagged mainline source. |
+| **CURRENT DEV IMPLEMENTATION** | `dev` / local `origin/dev`: `4a61b840` (`refactor: router-planner dynamic system prompts tuning`) | Adds RequestIdentity, local persistence adapters, compact thread state, typed LTM lifecycle/retrieval, bounded memory workflow, and the prompt architecture. |
+| **TARGET PRODUCTION MEMORY INTEGRATION** | Proposed | Product remains canonical for users, tenants, chatrooms, and messages. Product PostgreSQL gains Copilot memory records or exposes an equivalent trusted memory service. |
 
-Postman assets accompanying this document are test/documentation tools.
+`main...dev` contains the request-identity and memory integration sequence beginning at `4081398` (`Refactor(api): add conversation and request identity contracts`), local simulation/persistence, typed LTM, semantic retrieval, lifecycle stabilization, and prompt changes. It is not deployed merely because it exists on `dev`.
 
-## 2. Production architecture
+## 2. CURRENT DEPLOYED MAIN / TAG
 
-The current Product topology is direct streaming:
+### 2.1 Request and persistence contract
+
+The `main` source has a local `ChatRequest` with only `session_id`, `message`, and optional `ui_context`. `/chat` and `/chat/stream` create a server request ID (`uuid4().hex[:12]`) and pass it internally; clients do not supply `conversation_id` or `request_id`.
+
+```json
+{
+  "session_id": "<browser-generated/reused UUID>",
+  "message": "…",
+  "ui_context": {"selected_ip": "203.0.113.8"}
+}
+```
+
+`app/app_st.py` on `main` creates/replaces its session UUID in browser state and sends exactly the body above (omitting `ui_context` when no selected IP exists). Therefore the documented deployed Product flow is compatible with a Product chatroom ID only by treating it as the legacy `session_id`; it does **not** send separate conversation/request IDs.
 
 ```text
-Product browser
-  |  Product login/session and selected chatroom
-  |  POST Copilot /chat/stream directly; receive SSE directly
-  |  current Copilot static key supplied by browser integration
-  v
-Soorin Copilot API                                  (this repository)
-  |  validates static Copilot API key on every request except GET /health
-  |-- Arvan-compatible Router / optional Planner / Chat deployments
-  |-- Product login and bearer-token manager
-  |-- Product profile endpoint
-  |-- Product asset-detection endpoint
-  |-- Product topology endpoint used by background Graph refresh
-  |-- Product LLM-usage reporting endpoint (when enabled)
-  |-- local NetworkX last-known-good Graph snapshot
-  |-- Qdrant knowledge collection (optional)
-  `-- Hugging Face embedding model cache (optional, lazy)
-
-Product browser
-  |  after a completed turn, store user/assistant messages
-  v
-Product Backend chatroom/message endpoints
-  v
-Product PostgreSQL
+Product browser                         Copilot main/tag
+  Product login/chatroom selection       static API-key check
+  ── POST /chat/stream ───────────────►  session continuity in process
+  ◄──────────── UTF-8 SSE ─────────────  answer
+  ── Product chatroom/message APIs ───► Product backend ─► Product PostgreSQL
 ```
 
-There is no mandatory Product backend proxy or BFF in the current chat path.
-A gateway remains an optional future security-hardening choice, but the present
-browser calls Copilot directly and separately uses Product Backend endpoints for
-chatroom/message persistence.
+Product creates/owns chatrooms and stores user/assistant messages in its PostgreSQL database. Copilot does not create Product chatrooms or persist Product transcripts. The deployed Copilot session is an application continuity key, not a Product ownership credential.
 
-## 3. Trust boundaries
+### 2.2 Authentication fact, not assumption
 
-| Boundary | Trusted responsibility | Untrusted input |
-|---|---|---|
-| Browser -> Copilot | current message, session/chatroom continuity, selected IP, Copilot key | all message and UI fields remain untrusted input |
-| Browser -> Product backend | Product authentication, chatroom ownership, message persistence | chatroom/message input |
-| Copilot -> Product API | shared Product client, bearer token, `x-hwid`, configured paths | Product JSON is validated at provider boundaries |
-| Copilot -> Arvan | provider credentials and normalized messages | model output is routed through validation/review |
-| Copilot -> Graph/Qdrant | configured local or server data stores | snapshots may be stale, incomplete, or unavailable |
+Both `main` and current `dev` authenticate Copilot with the configured static `SOORIN_COPILOT_API_KEY`. The static key can be sent as `Authorization: Bearer <copilot key>`. Current `dev` additionally accepts it in `Soorin_copilot_api_key`, allowing a Product JWT to remain in `Authorization`.
 
-**Authentication:** every Copilot endpoint except `GET /health` requires a
-static Copilot API key (`SOORIN_COPILOT_API_KEY`). Direct service callers may send:
+The Copilot repository does **not** decode, validate, or authorize a Product JWT. A Product JWT in `Authorization` is therefore not a current Copilot identity contract unless the custom static-key header is also supplied. Product authentication/ownership checks remain Product Backend duties. The historical direct-browser key exposure is a known limitation.
 
+## 3. CURRENT DEV IMPLEMENTATION
+
+### 3.1 Exact `/chat` and `/chat/stream` request identity
+
+`ChatRequest` now accepts these nullable fields, all normalized to a conservative identifier (`1..128` characters; `[A-Za-z0-9][A-Za-z0-9._:@-]*`):
+
+```json
+{
+  "conversation_id": "<optional>",
+  "session_id": "<optional>",
+  "request_id": "<optional>",
+  "message": "<required, non-empty>",
+  "ui_context": {"selected_ip": "<optional IPv4>"}
+}
 ```
+
+`RequestIdentity.resolve` preserves supplied IDs; absent `session_id` becomes `uuid4().hex`, absent `request_id` becomes `uuid4().hex[:12]`, and:
+
+```text
+thread_key = conversation_id when supplied, otherwise session_id
+```
+
+`conversation_id` is identity/continuity metadata only today. It is not checked against a Product chatroom. `X-User-ID` is an optional, syntactically validated header passed into `RequestIdentity.user_id`; it is **untrusted metadata**, not authentication or authorization. It must never be treated as trusted Product identity in production.
+
+Current protected requests use either:
+
+```http
 Authorization: Bearer <SOORIN_COPILOT_API_KEY>
 ```
 
-When the Product frontend keeps its Product JWT in `Authorization`, it may send
-the Copilot credential separately:
+or, when the browser retains Product JWT:
 
 ```http
+Authorization: Bearer <PRODUCT_JWT>
 Soorin_copilot_api_key: <SOORIN_COPILOT_API_KEY>
 ```
 
-The custom header takes precedence when present. Copilot does not decode or
-validate the Product JWT; Product authentication and authorization remain the
-Product Backend's responsibility for Product endpoints.
+The latter authenticates only the static Copilot key. The custom header takes precedence if both mechanisms are present. `X-User-ID` alone is rejected as unauthorized.
 
-Missing or invalid Copilot credentials return `401`. The static key does not
-identify or authorize a Product user, tenant, chatroom, or asset. In the current
-direct-browser flow the key is exposed to browser code, which is a known security
-limitation. Restrict exposure and origin/network access; an optional future
-gateway can move this credential out of the browser.
+### 3.2 Local Streamlit Product simulation — Local only
 
-## 4. Current direct-browser request flow
+The local-simulation client creates a local user/conversation, retains the stable local `conversation_id` and `session_id`, creates a browser-side `request_id`, and streams:
 
-Recommended normal chat flow:
-
-```text
-1. Frontend creates or opens a Product chatroom through Product Backend APIs.
-2. The Product chatroom ID may be sent as `conversation_id`; legacy clients
-   continue to reuse their `session_id`.
-3. Frontend POSTs directly to Copilot `/chat/stream`.
-4. Copilot returns UTF-8 SSE directly to the Frontend.
-5. Frontend incrementally appends answer deltas and completes only on `done`.
-6. Frontend stores the user and completed assistant messages through existing
-   Product Backend chatroom/message endpoints.
-7. Product Backend stores those records in Product PostgreSQL.
-8. Every later turn reuses the Product chatroom and its Copilot continuity ID.
+```http
+POST /chat/stream
+Authorization: Bearer <local Copilot API key>
+Soorin_copilot_api_key: <local Copilot API key>
+X-User-ID: <local simulation user ID>
+Content-Type: application/json
 ```
-
-Product Backend owns chatroom/message persistence and ownership checks. Copilot
-does not validate Product chatroom ownership, and neither
-`conversation_id` nor `session_id` is an authorization credential.
-
-For local development only, Gate 3 can opt into a SQLite-backed Product-chat
-simulation and compact thread-state restoration. It is disabled by default and
-does not change this API contract, authenticate `X-User-ID`, or replace Product
-Backend persistence. The relevant settings are:
-
-```env
-SOORIN_LOCAL_PRODUCT_SIMULATION_ENABLED=false
-SOORIN_THREAD_STATE_BACKEND=memory
-SOORIN_LOCAL_SQLITE_PATH=data/runtime/copilot-local.sqlite3
-SOORIN_LANGGRAPH_CHECKPOINT_BACKEND=none
-```
-
-The checkpoint setting is reserved: selecting `sqlite` currently logs a safe
-deferral because a checkpoint-safe workflow-state projection is not implemented.
-
-Gate 4 adds a separate local simulation UI/API boundary. It is enabled only when
-both local product simulation and the `local_simulation` Streamlit auth backend
-are configured. The browser still sends the existing direct `/chat/stream`
-request and unchanged dual Copilot credentials. It additionally sends the local
-selected user as `X-User-ID`; this is untrusted local metadata, not Product
-authorization. Local user/chatroom CRUD uses protected `/local-simulation/*`
-routes, while completed messages remain owned by the existing `/chat/stream`
-workflow.
-
-The production Browser -> Copilot stream -> Product Backend message-persistence
-flow remains unchanged. OIDC is optional future work and no external provider is
-required or configured for the local simulation.
-
-## 5. Internal Copilot-to-Product request flow
-
-These calls are made by Copilot through the shared `ProductApiClient`. They are
-not browser contracts.
-
-| Call | Configured default path | Purpose | Auth and headers | Timeout/retry/cache |
-|---|---|---|---|---|
-| `POST` Product login | `/auth/login` | obtain `accessToken` | `x-hwid`, `x-captcha-bypass`, JSON username/password | connect/read defaults 60/300s; no automatic POST status retry |
-| `GET` asset profile | `/profile/{ip}` | point-in-time identity/profile evidence | `Authorization: Bearer ...`, `x-hwid`, `Accept: application/json` | GET retry policy; independent in-memory cache, minimum TTL 600s; optional stale-on-error |
-| `GET` asset detection | `/asset-detection/test/{ip}` | point-in-time detection evidence | same | same cache policy in a separate provider namespace |
-| `GET` topology pairs | `/zeek/connections/unique-ip-pairs` | build/refresh NetworkX Graph | same | GET retry policy; persisted and validated last-known-good snapshots |
-| `POST` LLM usage | configured `LLM_USAGE_REPORTING_URL` | one aggregate token report per Copilot request when enabled | same plus `Content-Type` and `Idempotency-Key` | non-fatal; no automatic POST status retry |
-
-GET retry defaults are five retries, backoff factor 3, for 429/500/502/503/504.
-Every Product request may make one additional attempt after a 401 by invalidating
-and reacquiring the token. A configured bootstrap token is reused; with login
-credentials it refreshes after the configured token age (default 600 seconds).
-Without login credentials, an aged bootstrap token is reused until a 401.
-
-Nested runtime flow:
-
-```text
-Browser -> Copilot /chat/stream
-  -> Product profile/detection providers and/or local Graph/Qdrant
-  -> Router/Planner/Chat models
-  -> Copilot SSE -> Browser
-  -> Product Backend chatroom/message endpoints -> Product PostgreSQL
-```
-
-## 6. Public endpoint matrix
-
-All current success responses are UTF-8 JSON except `/chat/stream`. Copilot-layer authentication accepts either the service Bearer key (`Authorization: Bearer <SOORIN_COPILOT_API_KEY>`) or, when Product keeps its JWT in `Authorization`, `Soorin_copilot_api_key: <SOORIN_COPILOT_API_KEY>`. Every endpoint except `GET /health` requires a valid Copilot key; protected endpoints return `401` without one.
-
-| Method and path | Purpose | Input | Success | Errors and limits |
-|---|---|---|---|---|
-| `GET /health` | process liveness | none | 200 `{"status":"ok"}` does not test models, Product API, Graph, or Qdrant | no Authorization header required |
-| `GET /llm/health` | configured deployment readiness | none | 200 envelope with chat/router/planner metadata | configuration only; no model call; requires a valid Copilot key |
-| `POST /chat` | complete non-stream answer | `ChatRequest` | 200 `ChatResponse` | validation 422; handled `LLMError` is a 200 error envelope; requires a valid Copilot key |
-| `POST /chat/stream` | interactive answer | `ChatRequest` | 200 UTF-8 SSE | validation 422 before stream; runtime failures are SSE `error` after 200; requires a valid Copilot key |
-| `GET /graph/status` | Graph load/refresh diagnostics | none | 200 `GraphStatusResponse` | may reveal local artifact paths; requires a valid Copilot key |
-| `GET /graph/stats` | aggregate snapshot statistics | none | 200 `GraphStatsResponse` | no pagination; Graph unavailable may surface as server error; requires a valid Copilot key |
-| `GET /graph/nodes/{ip}` | node existence/degree | syntactically valid IP | 200 `GraphNodeResponse` | malformed IP 422; absent node is 200 `found=false`; requires a valid Copilot key |
-| `GET /graph/nodes/{ip}/neighbors` | direct observed peers | `direction`, `limit` | 200 `GraphNeighborsResponse` | `direction=in|out|both`; default 20; configured max default 1000; no cursor/offset; requires a valid Copilot key |
-| `GET /graph/nodes/{ip}/context` | compact node context | valid path IP | 200 `GraphContextResponse` | fixed internal top-peer bound; no client limit; requires a valid Copilot key |
-| `GET /graph/path` | directed shortest observed Graph path | required `source`, `target` | 200 `GraphPathResponse` | malformed/missing query 422; no hop-limit input; requires a valid Copilot key |
-
-FastAPI/Pydantic query validation uses HTTP 422 with a `detail` array. Custom IP
-validation uses HTTP 422 with `{"detail":"Invalid <field>."}`. Unexpected,
-unhandled runtime exceptions use normal server error behavior.
-
-## 7. Which endpoints the Product frontend should use
-
-The browser calls `/chat/stream` on Copilot directly. Product-owned routes remain
-responsible for Product chatroom/message persistence and the Product's canonical
-live Graph UI.
-
-| Copilot endpoint | Direct browser use | Recommendation |
-|---|---:|---|
-| `/chat/stream` | Yes | primary interactive chat transport |
-| `/chat` | Optional | fallback, tests, accessibility/non-interactive flows; do not retry after a stream already emitted text |
-| `/graph/stats` | Optional | small Copilot-snapshot summary only if Product accepts snapshot semantics |
-| `/graph/nodes/{ip}` | Optional | Copilot-specific side panel helper |
-| `/graph/nodes/{ip}/neighbors` | Optional | bounded helper, not a production paginated graph browser |
-| `/graph/nodes/{ip}/context` | Optional | Copilot-specific evidence preview |
-| `/graph/path` | Optional | observed communication path helper, not physical routing |
-
-If the Product already renders its canonical live Graph, continue using the
-Product Graph APIs for that UI. Pass only its currently selected asset to chat
-as typed `ui_context.selected_ip`. Mixing Product live topology with Copilot's
-snapshot lists can show inconsistent nodes, edges, or freshness.
-
-## 8. Which endpoints remain backend/internal/diagnostic
-
-| Endpoint or provider | Classification | Reason |
-|---|---|---|
-| `/health` | backend/monitoring | shallow process liveness |
-| `/llm/health` | backend/admin diagnostic | reveals deployment readiness and model metadata |
-| `/graph/status` | backend/admin diagnostic | refresh state plus local snapshot path fields |
-| Product login/profile/detection/topology/usage | Copilot internal only | credentials, service policy, evidence integrity |
-| Arvan model endpoints | Copilot internal only | API credentials and orchestration contract |
-| Qdrant and Hugging Face cache | Copilot internal only | storage/model implementation details |
-
-Do not expose diagnostics to ordinary users without field filtering and role
-authorization. In particular, omit `raw_snapshot_path` and
-`processed_snapshot_path` from a normal frontend response.
-
-## 9. Session ID lifecycle
-
-Current facts:
-
-- `session_id` is optional and nullable.
-- Supplied values are trimmed, limited to 128 conservative identifier
-  characters, and reject blank/control-character input with HTTP 422.
-- An absent value is replaced by a server-generated 32-character UUID4 hex
-  string.
-- The resolved ID is returned in `/chat` data and `/chat/stream` `done.data`.
-- State is keyed only by this string, not by user or tenant.
-- Conversation and routing state are in process memory and are lost on restart.
-- Multiple API replicas do not share state. Without sticky routing, follow-ups
-  can reach a replica with no prior context.
-
-Product ownership:
-
-1. Frontend may create `crypto.randomUUID()` for a new chat.
-2. Product Backend verifies that the Product chatroom is owned by the
-   authenticated user.
-3. Frontend reuses the chatroom's Copilot continuity value for direct calls.
-4. It rejects cross-user reuse, regardless of UUID entropy.
-5. A new-chat action creates a new ID.
-
-The request identity contract uses Product `conversation_id` as the preferred
-future durable thread key and retains `session_id` as the active legacy/runtime
-fallback. Neither field is an authorization decision.
-
-## 10. UI context and selected-IP lifecycle
-
-Current request shape:
 
 ```json
 {
-  "session_id": "8c3173b4-b153-4fcb-91b8-7fb86b063f97",
-  "message": "What is this asset?",
-  "ui_context": {"selected_ip": "192.0.2.10"}
+  "conversation_id": "local-chat-<uuid>",
+  "session_id": "<stable local session>",
+  "request_id": "<uuid4 hex>",
+  "message": "…",
+  "ui_context": {"selected_ip": "203.0.113.8"}
 }
 ```
 
-`ui_context` may be omitted or `null`; `selected_ip` may be omitted, blank, or
-`null`. The request model only trims it. Deterministic entity resolution later
-accepts valid IPv4 and ignores malformed or IPv6 values; malformed UI input does
-not currently produce a 422. A syntactically valid IP that is absent from the
-Graph can still become the target; relevant providers then report not-found or
-unavailable evidence.
+It reloads local conversations/messages, supports local create/open/delete, and persists completed turns only through the local repository. It approximates the required ID lifecycle and SSE behavior, but does **not** simulate Product JWT validation, tenant/workspace isolation, Product ownership checks, or Product PostgreSQL. The legacy Streamlit backend remains compatible with only `session_id`, `message`, and optional UI context.
 
-Entity authority is:
+### 3.3 Current SQLite schema (version 7; thread-state payload version 3)
+
+All SQLite persistence is opt-in development functionality. `PRAGMA foreign_keys=ON` is used. Product-owned simulation tables must **not** be copied as new production tables because Product already owns their equivalents.
+
+| Table | Exact columns / constraints | Ownership and role |
+| --- | --- | --- |
+| `schema_metadata` | `key TEXT PRIMARY KEY`, `value TEXT NOT NULL` | schema version bookkeeping. |
+| `local_users` | `user_id TEXT PRIMARY KEY`, `username TEXT`, `password_hash TEXT`, `created_at TEXT NOT NULL`; unique case-insensitive username when non-null | **Local only** user simulation. |
+| `local_conversations` | `conversation_id TEXT PRIMARY KEY`, `user_id TEXT NOT NULL REFERENCES local_users ON DELETE CASCADE`, `session_id TEXT NOT NULL UNIQUE`, `title TEXT NOT NULL DEFAULT ''`, `created_at TEXT NOT NULL`, `updated_at TEXT NOT NULL`; index `(user_id, updated_at DESC, conversation_id)` | **Local only** Product-chatroom surrogate. |
+| `local_messages` | `message_id TEXT PRIMARY KEY`, `conversation_id TEXT NOT NULL REFERENCES local_conversations ON DELETE CASCADE`, `request_id TEXT NOT NULL`, `role TEXT NOT NULL CHECK (role IN ('user','assistant'))`, `content TEXT NOT NULL`, `status TEXT NOT NULL CHECK (status IN ('completed','interrupted','failed'))`, `position INTEGER NOT NULL CHECK (position > 0)`, `created_at TEXT NOT NULL`; unique `(conversation_id, request_id, role)` and `(conversation_id, position)`; index `(conversation_id, position)` | **Local only** transcript surrogate. |
+| `local_request_commits` | `user_id TEXT NOT NULL REFERENCES local_users ON DELETE CASCADE`, `conversation_id TEXT NOT NULL REFERENCES local_conversations ON DELETE CASCADE`, `request_id TEXT NOT NULL`, `status TEXT NOT NULL CHECK (status IN ('started','interrupted','completed','failed'))`, timestamps; primary key `(user_id, conversation_id, request_id)` | **Local only** idempotent turn commit state. |
+| `local_thread_states` | `thread_key TEXT PRIMARY KEY`, nullable `user_id`, nullable `conversation_id`, `session_id TEXT NOT NULL`, `revision INTEGER NOT NULL CHECK (revision > 0)`, `schema_version INTEGER NOT NULL`, `state_json TEXT NOT NULL`, `updated_at TEXT NOT NULL` | Copilot compact continuity. JSON is bounded to 16,384 bytes and saved with optimistic revision. Production needs trusted owner/conversation enforcement absent from this local row. |
+| `local_long_term_memories` | `memory_id TEXT PRIMARY KEY`, `user_id TEXT NOT NULL REFERENCES local_users ON DELETE CASCADE`, `memory_type`, `statement`, `epistemic_status` non-null, `confidence REAL CHECK (0<=confidence<=1)`, source request/conversation IDs, `evidence_refs_json TEXT NOT NULL`, provenance, validity/timestamps, `revision INTEGER CHECK (>0)`, lifecycle `status`, `index_status`, `supersedes_memory_id`, fingerprint/logical-key/conflict/policy fields | Copilot canonical typed LTM, locally scoped to a simulation user. See §3.5. |
+| `local_long_term_memory_entities` | `memory_id TEXT NOT NULL REFERENCES local_long_term_memories ON DELETE CASCADE`, `entity_id TEXT NOT NULL`, primary key `(memory_id, entity_id)`; index `(entity_id, memory_id)` | LTM entity link. |
+| `local_long_term_memory_audit` | `event_id TEXT PRIMARY KEY`, `memory_id`, logical key/fingerprint, `user_id`, `entity_ids_json`, source request ID, action/from/to/reason/policy/evidence/actor/timestamp fields all non-null | append-only lifecycle history; deliberately no FK to allow retained history after candidate eviction. Indexes `(user_id, created_at DESC, event_id)` and `(memory_id, created_at DESC, event_id)`. |
+
+LTM indexes additionally include owner/status/time, owner/type/epistemic/status, partial unique live fingerprint (`candidate`/`active`), partial unique active logical key, and logical-key lookup. Local policy bounds a user to 100 conversations, 200 messages per conversation, 500 active LTM, and 250 candidate LTM. Candidate quota can evict candidates; active quota rejects new active promotion.
+
+### 3.4 Thread, working, and episodic state
+
+`ThreadMemoryState` (also called compact thread state) persists identity (`thread_key`, nullable user/conversation, session), active/last-resolved entities, prior entity mode/count, prior route dimensions, provider metadata, prior detection/profile requirements, optional `WorkingMemory`, bounded turn references, bounded episodes, summary metadata, `updated_at`, `revision`, and schema version.
+
+`WorkingMemory` is session-scoped and contains `session_id`, `MemoryContextKey`, `episode_id`, latest user/assistant turns, compact summary, providers/scope, limitations, and typed facts. `WorkingFact` has `key`, `value`, `fact_type` (default `user_provided`), scope (`conversation` or `entity`), entity IDs, and creation timestamp; entity scope requires an entity binding. `EpisodeRecord` contains its ID, session/context key, timestamps, compact summary, supported findings, facts, inferred role, findings, contradictions, unresolved questions, next checks, evidence scope, limitations, providers, scope, and turn count.
+
+`MemoryContextKey` uses entities, topic family, relationship mode, and scope family; it intentionally does not use the literal user message. Serialization validates strict item/text bounds (for example 20 facts/episodes/turn references in persistence representations; 4,000-character working summary) and rejects malformed/future/corrupt state.
+
+### 3.5 Typed long-term memory and lifecycle
+
+`LongTermMemoryRecord` fields are exactly: `memory_id`, `memory_type`, `user_id`, `entity_ids`, `statement`, `epistemic_status`, `confidence`, `source_request_id`, `source_conversation_id`, `evidence_refs`, `provenance_category`, `valid_from`, `valid_until`, `created_at`, `updated_at`, `revision`, `status`, `index_status`, `supersedes_memory_id`, `idempotency_fingerprint`, `logical_memory_key`, `has_unresolved_conflict`, and `policy_version`.
+
+There is no separate `observed_at`, `validated_at`, or `superseded_by` field in the current contract. Observation time is normalized into `valid_from`; `valid_until` expresses freshness. Supported types are validated finding, investigation outcome, analyst correction, approved asset fact, known benign behavior, and hypothesis resolution. Epistemic values are candidate, analyst-confirmed, source-validated, historical, or unconfirmed. Lifecycle states are candidate, active, invalidated, superseded, rejected, or expired.
+
+The canonical store operations are `get`, `put`, revision-checked `update`, owner/entity/type/status filtered `list`, `apply_promotion`, audit listing, `invalidate`, `expire`, revision-checked `supersede`, and `delete`. `apply_promotion`, confirmation/deduplication, changed-value supersession/conflict decision, lifecycle-audit insertion, and quota decisions must be transactional. Optimistic revision checks prevent lost updates. A structured safe Product result becomes a candidate, deterministic policy evaluates it, and a decision may promote, retain/review, reject, confirm a same-value active record, supersede a changed compatible active record, or retain a conflict candidate. Candidate and active identity are owner-scoped through both fingerprint and logical key.
+
+### 3.6 BGE/Qdrant is a discovery index, never authority
+
+Long-term memory and vector indexing are disabled by default (`SOORIN_LONG_TERM_MEMORY_ENABLED=false`, `SOORIN_MEMORY_VECTOR_INDEX_ENABLED=false`). When enabled, a separate Qdrant collection (default `soorin_copilot_memory_v1`) uses the existing BGE embedding setup; the configured default embedding is `BAAI/bge-base-en-v1.5`, dimension 768. It must not share the SOC knowledge collection.
+
+The index stores memory ID plus owner, entities, lifecycle, epistemic/freshness, revision, source, and retrieval projection metadata. Search filters `user_id` and `status=active`, then every hit is reloaded from the canonical store and fails closed on owner, lifecycle, epistemic authority, conflict, freshness, entity, score, or token-budget checks. Qdrant failure adds a limitation and falls back to canonical exact retrieval; canonical writes remain durable and record index failure status. Vector search is therefore retrieval/discovery only, never canonical memory authority.
+
+### 3.7 Current memory read/write path
 
 ```text
-explicit valid IP(s) in the current message
-  > valid UI-selected IP
-  > active entity/entities in Copilot session memory
+request → RequestIdentity → thread-state load(thread_key, identity)
+→ restore routing/working/episodes; local transcript restore only when local repository + user + conversation
+→ entity resolution → eligible active LTM exact retrieval (+ optional semantic discovery)
+→ Router → TaskSpec → EvidenceRequirements/Gate 8
+→ direct plan or bounded Planner → PlanValidator → only missing capabilities
+→ ToolResults → EvidencePack → retrieval review → at most one supplement
+→ bounded MemoryContextPackage/ContextComposer/token guard → Synthesizer
+→ update working facts/episode/raw in-process state → build LTM candidate/promotion
+→ persist compact thread state with expected revision; locally commit or finalize local request.
 ```
 
-Consequences:
+Reads are owner-scoped only when a `user_id` is present. The service restores durable state before workflow execution and saves terminal compact state after it. Local transcript/request-commit writes are deliberately guarded by the local user+conversation pair. LTM promotion writes are canonical and transactional in the local adapter; semantic index synchronization is best effort after canonical lifecycle application.
 
-- An explicit message IP is not replaced by a conflicting selected IP.
-- A valid explicit pair is preserved for comparison/path requests.
-- Without an explicit IP, referential text such as "what is this?" can use the
-  UI-selected IP.
-- Pair references can use a previous active pair when no explicit/UI entity has
-  higher authority.
-- Topic-detached general questions suppress stale asset context.
-- Browser deselection should set local selected state to null and send
-  `ui_context: null` (omission is equivalent in the current API).
-- Do not inject the selected IP into the natural-language message; use the typed
-  field and keep the user's words unchanged.
+## 4. TARGET PRODUCTION MEMORY INTEGRATION — Proposed
 
-Current Streamlit clears selection when empty Graph canvas is clicked. Its
-"Clear chat" action creates a new session but intentionally does **not** clear
-the selected Graph asset; Product UX should decide whether new-chat should also
-clear selection and implement that choice explicitly.
+### 4.1 Recommended browser contract and identity model
 
-## 11. Exact /chat contract
-
-Request:
-
-```ts
-type ChatRequest = {
-  session_id?: string | null;       // bounded legacy/runtime continuity ID
-  conversation_id?: string | null;  // preferred future durable thread ID
-  request_id?: string | null;       // one turn; generated when absent
-  message: string;                  // JSON string, min_length=1
-  ui_context?: { selected_ip?: string | null } | null;
-};
-```
-
-Both chat routes also accept optional `X-User-ID` metadata. It is bounded and
-validated but never authenticates or authorizes the request.
-
-Successful response, captured locally with the harmless prompt "Just say test.":
+After Product migration, require a Product chatroom ID as `conversation_id`, equal to the canonical Product chatroom ID. Retain `session_id` only as legacy compatibility during migration; do not make it a second ownership source. Use Product-generated or Product-backend-generated immutable turn/request IDs where possible (browser-generated UUID is acceptable only if Product/BFF binds it idempotently). Copilot may still generate a fallback for legacy callers, but a memory-enabled production request should require a stable trusted request ID.
 
 ```http
-HTTP/1.1 200 OK
-content-type: application/json
-
-{"status":"ok","data":{"session_id":"frontend-contract-test","answer":"test","provider":"arvan","model":"kimi-k3"},"warnings":[],"errors":[]}
+Authorization: Bearer <PRODUCT_JWT>
+Soorin_copilot_api_key: <COPILOT_SERVICE_KEY>
 ```
-
-No `request_id`, `trace_id`, resolved entities, evidence pack, or provider
-limitations are returned. Final answer text is `data.answer`. Provider and model
-name are returned, but provider evidence status is not.
-
-Handled model error:
 
 ```json
 {
-  "status": "error",
-  "data": null,
-  "warnings": [],
-  "errors": [{"reason": "provider_reason", "message": "safe message"}]
+  "conversation_id": "<Product chatroom ID>",
+  "session_id": "<legacy migration key only>",
+  "request_id": "<Product-bound idempotency key>",
+  "message": "…",
+  "ui_context": {"selected_ip": "203.0.113.8"}
 }
 ```
 
-This handled error remains HTTP 200, so clients must inspect `status`.
+Trusted memory isolation ultimately needs at least `tenant_id`/`organization_id`, `user_id`, `workspace_id` when Product scopes data that way, and `conversation_id`. The repository currently carries only optional `user_id` and `conversation_id`; it has no tenant/workspace fields and does not validate Product ownership. A plain browser-supplied user ID, including `X-User-ID`, must remain metadata and must not authorize memory.
 
-## 12. Exact /chat/stream wire protocol
+Product JWT plus `conversation_id` can resolve canonical ownership only when a trusted Product backend validates the JWT and checks chatroom membership. Rank the integration choices:
 
-The response is standards-shaped Server-Sent Events (SSE), not NDJSON, JSON
-Lines, or raw token text.
+1. **B — Product Backend/BFF issues short-lived signed Copilot context:** strongest separation and no static Copilot key in the browser; moderate Product work.
+2. **A — Direct browser to Copilot; Copilot validates/resolves the Product JWT through Product Backend:** secure when token validation, audience, issuer, expiry, tenant, and conversation ownership are enforced; higher Copilot/Product coupling and latency.
+3. **C — Browser supplies `user_id`:** lowest migration cost and unacceptable as authorization. It is usable only as non-authoritative display metadata with Product verification.
 
-Verified response headers:
+### 4.2 Proposed minimum Product Memory API responsibilities
 
-```http
-HTTP/1.1 200 OK
-content-type: text/event-stream; charset=utf-8
-cache-control: no-cache
-x-accel-buffering: no
-transfer-encoding: chunked
-```
+These are operations, not endorsed URLs or final payloads.
 
-Each record is exactly:
+| Operation | Caller and authorization | Required request/response semantics |
+| --- | --- | --- |
+| Resolve trusted request context | Copilot/BFF; validate Product identity and chatroom membership | Input token/signed context plus conversation/request ID. Output immutable tenant, user, workspace (if applicable), canonical conversation, and authorization decision. Must reject cross-tenant/chatroom access. |
+| Load/save compact thread state | Copilot; trusted context required | Key by tenant/user/conversation/thread key. Load typed JSON/version/revision; save with expected revision and conflict response; delete on authorized conversation deletion/retention. |
+| Put/evaluate/promote LTM candidate | Copilot/system or approved analyst; trusted owner context | Typed record, fingerprint, logical key, evidence provenance, policy version, idempotency key. Return canonical record, lifecycle decision, revision, audit event(s), conflict/supersession result. Must be one transaction. |
+| Get/list exact active LTM | Copilot; trusted owner context | Owner/entity/type/status/epistemic filters, bounded pagination/limits. Return canonical records only, not vector payload authority. |
+| Lifecycle operations and audit | Copilot/authorized analyst; role-aware | Revision-checked invalidate, expire, supersede, delete and bounded audit list. Each lifecycle mutation is transactional and appends immutable audit history. |
+| Semantic-index outbox/status | Copilot worker/service | Publish canonical post-commit changes; return/persist index state. Index failures must not roll back canonical records. |
 
-```text
-event: <event-type>\n
-data: <compact UTF-8 JSON object>\n
-\n
-```
+### 4.3 Proposed Product PostgreSQL additions
 
-Example captured sequence (token counts intentionally illustrative here; their
-shape comes from provider-reported usage and may contain additional keys):
+Do not duplicate Product `users`, chatrooms/conversations, or messages. Add Copilot-owned records associated with those existing concepts (actual FK table/column names remain a Product decision):
 
-```text
-event: answer_delta
-data: {"type":"answer_delta","text":"test"}
+| Proposed table | Essential columns and constraints |
+| --- | --- |
+| `copilot_thread_state` | `thread_key` PK (or tenant/conversation composite key), tenant/user/workspace/conversation FKs or immutable IDs, legacy `session_id`, `state_json JSONB`, `schema_version`, `revision`, timestamps. Unique owner+conversation/thread binding; index owner/conversation and update time. Enforce trusted membership before read/write. |
+| `copilot_long_term_memory` | UUID/text memory PK; tenant/user/workspace and source conversation IDs; type, statement/payload JSONB or text, epistemic/provenance/status/index-status enums/checks, confidence numeric check, evidence refs JSONB, validity/timestamps, revision, supersedes ID, fingerprint, logical key, conflict flag, policy version. Partial unique `(tenant,user,idempotency_fingerprint)` for live candidate/active; partial unique `(tenant,user,logical_memory_key)` for active; owner/status/time and owner/type/epistemic indexes. |
+| `copilot_memory_entity_link` | memory FK, normalized entity ID, composite PK; entity lookup index. |
+| `copilot_memory_audit` | immutable event PK, memory ID (may intentionally omit FK to retain evicted-candidate history), trusted owner fields, entity IDs JSONB, source request ID, action/from/to/reason/policy/evidence/actor/timestamp; owner/time and memory/time indexes. |
+| `copilot_memory_index_outbox` (recommended) | canonical memory/version/action, retry state, error metadata, timestamps, idempotency uniqueness. Lets Qdrant synchronize asynchronously after a committed canonical transaction. |
 
-event: usage
-data: {"type":"usage","data":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}
+Retention/deletion must follow Product tenant/user/chatroom policy. Conversation deletion must not automatically delete user-scoped LTM without an explicit Product retention rule; thread state may be deleted with the conversation. Tenant deletion must cascade or be cryptographically/operationally erased across canonical and vector projections. The precise choice of tenant/workspace foreign keys, RLS policy, enum versus check constraints, and transcript-retention relationship is a Product schema decision, not determined by this repository.
 
-event: done
-data: {"type":"done","data":{"session_id":"frontend-stream-contract-test","provider":"arvan","model":"kimi-k3","warnings":[]}}
+## 5. Implemented versus proposed summary
 
-```
+| Capability | Main/tag | Dev | Target production |
+| --- | --- | --- | --- |
+| Product chatroom/messages in Product PostgreSQL | documented Product responsibility | unchanged | remains Product-owned |
+| `conversation_id`/`request_id` request fields | absent | optional | required for memory-enabled Product flow |
+| Product JWT validation by Copilot | absent | absent | BFF signed context or Copilot→Product validation |
+| `X-User-ID` trusted identity | absent | no; metadata only | never direct authorization |
+| Thread/working/episodic durability | in-process only | SQLite local adapter | Product PostgreSQL/service adapter |
+| Typed LTM/lifecycle/audit | absent | SQLite local adapter | Product PostgreSQL/service adapter |
+| BGE/Qdrant LTM discovery | absent | optional, disabled | post-commit projection only |
 
-Public event union:
+## 6. Verification performed
 
-| Event | JSON fields | Meaning |
-|---|---|---|
-| `reasoning_delta` | `type`, `text` | only sent when reasoning exposure is enabled; normally absent |
-| `answer_delta` | `type`, `text` | append text exactly, preserving Unicode |
-| `usage` | `type`, `data` | provider-reported usage; flexible metadata, not a stable billing schema |
-| `done` | `type`, `data.session_id`, `provider`, `model`, `warnings` | only successful application-level completion marker |
-| `error` | `type`, `message`, `data.reason` | safe failure after HTTP 200; no `done` follows |
+- Read-only Git inspection: `status`, branches, tag ancestry, `log`, `show`, and `diff main...dev`.
+- Offline test collection: 92 relevant tests across request identity, authentication/CORS, local simulation, SQLite persistence, and LTM lifecycle were discovered.
+- Four focused offline assertions passed: legacy request/session fallback, Product-JWT-plus-custom-Copilot-key authentication, thread-state owner/conversation/revision isolation, and atomic changed-value LTM supersession.
+- `python -m compileall -q app/src` completed successfully.
+- No runtime integration assertion is claimed: the combined pytest execution did not provide a complete terminal summary in this environment, so it is not reported as a passing suite.
 
-There are no SSE comments or heartbeats. `session_id` appears only in `done`.
-No request ID or trace ID appears in-stream.
-
-If the provider stream fails before emitting answer text, Copilot may perform a
-non-stream model fallback and emit one answer delta followed by `done`. If it
-fails after partial answer output, Copilot emits `error`; clients must retain or
-mark the partial output as interrupted and must not treat it as complete.
-
-Browser disconnect currently stops delivery but is not propagated to the daemon
-workflow/model worker. It may continue consuming resources. `AbortController`
-still matters for UX, but true upstream cancellation is a required follow-up.
-
-## 13. Current Streamlit implementation
-
-The reference UI uses `app/app_st.py` as a shell and shared controllers under
-`app/src/web`:
-
-- creates `uuid4().hex` once in `st.session_state.session_id`;
-- reuses it for all messages until "Clear chat";
-- stores display history in `st.session_state.messages`;
-- sends only the current message, not browser history;
-- relies on Copilot's session memory for continuity;
-- includes `ui_context` only when a Graph IP is selected;
-- uses `/chat/stream` for the normal UI path;
-- has a non-stream `/chat` helper that is not used by the rendered chat flow;
-- sets response encoding to UTF-8 and consumes `iter_lines(..., decode_unicode=True)`;
-- parses `data:` JSON, ignores comments and the `event:` line, and uses JSON
-  `type` as the event discriminator;
-- accumulates answer deltas, stores the assistant message only after `done`, and
-  displays but does not store a partial answer when interrupted;
-- checks `/health` and `/llm/health` for sidebar status;
-- loads the local Graph pickle directly and calls Python Graph helpers;
-- does **not** call the public `/graph/*` endpoints;
-- supports PyVis node select, empty-canvas clear, Explore-IP select, zoom, and
-  local Graph filters;
-- automatically attaches `Authorization: Bearer <SOORIN_COPILOT_API_KEY>` to every
-  protected request (`/chat`, `/chat/stream`, `/llm/health`) and omits the header
-  from the unauthenticated `/health` endpoint;
-- shows a sidebar warning when `SOORIN_COPILOT_API_KEY` is not configured.
-- selects `LegacyDirectBackend` or `LocalSimulationBackend` behind one
-  `ChatBackend` contract and one conversation/message/SSE renderer.
-
-Streamlit-specific behavior that must not be copied: direct pickle access,
-in-process Graph functions, Streamlit session state as durable history, PyVis's
-custom component protocol, rerun-based rendering, and local API URLs. A real
-browser should use Product-owned state and HTTP APIs.
-
-Audit note: the current Streamlit history loop renders `st.markdown` twice for
-each stored item. This is a UI defect outside this contract task, not an API
-contract to reproduce.
-
-## 14. Production frontend state machine
-
-```text
-IDLE
-  -> SUBMITTING: append user message once, disable duplicate submit
-  -> STREAMING: append answer_delta; optionally show reasoning_delta separately
-  -> COMPLETE: on done, commit assistant message and returned session_id
-  -> FAILED_BEFORE_TEXT: show retryable error
-  -> INTERRUPTED_AFTER_TEXT: preserve partial display, mark incomplete, no auto retry
-  -> CANCELLED: abort browser request and mark local turn cancelled
-```
-
-The frontend should retain Product display history independently of Copilot
-runtime memory. It should not resend full history unless a future API contract
-adds such a field.
-
-## 15. TypeScript contracts
-
-These interfaces mirror current response fields, including nullable and
-variable health metadata:
-
-```ts
-export interface ChatUIContext {
-  selected_ip?: string | null;
-}
-
-export interface ChatRequest {
-  session_id?: string | null;
-  conversation_id?: string | null;
-  request_id?: string | null;
-  message: string;
-  ui_context?: ChatUIContext | null;
-}
-
-export interface ChatData {
-  session_id: string;
-  answer: string;
-  provider: string;
-  model: string;
-}
-
-export interface ChatErrorItem {
-  reason: string;
-  message: string;
-}
-
-export type ChatResponse = {
-  status: "ok" | "error";
-  data: ChatData | null;
-  warnings: string[];
-  errors: ChatErrorItem[];
-};
-
-export type ChatStreamEvent =
-  | { type: "reasoning_delta"; text: string }
-  | { type: "answer_delta"; text: string }
-  | { type: "usage"; data: Record<string, unknown> }
-  | { type: "done"; data: {
-      session_id: string; provider: string; model: string; warnings: string[];
-    } }
-  | { type: "error"; message: string; data: { reason: string } };
-
-export interface GraphDegree {
-  in: number;
-  out: number;
-  total: number;
-}
-
-export interface GraphStatusResponse {
-  loaded: boolean;
-  nodes: number;
-  edges: number;
-  directed: boolean;
-  artifact_available: boolean;
-  active_graph_loaded_at: string | null;
-  active_graph_source: string | null;
-  active_graph_version: string | null;
-  refresh_enabled: boolean;
-  refresh_running: boolean;
-  refresh_interval_seconds: number;
-  refresh_last_attempt_at: string | null;
-  refresh_last_success_at: string | null;
-  refresh_last_failure_at: string | null;
-  refresh_last_error_type: string | null;
-  refresh_last_error_message: string | null;
-  refresh_consecutive_failures: number;
-  raw_snapshot_path: string | null;
-  processed_snapshot_path: string | null;
-  last_known_good: boolean;
-}
-
-export interface GraphStatsResponse {
-  total_nodes: number;
-  total_edges: number;
-  avg_degree: number;
-  top_destinations: Array<{ ip: string; incoming: number }>;
-  top_sources: Array<{ ip: string; outgoing: number }>;
-  ip_range_distribution: Record<string, number>;
-}
-
-export interface GraphNodeResponse {
-  ip: string;
-  found: boolean;
-  degree: GraphDegree;
-}
-
-export interface GraphNeighbor {
-  ip: string;
-  direction: "in" | "out";
-  edge_weight: number;
-}
-
-export interface GraphNeighborsResponse {
-  target_ip: string;
-  found: boolean;
-  direction: "in" | "out" | "both";
-  total: number;
-  returned: number;
-  neighbors: GraphNeighbor[];
-}
-
-export interface GraphContextResponse {
-  target_ip: string;
-  node_found: boolean;
-  degree: GraphDegree;
-  top_inbound_peers: string[];
-  top_outbound_peers: string[];
-  bidirectional_peers: string[];
-  subnets_reached: string[];
-  limitations: string[];
-}
-
-export interface GraphPathResponse {
-  source: string;
-  target: string;
-  found: boolean;
-  path: string[];
-  edge_count: number;
-  semantics: string;
-  reason: "source_not_found" | "target_not_found" |
-    "no_observed_communication_graph_path" | null;
-}
-
-export interface ValidationIssue {
-  loc: Array<string | number>;
-  msg: string;
-  type: string;
-  input?: unknown;
-  ctx?: Record<string, unknown>;
-}
-
-export type ValidationErrorResponse =
-  | { detail: ValidationIssue[] }
-  | { detail: string };
-```
-
-OpenAPI is now sufficiently typed for ordinary JSON response generation, but
-the SSE union and incremental parser still require handwritten frontend code.
-The LLM usage event and nested deployment diagnostics intentionally remain
-extensible.
-
-## 16. Streaming parser example
-
-`EventSource` cannot POST a JSON body, so use `fetch()` and parse SSE framing.
-This parser keeps a persistent `TextDecoder`, handles UTF-8 characters split
-across transport chunks, supports multiple `data:` lines, and validates JSON
-`type` rather than assuming network chunk boundaries equal events.
-
-```ts
-export async function streamCopilot(
-  url: string,
-  request: ChatRequest,
-  signal: AbortSignal,
-  onEvent: (event: ChatStreamEvent) => void,
-): Promise<void> {
-  const response = await fetch(url, {
-    method: "POST",
-    credentials: "include",
-    headers: {
-      "Content-Type": "application/json",
-      Accept: "text/event-stream",
-    },
-    body: JSON.stringify(request),
-    signal,
-  });
-
-  if (!response.ok) {
-    const body = await response.json().catch(() => null);
-    throw new HttpError(response.status, body);
-  }
-  if (!response.headers.get("content-type")?.startsWith("text/event-stream")) {
-    throw new Error("Copilot returned an unexpected content type");
-  }
-  if (!response.body) throw new Error("Streaming body is unavailable");
-
-  const decoder = new TextDecoder("utf-8", { fatal: false });
-  const reader = response.body.getReader();
-  let pending = "";
-  let dataLines: string[] = [];
-
-  const consumeLine = (line: string) => {
-    if (line.endsWith("\r")) line = line.slice(0, -1);
-    if (line === "") {
-      if (dataLines.length) {
-        const value = JSON.parse(dataLines.join("\n")) as ChatStreamEvent;
-        if (!value || typeof value.type !== "string") {
-          throw new Error("Invalid Copilot stream event");
-        }
-        onEvent(value);
-        dataLines = [];
-      }
-    } else if (line.startsWith("data:")) {
-      dataLines.push(line.slice(5).trimStart());
-    }
-    // Current Streamlit likewise ignores comments and the event: line.
-  };
-
-  while (true) {
-    const { value, done } = await reader.read();
-    pending += decoder.decode(value ?? new Uint8Array(), { stream: !done });
-    let newline: number;
-    while ((newline = pending.indexOf("\n")) >= 0) {
-      consumeLine(pending.slice(0, newline));
-      pending = pending.slice(newline + 1);
-    }
-    if (done) break;
-  }
-  pending += decoder.decode();
-  if (pending) consumeLine(pending);
-  consumeLine("");
-}
-```
-
-On `answer_delta`, append `text`. On `done`, mark complete and update the local
-session ID from `data.session_id`. On `error`, mark the turn failed. Never render
-reasoning as final answer text.
-
-## 17. Cancellation and retry behavior
-
-- Create one `AbortController` per submitted turn.
-- Cancel on explicit user action, page teardown, or conversation switch.
-- Current Copilot does not propagate disconnect to its worker/model call, so
-  cancellation is client-side delivery cancellation, not guaranteed compute
-  cancellation.
-- Retry transport errors only before any answer delta was displayed.
-- After partial text, require an explicit user retry and create a new turn; an
-  automatic replay can duplicate model work and token usage.
-- A retry should use the same Product request idempotency/correlation policy,
-  but do not assume Copilot chat itself is idempotent.
-- Do not fall back to `/chat` after partial SSE output.
-
-## 18. Product persistence responsibilities
-
-The current Product Backend does not proxy Copilot. It owns Product users,
-chatrooms, chatroom ownership, persisted user/assistant messages, timestamps,
-and Product retention/deletion policy. The Frontend creates or opens a chatroom,
-calls Copilot directly, receives SSE directly, and stores the completed turn
-through existing Product Backend message endpoints. Only a completed assistant
-message after SSE `done` should be stored as complete; interrupted output may be
-stored separately according to Product policy.
-
-## 19. Optional gateway hardening
-
-A future gateway or BFF is optional security hardening, not a current Product
-requirement. If adopted, it can remove the static Copilot key from browser code,
-enforce per-user/asset authorization and rate limits, propagate correlation and
-disconnect signals, and stream SSE without buffering. This optional deployment
-must preserve the existing Copilot `/chat/stream` wire contract and must not
-route Copilot's internal Product profile/detection/login calls back into itself.
-
-## 20. Authentication and authorization
-
-Copilot protected endpoints (`/chat`, `/chat/stream`, `/llm/health`, and
-all `/graph/*` routes) require `SOORIN_COPILOT_API_KEY`. They accept either
-`Authorization: Bearer <SOORIN_COPILOT_API_KEY>` or, for a Product request
-that retains its Product JWT in `Authorization`,
-`Soorin_copilot_api_key: <SOORIN_COPILOT_API_KEY>`. The custom header takes
-precedence and an invalid custom key is rejected even when a Bearer credential
-is also supplied. The built-in Streamlit UI (`app/app_st.py`) uses the Bearer
-form for its protected requests and omits it from `GET /health`. Missing or
-invalid Copilot credentials return `401`. This is a service-to-service auth layer only. The Copilot request
-still carries no user ID, tenant ID, organization ID, role, permission, or
-authorized-asset scope. Therefore these endpoints must not be internet/browser
-exposed as an authorization boundary.
-
-## 21. Multi-tenant concerns
-
-The request contract carries no tenant/user identity and memory is keyed only by
-session string. If two users submit the same ID to one process, they can share
-routing/conversation state. UUID randomness reduces accidental collision but is
-not authorization.
-
-Before multi-tenant production:
-
-- bind Product thread IDs to authenticated user and tenant in Product DB;
-- enforce that binding on Product chatroom/message requests;
-- pass typed conversation/user identity to Copilot without treating it as auth;
-- protect direct Copilot access and rotate the browser-visible static key;
-- define tenant-correct Product service credentials and Qdrant/Graph data scope;
-- decide whether future signed tenant/user context or an optional gateway is required;
-- avoid multiple stateless Copilot replicas unless routing is sticky or runtime
-  state is moved to a shared, tenant-scoped store.
-
-## 22. Graph API usage
-
-Graph data is a directed NetworkX snapshot built from validated Product unique
-IP-pair records. It is not a packet capture, routing table, reachability proof,
-or necessarily the same instant as Product UI data.
-
-Detailed behavior:
-
-- Node/path inputs use `ipaddress.ip_address`; syntactic IPv4 and IPv6 are
-  accepted at API validation, though the current graph/entity baseline is IPv4.
-- Missing nodes return HTTP 200 and `found=false` for node/neighbors/context.
-- Neighbor direction is `in`, `out`, or `both`.
-- Neighbor records sort by descending `edge_weight`, then IP, then direction.
-- `both` can return the same peer twice when both directed edges exist.
-- `edge_weight` is duplicate validated topology-record count, not bytes, flow
-  frequency, risk, or traffic volume.
-- Context returns fixed top inbound/outbound/bidirectional peer lists, subnet
-  list, and limitations.
-- Path is NetworkX directed shortest path in observed communication edges.
-- Path `reason` can be `source_not_found`, `target_not_found`, or
-  `no_observed_communication_graph_path`.
-- Equal source/target currently returns `found=true`, one-node path, even if the
-  node is absent; frontend should avoid using that as existence proof.
-- Graph version/freshness is exposed by `/graph/status`; last-known-good can
-  remain loaded after refresh failure.
-
-## 23. Graph pagination and truncation
-
-`/graph/nodes/{ip}/neighbors` has `limit` but no `offset`, cursor, continuation
-token, or stable snapshot token. `total` is the full matching record count and
-`returned` is the included count. When `returned < total`, show "showing N of
-M" and do not describe the list as complete.
-
-The API is not sufficient for production page-through pagination. Increasing
-`limit` can retrieve more up to the configured maximum (default 1000), but that
-is bounded expansion, not pagination. Add snapshot/version-bound cursor or
-offset semantics before using it for very large browser lists.
-
-Stats top source/destination lists are capped at 10. Context peer lists are
-internally capped (currently 20 per inbound/outbound direction). Neither offers
-pagination.
-
-## 24. Error handling
-
-Frontend handling matrix:
-
-| Condition | Current signal | Action |
-|---|---|---|
-| invalid JSON/body/query | HTTP 422, `detail` string or array | show field-safe validation; do not retry unchanged |
-| Product API unauthenticated/unauthorized | Product 401/403 | reauthenticate or show access denied |
-| quota/rate limit | recommended 429 | honor `Retry-After`; no immediate loop |
-| Copilot unavailable | network/5xx | availability UI; retry only before output |
-| handled non-stream LLM failure | HTTP 200 with `status=error` | inspect body status, show safe error |
-| stream model failure | HTTP 200 then SSE `error` | mark interrupted; no `done`; do not auto replay after partial text |
-| browser abort | `AbortError` | mark cancelled, not failed |
-| missing Graph node | HTTP 200 `found=false` | normal empty/not-found state |
-| Graph truncation | `returned < total` | visibly label partial result |
-
-Never render backend error text as raw HTML. Bound diagnostic display and keep
-full exception details server-side.
-
-## 25. Request IDs and observability
-
-Copilot generates an internal 12-hex request ID for each `/chat` or stream call
-and a separate internal trace ID, but neither is currently returned in JSON,
-SSE, or headers. Therefore a Product request ID cannot yet be correlated to
-Copilot logs at wire level.
-
-Immediate Frontend/Product behavior:
-
-- generate/preserve a Product request ID for Product message records;
-- log safe status, first-byte time, completion/error event, and disconnect;
-- never log secrets, authorization headers, raw Product evidence, hidden
-  reasoning, or full model responses.
-
-Recommended bounded Copilot follow-up: accept/validate a correlation header or
-return its internal request ID in a response header and final/error metadata.
-That is not implemented in this audit to avoid changing the runtime contract.
-
-## 26. Chat persistence responsibilities
-
-Current Copilot memory is bounded. Its default backend remains in process, while
-the opt-in local simulation persists owner-scoped transcripts and one bounded
-`ThreadMemoryState` in development SQLite. Same-conversation relevant-turn
-retrieval remains deterministic. Separately, disabled-by-default typed long-term
-memory can retrieve validated owner-scoped records across conversations using
-exact metadata plus the existing BGE/Qdrant boundary. Gate 8 may explicitly
-reuse fully authoritative revision-based or historical evidence; current
-Detection, Graph, risk, and activity requirements still require verification.
-This internal policy does not change frontend request or SSE schemas.
-
-Recommended division:
-
-```text
-Product database
-  conversation metadata and title
-  user and tenant ownership
-  displayed user/assistant messages
-  timestamps and completion/cancellation state
-  Product request/correlation IDs
-
-Copilot runtime
-  bounded active entity and routing/workflow memory
-  compact short-term context through storage-neutral memory ports
-  no claim of durable chat history
-```
-
-Production must replace SQLite with Product Memory API/PostgreSQL adapters that
-preserve ownership, revision, transcript, thread-state, summary, and episode
-semantics. For typed long-term memory, the future adapter also needs canonical
-create/get/update/delete/search plus approve/promote, invalidate, and supersede
-semantics over stable memory IDs, user scope, entity/type/status filters,
-epistemic/provenance/validity fields, optimistic revision, and index state. A
-possible backend shape is `POST /copilot/memory`, `GET|PUT|DELETE
-/copilot/memory/{id}`, `GET /copilot/memory/search`, and explicit
-`approve`/`invalidate` actions; Product owns the final URLs and authorization.
-Copilot never connects directly to Product PostgreSQL, and Qdrant is a rebuildable
-retrieval index rather than the canonical fact store. Copilot SQLite is
-development/test/demo infrastructure only.
-
-Persist only the final committed assistant message after `done`; store partial
-output separately as interrupted if Product policy requires it.
-
-## 27. Postman usage
-
-Use:
-
-- `postman/Soorin_Copilot_API.postman_collection.json`
-- `postman/Soorin_Copilot_Local.postman_environment.json`
-
-Set variables for non-local environments through a private, untracked Postman
-environment. The tracked environment contains no credentials or organization
-asset IPs. Postman may buffer or display SSE differently from a browser and is
-not proof of proxy buffering behavior; use `curl -N` or browser integration for
-wire-level stream QA.
-
-The collection is for contract exploration and QA. It does not implement
-Product chatroom/message persistence or user authorization.
-
-## 28. Deployment/service discovery
-
-Local example base URL is `http://127.0.0.1:6998`. Compose API service name is
-`api` on `copilot-network`, while an external Product stack should use its own
-internal DNS/service discovery and health policy. Do not bake container names or
-host loopback addresses into frontend bundles.
-
-The API healthcheck currently checks `/health` and `/openapi.json`; this verifies
-process/schema availability, not models, Product API, Graph freshness, or RAG.
-Use `/llm/health` for deployment configuration readiness and `/graph/status` for
-Graph diagnostics, with backend-only access.
-
-Qdrant local mode and in-process session memory constrain horizontal scaling.
-Do not point multiple writers at one embedded local Qdrant path, and do not
-assume conversation continuity across replicas.
-
-## 29. Authentication configuration
-
-### Configuration variable
-
-| Variable | Required | Default | Purpose |
-|---|---|---|---|
-| `SOORIN_COPILOT_API_KEY` | yes | (none) | Static Copilot API key for service-to-service auth |
-
-Set in the repository-root `.env`:
-
-```ini
-SOORIN_COPILOT_API_KEY=your-generated-api-key
-```
-
-### Which endpoints are protected
-
-Every endpoint except `GET /health` requires the API key:
-
-| Protected | Endpoint |
-|---|---|
-| Yes | `GET /llm/health` |
-| Yes | `POST /chat` |
-| Yes | `POST /chat/stream` |
-| Yes | `GET /graph/status` |
-| Yes | `GET /graph/stats` |
-| Yes | `GET /graph/nodes/{ip}` |
-| Yes | `GET /graph/nodes/{ip}/neighbors` |
-| Yes | `GET /graph/nodes/{ip}/context` |
-| Yes | `GET /graph/path` |
-| **No** | **`GET /health`** |
-
-### HTTP responses
-
-| Condition | Status | Body |
-|---|---|---|
-| Missing Bearer and custom Copilot credentials | `401` | `{"detail":"Missing Authorization header"}` |
-| Invalid Bearer or custom Copilot key | `401` | `{"detail":"Invalid Bearer token"}` |
-| Valid Bearer or custom Copilot key | `200` | Normal response |
-
-### Development workflow
-
-```text
-# Generate an API key (one time)
-SOORIN_COPILOT_API_KEY=$(python3 -c "import secrets; print(secrets.token_urlsafe(32))")
-
-# Start the API
-SOORIN_COPILOT_API_KEY=$SOORIN_COPILOT_API_KEY python app/run.py --api
-
-# Test the key
-curl -H "Authorization: Bearer $SOORIN_COPILOT_API_KEY" http://127.0.0.1:6998/chat/stream
-```
-
-### Current Product workflow
-
-```text
-Browser
-  |  1. Authenticate with Product and create/open a Product chatroom
-  |  2. POST directly to Copilot /chat/stream
-  |  3. Keep Product JWT in Authorization and add Soorin_copilot_api_key,
-  |     or use the Copilot Bearer form when no Product JWT is present
-  v
-Soorin Copilot API
-  |  Validates the custom Copilot key when present; otherwise the Bearer key
-  |  Rejects with 401 if missing or invalid
-  |  Streams SSE directly to Browser
-  v
-Browser
-  |  4. Persist user and completed assistant messages
-  v
-Product Backend chatroom/message endpoints -> Product PostgreSQL
-```
-
-### Example Authorization header
-
-```http
-Authorization: Bearer abc123def456ghi789jkl012mno345pqr678stu901vwx
-```
-
-The Bearer token is the literal value of `SOORIN_COPILOT_API_KEY`. The current
-direct-browser integration necessarily exposes this shared key to browser code;
-it is not user authorization and should be treated as a temporary limitation.
-
-When the Product request keeps its own JWT in `Authorization`, send instead:
-
-```http
-Soorin_copilot_api_key: abc123def456ghi789jkl012mno345pqr678stu901vwx
-```
-
-This is a Copilot service credential, not a replacement for the Product JWT.
-
-### OpenAPI / Swagger
-
-Protected endpoints expose an **Authorize** button in Swagger UI
-(`/docs`). Clicking it prompts for a Bearer token. All protected operations
-then include the `Authorization: Bearer <token>` header automatically.
-
-### Implementation notes
-
-- Uses FastAPI `HTTPBearer` security scheme with `Security()` dependency.
-- `GET /health` intentionally excluded — used by load balancers, healthchecks,
-  and monitoring without requiring the API key.
-- No user, tenant, or role scoping — this is a single shared static key.
-- The key is loaded from the repository-root `.env` at settings initialization time.
-- Changing the key requires a service restart.
-
-## 30. Current limitations
-
-- no tenant/user authorization (static API key only);
-- session IDs are arbitrary, unbounded strings and are not identity scoped;
-- Product Memory API/PostgreSQL adapters are not implemented;
-- typed cross-conversation memory is disabled by default and requires a trusted
-  user identity plus an explicitly configured canonical/index backend;
-- local SQLite thread memory is development-only and is not a production
-  ownership, authorization, or multi-replica solution;
-- browser disconnect does not cancel upstream model/workflow execution;
-- no heartbeats during long pre-answer periods;
-- no public request/trace ID;
-- handled `/chat` LLM errors use HTTP 200;
-- `/chat` returns no evidence status, resolved entities, citations, or limitations;
-- SSE `usage.data` is provider-flexible rather than a generated-client contract;
-- Graph status exposes filesystem paths;
-- Graph neighbors have truncation but no pagination;
-- Product live Graph and Copilot snapshot Graph can differ;
-- selected IP request validation trims but does not return 422 for malformed IP;
-- Streamlit directly reads local Graph artifacts and is not a production frontend pattern;
-- current Streamlit history display duplicates each stored message visually;
-- OpenAPI cannot generate the incremental stream parser.
-
-## 31. Required follow-up changes
-
-Before broad frontend release, Product and Copilot teams should decide and then
-implement, in priority order:
-
-1. Product chatroom/message integration and conversation ownership validation.
-2. Context compaction and durable thread state.
-3. Trusted Product ownership validation for identity metadata.
-4. Decide whether an optional gateway is needed to remove the static key from
-   browser code and add stronger asset authorization/rate limits.
-4. True disconnect/cancellation propagation and optional SSE heartbeat policy.
-5. Whether Product canonical Graph or Copilot snapshot Graph owns each UI panel.
-6. Cursor/version pagination if browser Graph neighbor lists require page-through.
-7. Remove or role-filter filesystem path diagnostics from user-facing status.
-8. Optional API hardening: strict IPv4 UI-context validation, coordinated as a
-   versioned behavior change.
-9. Decide whether evidence/limitations/citations need a stable public response
-   contract rather than remaining inside answer prose.
-
-The current direct streaming path remains valid with the optional identifier
-fields and dormant storage ports introduced backward-compatibly.
-
-## 32. Frontend implementation checklist
-
-- [ ] Call Copilot `/chat/stream` directly; never call internal provider URLs.
-- [ ] Create or obtain one authorized UUID per chat and reuse it.
-- [ ] Keep Product display history; send only current `message`.
-- [ ] Send `ui_context.selected_ip` as typed state, not injected prose.
-- [ ] Clear/send null on deselection; decide new-chat selection behavior.
-- [ ] Use `POST /chat/stream` with `Accept: text/event-stream`.
-- [ ] Parse SSE across arbitrary byte/chunk boundaries with UTF-8 `TextDecoder`.
-- [ ] Append only `answer_delta`; finalize only on `done`.
-- [ ] Treat `error` after 200 as failure and preserve partial text as incomplete.
-- [ ] Add `AbortController`; do not auto retry after partial output.
-- [ ] Handle 422, 401/403, 429, and 502/503/504 distinctly.
-- [ ] Sanitize Markdown: disable raw HTML, unsafe links, scripts, and event handlers.
-- [ ] Show Graph `returned/total` truncation and path semantics.
-- [ ] Persist final messages only under authenticated Product ownership.
-
-## 33. Product Backend integration checklist
-
-- [ ] Keep Product user, chatroom, message, retention, and deletion ownership.
-- [ ] Enforce user/chatroom ownership for every Product message operation.
-- [ ] Persist the user message and only the completed assistant message after `done`.
-- [ ] Preserve Product request/correlation IDs with persisted turns.
-- [ ] Keep Product/API/model credentials out of logs.
-- [ ] Decide separately whether an optional Copilot gateway is required.
-
-## 34. QA acceptance checklist
-
-- [ ] `/health` returns exact 200 JSON status without any Authorization header.
-- [ ] `/llm/health` returns 401 without Authorization header.
-- [ ] `/llm/health` returns 401 with invalid Bearer token.
-- [ ] `/llm/health` returns 200 with valid Bearer token.
-- [ ] `/chat` success and handled error envelopes match this document.
-- [ ] `/chat/stream` is UTF-8 SSE with blank-line frame boundaries.
-- [ ] Unicode smart quotes, Persian, arrows, dashes, and emoji round-trip exactly.
-- [ ] A stream completes only on `done`; an `error` after 200 is surfaced.
-- [ ] Browser/parser works when one UTF-8 character spans network chunks.
-- [ ] One chat reuses one authorized session ID; new chat uses a new ID.
-- [ ] Two users cannot access one another's session by guessing/submitting an ID.
-- [ ] Explicit message IP wins over a conflicting selected IP, after both are
-      authorized by Product backend.
-- [ ] Deselect sends null/omits context and no stale selected IP is forwarded.
-- [ ] General detached questions do not receive stale asset context.
-- [ ] Browser cancel stops rendering and is recorded as cancelled.
-- [ ] Direct browser stream emits chunks promptly without client-side buffering.
-- [ ] 422, 401/403, 429, 502/503/504, partial stream, and disconnect are tested.
-- [ ] Missing Graph node is a normal 200 not-found state.
-- [ ] Neighbor truncation is visible and no unsupported pagination is implied.
-- [ ] Product and Copilot Graph freshness/version differences are tested.
-- [ ] Postman files contain no credentials or organization-specific IPs.
-- [ ] Generated OpenAPI JSON contracts pass, while SSE uses the manual parser.
+This document supersedes historical integration claims where they conflict with the source at the revisions above.
