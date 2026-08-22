@@ -806,7 +806,7 @@ Secrets such as API keys, passwords, Product tokens, captcha bypass values, and 
 
 ### `SOORIN_LONG_TERM_MEMORY_BACKEND`
 
-`SOORIN_LONG_TERM_MEMORY_BACKEND` selects the canonical store implementation for typed long-term records. The current development architecture implements `sqlite`; production Product/PostgreSQL adapters are not part of the current local path. Only backends implemented in current code should be configured. `(double-check exact accepted enum in settings.py)`
+`SOORIN_LONG_TERM_MEMORY_BACKEND` currently accepts only `sqlite`, the complete local/reference implementation including canonical lifecycle transactions. Product LTM transport/read/create/audit code exists as a foundation but is deliberately not selectable until the Product Backend provides equivalent atomic lifecycle operations. Qdrant remains a discovery index, never a canonical backend.
 
 ### `SOORIN_MEMORY_VECTOR_INDEX_ENABLED`
 
@@ -882,9 +882,17 @@ retention and does not delete audit history.
 
 `SOORIN_LOCAL_TEST_USER_CREATION_ENABLED` controls whether the local development simulation is allowed to create local test-user metadata. `true` permits the development-only user creation path where local simulation is active; `false` prevents creation. It must not be treated as a production user-provisioning or authentication capability.
 
+### `SOORIN_LOCAL_PRODUCT_TEST_USER_ID`
+
+`SOORIN_LOCAL_PRODUCT_TEST_USER_ID` is an optional dedicated non-production Product owner identifier used only when local simulation exercises the Product thread-state backend. It replaces the random local simulation user only at the Product-memory adapter boundary; local chat simulation retains its own user. Leave it blank unless the Product test backend recognizes the owner. It is ownership context, not authentication, and must never contain a production user identity.
+
 ### `SOORIN_THREAD_STATE_BACKEND`
 
-`SOORIN_THREAD_STATE_BACKEND` selects the storage backend for compact thread/routing/working-memory continuity. Current architecture supports `memory` for process-local state and `sqlite` for opt-in development persistence across restarts. SQLite persists only bounded typed thread state, not arbitrary LangGraph runtime state or raw provider payloads. `(double-check exact accepted values in settings.py)`
+`SOORIN_THREAD_STATE_BACKEND` accepts `memory`, `sqlite`, or `product`. `memory` is process-local; `sqlite` is opt-in local persistence; `product` uses the Product memory API and PostgreSQL through the shared Product authentication client. Product mode requires a trusted `X-User-ID` and `conversation_id` per request, does not fall back to SQLite on failure, and persists only bounded typed state—not arbitrary LangGraph runtime state or raw provider payloads.
+
+### `SOORIN_PRODUCT_MEMORY_THREAD_STATE_PATH` and `SOORIN_PRODUCT_MEMORY_LTM_PATH`
+
+These non-secret paths select Product Backend memory resources while reusing `SOORIN_PRODUCT_API_BASE_URL`, bearer authentication, and HWID. The thread path receives a conversation ID suffix; the LTM path is the base for create, search, ID, audit, and transition routes. Defaults are `/api/v1/copilot/memory/thread-state` and `/api/v1/copilot/memory/ltm`.
 
 ### `SOORIN_LOCAL_SQLITE_PATH`
 

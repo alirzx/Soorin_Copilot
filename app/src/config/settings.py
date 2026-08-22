@@ -253,6 +253,7 @@ class Settings:
     local_product_simulation_enabled: bool
     streamlit_auth_backend: str
     local_test_user_creation_enabled: bool
+    local_product_test_user_id: str
     thread_state_backend: str
     local_sqlite_path: str
     local_max_conversations_per_user: int
@@ -281,6 +282,8 @@ class Settings:
     product_read_timeout_seconds: int
     product_max_retries: int
     product_retry_backoff_seconds: float
+    product_memory_thread_state_path: str
+    product_memory_ltm_path: str
     detection_cache_enabled: bool
     detection_cache_ttl_seconds: int
     detection_stale_on_error: bool
@@ -645,10 +648,11 @@ def get_settings() -> Settings:
             "SOORIN_LOCAL_TEST_USER_CREATION_ENABLED",
             False,
         ),
+        local_product_test_user_id=os.getenv("SOORIN_LOCAL_PRODUCT_TEST_USER_ID", "").strip(),
         thread_state_backend=_choice(
             "SOORIN_THREAD_STATE_BACKEND",
             "memory",
-            {"memory", "sqlite"},
+            {"memory", "sqlite", "product"},
         ),
         local_sqlite_path=os.getenv(
             "SOORIN_LOCAL_SQLITE_PATH",
@@ -705,6 +709,8 @@ def get_settings() -> Settings:
         product_read_timeout_seconds=_int("SOORIN_PRODUCT_READ_TIMEOUT_SECONDS", 300),
         product_max_retries=_int("SOORIN_PRODUCT_MAX_RETRIES", 5),
         product_retry_backoff_seconds=_float("SOORIN_PRODUCT_RETRY_BACKOFF_SECONDS", 3.0),
+        product_memory_thread_state_path=os.getenv("SOORIN_PRODUCT_MEMORY_THREAD_STATE_PATH", "/api/v1/copilot/memory/thread-state").strip(),
+        product_memory_ltm_path=os.getenv("SOORIN_PRODUCT_MEMORY_LTM_PATH", "/api/v1/copilot/memory/ltm").strip(),
         detection_cache_enabled=_bool("SOORIN_DETECTION_CACHE_ENABLED", True),
         detection_cache_ttl_seconds=max(600, _int("SOORIN_DETECTION_CACHE_TTL_SECONDS", 600)),
         detection_stale_on_error=_bool("SOORIN_DETECTION_STALE_ON_ERROR", True),

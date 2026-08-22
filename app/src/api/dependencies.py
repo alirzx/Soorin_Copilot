@@ -10,6 +10,7 @@ from src.core.graph.refresh import GraphRefreshService
 from src.core.graph.service import GraphService
 from src.core.memory.factory import LocalPersistenceAdapters, build_local_persistence
 from src.core.product_client import ProductApiClient
+from src.core.product_client.memory_client import ProductMemoryClient
 
 
 @lru_cache(maxsize=1)
@@ -21,6 +22,11 @@ def get_graph_service() -> GraphService:
 @lru_cache(maxsize=1)
 def get_product_api_client() -> ProductApiClient:
     return ProductApiClient(get_settings())
+
+
+@lru_cache(maxsize=1)
+def get_product_memory_client() -> ProductMemoryClient:
+    return ProductMemoryClient(get_product_api_client())
 
 
 @lru_cache(maxsize=1)
@@ -38,4 +44,6 @@ def get_graph_refresh_service() -> GraphRefreshService:
 @lru_cache(maxsize=1)
 def get_local_persistence() -> LocalPersistenceAdapters:
     """Build disabled-by-default local simulation adapters once per process."""
-    return build_local_persistence(get_settings())
+    return build_local_persistence(
+        get_settings(), product_memory_client=get_product_memory_client()
+    )
