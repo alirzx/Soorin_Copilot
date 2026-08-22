@@ -14,6 +14,8 @@ from src.core.memory.sqlite import (
     SQLiteThreadStateStore,
 )
 from src.core.memory.sqlite_long_term import SQLiteLongTermMemoryStore
+from src.core.memory.product import ProductThreadStateStore
+from src.core.product_client.memory_client import ProductMemoryClient
 
 
 logger = logging.getLogger(__name__)
@@ -26,16 +28,34 @@ class LocalPersistenceAdapters:
     long_term_memory_store: LongTermMemoryStore | None = None
 
 
-def build_local_persistence(settings: Settings) -> LocalPersistenceAdapters:
+def build_local_persistence(
+    settings: Settings,
+    *,
+    product_memory_client: ProductMemoryClient | None = None,
+) -> LocalPersistenceAdapters:
     """Construct only explicitly enabled local adapters; failure is non-fatal."""
     chat_enabled = settings.local_product_simulation_enabled
     thread_enabled = settings.thread_state_backend == "sqlite"
+    product_thread_enabled = settings.thread_state_backend == "product"
     long_term_enabled = (
         bool(getattr(settings, "long_term_memory_enabled", False))
         and getattr(settings, "long_term_memory_backend", "sqlite") == "sqlite"
     )
-    if not chat_enabled and not thread_enabled and not long_term_enabled:
+    if not chat_enabled and not thread_enabled and not product_thread_enabled and not long_term_enabled:
         return LocalPersistenceAdapters()
+
+    if product_thread_enabled and product_memory_client is None:
+        logger.warning("event=product_thread_persistence_unavailable reason=client_missing")
+        return LocalPersistenceAdapters()
+
+    sqlite_required = chat_enabled or thread_enabled or long_term_enabled
+    if not sqlite_required:
+        return LocalPersistenceAdapters(
+            thread_state_store=ProductThreadStateStore(
+                product_memory_client,
+                local_test_user_id="",
+            ) if product_thread_enabled and product_memory_client is not None else None,
+        )
 
     try:
         database = LocalSQLiteDatabase(settings.local_sqlite_path)
@@ -64,7 +84,18 @@ def build_local_persistence(settings: Settings) -> LocalPersistenceAdapters:
     )
     return LocalPersistenceAdapters(
         chat_repository=SQLiteChatRepository(database, policy) if chat_enabled else None,
-        thread_state_store=SQLiteThreadStateStore(database) if thread_enabled else None,
+        thread_state_store=(
+            ProductThreadStateStore(
+                product_memory_client,
+                local_test_user_id=(
+                    settings.local_product_test_user_id
+                    if settings.local_product_simulation_enabled else ""
+                ),
+                require_local_test_user=settings.local_product_simulation_enabled,
+            )
+            if product_thread_enabled and product_memory_client is not None
+            else SQLiteThreadStateStore(database) if thread_enabled else None
+        ),
         long_term_memory_store=(
             SQLiteLongTermMemoryStore(database, policy) if long_term_enabled else None
         ),
