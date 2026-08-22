@@ -1,0 +1,70 @@
+from __future__ import annotations
+
+from dataclasses import replace
+from types import SimpleNamespace
+
+import pytest
+
+from src.core.identity import RequestIdentity
+from src.core.memory.persistence import LocalPersistenceConflictError, ThreadMemoryState
+from src.core.memory.product import ProductLongTermMemoryStore, ProductThreadStateStore
+from src.core.product_client.memory_client import ProductMemoryClient, ProductMemoryNotFoundError
+
+
+class FakeProductClient:
+    def __init__(self, payload=None, error=None):
+        self.payload, self.error, self.calls = payload, error, []
+        self.settings = SimpleNamespace(
+            product_memory_thread_state_path="/configured/thread",
+            product_memory_ltm_path="/configured/ltm",
+        )
+    def _request_json(self, method, path, **kwargs):
+        self.calls.append((method, path, kwargs))
+        if self.error: raise self.error
+        return self.payload, 200, 0.01
+
+
+def test_memory_transport_scopes_owner_header_without_global_client_change():
+    client = FakeProductClient({"revision": 1, "schemaVersion": 3, "stateJson": {}})
+    ProductMemoryClient(client).get_thread_state(user_id="local-owner", conversation_id="chat-1")
+    method, path, kwargs = client.calls[0]
+    assert (method, path) == ("GET", "/configured/thread/chat-1")
+    assert kwargs["extra_headers"]["X-User-ID"] == "local-owner"
+
+
+def test_product_thread_state_404_means_absent():
+    store = ProductThreadStateStore(ProductMemoryClient(FakeProductClient(error=ProductMemoryNotFoundError("missing"))))
+    identity = RequestIdentity.resolve(user_id="owner", conversation_id="chat-1", session_id="session-1")
+    assert store.load(identity=identity) is None
+
+
+def test_product_thread_state_save_uses_canonical_payload_and_revision():
+    fake = FakeProductClient({"revision": 1, "sessionId": "session-1", "updatedAt": "2026-01-01T00:00:00+00:00"})
+    store = ProductThreadStateStore(ProductMemoryClient(fake))
+    identity = RequestIdentity.resolve(user_id="owner", conversation_id="chat-1", session_id="session-1")
+    state = ThreadMemoryState.from_routing_state(identity, __import__("src.core.memory.routing_state", fromlist=["SessionRoutingState"]).SessionRoutingState())
+    saved = store.save(identity=identity, state=state, expected_revision=0)
+    assert saved.revision == 1
+    body = fake.calls[0][2]["json_body"]
+    assert body["conversationId"] == "chat-1" and body["stateJson"] == state.to_payload()
+
+
+def test_product_ltm_create_preserves_candidate_domain_values_and_lossless_refs():
+    record = __import__("src.core.memory.long_term", fromlist=["LongTermMemoryRecord"]).LongTermMemoryRecord.candidate(
+        memory_type="validated_finding", user_id="owner", entity_ids=("192.0.2.1",), statement="{}",
+        source_request_id="request-1", source_conversation_id="chat-1", evidence_refs=("evidence_class_asset_identity",),
+    )
+    response = {"memoryId": record.memory_id, "memoryType": record.memory_type, "userId": record.user_id,
+                "entityIds": list(record.entity_ids), "statement": record.statement, "epistemicStatus": "candidate",
+                "confidence": record.confidence, "sourceRequestId": record.source_request_id, "sourceConversationId": record.source_conversation_id,
+                "evidenceRefs": [{"type": "canonical_ref", "id": record.evidence_refs[0]}], "provenanceCategory": record.provenance_category,
+                "validFrom": record.valid_from, "validUntil": record.valid_until, "createdAt": record.created_at, "updatedAt": record.updated_at,
+                "revision": 1, "status": "candidate", "indexStatus": record.index_status, "idempotencyFingerprint": record.idempotency_fingerprint,
+                "logicalMemoryKey": record.logical_memory_key, "policyVersion": record.policy_version}
+    fake = FakeProductClient(response)
+    stored = ProductLongTermMemoryStore(ProductMemoryClient(fake)).put(memory=record)
+    body = fake.calls[0][2]["json_body"]
+    assert body["epistemicStatus"] == "candidate"
+    assert body["entityIds"] == ["192.0.2.1"]
+    assert body["evidenceRefs"] == [{"type": "canonical_ref", "id": "evidence_class_asset_identity"}]
+    assert stored.idempotency_fingerprint == record.idempotency_fingerprint

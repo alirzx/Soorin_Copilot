@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import replace
 from pathlib import Path
 from threading import RLock
@@ -14,6 +15,7 @@ from src.core.agent.workflow import BoundedCopilotWorkflow
 from src.core.copilot.service import CopilotService
 from src.core.identity import RequestIdentity
 from src.core.memory.factory import build_local_persistence
+from src.core.product_client.memory_client import ProductMemoryClient
 from src.core.memory.persistence import (
     LOCAL_SCHEMA_VERSION,
     MAX_THREAD_STATE_BYTES,
@@ -118,11 +120,18 @@ def continuity_service(store, chat_repository=None) -> CopilotService:
     return service
 
 
-def test_default_configuration_remains_memory_and_none() -> None:
-    settings = get_settings()
-    assert settings.local_product_simulation_enabled is False
-    assert settings.thread_state_backend == "memory"
-    assert settings.langgraph_checkpoint_backend == "none"
+def test_default_configuration_remains_memory_and_none(monkeypatch, tmp_path: Path) -> None:
+    import src.config.settings as settings_module
+    with pytest.MonkeyPatch.context() as isolated:
+        isolated.setattr(settings_module, "ENV_PATH", tmp_path / "missing.env")
+        isolated.setattr(settings_module, "LEGACY_ENV_PATH", tmp_path / "missing-legacy.env")
+        isolated.setattr(os, "environ", {})
+        settings_module.get_settings.cache_clear()
+        settings = settings_module.get_settings()
+        assert settings.local_product_simulation_enabled is False
+        assert settings.thread_state_backend == "memory"
+        assert settings.langgraph_checkpoint_backend == "none"
+        settings_module.get_settings.cache_clear()
 
 
 def test_disabled_configuration_creates_no_sqlite_file(tmp_path: Path) -> None:
@@ -131,6 +140,7 @@ def test_disabled_configuration_creates_no_sqlite_file(tmp_path: Path) -> None:
         get_settings(),
         local_product_simulation_enabled=False,
         thread_state_backend="memory",
+        long_term_memory_enabled=False,
         local_sqlite_path=str(path),
         langgraph_checkpoint_backend="none",
     )
@@ -141,6 +151,28 @@ def test_disabled_configuration_creates_no_sqlite_file(tmp_path: Path) -> None:
     assert adapters.thread_state_store is None
     assert not path.exists()
     assert not path.parent.exists()
+
+
+def test_product_thread_without_sqlite_subsystem_creates_no_sqlite_file(tmp_path: Path) -> None:
+    path = tmp_path / "product-only" / "copilot.sqlite3"
+    settings = replace(
+        get_settings(), local_product_simulation_enabled=False, thread_state_backend="product",
+        long_term_memory_enabled=False, local_sqlite_path=str(path), langgraph_checkpoint_backend="none",
+    )
+    adapters = build_local_persistence(settings, product_memory_client=ProductMemoryClient(object()))
+    assert adapters.thread_state_store is not None
+    assert not path.exists() and not path.parent.exists()
+
+
+def test_product_thread_with_sqlite_ltm_initializes_sqlite(tmp_path: Path) -> None:
+    path = tmp_path / "staged" / "copilot.sqlite3"
+    settings = replace(
+        get_settings(), local_product_simulation_enabled=False, thread_state_backend="product",
+        long_term_memory_enabled=True, long_term_memory_backend="sqlite", local_sqlite_path=str(path),
+    )
+    adapters = build_local_persistence(settings, product_memory_client=ProductMemoryClient(object()))
+    assert adapters.thread_state_store is not None and adapters.long_term_memory_store is not None
+    assert path.exists()
 
 
 def test_checkpoint_sqlite_setting_remains_deferred_and_creates_no_file(
