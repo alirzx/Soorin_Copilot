@@ -174,6 +174,12 @@ Reads are owner-scoped only when a `user_id` is present. The service restores du
 
 ## 4. TARGET PRODUCTION MEMORY INTEGRATION — Proposed
 
+> **2026-08-22 staged implementation:** `ProductMemoryClient` and
+> `ProductThreadStateStore` are implemented. Product LTM GET/search/create/audit
+> DTO/adapter foundations are implemented for contract testing, but Product LTM
+> is not a selectable runtime backend until atomic lifecycle transitions are
+> available. SQLite remains the complete local/reference LTM backend.
+
 ### 4.1 Recommended browser contract and identity model
 
 After Product migration, require a Product chatroom ID as `conversation_id`, equal to the canonical Product chatroom ID. Retain `session_id` only as legacy compatibility during migration; do not make it a second ownership source. Use Product-generated or Product-backend-generated immutable turn/request IDs where possible (browser-generated UUID is acceptable only if Product/BFF binds it idempotently). Copilot may still generate a fallback for legacy callers, but a memory-enabled production request should require a stable trusted request ID.
