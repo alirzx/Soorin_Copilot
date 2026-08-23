@@ -62,6 +62,7 @@ class FakeProductClient:
         *,
         request_id: str = "",
         idempotency_key: str = "",
+        operation: str = "other",
     ) -> tuple[dict[str, Any], int, float]:
         self.calls.append(
             {
@@ -69,6 +70,7 @@ class FakeProductClient:
                 "payload": payload,
                 "request_id": request_id,
                 "idempotency_key": idempotency_key,
+                "operation": operation,
             }
         )
         if self.failures > 0:
@@ -400,6 +402,48 @@ class UsageReportingTests(unittest.TestCase):
                 ],
             },
         )
+
+    def test_repair_calls_count_as_actual_router_and_planner_consumption(self) -> None:
+        product_client = FakeProductClient()
+        reporter = ProductUsageReporter(make_settings(), product_client)  # type: ignore[arg-type]
+        scope = reporter.start_request("req-repair", "trace-repair")
+        for purpose, call_id, input_tokens, output_tokens in (
+            ("intent_router", "router", 10, 2),
+            ("intent_router_repair", "router-repair", 4, 1),
+            ("planner_repair", "planner-repair", 6, 3),
+        ):
+            reporter.record(
+                LLMUsageCall.from_usage(
+                    request_id="req-repair",
+                    call_id=call_id,
+                    model="test-model",
+                    purpose=purpose,
+                    usage={"input_tokens": input_tokens, "output_tokens": output_tokens},
+                )
+            )
+        reporter.finish_request(scope, request_success=True)
+
+        payload = product_client.calls[0]["payload"]
+        self.assertEqual(payload["inputTokens"], 20)
+        self.assertEqual(payload["outputTokens"], 6)
+        self.assertEqual(
+            payload["models"],
+            [
+                {
+                    "purpose": "router",
+                    "model": "test-model",
+                    "inputTokens": 14,
+                    "outputTokens": 3,
+                },
+                {
+                    "purpose": "planner",
+                    "model": "test-model",
+                    "inputTokens": 6,
+                    "outputTokens": 3,
+                },
+            ],
+        )
+        self.assertEqual(product_client.calls[0]["operation"], "usage_report")
 
     def test_planner_is_absent_when_it_did_not_run(self) -> None:
         product_client = FakeProductClient()

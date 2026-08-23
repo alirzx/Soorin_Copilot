@@ -32,6 +32,7 @@ def test_memory_transport_scopes_owner_header_without_global_client_change():
     method, path, kwargs = client.calls[0]
     assert (method, path) == ("GET", "/configured/thread/chat-1")
     assert kwargs["extra_headers"]["X-User-ID"] == "local-owner"
+    assert kwargs["operation"] == "memory_thread_load"
 
 
 def test_product_thread_state_404_means_absent():
@@ -97,6 +98,7 @@ def test_product_ltm_promotion_uses_one_atomic_transition_request():
     assert kwargs["json_body"]["action"] == "promote"
     assert kwargs["json_body"]["reasonCode"] == "validated_product_fact"
     assert kwargs["json_body"]["expectedRevision"] == record.revision
+    assert kwargs["operation"] == "memory_transition"
 
 
 def test_product_ltm_local_test_owner_is_transport_only():
