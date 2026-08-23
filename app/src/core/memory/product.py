@@ -9,6 +9,7 @@ from typing import Any
 from src.core.identity import RequestIdentity
 from src.core.memory.long_term import LongTermMemoryRecord, MemoryLifecycleAuditEvent, MemoryLifecycleResult, PromotionDecision
 from src.core.memory.persistence import LocalPersistenceConflictError, LocalPersistenceError, LocalPersistenceOwnershipError, ThreadMemoryState
+from src.core.observability.metrics import get_metrics
 from src.core.product_client.memory_client import ProductMemoryClient, ProductMemoryConflictError, ProductMemoryNotFoundError
 
 
@@ -141,9 +142,18 @@ class ProductLongTermMemoryStore:
         response = _object(self.client.create_ltm(user_id=self._owner(memory.user_id), body={**self._wire(memory), "actor": "copilot"}, request_id=memory.source_request_id))
         return self._domain_record(response, domain_user_id=memory.user_id) if "memoryType" in response else self._hydrate(memory.user_id, response.get("memoryId"))
     def _hydrate(self, user_id: str, memory_id: Any) -> LongTermMemoryRecord:
-        if not isinstance(memory_id, str) or not memory_id: raise LocalPersistenceError("Product memory response omitted memoryId.")
-        memory = self.get(user_id=user_id, memory_id=memory_id)
-        if memory is None: raise LocalPersistenceError("Product memory canonical readback was unavailable.")
+        if not isinstance(memory_id, str) or not memory_id:
+            get_metrics().observe_memory_canonical_reload("product", "failure")
+            raise LocalPersistenceError("Product memory response omitted memoryId.")
+        try:
+            memory = self.get(user_id=user_id, memory_id=memory_id)
+        except Exception:
+            get_metrics().observe_memory_canonical_reload("product", "failure")
+            raise
+        if memory is None:
+            get_metrics().observe_memory_canonical_reload("product", "failure")
+            raise LocalPersistenceError("Product memory canonical readback was unavailable.")
+        get_metrics().observe_memory_canonical_reload("product", "success")
         return memory
     def list(self, *, user_id: str, entity_ids=(), memory_types=(), statuses=("active",), epistemic_statuses=(), limit: int = 100, logical_memory_key: str = ""):
         body = {"entityIds": list(entity_ids), "memoryTypes": list(memory_types), "statuses": list(statuses), "epistemicStatuses": list(epistemic_statuses), "limit": limit, "offset": 0}

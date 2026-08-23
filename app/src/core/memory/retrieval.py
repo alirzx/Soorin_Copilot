@@ -254,6 +254,7 @@ class LongTermMemoryRetriever:
                     user_id=user_id,
                     limit=self.candidate_k,
                 )
+                get_metrics().observe_memory_vector("search", "success")
                 for hit in semantic_hits:
                     memory_id = str(hit.payload.get("memory_id") or hit.id)
                     if hit.score < self.min_score or memory_id in candidates:
@@ -282,6 +283,7 @@ class LongTermMemoryRetriever:
                     time.perf_counter() - semantic_started,
                 )
             except Exception as exc:
+                get_metrics().observe_memory_vector("search", "failure")
                 limitations.append("semantic_memory_unavailable")
                 logger.warning(
                     "event=memory_semantic_search_completed request_id=%s status=unavailable error_type=%s",
@@ -427,7 +429,12 @@ class LongTermMemoryCoordinator:
     def create_candidate(self, memory: LongTermMemoryRecord) -> LongTermMemoryRecord:
         if memory.status != "candidate" or memory.epistemic_status != "candidate":
             raise ValueError("Only explicit candidate records can use create_candidate")
-        stored = self.store.put(memory=memory)
+        try:
+            stored = self.store.put(memory=memory)
+        except Exception:
+            get_metrics().observe_memory_lifecycle("candidate_created", "failure")
+            raise
+        get_metrics().observe_memory_lifecycle("candidate_created", "success")
         logger.info(
             "event=long_term_memory_candidate_write memory_type=%s status=candidate deduplicated=%s",
             memory.memory_type,
@@ -473,6 +480,7 @@ class LongTermMemoryCoordinator:
                 epistemic_status=stored.epistemic_status,
                 provenance_category=stored.provenance_category,
             )
+            get_metrics().observe_memory_lifecycle("confirmed", "success")
             return MemoryLifecycleResult(stored, decision, deduplicated=True)
         decision = MemoryPromotionPolicy.evaluate_candidate_for_promotion(
             stored,
@@ -507,6 +515,16 @@ class LongTermMemoryCoordinator:
             result.superseded_count,
             result.conflict_count,
         )
+        lifecycle_action = (
+            "conflict" if result.conflict_count else
+            "superseded" if result.superseded_count else
+            "confirmed" if result.deduplicated else
+            "rejected" if current.status == "rejected" else
+            "promoted" if current.status == "active" else
+            "candidate_created"
+        )
+        if lifecycle_action != "candidate_created":
+            get_metrics().observe_memory_lifecycle(lifecycle_action, "success")
         return replace(result, memory=current, previous_memory=previous)
 
     def promote(
@@ -525,6 +543,7 @@ class LongTermMemoryCoordinator:
         )
         canonical = self.store.update(memory=promoted, expected_revision=candidate.revision)
         result = self._index_canonical(canonical)
+        get_metrics().observe_memory_lifecycle("promoted", "success")
         logger.info(
             "event=long_term_memory_promoted memory_type=%s epistemic_status=%s index_status=%s",
             result.memory_type,
@@ -539,13 +558,20 @@ class LongTermMemoryCoordinator:
         try:
             if memory.status == "active":
                 self.semantic_index.index(memory)
+                vector_operation = "index"
             else:
                 self.semantic_index.delete(memory.memory_id)
+                vector_operation = "delete"
             index_status = "synced"
             event = "memory_index_write_completed"
+            get_metrics().observe_memory_vector(vector_operation, "success")
         except Exception as exc:
             index_status = "failed"
             event = "memory_index_write_failed"
+            get_metrics().observe_memory_vector(
+                "index" if memory.status == "active" else "delete",
+                "failure",
+            )
             logger.warning(
                 "event=%s memory_type=%s error_type=%s",
                 event,
@@ -576,6 +602,7 @@ class LongTermMemoryCoordinator:
             expected_revision=expected_revision,
         )
         result = self._index_canonical(memory)
+        get_metrics().observe_memory_lifecycle("invalidated", "success")
         logger.info("event=long_term_memory_invalidated status=%s", result.status)
         return result
 
@@ -592,6 +619,7 @@ class LongTermMemoryCoordinator:
             expected_revision=expected_revision,
         )
         result = self._index_canonical(memory)
+        get_metrics().observe_memory_lifecycle("expired", "success")
         logger.info("event=long_term_memory_expired status=%s", result.status)
         return result
 
@@ -612,6 +640,7 @@ class LongTermMemoryCoordinator:
         old = self._index_canonical(old)
         if new.status == "active":
             new = self._index_canonical(new)
+        get_metrics().observe_memory_lifecycle("superseded", "success")
         return old, new
 
     def delete(self, *, user_id: str, memory_id: str) -> bool:
@@ -619,11 +648,15 @@ class LongTermMemoryCoordinator:
         if deleted and self.semantic_index is not None:
             try:
                 self.semantic_index.delete(memory_id)
+                get_metrics().observe_memory_vector("delete", "success")
             except Exception as exc:
+                get_metrics().observe_memory_vector("delete", "failure")
                 logger.warning(
                     "event=memory_index_write_failed operation=delete error_type=%s",
                     type(exc).__name__,
                 )
+        if deleted:
+            get_metrics().observe_memory_lifecycle("deleted", "success")
         return deleted
 
     def reconcile(self, *, user_id: str, limit: int = 500) -> dict[str, int]:
@@ -644,5 +677,9 @@ class LongTermMemoryCoordinator:
             len(records),
             synced,
             failed,
+        )
+        get_metrics().observe_memory_vector(
+            "reconcile",
+            "failure" if failed else "success",
         )
         return {"candidate_count": len(records), "synced_count": synced, "failed_count": failed}

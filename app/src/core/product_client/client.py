@@ -21,6 +21,12 @@ from src.core.product_client.schemas import ProductAssetResponse, ProductTopolog
 logger = logging.getLogger(__name__)
 
 
+def _metrics():
+    from src.core.observability.metrics import get_metrics
+
+    return get_metrics()
+
+
 class ProductApiClient:
     """Authenticated product API boundary.
 
@@ -95,6 +101,7 @@ class ProductApiClient:
         request_id: str = "",
         json_body: Any | None = None,
         extra_headers: dict[str, str] | None = None,
+        operation: str = "other",
     ) -> tuple[Any, int, float]:
         method = method.upper()
         url, endpoint_path = self._resolve_url(endpoint_or_url)
@@ -123,6 +130,10 @@ class ProductApiClient:
                     request_kwargs["json"] = json_body
                 response = self.session.request(method, url, **request_kwargs)
             except requests.RequestException as exc:
+                _metrics().observe_product(
+                    operation,
+                    duration_seconds=time.perf_counter() - started,
+                )
                 logger.warning(
                     "event=product_request_exception request_id=%s method=%s endpoint_path=%s error_type=%s",
                     request_id,
@@ -151,6 +162,11 @@ class ProductApiClient:
             raise ProductApiError("Product API request did not produce a response.")
 
         elapsed = time.perf_counter() - started
+        _metrics().observe_product(
+            operation,
+            duration_seconds=elapsed,
+            status_code=response.status_code,
+        )
         logger.info(
             "event=product_response_received request_id=%s method=%s endpoint_path=%s status_code=%s elapsed_ms=%s auth_source=%s token_refreshed=%s auth_retry_count=%s",
             request_id,
@@ -179,9 +195,17 @@ class ProductApiClient:
         except ValueError as exc:
             raise ProductApiError("Product API response was not valid JSON.") from exc
 
-    def get_json(self, endpoint_path: str, *, request_id: str = "") -> tuple[Any, int, float]:
+    def get_json(
+        self,
+        endpoint_path: str,
+        *,
+        request_id: str = "",
+        operation: str = "other",
+    ) -> tuple[Any, int, float]:
         """Fetch JSON from a product endpoint without logging sensitive data."""
-        return self._request_json("GET", endpoint_path, request_id=request_id)
+        return self._request_json(
+            "GET", endpoint_path, request_id=request_id, operation=operation
+        )
 
     def post_json(
         self,
@@ -190,6 +214,7 @@ class ProductApiClient:
         *,
         request_id: str = "",
         idempotency_key: str = "",
+        operation: str = "other",
     ) -> tuple[Any, int, float]:
         headers = {"Content-Type": "application/json"}
         if idempotency_key:
@@ -200,11 +225,15 @@ class ProductApiClient:
             request_id=request_id,
             json_body=payload,
             extra_headers=headers,
+            operation=operation,
         )
 
     def fetch_topology_unique_ip_pairs(self) -> ProductTopologyResponse:
         """Fetch currently supported topology unique communication pairs."""
-        payload, status_code, elapsed = self.get_json(self.settings.product_topology_path)
+        payload, status_code, elapsed = self.get_json(
+            self.settings.product_topology_path,
+            operation="topology",
+        )
         return ProductTopologyResponse.from_payload(
             payload,
             endpoint_path=self.settings.product_topology_path,
@@ -240,7 +269,11 @@ class ProductApiClient:
         )
 
         try:
-            payload, status_code, elapsed = self.get_json(endpoint_path, request_id=request_id)
+            payload, status_code, elapsed = self.get_json(
+                endpoint_path,
+                request_id=request_id,
+                operation="detection" if endpoint_name.startswith("asset_detection") else "profile",
+            )
         except ProductApiHTTPError as exc:
             if exc.status_code != 404:
                 raise
