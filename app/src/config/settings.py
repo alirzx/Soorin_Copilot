@@ -466,8 +466,6 @@ class Settings:
     def validate_long_term_memory_configuration(self) -> None:
         if not self.long_term_memory_enabled:
             return
-        if self.long_term_memory_backend != "sqlite":
-            raise ValueError("Only the local SQLite long-term memory backend is currently available.")
         if self.memory_vector_index_enabled:
             if not self.memory_qdrant_collection:
                 raise ValueError("SOORIN_MEMORY_QDRANT_COLLECTION must not be blank.")
@@ -605,7 +603,7 @@ def get_settings() -> Settings:
         ),
         long_term_memory_enabled=_bool("SOORIN_LONG_TERM_MEMORY_ENABLED", False),
         long_term_memory_backend=_choice(
-            "SOORIN_LONG_TERM_MEMORY_BACKEND", "sqlite", {"sqlite"}
+            "SOORIN_LONG_TERM_MEMORY_BACKEND", "sqlite", {"sqlite", "product"}
         ),
         memory_vector_index_enabled=_bool("SOORIN_MEMORY_VECTOR_INDEX_ENABLED", False),
         memory_qdrant_collection=os.getenv(

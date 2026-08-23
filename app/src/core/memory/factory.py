@@ -14,7 +14,7 @@ from src.core.memory.sqlite import (
     SQLiteThreadStateStore,
 )
 from src.core.memory.sqlite_long_term import SQLiteLongTermMemoryStore
-from src.core.memory.product import ProductThreadStateStore
+from src.core.memory.product import ProductLongTermMemoryStore, ProductThreadStateStore
 from src.core.product_client.memory_client import ProductMemoryClient
 
 
@@ -41,11 +41,15 @@ def build_local_persistence(
         bool(getattr(settings, "long_term_memory_enabled", False))
         and getattr(settings, "long_term_memory_backend", "sqlite") == "sqlite"
     )
-    if not chat_enabled and not thread_enabled and not product_thread_enabled and not long_term_enabled:
+    product_ltm_enabled = (
+        bool(getattr(settings, "long_term_memory_enabled", False))
+        and getattr(settings, "long_term_memory_backend", "sqlite") == "product"
+    )
+    if not chat_enabled and not thread_enabled and not product_thread_enabled and not long_term_enabled and not product_ltm_enabled:
         return LocalPersistenceAdapters()
 
-    if product_thread_enabled and product_memory_client is None:
-        logger.warning("event=product_thread_persistence_unavailable reason=client_missing")
+    if (product_thread_enabled or product_ltm_enabled) and product_memory_client is None:
+        logger.warning("event=product_memory_persistence_unavailable reason=client_missing")
         return LocalPersistenceAdapters()
 
     sqlite_required = chat_enabled or thread_enabled or long_term_enabled
@@ -55,6 +59,11 @@ def build_local_persistence(
                 product_memory_client,
                 local_test_user_id="",
             ) if product_thread_enabled and product_memory_client is not None else None,
+            long_term_memory_store=ProductLongTermMemoryStore(
+                product_memory_client,
+                local_test_user_id=(settings.local_product_test_user_id if settings.local_product_simulation_enabled else ""),
+                require_local_test_user=settings.local_product_simulation_enabled,
+            ) if product_ltm_enabled and product_memory_client is not None else None,
         )
 
     try:
@@ -97,6 +106,11 @@ def build_local_persistence(
             else SQLiteThreadStateStore(database) if thread_enabled else None
         ),
         long_term_memory_store=(
-            SQLiteLongTermMemoryStore(database, policy) if long_term_enabled else None
+            SQLiteLongTermMemoryStore(database, policy) if long_term_enabled
+            else ProductLongTermMemoryStore(
+                product_memory_client,
+                local_test_user_id=(settings.local_product_test_user_id if settings.local_product_simulation_enabled else ""),
+                require_local_test_user=settings.local_product_simulation_enabled,
+            ) if product_ltm_enabled and product_memory_client is not None else None
         ),
     )
