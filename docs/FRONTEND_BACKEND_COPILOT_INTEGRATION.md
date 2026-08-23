@@ -116,6 +116,12 @@ Content-Type: application/json
 
 It reloads local conversations/messages, supports local create/open/delete, and persists completed turns only through the local repository. It approximates the required ID lifecycle and SSE behavior, but does **not** simulate Product JWT validation, tenant/workspace isolation, Product ownership checks, or Product PostgreSQL. The legacy Streamlit backend remains compatible with only `session_id`, `message`, and optional UI context.
 
+### 3.2.1 Product-backed local Streamlit workspace — Implemented on `dev`
+
+`SOORIN_STREAMLIT_AUTH_BACKEND=product` dispatches before local graph/SQLite initialization. The browser session performs real Product login and Product-owned chatroom/message CRUD through `SOORIN_PRODUCT_CHAT_ROOMS_PATH`. The selected Product room ID is reused as both `conversation_id` and `session_id`; the authenticated Product user ID is sent as `X-User-ID`. `/chat/stream` receives the interactive JWT in `Authorization`, the static Copilot key in `Soorin_copilot_api_key`, and a stable per-turn `request_id`.
+
+The Product workspace reuses the canonical shared chat renderer and SSE parser. It appends the user message before starting the stream, requires a terminal `done` event before appending the assistant message, and guards both writes against duplicate reruns. A selected topology IP is preserved in `ui_context`; new Product rooms use that IP as `assetIp`, or an explicit empty value when no asset is selected. Product mode has no local transcript or SQLite fallback; a `401` clears the Product browser session and returns to login.
+
 ### 3.3 Current SQLite schema (version 7; thread-state payload version 3)
 
 All SQLite persistence is opt-in development functionality. `PRAGMA foreign_keys=ON` is used. Product-owned simulation tables must **not** be copied as new production tables because Product already owns their equivalents.

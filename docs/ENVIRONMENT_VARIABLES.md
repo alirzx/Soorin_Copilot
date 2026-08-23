@@ -106,11 +106,11 @@ Secrets such as API keys, passwords, Product tokens, captcha bypass values, and 
 
 ### `SOORIN_OBSERVABILITY_RETENTION`
 
-`SOORIN_OBSERVABILITY_RETENTION` configures how long the optional observability stack retains its stored telemetry, using the duration syntax expected by the deployment, for example `168h`. A longer retention window preserves more historical metrics/logs and consumes more storage; a shorter window reduces disk use but limits retrospective investigation. `(double-check exact consumer and accepted duration syntax against current observability Compose/config files)`
+`SOORIN_OBSERVABILITY_RETENTION` configures Prometheus TSDB and Loki retention using Prometheus-compatible duration syntax, for example `168h`. A longer retention window preserves more historical metrics/logs and consumes more storage; a shorter window reduces disk use but limits retrospective investigation. The Compose profile passes the same value to both backends.
 
 ### `SOORIN_OBSERVABILITY_ENVIRONMENT`
 
-`SOORIN_OBSERVABILITY_ENVIRONMENT` provides the environment label attached to the optional observability stack, such as `development`, so dashboards and telemetry can identify where data originated. It is primarily a labeling/configuration value and does not change evidence retrieval or workflow policy. `(double-check exact allowed values against current observability configuration)`
+`SOORIN_OBSERVABILITY_ENVIRONMENT` provides the environment label attached to scraped API metrics and Alloy-collected log streams, such as `development`, so dashboard filtering is consistent across Prometheus and Loki. Use a stable, low-cardinality deployment name. The value does not change evidence retrieval or workflow policy.
 
 ### `SOORIN_GRAFANA_ADMIN_USER`
 
@@ -876,7 +876,7 @@ retention and does not delete audit history.
 
 ### `SOORIN_STREAMLIT_AUTH_BACKEND`
 
-`SOORIN_STREAMLIT_AUTH_BACKEND` selects the Streamlit-side identity/chat backend mode. Current architecture describes `none` for the legacy/direct developer workflow and `local_simulation` for the password-free local user/chatroom simulation. This setting does not create real Product authentication or authorization. `(double-check exact accepted enum in current UI settings validation)`
+`SOORIN_STREAMLIT_AUTH_BACKEND` selects the Streamlit-side identity/chat backend mode: `none` for the legacy direct developer workflow, `local_simulation` for the password-free SQLite development simulation, `product` for real Product login/chatroom/message APIs, and `oidc` for the existing OIDC placeholder. Product mode retains the interactive Product JWT only in the Streamlit session, sends it to Product chat CRUD, and sends it with the custom Copilot API key and trusted `X-User-ID` when streaming. It has no SQLite fallback and startup validation requires Product thread state and Product long-term memory.
 
 ### `SOORIN_LOCAL_TEST_USER_CREATION_ENABLED`
 
@@ -893,6 +893,10 @@ retention and does not delete audit history.
 ### `SOORIN_PRODUCT_MEMORY_THREAD_STATE_PATH` and `SOORIN_PRODUCT_MEMORY_LTM_PATH`
 
 These non-secret paths select Product Backend memory resources while reusing `SOORIN_PRODUCT_API_BASE_URL`, bearer authentication, and HWID. The thread path receives a conversation ID suffix; the LTM path is the base for create, search, ID, audit, and transition routes. Defaults are `/api/v1/copilot/memory/thread-state` and `/api/v1/copilot/memory/ltm`.
+
+### `SOORIN_PRODUCT_CHAT_ROOMS_PATH`
+
+Non-secret base path for Product-owned chatroom and transcript CRUD used by Streamlit `product` mode. The default is `/chat-rooms`; room IDs and message suffixes are derived by the Product UI client. Product owns authorization, chatroom identity, ordering, and PostgreSQL persistence. Copilot does not fall back to local transcript storage when these calls fail.
 
 ### `SOORIN_LOCAL_SQLITE_PATH`
 
