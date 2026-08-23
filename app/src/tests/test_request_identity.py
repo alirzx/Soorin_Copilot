@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-import asyncio
 from unittest.mock import patch
 
+import anyio
 import httpx
 import pytest
 from pydantic import ValidationError
@@ -88,10 +88,19 @@ def test_stream_accepts_identity_without_changing_sse_contract() -> None:
             },
         ),
     ]
-    with patch(
-        "src.api.routes.copilot_service.chat_stream",
-        return_value=iter(events),
-    ) as service:
+    async def inline_iterator(iterator):
+        # Exercise Starlette's async iterator contract inline; worker-pool
+        # scheduling is unrelated to the SSE identity/framing assertion here.
+        for item in iterator:
+            yield item
+
+    with (
+        patch(
+            "src.api.routes.copilot_service.chat_stream",
+            return_value=iter(events),
+        ) as service,
+        patch("starlette.responses.iterate_in_threadpool", inline_iterator),
+    ):
         response = chat_stream(request, x_user_id="product-user-2")
 
         async def consume() -> str:
@@ -101,7 +110,8 @@ def test_stream_accepts_identity_without_changing_sse_contract() -> None:
                 for chunk in chunks
             )
 
-        body = asyncio.run(consume())
+        # Keep the consumer in Starlette's AnyIO runtime contract.
+        body = anyio.run(consume)
 
     identity = service.call_args.kwargs["request_identity"]
     assert identity.user_id == "product-user-2"
@@ -175,7 +185,11 @@ def test_openapi_exposes_optional_identity_fields_and_user_header() -> None:
 
 def test_invalid_user_id_header_returns_standard_422_before_service() -> None:
     app = create_app()
-    app.dependency_overrides[verify_api_key] = lambda: None
+
+    async def allow_request() -> None:
+        return None
+
+    app.dependency_overrides[verify_api_key] = allow_request
 
     async def post_invalid_header():
         transport = httpx.ASGITransport(app=app)
@@ -190,7 +204,7 @@ def test_invalid_user_id_header_returns_standard_422_before_service() -> None:
             )
 
     with patch("src.api.routes.copilot_service.chat") as service:
-        response = asyncio.run(post_invalid_header())
+        response = anyio.run(post_invalid_header)
 
     assert response.status_code == 422
     assert service.call_count == 0
