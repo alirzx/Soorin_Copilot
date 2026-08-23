@@ -176,12 +176,24 @@ services:
     container_name: soorin-copilot-prometheus
     profiles: ["observability"]
     restart: "${SOORIN_RESTART_POLICY:-unless-stopped}"
+    entrypoint:
+      - /bin/sh
+      - -ec
     command:
-      - --config.file=/etc/prometheus/prometheus.yml
-      - --storage.tsdb.path=/prometheus
-      - --storage.tsdb.retention.time=${SOORIN_OBSERVABILITY_RETENTION:-168h}
-      - --web.enable-lifecycle
-      - --enable-feature=expand-external-labels
+      - |
+        case "$$SOORIN_OBSERVABILITY_ENVIRONMENT" in
+          ""|*[!A-Za-z0-9_.-]*)
+            echo "invalid SOORIN_OBSERVABILITY_ENVIRONMENT" >&2
+            exit 1
+            ;;
+        esac
+        sed "s/__SOORIN_OBSERVABILITY_ENVIRONMENT__/$$SOORIN_OBSERVABILITY_ENVIRONMENT/g" \
+          /etc/prometheus/prometheus.yml > /tmp/prometheus.yml
+        exec /bin/prometheus \
+          --config.file=/tmp/prometheus.yml \
+          --storage.tsdb.path=/prometheus \
+          --storage.tsdb.retention.time=${SOORIN_OBSERVABILITY_RETENTION:-168h} \
+          --web.enable-lifecycle
     environment:
       SOORIN_OBSERVABILITY_ENVIRONMENT: "${SOORIN_OBSERVABILITY_ENVIRONMENT:-development}"
     ports:

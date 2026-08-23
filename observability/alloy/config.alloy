@@ -1,54 +1,89 @@
 discovery.docker "soorin_copilot" {
-  host             = "unix:///var/run/docker.sock"
-  refresh_interval = "10s"
+	host             = "unix:///var/run/docker.sock"
+	refresh_interval = "10s"
 }
 
 discovery.relabel "soorin_copilot" {
-  targets = discovery.docker.soorin_copilot.targets
+	targets = discovery.docker.soorin_copilot.targets
 
-  rule {
-    source_labels = ["__meta_docker_container_label_com_docker_compose_project"]
-    regex         = "soorin-copilot"
-    action        = "keep"
-  }
+	rule {
+		source_labels = ["__meta_docker_container_label_com_docker_compose_project"]
+		regex         = "soorin-copilot"
+		action        = "keep"
+	}
 
-  rule {
-    source_labels = ["__meta_docker_container_label_com_docker_compose_service"]
-    regex         = "api|ui"
-    action        = "keep"
-  }
+	rule {
+		source_labels = ["__meta_docker_container_label_com_docker_compose_service"]
+		regex         = "api|ui"
+		action        = "keep"
+	}
 
-  rule {
-    source_labels = ["__meta_docker_container_label_com_docker_compose_service"]
-    target_label  = "compose_service"
-  }
+	rule {
+		source_labels = ["__meta_docker_container_label_com_docker_compose_service"]
+		target_label  = "compose_service"
+	}
 
-  rule {
-    source_labels = ["__meta_docker_container_name"]
-    regex         = "/(.*)"
-    target_label  = "service_name"
-    replacement   = "$1"
-  }
+	rule {
+		source_labels = ["__meta_docker_container_name"]
+		regex         = "/(.*)"
+		target_label  = "service_name"
+		replacement   = "$1"
+	}
 }
 
 loki.source.docker "soorin_copilot" {
-  host       = "unix:///var/run/docker.sock"
-  targets    = discovery.relabel.soorin_copilot.output
-  forward_to = [loki.process.soorin_copilot.receiver]
+	host       = "unix:///var/run/docker.sock"
+	targets    = discovery.relabel.soorin_copilot.output
+	forward_to = [loki.process.soorin_copilot.receiver]
 }
 
 loki.process "soorin_copilot" {
-  stage.static_labels {
-    values = {
-      environment = sys.env("SOORIN_OBSERVABILITY_ENVIRONMENT"),
-    }
-  }
+	stage.static_labels {
+		values = {
+			environment = sys.env("SOORIN_OBSERVABILITY_ENVIRONMENT"),
+		}
+	}
 
-  forward_to = [loki.write.local.receiver]
+	stage.match {
+		selector = "{compose_service=\"api\"}"
+
+		stage.json {
+			expressions = {
+				timestamp  = "timestamp",
+				level      = "level",
+				logger     = "logger",
+				event      = "event",
+				request_id = "request_id",
+				trace_id   = "trace_id",
+				status     = "status",
+				error_type = "error_type",
+			}
+		}
+
+		stage.labels {
+			values = {
+				level = "",
+			}
+		}
+
+		stage.structured_metadata {
+			values = {
+				timestamp  = "",
+				logger     = "",
+				event      = "",
+				request_id = "",
+				trace_id   = "",
+				status     = "",
+				error_type = "",
+			}
+		}
+	}
+
+	forward_to = [loki.write.local.receiver]
 }
 
 loki.write "local" {
-  endpoint {
-    url = "http://loki:3100/loki/api/v1/push"
-  }
+	endpoint {
+		url = "http://loki:3100/loki/api/v1/push"
+	}
 }
