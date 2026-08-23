@@ -56,6 +56,52 @@ KNOWN_VIEWS = frozenset(
     }
 )
 
+HTTP_DURATION_BUCKETS = (0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 120, 300, 600)
+DEPENDENCY_DURATION_BUCKETS = (0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 120, 300)
+LLM_DURATION_BUCKETS = (0.1, 0.25, 0.5, 1, 2.5, 5, 10, 20, 30, 60, 120, 180, 300, 600)
+WORKFLOW_DURATION_BUCKETS = (0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 20, 30, 60, 120, 180, 300, 600)
+STAGE_DURATION_BUCKETS = (0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 20, 30, 60, 120, 300)
+MEMORY_DURATION_BUCKETS = (0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60)
+CONTEXT_TOKEN_BUCKETS = (16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536)
+
+STREAM_STATUSES = frozenset({"completed", "error", "interrupted"})
+PRODUCT_OPERATIONS = frozenset(
+    {
+        "login",
+        "profile",
+        "detection",
+        "topology",
+        "memory_thread_load",
+        "memory_thread_save",
+        "memory_search",
+        "memory_get",
+        "memory_create",
+        "memory_transition",
+        "memory_audit",
+        "usage_report",
+        "other",
+    }
+)
+PRODUCT_STATUS_CLASSES = frozenset({"2xx", "3xx", "4xx", "5xx", "exception"})
+MEMORY_LIFECYCLE_ACTIONS = frozenset(
+    {
+        "candidate_created",
+        "promoted",
+        "confirmed",
+        "superseded",
+        "conflict",
+        "rejected",
+        "invalidated",
+        "expired",
+        "deleted",
+    }
+)
+OBSERVATION_RESULTS = frozenset({"success", "failure"})
+MEMORY_REVISION_OPERATIONS = frozenset({"thread_save", "memory_transition", "index_status", "other"})
+MEMORY_CANONICAL_SOURCES = frozenset({"product", "local", "other"})
+MEMORY_VECTOR_OPERATIONS = frozenset({"search", "index", "delete", "reconcile", "other"})
+WORKFLOW_FALLBACK_KINDS = frozenset({"routing", "plan"})
+
 
 def _bounded(value: object, allowed: Iterable[str], fallback: str = "other") -> str:
     normalized = str(value or "").strip().lower()
@@ -64,6 +110,23 @@ def _bounded(value: object, allowed: Iterable[str], fallback: str = "other") -> 
 
 def _error_class(value: object) -> str:
     normalized = str(value or "").strip().lower()
+    if isinstance(value, int) or normalized.isdigit():
+        status = int(value)
+        if status in {400, 422}:
+            return "validation"
+        if status in {401, 403}:
+            return "authentication"
+        if status in {408, 504}:
+            return "timeout"
+        if status == 409:
+            return "conflict"
+        if status == 429:
+            return "rate_limit"
+        if status in {502, 503}:
+            return "unavailable"
+        if 500 <= status <= 599:
+            return "upstream"
+        return "other"
     for marker, category in (
         ("timeout", "timeout"),
         ("auth", "authentication"),
@@ -72,6 +135,8 @@ def _error_class(value: object) -> str:
         ("invalid", "validation"),
         ("unavailable", "unavailable"),
         ("connection", "connection"),
+        ("conflict", "conflict"),
+        ("upstream", "upstream"),
         ("rate", "rate_limit"),
     ):
         if marker in normalized:
@@ -96,6 +161,7 @@ class SoorinMetrics:
             "soorin_http_request_duration_seconds",
             "Copilot API request duration.",
             ("route", "method"),
+            buckets=HTTP_DURATION_BUCKETS,
             registry=self.registry,
         )
         self.copilot_requests = Counter(
@@ -107,12 +173,14 @@ class SoorinMetrics:
         self.copilot_duration = Histogram(
             "soorin_copilot_request_duration_seconds",
             "End-to-end Copilot workflow duration.",
+            buckets=WORKFLOW_DURATION_BUCKETS,
             registry=self.registry,
         )
         self.workflow_stage_duration = Histogram(
             "soorin_workflow_stage_duration_seconds",
             "Duration of bounded workflow stages.",
             ("stage",),
+            buckets=STAGE_DURATION_BUCKETS,
             registry=self.registry,
         )
         self.llm_requests = Counter(
@@ -125,6 +193,7 @@ class SoorinMetrics:
             "soorin_llm_request_duration_seconds",
             "LLM call duration.",
             ("purpose", "provider", "model"),
+            buckets=LLM_DURATION_BUCKETS,
             registry=self.registry,
         )
         self.llm_input_tokens = Counter(
@@ -149,6 +218,7 @@ class SoorinMetrics:
             "soorin_tool_duration_seconds",
             "Bounded capability call duration.",
             ("capability", "view"),
+            buckets=DEPENDENCY_DURATION_BUCKETS,
             registry=self.registry,
         )
         self.memory_retrieval = Counter(
@@ -172,11 +242,13 @@ class SoorinMetrics:
         self.memory_semantic_duration = Histogram(
             "soorin_memory_semantic_retrieval_duration_seconds",
             "Semantic memory retrieval duration.",
+            buckets=MEMORY_DURATION_BUCKETS,
             registry=self.registry,
         )
         self.memory_rerank_duration = Histogram(
             "soorin_memory_rerank_duration_seconds",
             "Memory reranking duration.",
+            buckets=MEMORY_DURATION_BUCKETS,
             registry=self.registry,
         )
         self.context_estimated_tokens = Gauge(
@@ -197,6 +269,20 @@ class SoorinMetrics:
             ("section",),
             registry=self.registry,
         )
+        self.context_estimated_tokens_per_request = Histogram(
+            "soorin_context_estimated_tokens_per_request",
+            "Estimated context tokens observed for one request section.",
+            ("section",),
+            buckets=CONTEXT_TOKEN_BUCKETS,
+            registry=self.registry,
+        )
+        self.context_compacted_tokens_per_request = Histogram(
+            "soorin_context_compacted_tokens_per_request",
+            "Compacted context tokens observed for one request section.",
+            ("section",),
+            buckets=CONTEXT_TOKEN_BUCKETS,
+            registry=self.registry,
+        )
         self.product_view_selected = Counter(
             "soorin_product_view_selected_total",
             "Bounded Product evidence view selections.",
@@ -207,6 +293,67 @@ class SoorinMetrics:
             "soorin_errors_total",
             "Coarsely classified subsystem errors.",
             ("subsystem", "error_class"),
+            registry=self.registry,
+        )
+        self.stream_time_to_first_output = Histogram(
+            "soorin_stream_time_to_first_output_seconds",
+            "Time from accepted stream request to first reasoning or answer output.",
+            buckets=WORKFLOW_DURATION_BUCKETS,
+            registry=self.registry,
+        )
+        self.stream_duration = Histogram(
+            "soorin_stream_duration_seconds",
+            "Total user-visible stream lifecycle duration.",
+            buckets=WORKFLOW_DURATION_BUCKETS,
+            registry=self.registry,
+        )
+        self.stream_completions = Counter(
+            "soorin_stream_completions_total",
+            "Terminal streaming outcomes.",
+            ("status",),
+            registry=self.registry,
+        )
+        self.product_requests = Counter(
+            "soorin_product_requests_total",
+            "Product dependency request outcomes by bounded operation.",
+            ("operation", "status_class"),
+            registry=self.registry,
+        )
+        self.product_request_duration = Histogram(
+            "soorin_product_request_duration_seconds",
+            "Product dependency request duration by bounded operation.",
+            ("operation",),
+            buckets=DEPENDENCY_DURATION_BUCKETS,
+            registry=self.registry,
+        )
+        self.memory_lifecycle_events = Counter(
+            "soorin_memory_lifecycle_events_total",
+            "Canonical long-term memory lifecycle outcomes.",
+            ("action", "result"),
+            registry=self.registry,
+        )
+        self.memory_revision_conflicts = Counter(
+            "soorin_memory_revision_conflicts_total",
+            "Optimistic-revision conflicts at Product memory boundaries.",
+            ("operation",),
+            registry=self.registry,
+        )
+        self.memory_canonical_reload = Counter(
+            "soorin_memory_canonical_reload_total",
+            "Canonical memory readback outcomes after a mutation.",
+            ("source", "result"),
+            registry=self.registry,
+        )
+        self.memory_vector_operations = Counter(
+            "soorin_memory_vector_operations_total",
+            "Semantic memory vector operation outcomes.",
+            ("operation", "result"),
+            registry=self.registry,
+        )
+        self.workflow_fallbacks = Counter(
+            "soorin_workflow_fallbacks_total",
+            "Bounded deterministic workflow fallback activations.",
+            ("kind",),
             registry=self.registry,
         )
 
@@ -316,7 +463,74 @@ class SoorinMetrics:
         compacted = max(0, int(compacted))
         self.context_estimated_tokens.labels(safe_section).set(estimated)
         self.context_compacted_tokens.labels(safe_section).set(compacted)
+        self.context_estimated_tokens_per_request.labels(safe_section).observe(estimated)
+        self.context_compacted_tokens_per_request.labels(safe_section).observe(compacted)
         self.context_token_savings.labels(safe_section).inc(max(0, estimated - compacted))
+
+    def observe_stream(
+        self,
+        *,
+        duration_seconds: float,
+        status: str,
+        first_output_seconds: float | None = None,
+    ) -> None:
+        if not self.enabled:
+            return
+        if first_output_seconds is not None:
+            self.stream_time_to_first_output.observe(max(0.0, first_output_seconds))
+        self.stream_duration.observe(max(0.0, duration_seconds))
+        self.stream_completions.labels(_bounded(status, STREAM_STATUSES, "error")).inc()
+
+    def observe_product(
+        self,
+        operation: str,
+        *,
+        duration_seconds: float,
+        status_code: int | None = None,
+    ) -> None:
+        if not self.enabled:
+            return
+        safe_operation = _bounded(operation, PRODUCT_OPERATIONS)
+        if status_code is None:
+            status_class = "exception"
+        else:
+            status_class = f"{max(2, min(5, int(status_code) // 100))}xx"
+            status_class = _bounded(status_class, PRODUCT_STATUS_CLASSES, "exception")
+        self.product_requests.labels(safe_operation, status_class).inc()
+        self.product_request_duration.labels(safe_operation).observe(max(0.0, duration_seconds))
+        if status_class != "2xx":
+            self.observe_error("product", status_code if status_code is not None else "connection")
+
+    def observe_memory_lifecycle(self, action: str, result: str = "success") -> None:
+        if self.enabled:
+            self.memory_lifecycle_events.labels(
+                _bounded(action, MEMORY_LIFECYCLE_ACTIONS),
+                _bounded(result, OBSERVATION_RESULTS, "failure"),
+            ).inc()
+
+    def observe_memory_revision_conflict(self, operation: str) -> None:
+        if self.enabled:
+            self.memory_revision_conflicts.labels(
+                _bounded(operation, MEMORY_REVISION_OPERATIONS)
+            ).inc()
+
+    def observe_memory_canonical_reload(self, source: str, result: str) -> None:
+        if self.enabled:
+            self.memory_canonical_reload.labels(
+                _bounded(source, MEMORY_CANONICAL_SOURCES),
+                _bounded(result, OBSERVATION_RESULTS, "failure"),
+            ).inc()
+
+    def observe_memory_vector(self, operation: str, result: str) -> None:
+        if self.enabled:
+            self.memory_vector_operations.labels(
+                _bounded(operation, MEMORY_VECTOR_OPERATIONS),
+                _bounded(result, OBSERVATION_RESULTS, "failure"),
+            ).inc()
+
+    def observe_workflow_fallback(self, kind: str) -> None:
+        if self.enabled:
+            self.workflow_fallbacks.labels(_bounded(kind, WORKFLOW_FALLBACK_KINDS)).inc()
 
     def observe_view(self, capability: str, views: Iterable[str]) -> None:
         if not self.enabled:

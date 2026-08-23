@@ -21,6 +21,7 @@ _SENSITIVE_LOG_VALUE = re.compile(
     r"(?:bearer|apikey|basic)\s+[^\s,;]+|[^\s,;]+)"
 )
 _STANDARD_FORMAT = "%(asctime)s %(levelname)s %(name)s %(message)s"
+_MAX_EXCEPTION_CHARS = 2000
 
 
 def _redact_text(value: str) -> str:
@@ -42,6 +43,14 @@ class JsonLogFormatter(logging.Formatter):
                     payload[key] = value
         else:
             payload["message"] = message.replace("\n", " ")[:500]
+        if record.exc_info:
+            error_type = getattr(record.exc_info[0], "__name__", "Exception")
+            payload.setdefault("error_type", str(error_type)[:80])
+            try:
+                exception = self.formatException(record.exc_info)
+            except Exception:
+                exception = str(record.exc_info[1] or "Exception")
+            payload["exception"] = _redact_text(exception)[:_MAX_EXCEPTION_CHARS]
         return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
 
 

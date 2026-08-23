@@ -17,7 +17,7 @@ from src.api.dependencies import get_local_persistence, get_product_api_client
 from src.api.schemas.chat import ChatResponse, HealthResponse, LLMHealthResponse
 from src.config.settings import get_settings
 from src.core.copilot.service import CopilotService
-from src.core.context.models import approx_tokens, compact_preview
+from src.core.context.models import approx_tokens
 from src.core.llm.client import LLMClient
 from src.core.llm.errors import LLMError
 from src.core.llm.providers.base import LLMStreamEvent
@@ -30,6 +30,7 @@ from src.core.identity import (
 )
 from src.core.memory.store import MemoryStore
 from src.core.observability.llm_usage import ProductUsageReporter
+from src.core.observability.metrics import get_metrics
 
 
 logger = logging.getLogger(__name__)
@@ -161,14 +162,13 @@ def chat(
         session_for_log,
     )
     logger.info(
-        "event=http_chat_request request_id=%s session_id=%s message_chars=%s approx_tokens=%s ui_context_present=%s selected_ip_present=%s user_preview=%r",
+        "event=http_chat_request request_id=%s session_id=%s message_chars=%s approx_tokens=%s ui_context_present=%s selected_ip_present=%s",
         request_id,
         session_for_log,
         len(request.message),
         approx_tokens(request.message),
         bool(request.ui_context),
         selected_ip_present,
-        compact_preview(request.message),
     )
     try:
         result = copilot_service.chat(
@@ -268,7 +268,8 @@ def chat_stream(
     )
 
     def events() -> Iterator[str]:
-        status = "error"
+        status = "interrupted"
+        first_output_seconds: float | None = None
         try:
             for event in copilot_service.chat_stream(
                 request.message,
@@ -277,16 +278,29 @@ def chat_stream(
                 request_id=request_id,
                 request_identity=identity,
             ):
+                if first_output_seconds is None and event.type in {"reasoning_delta", "answer_delta"}:
+                    first_output_seconds = time.perf_counter() - started
                 if event.type == "done":
-                    status = "ok"
+                    status = "completed"
+                elif event.type == "error":
+                    status = "error"
                 yield encode_sse_event(event)
+        except Exception:
+            status = "error"
+            raise
         finally:
+            duration_seconds = time.perf_counter() - started
+            get_metrics().observe_stream(
+                duration_seconds=duration_seconds,
+                status=status,
+                first_output_seconds=first_output_seconds,
+            )
             logger.info(
                 "event=http_chat_stream_response request_id=%s session_id=%s status=%s latency_ms=%s",
                 request_id,
                 session_for_log,
                 status,
-                int((time.perf_counter() - started) * 1000),
+                int(duration_seconds * 1000),
             )
 
     return StreamingResponse(

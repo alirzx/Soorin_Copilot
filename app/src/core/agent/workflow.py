@@ -661,6 +661,10 @@ class BoundedCopilotWorkflow:
             workflow_mode,
             time.perf_counter() - request_started,
         )
+        if final.get("routing_fallback_used"):
+            get_metrics().observe_workflow_fallback("routing")
+        if final.get("fallback_used"):
+            get_metrics().observe_workflow_fallback("plan")
         return response
 
     def _config(self, request_id: str) -> dict[str, Any]:

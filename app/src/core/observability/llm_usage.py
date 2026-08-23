@@ -18,7 +18,9 @@ logger = logging.getLogger(__name__)
 _CURRENT_COLLECTOR: ContextVar["UsageCollector | None"] = ContextVar("soorin_llm_usage_collector", default=None)
 _OUTBOUND_PURPOSES = {
     "intent_router": "router",
+    "intent_router_repair": "router",
     "planner": "planner",
+    "planner_repair": "planner",
     "chat": "chat",
 }
 
@@ -252,6 +254,7 @@ class ProductUsageReporter(LLMUsageRecorder):
                 payload,
                 request_id=request_id,
                 idempotency_key=request_id,
+                operation="usage_report",
             )
         except Exception as exc:
             logger.warning(
