@@ -174,11 +174,16 @@ Reads are owner-scoped only when a `user_id` is present. The service restores du
 
 ## 4. TARGET PRODUCTION MEMORY INTEGRATION — Proposed
 
-> **2026-08-22 staged implementation:** `ProductMemoryClient` and
-> `ProductThreadStateStore` are implemented. Product LTM GET/search/create/audit
-> DTO/adapter foundations are implemented for contract testing, but Product LTM
-> is not a selectable runtime backend until atomic lifecycle transitions are
-> available. SQLite remains the complete local/reference LTM backend.
+> **2026-08-23 Product LTM lifecycle integration:** `ProductMemoryClient`,
+> `ProductThreadStateStore`, and `ProductLongTermMemoryStore` are implemented.
+> Set `SOORIN_LONG_TERM_MEMORY_BACKEND=product` to select the Product/PostgreSQL
+> canonical LTM authority. The adapter canonically looks up an active record by
+> logical key, then sends one configured `/transition` mutation: `promote` when
+> none exists, `confirm` for an equal value, `supersede` for a compatible change,
+> and `conflict` for a material contradiction. The Backend atomically performs related record changes,
+> optimistic revision enforcement, and audit writes. SQLite remains available as
+> the local/reference backend. Qdrant is semantic discovery only and is never a
+> canonical authority or a fallback write target.
 
 ### 4.1 Recommended browser contract and identity model
 

@@ -597,15 +597,16 @@ reason and current Product evidence remains authoritative.
 
 ### Production topology contract
 
-SQLite schema v7 is local/test only. The production system should place canonical
-records and lifecycle audit in Product-owned PostgreSQL under tenant authorization.
-PostgreSQL must provide atomic promotion/supersession/audit, optimistic revisions,
-a one-active-per-logical-key constraint, bounded indexed queries, and retention/
-legal-hold policy. Qdrant remains a rebuildable semantic index. Optional Redis may
-cache non-authoritative projections, and optional read replicas may serve bounded
-recall, but either must canonically validate against a sufficiently current source
-before use and neither may process writes or promotion decisions. These production
-components are not implemented or deployed in this repository change.
+SQLite schema v7 is local/test only. When
+`SOORIN_LONG_TERM_MEMORY_BACKEND=product`, the Product API/PostgreSQL lifecycle
+adapter is the canonical authority: one Copilot lifecycle decision produces one
+`/transition` mutation and the Backend owns atomic promotion/supersession/audit,
+optimistic revisions, one-active-per-logical-key enforcement, and retention
+policy. This repository change does not deploy or live-validate that Backend.
+Qdrant remains a rebuildable semantic index. Optional Redis may cache
+non-authoritative projections, and optional read replicas may serve bounded recall,
+but either must canonically validate against a sufficiently current source before
+use and neither may process writes or promotion decisions.
 
 Operational retention remains bounded at every layer. Working facts and episodes
 are newest/relevance bounded; candidate quota may remove the oldest candidate;

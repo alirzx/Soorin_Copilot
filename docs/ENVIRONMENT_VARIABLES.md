@@ -806,7 +806,7 @@ Secrets such as API keys, passwords, Product tokens, captcha bypass values, and 
 
 ### `SOORIN_LONG_TERM_MEMORY_BACKEND`
 
-`SOORIN_LONG_TERM_MEMORY_BACKEND` currently accepts only `sqlite`, the complete local/reference implementation including canonical lifecycle transactions. Product LTM transport/read/create/audit code exists as a foundation but is deliberately not selectable until the Product Backend provides equivalent atomic lifecycle operations. Qdrant remains a discovery index, never a canonical backend.
+`SOORIN_LONG_TERM_MEMORY_BACKEND` accepts `sqlite` or `product`. `sqlite` remains the local behavioral reference; `product` selects `ProductLongTermMemoryStore`, whose canonical authority is the Product Backend/PostgreSQL lifecycle API. In Product mode, each lifecycle decision is one `POST {SOORIN_PRODUCT_MEMORY_LTM_PATH}/{memoryId}/transition` request and the Backend owns any related-record/audit changes in its transaction. Copilot does not dual-write or fall back to SQLite. Qdrant remains a discovery index, never a canonical backend.
 
 ### `SOORIN_MEMORY_VECTOR_INDEX_ENABLED`
 
@@ -884,7 +884,7 @@ retention and does not delete audit history.
 
 ### `SOORIN_LOCAL_PRODUCT_TEST_USER_ID`
 
-`SOORIN_LOCAL_PRODUCT_TEST_USER_ID` is an optional dedicated non-production Product owner identifier used only when local simulation exercises the Product thread-state backend. It replaces the random local simulation user only at the Product-memory adapter boundary; local chat simulation retains its own user. Leave it blank unless the Product test backend recognizes the owner. It is ownership context, not authentication, and must never contain a production user identity.
+`SOORIN_LOCAL_PRODUCT_TEST_USER_ID` is an optional dedicated non-production Product owner identifier used only when local simulation exercises Product thread-state or Product LTM persistence. It replaces the random local simulation user only in Product-memory transport (`X-User-ID`); domain `RequestIdentity` and `LongTermMemoryRecord.user_id` remain the local user. Leave it blank unless the Product test backend recognizes the owner. It is ownership context, not authentication, and must never contain a production user identity.
 
 ### `SOORIN_THREAD_STATE_BACKEND`
 
