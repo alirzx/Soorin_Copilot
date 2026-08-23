@@ -67,8 +67,15 @@ def test_disabled_local_routes_return_typed_not_enabled(monkeypatch, tmp_path: P
 
 
 def test_local_auth_defaults_and_test_user_creation_guard(monkeypatch, tmp_path: Path) -> None:
-    assert get_settings().streamlit_auth_backend == "none"
-    assert get_settings().local_test_user_creation_enabled is False
+    monkeypatch.setenv("SOORIN_STREAMLIT_AUTH_BACKEND", "none")
+    monkeypatch.setenv("SOORIN_LOCAL_TEST_USER_CREATION_ENABLED", "false")
+    get_settings.cache_clear()
+    try:
+        defaults = get_settings()
+        assert defaults.streamlit_auth_backend == "none"
+        assert defaults.local_test_user_creation_enabled is False
+    finally:
+        get_settings.cache_clear()
     repository = local_repository(tmp_path)
     settings = enabled_settings(repository.database.path, local_test_user_creation_enabled=False)
     local_routes_ready(monkeypatch, repository, settings)

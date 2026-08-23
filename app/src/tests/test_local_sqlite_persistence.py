@@ -175,6 +175,19 @@ def test_product_thread_with_sqlite_ltm_initializes_sqlite(tmp_path: Path) -> No
     assert path.exists()
 
 
+def test_product_thread_with_product_ltm_creates_no_sqlite_file(tmp_path: Path) -> None:
+    path = tmp_path / "product-ltm-only" / "copilot.sqlite3"
+    settings = replace(
+        get_settings(), local_product_simulation_enabled=False, thread_state_backend="product",
+        long_term_memory_enabled=True, long_term_memory_backend="product", local_sqlite_path=str(path),
+    )
+
+    adapters = build_local_persistence(settings, product_memory_client=ProductMemoryClient(object()))
+
+    assert adapters.thread_state_store is not None and adapters.long_term_memory_store is not None
+    assert not path.exists() and not path.parent.exists()
+
+
 def test_checkpoint_sqlite_setting_remains_deferred_and_creates_no_file(
     tmp_path: Path,
 ) -> None:

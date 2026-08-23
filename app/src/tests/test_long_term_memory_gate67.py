@@ -18,6 +18,7 @@ from src.core.memory.long_term import (
     MemoryPromotionPolicy,
     RetrievedLongTermMemory,
     retrieval_document,
+    utc_now,
 )
 from src.core.agent.contracts import ToolResult
 from src.core.memory.persistence import (
@@ -614,7 +615,7 @@ def test_active_ltm_survives_restart_crosses_conversations_but_not_users(
     promoted = LongTermMemoryCoordinator(
         first_store, None, active_validity_seconds=7 * 24 * 60 * 60
     ).process_candidate(
-        structured_candidate(), product_evidence()
+        structured_candidate(), replace(product_evidence(), retrieved_at=utc_now())
     ).memory
 
     reopened = LocalSQLiteDatabase(database.path)
