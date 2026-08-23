@@ -82,13 +82,18 @@ def render_conversation_chat(
     answer = "".join(answer_parts).strip()
     if completed and answer:
         placeholder.markdown(answer)
+        try:
+            controller.complete_turn(
+                conversation,
+                request_id=request_id,
+                user_content=prompt,
+                assistant_content=answer,
+            )
+        except error_types as exc:
+            status.update(label="Response could not be saved", state="error", expanded=False)
+            st.error(str(exc))
+            return False
         status.update(label="Response complete", state="complete", expanded=False)
-        controller.complete_turn(
-            conversation,
-            request_id=request_id,
-            user_content=prompt,
-            assistant_content=answer,
-        )
         return True
     if answer:
         placeholder.markdown(answer)

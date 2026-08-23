@@ -284,6 +284,7 @@ class Settings:
     product_retry_backoff_seconds: float
     product_memory_thread_state_path: str
     product_memory_ltm_path: str
+    product_chat_rooms_path: str
     detection_cache_enabled: bool
     detection_cache_ttl_seconds: int
     detection_stale_on_error: bool
@@ -462,6 +463,35 @@ class Settings:
                 "SOORIN_STREAMLIT_AUTH_BACKEND=local_simulation requires "
                 "SOORIN_LOCAL_PRODUCT_SIMULATION_ENABLED=true."
             )
+        if self.streamlit_auth_backend == "product":
+            if self.local_product_simulation_enabled:
+                raise ValueError(
+                    "SOORIN_STREAMLIT_AUTH_BACKEND=product requires "
+                    "SOORIN_LOCAL_PRODUCT_SIMULATION_ENABLED=false."
+                )
+            if self.thread_state_backend != "product":
+                raise ValueError(
+                    "SOORIN_STREAMLIT_AUTH_BACKEND=product requires "
+                    "SOORIN_THREAD_STATE_BACKEND=product."
+                )
+            if not self.long_term_memory_enabled or self.long_term_memory_backend != "product":
+                raise ValueError(
+                    "SOORIN_STREAMLIT_AUTH_BACKEND=product requires enabled Product-backed "
+                    "long-term memory."
+                )
+            required = {
+                "SOORIN_PRODUCT_API_BASE_URL": self.product_api_base_url,
+                "SOORIN_PRODUCT_LOGIN_PATH": self.product_login_path,
+                "SOORIN_PRODUCT_CHAT_ROOMS_PATH": self.product_chat_rooms_path,
+                "SOORIN_PRODUCT_HWID": self.product_hwid,
+                "SOORIN_COPILOT_API_KEY": self.copilot_api_key,
+            }
+            missing = [name for name, value in required.items() if not value]
+            if missing:
+                raise ValueError(
+                    "Product Streamlit mode is missing required configuration: "
+                    + ", ".join(missing)
+                )
 
     def validate_long_term_memory_configuration(self) -> None:
         if not self.long_term_memory_enabled:
@@ -640,7 +670,7 @@ def get_settings() -> Settings:
         streamlit_auth_backend=_choice(
             "SOORIN_STREAMLIT_AUTH_BACKEND",
             "none",
-            {"none", "local_simulation", "oidc"},
+            {"none", "local_simulation", "product", "oidc"},
         ),
         local_test_user_creation_enabled=_bool(
             "SOORIN_LOCAL_TEST_USER_CREATION_ENABLED",
@@ -709,6 +739,7 @@ def get_settings() -> Settings:
         product_retry_backoff_seconds=_float("SOORIN_PRODUCT_RETRY_BACKOFF_SECONDS", 3.0),
         product_memory_thread_state_path=os.getenv("SOORIN_PRODUCT_MEMORY_THREAD_STATE_PATH", "/api/v1/copilot/memory/thread-state").strip(),
         product_memory_ltm_path=os.getenv("SOORIN_PRODUCT_MEMORY_LTM_PATH", "/api/v1/copilot/memory/ltm").strip(),
+        product_chat_rooms_path=os.getenv("SOORIN_PRODUCT_CHAT_ROOMS_PATH", "/chat-rooms").strip(),
         detection_cache_enabled=_bool("SOORIN_DETECTION_CACHE_ENABLED", True),
         detection_cache_ttl_seconds=max(600, _int("SOORIN_DETECTION_CACHE_TTL_SECONDS", 600)),
         detection_stale_on_error=_bool("SOORIN_DETECTION_STALE_ON_ERROR", True),

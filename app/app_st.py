@@ -17,6 +17,7 @@ from src.web.chat_backend import ConversationController, LegacyDirectBackend
 from src.web.chat_ui import render_conversation_chat
 from src.web.local_simulation import copilot_auth_headers
 from src.web.local_simulation_ui import run_local_simulation_workspace
+from src.web.product_user_ui import run_product_workspace
 from src.web.pages.topology import build_copilot_ui_context, show_topology_page
 
 logger = logging.getLogger(__name__)
@@ -48,6 +49,9 @@ st.set_page_config(page_title="Soorin Cyber Copilot", layout="wide")
 
 if settings.streamlit_auth_backend == "local_simulation":
     run_local_simulation_workspace(settings)
+    st.stop()
+if settings.streamlit_auth_backend == "product":
+    run_product_workspace(settings)
     st.stop()
 if settings.streamlit_auth_backend == "oidc":
     st.title("Soorin Copilot")
