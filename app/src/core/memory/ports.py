@@ -141,7 +141,14 @@ class ThreadStateStore(Protocol):
 class LongTermMemoryStore(Protocol):
     """Validated durable-memory boundary, separate from raw chat messages."""
 
-    def get(self, *, user_id: str, memory_id: str) -> LongTermMemoryRecord | None: ...
+    def get(
+        self,
+        *,
+        user_id: str,
+        memory_id: str,
+        request_id: str = "",
+        purpose: str = "",
+    ) -> LongTermMemoryRecord | None: ...
 
     def put(self, *, memory: LongTermMemoryRecord) -> LongTermMemoryRecord: ...
 
@@ -158,6 +165,7 @@ class LongTermMemoryStore(Protocol):
         candidate: LongTermMemoryRecord,
         decision: PromotionDecision,
         actor: str = "system",
+        request_id: str = "",
     ) -> MemoryLifecycleResult: ...
 
     def list_audit_events(
@@ -177,6 +185,8 @@ class LongTermMemoryStore(Protocol):
         statuses: tuple[MemoryStatus, ...] = ("active",),
         epistemic_statuses: tuple[EpistemicStatus, ...] = (),
         limit: int = 100,
+        request_id: str = "",
+        purpose: str = "",
     ) -> tuple[LongTermMemoryRecord, ...]: ...
 
     def invalidate(

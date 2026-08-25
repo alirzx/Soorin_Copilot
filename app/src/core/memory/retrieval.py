@@ -220,6 +220,8 @@ class LongTermMemoryRetriever:
             entity_ids=entity_ids,
             statuses=("active",),
             limit=self.candidate_k,
+            request_id=request_id,
+            purpose="exact_active_retrieval",
         ) if entity_ids else ()
         logger.info(
             "event=memory_exact_search_completed request_id=%s status=ok candidate_count=%s",
@@ -259,7 +261,12 @@ class LongTermMemoryRetriever:
                     memory_id = str(hit.payload.get("memory_id") or hit.id)
                     if hit.score < self.min_score or memory_id in candidates:
                         continue
-                    memory = self.store.get(user_id=user_id, memory_id=memory_id)
+                    memory = self.store.get(
+                        user_id=user_id,
+                        memory_id=memory_id,
+                        request_id=request_id,
+                        purpose="semantic_canonical_hydration",
+                    )
                     if memory is None or not self._eligible(memory):
                         if memory is not None:
                             rejected_reasons.append(self._eligibility_reason(memory))
@@ -446,6 +453,8 @@ class LongTermMemoryCoordinator:
         self,
         memory: LongTermMemoryRecord,
         evidence: object,
+        *,
+        request_id: str = "",
     ) -> MemoryLifecycleResult:
         """Persist, evaluate, and atomically apply one deterministic lifecycle decision."""
         observed_at = str(
@@ -498,6 +507,7 @@ class LongTermMemoryCoordinator:
             candidate=stored,
             decision=decision,
             actor="system",
+            request_id=request_id or memory.source_request_id,
         )
         previous = result.previous_memory
         if previous is not None and previous.status in {"superseded", "invalidated", "expired"}:

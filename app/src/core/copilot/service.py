@@ -239,12 +239,16 @@ class CopilotService:
                     entity_ids=entity_ids,
                     statuses=("candidate",),
                     limit=100,
+                    request_id=identity.request_id,
+                    purpose="candidate_inventory",
                 )
                 active = self.long_term_memory_store.list(
                     user_id=identity.user_id,
                     entity_ids=entity_ids,
                     statuses=("active",),
                     limit=100,
+                    request_id=identity.request_id,
+                    purpose="active_inventory",
                 )
             except Exception as exc:
                 logger.warning(

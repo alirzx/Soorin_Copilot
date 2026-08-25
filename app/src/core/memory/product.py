@@ -131,22 +131,68 @@ class ProductLongTermMemoryStore:
     @classmethod
     def _wire(cls, memory: LongTermMemoryRecord) -> dict[str, Any]:
         return {"memoryType": memory.memory_type, "statement": memory.statement, "epistemicStatus": memory.epistemic_status, "confidence": memory.confidence, "sourceRequestId": memory.source_request_id, "sourceConversationId": memory.source_conversation_id, "evidenceRefs": cls._refs(memory.evidence_refs), "provenanceCategory": memory.provenance_category, "validFrom": memory.valid_from, "validUntil": memory.valid_until, "entityIds": list(memory.entity_ids), "idempotencyFingerprint": memory.idempotency_fingerprint, "logicalMemoryKey": memory.logical_memory_key, "policyVersion": memory.policy_version}
-    def get(self, *, user_id: str, memory_id: str) -> LongTermMemoryRecord | None:
+    def get(
+        self,
+        *,
+        user_id: str,
+        memory_id: str,
+        request_id: str = "",
+        purpose: str = "canonical_get",
+    ) -> LongTermMemoryRecord | None:
         try:
-            return self._domain_record(
-                self.client.get_ltm(user_id=self._owner(user_id), memory_id=memory_id),
+            memory = self._domain_record(
+                self.client.get_ltm(
+                    user_id=self._owner(user_id),
+                    memory_id=memory_id,
+                    request_id=request_id,
+                ),
                 domain_user_id=user_id,
             )
-        except ProductMemoryNotFoundError: return None
+        except ProductMemoryNotFoundError:
+            logger.info(
+                "event=product_ltm_read_completed request_id=%s operation=get purpose=%s status=not_found",
+                request_id,
+                purpose or "canonical_get",
+            )
+            return None
+        logger.info(
+            "event=product_ltm_read_completed request_id=%s operation=get purpose=%s status=ok",
+            request_id,
+            purpose or "canonical_get",
+        )
+        return memory
+
     def put(self, *, memory: LongTermMemoryRecord) -> LongTermMemoryRecord:
         response = _object(self.client.create_ltm(user_id=self._owner(memory.user_id), body={**self._wire(memory), "actor": "copilot"}, request_id=memory.source_request_id))
-        return self._domain_record(response, domain_user_id=memory.user_id) if "memoryType" in response else self._hydrate(memory.user_id, response.get("memoryId"))
-    def _hydrate(self, user_id: str, memory_id: Any) -> LongTermMemoryRecord:
+        return (
+            self._domain_record(response, domain_user_id=memory.user_id)
+            if "memoryType" in response
+            else self._hydrate(
+                memory.user_id,
+                response.get("memoryId"),
+                request_id=memory.source_request_id,
+                purpose="candidate_canonical_readback",
+            )
+        )
+
+    def _hydrate(
+        self,
+        user_id: str,
+        memory_id: Any,
+        *,
+        request_id: str = "",
+        purpose: str = "lifecycle_canonical_readback",
+    ) -> LongTermMemoryRecord:
         if not isinstance(memory_id, str) or not memory_id:
             get_metrics().observe_memory_canonical_reload("product", "failure")
             raise LocalPersistenceError("Product memory response omitted memoryId.")
         try:
-            memory = self.get(user_id=user_id, memory_id=memory_id)
+            memory = self.get(
+                user_id=user_id,
+                memory_id=memory_id,
+                request_id=request_id,
+                purpose=purpose,
+            )
         except Exception:
             get_metrics().observe_memory_canonical_reload("product", "failure")
             raise
@@ -155,12 +201,38 @@ class ProductLongTermMemoryStore:
             raise LocalPersistenceError("Product memory canonical readback was unavailable.")
         get_metrics().observe_memory_canonical_reload("product", "success")
         return memory
-    def list(self, *, user_id: str, entity_ids=(), memory_types=(), statuses=("active",), epistemic_statuses=(), limit: int = 100, logical_memory_key: str = ""):
+
+    def list(
+        self,
+        *,
+        user_id: str,
+        entity_ids=(),
+        memory_types=(),
+        statuses=("active",),
+        epistemic_statuses=(),
+        limit: int = 100,
+        logical_memory_key: str = "",
+        request_id: str = "",
+        purpose: str = "inventory",
+    ):
         body = {"entityIds": list(entity_ids), "memoryTypes": list(memory_types), "statuses": list(statuses), "epistemicStatuses": list(epistemic_statuses), "limit": limit, "offset": 0}
         if logical_memory_key: body["logicalMemoryKey"] = logical_memory_key
-        result = _object(self.client.search_ltm(user_id=self._owner(user_id), body=body))
+        result = _object(
+            self.client.search_ltm(
+                user_id=self._owner(user_id),
+                body=body,
+                request_id=request_id,
+            )
+        )
         records = next((result[name] for name in ("records", "items", "memories") if name in result), None)
-        if not isinstance(records, list): raise LocalPersistenceError("Product memory search response was invalid.")
+        if not isinstance(records, list):
+            raise LocalPersistenceError("Product memory search response was invalid.")
+        logger.info(
+            "event=product_ltm_read_completed request_id=%s operation=search purpose=%s status=ok record_count=%s",
+            request_id,
+            purpose or "inventory",
+            len(records),
+        )
         return tuple(self._domain_record(item, domain_user_id=user_id) for item in records)
     def list_audit_events(self, *, user_id: str, memory_id: str | None = None, limit: int = 100):
         if not memory_id: raise LocalPersistenceError("Product audit reads require a memory id.")
@@ -181,6 +253,7 @@ class ProductLongTermMemoryStore:
         expected_revision: int,
         policy_version: str,
         request_id: str = "",
+        source_request_id: str = "",
         related_memory_id: str | None = None,
         related_expected_revision: int | None = None,
         hydrate: bool = True,
@@ -190,7 +263,7 @@ class ProductLongTermMemoryStore:
             "reasonCode": reason_code,
             "actor": actor,
             "policyVersion": policy_version,
-            "sourceRequestId": request_id,
+            "sourceRequestId": source_request_id or request_id,
             "expectedRevision": expected_revision,
         }
         if related_memory_id:
@@ -201,17 +274,55 @@ class ProductLongTermMemoryStore:
         except ProductMemoryConflictError as exc: raise LocalPersistenceConflictError("Long-term memory revision is stale.") from exc
         if "memoryType" in response:
             return self._domain_record(response, domain_user_id=user_id), response
-        return (self._hydrate(user_id, response.get("memoryId", memory_id)) if hydrate else None), response
+        return (
+            self._hydrate(
+                user_id,
+                response.get("memoryId", memory_id),
+                request_id=request_id,
+                purpose="lifecycle_canonical_readback",
+            )
+            if hydrate
+            else None
+        ), response
 
-    def _active_for(self, candidate: LongTermMemoryRecord) -> LongTermMemoryRecord | None:
-        active = self.list(user_id=candidate.user_id, statuses=("active",), limit=2, logical_memory_key=candidate.logical_memory_key)
+    def _active_for(
+        self,
+        candidate: LongTermMemoryRecord,
+        *,
+        request_id: str = "",
+    ) -> LongTermMemoryRecord | None:
+        active = self.list(
+            user_id=candidate.user_id,
+            statuses=("active",),
+            limit=2,
+            logical_memory_key=candidate.logical_memory_key,
+            request_id=request_id,
+            purpose="lifecycle_active_lookup",
+        )
         return next((record for record in active if record.logical_memory_key == candidate.logical_memory_key), None)
 
-    def apply_promotion(self, *, candidate: LongTermMemoryRecord, decision: PromotionDecision, actor: str = "system") -> MemoryLifecycleResult:
-        active = self._active_for(candidate)
+    def apply_promotion(
+        self,
+        *,
+        candidate: LongTermMemoryRecord,
+        decision: PromotionDecision,
+        actor: str = "system",
+        request_id: str = "",
+    ) -> MemoryLifecycleResult:
+        current_request_id = request_id or candidate.source_request_id
+        active = None
+        if (
+            decision.action not in {"keep_candidate", "requires_review"}
+            or decision.reason_code == "unresolved_material_conflict"
+        ):
+            active = self._active_for(candidate, request_id=current_request_id)
         if decision.action in {"keep_candidate", "requires_review"}:
             if decision.reason_code != "unresolved_material_conflict" or active is None:
-                return MemoryLifecycleResult(self.get(user_id=candidate.user_id, memory_id=candidate.memory_id) or candidate, decision, previous_memory=active)
+                return MemoryLifecycleResult(
+                    candidate,
+                    decision,
+                    previous_memory=active,
+                )
             action, reason_code = "conflict", decision.reason_code
         elif decision.action == "reject":
             action, reason_code = "reject", decision.reason_code
@@ -221,7 +332,7 @@ class ProductLongTermMemoryStore:
             action, reason_code = "confirm", "same_value_revalidated"
         else:
             action, reason_code = "supersede", "newer_compatible_value"
-        current, result = self._transition(user_id=candidate.user_id, memory_id=candidate.memory_id, action=action, reason_code=reason_code, actor=actor or "copilot", expected_revision=candidate.revision, policy_version=decision.policy_version, request_id=candidate.source_request_id, related_memory_id=active.memory_id if active is not None else None, related_expected_revision=active.revision if active is not None else None)
+        current, result = self._transition(user_id=candidate.user_id, memory_id=candidate.memory_id, action=action, reason_code=reason_code, actor=actor or "copilot", expected_revision=candidate.revision, policy_version=decision.policy_version, request_id=current_request_id, source_request_id=candidate.source_request_id, related_memory_id=active.memory_id if active is not None else None, related_expected_revision=active.revision if active is not None else None)
         if current is None: raise LocalPersistenceError("Product promotion did not return a canonical memory.")
         previous = result.get("relatedRecord", result.get("related_record"))
         return MemoryLifecycleResult(current, decision, previous_memory=self._domain_record(previous, domain_user_id=candidate.user_id) if isinstance(previous, dict) else active, deduplicated=action == "confirm" or bool(result.get("deduplicated", False)), superseded_count=1 if action == "supersede" else int(result.get("supersededCount", 0)), conflict_count=1 if action == "conflict" else int(result.get("conflictCount", 0)))

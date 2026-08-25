@@ -209,7 +209,15 @@ class SQLiteLongTermMemoryStore:
             memory.policy_version,
         )
 
-    def get(self, *, user_id: str, memory_id: str) -> LongTermMemoryRecord | None:
+    def get(
+        self,
+        *,
+        user_id: str,
+        memory_id: str,
+        request_id: str = "",
+        purpose: str = "",
+    ) -> LongTermMemoryRecord | None:
+        del request_id, purpose
         user = _identifier(user_id, "user_id")
         identifier = _identifier(memory_id, "memory_id")
         with self.database.connect() as connection:
@@ -354,8 +362,10 @@ class SQLiteLongTermMemoryStore:
         candidate: LongTermMemoryRecord,
         decision: PromotionDecision,
         actor: str = "system",
+        request_id: str = "",
     ) -> MemoryLifecycleResult:
         """Atomically evaluate and apply one candidate lifecycle decision."""
+        del request_id
         assignments = ", ".join(f"{name.strip()} = ?" for name in _COLUMNS.split(",")[2:])
         with self.database.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
@@ -644,7 +654,10 @@ class SQLiteLongTermMemoryStore:
         statuses: tuple[MemoryStatus, ...] = ("active",),
         epistemic_statuses: tuple[EpistemicStatus, ...] = (),
         limit: int = 100,
+        request_id: str = "",
+        purpose: str = "",
     ) -> tuple[LongTermMemoryRecord, ...]:
+        del request_id, purpose
         user = _identifier(user_id, "user_id")
         bounded_limit = max(1, min(500, int(limit)))
         clauses = ["m.user_id = ?"]
