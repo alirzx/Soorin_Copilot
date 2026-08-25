@@ -685,6 +685,52 @@ class CopilotProductOrchestrationTests(unittest.TestCase):
         self.assertEqual(state.active_entities, ips)
         self.assertEqual(set(state.last_providers), {"graph", "detection", "asset_profile"})
 
+    def test_comprehensive_asset_with_rich_detection_still_invokes_synthesizer(self) -> None:
+        service, llm = self.service(
+            self.single_route_json(graph=True, detection=True, profile=True)
+        )
+        rich_detection = detection_result("192.0.2.10")
+        rich_payload = dict(rich_detection.raw_payload or {})
+        rich_payload["matchedRules"] = [
+            {"id": index, "evidence": [f"signal-{index}", "behavior " * 8]}
+            for index in range(500)
+        ]
+        rich_serialized = json.dumps(
+            rich_payload,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        rich_detection = replace(
+            rich_detection,
+            raw_payload=rich_payload,
+            serialized_json=rich_serialized,
+            raw_json_bytes=len(rich_serialized.encode("utf-8")),
+            raw_json_chars=len(rich_serialized),
+            raw_json_approx_tokens=max(1, len(rich_serialized) // 4),
+        )
+        service.detection_provider = FakeProductContextProvider(
+            {"192.0.2.10": rich_detection}
+        )  # type: ignore[assignment]
+        service.asset_profile_provider = FakeProductContextProvider(
+            {"192.0.2.10": profile_result("192.0.2.10")}
+        )  # type: ignore[assignment]
+        service.graph_provider = FakeGraphProvider(graph_result())  # type: ignore[assignment]
+
+        response = service.chat(
+            "Analyze comprehensively 192.0.2.10 using all live evidence.",
+            request_id="req-rich-bounded-detection",
+        )
+
+        self.assertEqual(response["answer"], "grounded answer")
+        self.assertEqual(len(llm.calls), 2)
+        model_context = "\n".join(
+            message["content"] for message in llm.calls[-1]["messages"]
+        )
+        self.assertIn("[ASSET_PROFILE_CONTEXT_JSON", model_context)
+        self.assertIn("[ASSET_DETECTION_CONTEXT_JSON", model_context)
+        self.assertIn("[SOORIN_GRAPH_CONTEXT_JSON]", model_context)
+
     def test_partial_product_failure_preserves_successful_other_entity_evidence(self) -> None:
         ips = ("192.0.2.10", "192.0.2.11")
         service, llm = self.service(self.pair_route_json(graph=False, detection=True, profile=True))

@@ -65,6 +65,11 @@ FULL_NEIGHBORS_CONTEXT_MAX_TOKENS = 3000
 PROFILE_CONTEXT_MAX_TOKENS = 3200
 DETECTION_CONTEXT_MAX_TOKENS = 2400
 
+MINIMUM_PRODUCT_VIEWS = {
+    "asset_profile": ("overview", "identity", "security", "network"),
+    "detection": ("overview", "evidence"),
+}
+
 
 class ContextComposer:
     """Turn typed provider results into bounded model evidence without lossy product transforms."""
@@ -134,6 +139,14 @@ class ContextComposer:
             profile_sections,
             detection_sections,
         )
+        profile_minimum_tokens = self._minimum_product_tokens(
+            profile_sections,
+            package.asset_profiles,
+        )
+        detection_minimum_tokens = self._minimum_product_tokens(
+            detection_sections,
+            package.detections,
+        )
         output_reserve = (
             self.settings.llm_reserved_output_tokens
             if reserved_output_tokens is None
@@ -166,10 +179,18 @@ class ContextComposer:
             max_dynamic_tokens // 2,
             sum(self._graph_context_cap(item.context) for item in package.graph_results),
         )
-        product_global_cap = max(0, max_dynamic_tokens - graph_reserve)
+        minimum_product_tokens = profile_minimum_tokens + detection_minimum_tokens
+        product_global_cap = min(
+            max_dynamic_tokens,
+            max(max(0, max_dynamic_tokens - graph_reserve), minimum_product_tokens),
+        )
+        profile_cap = min(
+            PROFILE_CONTEXT_MAX_TOKENS,
+            max(profile_minimum_tokens, product_global_cap - detection_minimum_tokens),
+        )
         profile_text, profile_used = self._fit_product_sections(
             profile_sections,
-            min(PROFILE_CONTEXT_MAX_TOKENS, product_global_cap),
+            profile_cap,
             package.asset_profiles,
         )
         detection_text, detection_used = self._fit_product_sections(
@@ -194,7 +215,6 @@ class ContextComposer:
         self.last_budget["required_product_tokens"] = approx_tokens(product_text)
         self.last_budget["manifest_tokens"] = approx_tokens(manifest)
         if product_required_tokens > max_dynamic_tokens:
-            self.required_context_missing = True
             self.required_context_missing_reason = "required_product_projections_exceed_context"
 
         delta_text = self._compose_delta_context(
@@ -298,6 +318,7 @@ class ContextComposer:
             identity = str(package.graph_results[0].context.get("context_identity") or "graph:0")
             self.last_inclusion["graph"] = self.last_inclusion[identity]
             self.last_representation["graph"] = self.last_representation[identity]
+        self._recompute_required_context(package, profile_sections, detection_sections)
         self.last_parts = {
             "status": manifest,
             "asset_profile": profile_text,
@@ -590,11 +611,108 @@ class ContextComposer:
                     "full_minified" if result and result.full_payload_included else "projected"
                 )
             else:
-                self.last_inclusion[key] = (False, "evidence_class_budget_exceeded")
-                self.last_representation[key] = "excluded"
-                self.required_context_missing = True
-                self.required_context_missing_reason = "required_product_projection_excluded"
+                minimum = self._minimum_product_section(
+                    provider,
+                    ip,
+                    result,
+                    record_stats=True,
+                )
+                minimum_tokens = approx_tokens(minimum) if minimum else 0
+                if minimum and used + minimum_tokens <= max(0, token_cap):
+                    selected.append(minimum)
+                    used += minimum_tokens
+                    self.last_inclusion[key] = (True, "bounded_minimum_projection")
+                    self.last_representation[key] = "bounded_minimum"
+                else:
+                    self.last_inclusion[key] = (False, "evidence_class_budget_exceeded")
+                    self.last_representation[key] = "excluded"
         return "\n\n".join(selected), used
+
+    def _minimum_product_section(
+        self,
+        provider: str,
+        ip: str,
+        result: Any,
+        *,
+        record_stats: bool = False,
+    ) -> str:
+        if result is None or result.raw_payload is None:
+            return ""
+        try:
+            projected = build_product_view(
+                result.raw_payload,
+                provider=provider,
+                views=MINIMUM_PRODUCT_VIEWS[provider],
+                detail="brief",
+                max_context_tokens=(
+                    PROFILE_CONTEXT_MAX_TOKENS
+                    if provider == "asset_profile"
+                    else DETECTION_CONTEXT_MAX_TOKENS
+                ),
+                purpose="composer_minimum_projection",
+            )
+        except (KeyError, TypeError, ValueError):
+            return ""
+        tag = (
+            "ASSET_PROFILE_CONTEXT_JSON"
+            if provider == "asset_profile"
+            else "ASSET_DETECTION_CONTEXT_JSON"
+        )
+        serialized = json.dumps(
+            projected.payload,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        if record_stats:
+            self._product_projection_stats[f"{provider}:{ip}"] = (
+                projected.inventory.scalar_count,
+                projected.usable_fact_count,
+            )
+        return "\n".join((f'[{tag} ip="{ip}"]', serialized, f'[/{tag}]'))
+
+    def _minimum_product_tokens(
+        self,
+        sections: list[tuple[str, str, str]],
+        provider_results: list[Any],
+    ) -> int:
+        by_ip = {item.ip: item for item in provider_results}
+        total = 0
+        for provider, ip, _ in sections:
+            minimum = self._minimum_product_section(provider, ip, by_ip.get(ip))
+            if minimum:
+                total += approx_tokens(minimum)
+        return total
+
+    def _recompute_required_context(
+        self,
+        package: CopilotContextPackage,
+        profile_sections: list[tuple[str, str, str]],
+        detection_sections: list[tuple[str, str, str]],
+    ) -> None:
+        required_product_keys = {
+            f"{provider}:{ip}"
+            for provider, ip, _ in (*profile_sections, *detection_sections)
+        }
+        product_missing = any(
+            not self.last_inclusion.get(key, (False, None))[0]
+            for key in required_product_keys
+        )
+        graph_missing = any(
+            not self.last_inclusion.get(
+                str(result.context.get("context_identity") or f"graph:{index}"),
+                (False, None),
+            )[0]
+            for index, result in enumerate(package.graph_results)
+        )
+        self.required_context_missing = product_missing or graph_missing
+        self.required_context_missing_reason = (
+            "required_product_projection_excluded"
+            if product_missing
+            else "required_graph_context_excluded"
+            if graph_missing
+            else None
+        )
 
     @staticmethod
     def _deduplicate_product_sections(
@@ -644,15 +762,19 @@ class ContextComposer:
             entities[item.ip] = {
                 "status": item.status,
                 "payload_included": included,
-                "payload_complete": bool(included and not item.context_truncated),
-                "model_representation_projected": representation == "projected",
+                "payload_complete": bool(
+                    included
+                    and not item.context_truncated
+                    and representation != "bounded_minimum"
+                ),
+                "model_representation_projected": representation in {"projected", "bounded_minimum"},
                 "representation": representation,
                 "stale": bool(item.stale),
                 "source_payload_complete": bool(item.raw_payload_present and not item.context_truncated),
                 "full_payload_fetched": bool(item.full_payload_fetched),
                 "projection_usable": bool(item.serialized_json),
                 "usable_fact_count": projected_scalar_count,
-                "projection_truncated": False,
+                "projection_truncated": representation == "bounded_minimum",
                 "projection_omitted_count": max(0, source_scalar_count - projected_scalar_count),
             }
         return {
