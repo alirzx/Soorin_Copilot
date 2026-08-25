@@ -73,6 +73,82 @@ def test_product_ltm_create_preserves_candidate_domain_values_and_lossless_refs(
     assert stored.idempotency_fingerprint == record.idempotency_fingerprint
 
 
+def test_product_ltm_search_preserves_current_request_id():
+    fake = FakeProductClient({"items": []})
+    store = ProductLongTermMemoryStore(ProductMemoryClient(fake))
+
+    records = store.list(
+        user_id="owner",
+        entity_ids=("192.0.2.1",),
+        statuses=("active",),
+        request_id="current-request-1",
+        purpose="exact_active_retrieval",
+    )
+
+    assert records == ()
+    method, path, kwargs = fake.calls[0]
+    assert (method, path) == ("POST", "/configured/ltm/search")
+    assert kwargs["request_id"] == "current-request-1"
+    assert kwargs["operation"] == "memory_search"
+
+
+def test_product_ltm_get_preserves_current_request_id():
+    record = __import__("src.core.memory.long_term", fromlist=["LongTermMemoryRecord"]).LongTermMemoryRecord.candidate(
+        memory_type="validated_finding", user_id="owner", entity_ids=("192.0.2.1",), statement="{}",
+        source_request_id="source-request", source_conversation_id="chat-1", evidence_refs=("evidence_class_asset_identity",),
+    )
+    payload = {
+        "memoryId": record.memory_id, "memoryType": record.memory_type, "userId": record.user_id,
+        "entityIds": list(record.entity_ids), "statement": record.statement, "epistemicStatus": record.epistemic_status,
+        "confidence": record.confidence, "sourceRequestId": record.source_request_id, "sourceConversationId": record.source_conversation_id,
+        "evidenceRefs": [{"type": "canonical_ref", "id": record.evidence_refs[0]}], "provenanceCategory": record.provenance_category,
+        "validFrom": record.valid_from, "validUntil": record.valid_until, "createdAt": record.created_at, "updatedAt": record.updated_at,
+        "revision": record.revision, "status": record.status, "indexStatus": record.index_status,
+        "idempotencyFingerprint": record.idempotency_fingerprint, "logicalMemoryKey": record.logical_memory_key,
+        "policyVersion": record.policy_version,
+    }
+    fake = FakeProductClient(payload)
+    stored = ProductLongTermMemoryStore(ProductMemoryClient(fake)).get(
+        user_id=record.user_id,
+        memory_id=record.memory_id,
+        request_id="current-request-2",
+        purpose="semantic_canonical_hydration",
+    )
+
+    assert stored is not None
+    assert stored.source_request_id == "source-request"
+    method, path, kwargs = fake.calls[0]
+    assert (method, path) == ("GET", f"/configured/ltm/{record.memory_id}")
+    assert kwargs["request_id"] == "current-request-2"
+    assert kwargs["operation"] == "memory_get"
+
+
+def test_non_conflict_review_reuses_canonical_candidate_without_reads():
+    record = __import__("src.core.memory.long_term", fromlist=["LongTermMemoryRecord"]).LongTermMemoryRecord.candidate(
+        memory_type="validated_finding", user_id="owner", entity_ids=("192.0.2.1",), statement="{}",
+        source_request_id="source-request", source_conversation_id="chat-1", evidence_refs=("evidence_class_asset_identity",),
+    )
+    fake = FakeProductClient({"items": []})
+    decision = PromotionDecision(
+        "requires_review",
+        "evidence_class_requires_review",
+        "review required",
+        confidence=record.confidence,
+        epistemic_status=record.epistemic_status,
+        provenance_category=record.provenance_category,
+    )
+
+    result = ProductLongTermMemoryStore(ProductMemoryClient(fake)).apply_promotion(
+        candidate=record,
+        decision=decision,
+        request_id="current-request-3",
+    )
+
+    assert result.memory is record
+    assert result.memory.source_request_id == "source-request"
+    assert fake.calls == []
+
+
 def test_product_ltm_promotion_uses_one_atomic_transition_request():
     record = __import__("src.core.memory.long_term", fromlist=["LongTermMemoryRecord"]).LongTermMemoryRecord.candidate(
         memory_type="validated_finding", user_id="owner", entity_ids=("192.0.2.1",), statement="{}",

@@ -37,6 +37,7 @@ from src.core.memory.retrieval import (
 from src.core.memory.sqlite import LocalSQLiteDatabase
 from src.core.memory.sqlite_long_term import SQLiteLongTermMemoryStore
 from src.core.memory.store import MemoryStore
+from src.core.memory.episodes import MemoryContextKey, WorkingFact
 from src.core.agent.nodes import CopilotWorkflowNodes
 from src.core.context.models import EntityResolution, ResolvedEntity
 from src.core.identity import RequestIdentity
@@ -924,6 +925,98 @@ def test_workflow_retrieves_after_resolution_without_changing_entity_state() -> 
     assert update["resolved_entities"] is resolution
     assert update["long_term_memory_selection"].status == "empty"
     assert update["next_edge"] == "route"
+
+
+@pytest.mark.parametrize(
+    ("pending_facts", "processed_count", "expected_working_count"),
+    (
+        ((), 1, 0),
+        ((WorkingFact(key="investigation_tag", value="ORION-115"),), 0, 1),
+    ),
+)
+def test_memory_update_telemetry_separates_working_ltm_and_thread_persistence(
+    pending_facts,
+    processed_count: int,
+    expected_working_count: int,
+) -> None:
+    writes = []
+    persisted = []
+
+    class RoutingStore:
+        @staticmethod
+        def set(session_id, state):
+            persisted.append(("routing", session_id, state))
+
+    class WorkingStore:
+        @staticmethod
+        def upsert_working_facts(session_id, context_key, facts, **kwargs):
+            writes.extend(facts)
+
+    service = SimpleNamespace(
+        settings=replace(get_settings(), chat_store_history=False),
+        memory_store=WorkingStore(),
+        routing_state_store=RoutingStore(),
+        persist_thread_continuity=lambda identity, state: persisted.append(
+            ("thread", identity.request_id, state)
+        ),
+        persist_completed_local_turn=lambda identity, **kwargs: persisted.append(
+            ("turn", identity.request_id, kwargs)
+        ),
+    )
+    nodes = CopilotWorkflowNodes(service)
+    nodes._propose_long_term_candidates = lambda _state: processed_count
+    entity = ResolvedEntity(type="ip", value="192.0.2.10", source="message")
+    resolution = EntityResolution(
+        status="resolved",
+        entities=[entity],
+        primary_entity=entity,
+        entity_mode="single",
+        candidate_count=1,
+        valid_entity_count=1,
+    )
+    identity = RequestIdentity.resolve(
+        user_id="user-a",
+        conversation_id="conv-a",
+        session_id="session-a",
+        request_id="request-current",
+    )
+    update = nodes.update_memory(
+        {
+            "session_id": identity.session_id,
+            "request_id": identity.request_id,
+            "request_identity": identity,
+            "message": "Remember the investigation tag.",
+            "task": SimpleNamespace(scope="none"),
+            "tool_results": [],
+            "synthesis_result": {"answer": "Stored."},
+            "memory_context_key": MemoryContextKey(
+                (entity.value,), "asset_investigation", "none", "asset"
+            ),
+            "pending_working_facts": pending_facts,
+            "active_entity_state": SessionRoutingState(),
+            "resolved_entities": resolution,
+            "routing_result": SimpleNamespace(
+                intent="asset_investigation",
+                scope="none",
+                direction="none",
+                depth=0,
+                use_detection=False,
+                use_asset_profile=False,
+            ),
+            "execution_plan": SimpleNamespace(plan_id="plan-a"),
+            "review_decision": SimpleNamespace(outcome="sufficient"),
+            "evidence_pack": SimpleNamespace(limitations=()),
+        }
+    )
+
+    telemetry = update["memory_update_result"]
+    assert telemetry["memory_write_count"] == expected_working_count
+    assert telemetry["working_fact_write_count"] == expected_working_count
+    assert telemetry["ltm_candidate_processed_count"] == processed_count
+    assert telemetry["long_term_candidate_count"] == processed_count
+    assert telemetry["thread_state_persistence_attempted"] is True
+    assert len(writes) == expected_working_count
+    assert {item[0] for item in persisted} == {"routing", "thread", "turn"}
 
 
 def test_offline_retrieval_quality_fixture_metrics(sqlite_store) -> None:

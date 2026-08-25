@@ -1161,20 +1161,30 @@ class CopilotWorkflowNodes:
                 assistant_content=synthesis["answer"],
             )
         proposed_count = self._propose_long_term_candidates(state)
+        working_fact_write_count = len(pending_facts)
+        thread_state_persistence_attempted = identity is not None
         logger.info(
-            "event=memory_update_completed request_id=%s memory_write_count=%s tool_count=%s episode_transition=%s persistence_attempted=%s",
+            "event=memory_update_completed request_id=%s memory_write_count=%s "
+            "working_fact_write_count=%s ltm_candidate_processed_count=%s "
+            "thread_state_persistence_attempted=%s tool_count=%s episode_transition=%s",
             state["request_id"],
-            len(pending_facts),
+            working_fact_write_count,
+            working_fact_write_count,
+            proposed_count,
+            thread_state_persistence_attempted,
             len(results),
             bool(getattr(state.get("conversation_snapshot"), "episode_transition", False)),
-            identity is not None,
         )
         return {
             "active_entity_state": new_state,
             "memory_update_result": {
                 "completed": True,
                 "request_id": state["request_id"],
+                "memory_write_count": working_fact_write_count,
+                "working_fact_write_count": working_fact_write_count,
                 "long_term_candidate_count": proposed_count,
+                "ltm_candidate_processed_count": proposed_count,
+                "thread_state_persistence_attempted": thread_state_persistence_attempted,
             },
             "terminal": True,
             "completed_at": state.get("updated_at"),
@@ -1218,7 +1228,11 @@ class CopilotWorkflowNodes:
                     ),
                 )
                 if hasattr(coordinator, "process_candidate"):
-                    lifecycle = coordinator.process_candidate(candidate, result)
+                    lifecycle = coordinator.process_candidate(
+                        candidate,
+                        result,
+                        request_id=state["request_id"],
+                    )
                     promotion_action = lifecycle.decision.action
                     promotion_reason = lifecycle.decision.reason_code
                     final_status = lifecycle.memory.status
