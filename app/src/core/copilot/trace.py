@@ -392,6 +392,12 @@ def trace_from_investigation_state(state: dict[str, Any]) -> CopilotRequestTrace
     trace.put(
         "MEMORY TRANSITION",
         completed=bool(memory.get("completed")),
+        memory_write_count=memory.get("memory_write_count"),
+        working_fact_write_count=memory.get("working_fact_write_count"),
+        ltm_candidate_processed_count=memory.get("ltm_candidate_processed_count"),
+        thread_state_persistence_attempted=memory.get(
+            "thread_state_persistence_attempted"
+        ),
         active_entities=list(getattr(active, "active_entities", ()) or ()),
         previous_scope=getattr(active, "previous_scope", None),
     )
