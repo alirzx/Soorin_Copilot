@@ -8,6 +8,7 @@ from types import SimpleNamespace
 import pytest
 
 from src.config.settings import get_settings
+from src.core.agent.contracts import ExecutionPlan, PlanStep, RequestConstraints, TaskSpec
 from src.core.agent.nodes import CopilotWorkflowNodes
 from src.core.agent.task_mapping import (
     classify_historical_recall,
@@ -616,3 +617,34 @@ def test_identity_contradiction_preserves_explicit_topology_and_knowledge_needs(
         "graph.get_summary",
     )
     assert task.optional_capabilities == ("knowledge.search",)
+
+
+def test_exact_product_e2e_recall_phrase_is_memory_only() -> None:
+    message = (
+        "What did you conclude about this asset before?\n"
+        "Use only what you already remember from this conversation."
+    )
+    constraints = derive_request_constraints(message)
+    assert constraints.memory_only is True
+    assert constraints.allow_live is False
+
+
+def test_execution_guard_refuses_live_steps_when_request_disallows_live() -> None:
+    task = TaskSpec(
+        request="memory only", intent="memory_recall", scope="node_summary", direction="both",
+        entities=("192.168.30.115",), required_capabilities=(), evidence_mode="memory_only",
+        temporal_mode="historical",
+    )
+    plan = ExecutionPlan(
+        task=task,
+        steps=(PlanStep(id="forbidden", capability="asset.get_detection"),),
+    )
+    nodes = CopilotWorkflowNodes(SimpleNamespace(settings=get_settings()))
+    result = nodes.execute_capabilities({
+        "execution_plan": plan,
+        "request_constraints": RequestConstraints(allow_live=False, memory_only=True),
+        "memory_tool_results": [],
+    })
+    assert result["next_edge"] == "safe_failure"
+    assert result["tool_results"] == []
+    assert result["failure_metadata"]["safe_error_code"] == "live_capability_forbidden_by_request"

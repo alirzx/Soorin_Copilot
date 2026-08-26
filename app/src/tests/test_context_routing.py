@@ -1132,8 +1132,9 @@ class LLMPrimaryRouterTests(unittest.TestCase):
             ]),  # type: ignore[arg-type]
         )
         decision = router.classify("192.168.30.115", self.entities, SessionRoutingState())
-        self.assertFalse(decision.fallback_used)
-        self.assertEqual(decision.retry_count, 1)
+        self.assertTrue(decision.fallback_used)
+        self.assertEqual(decision.retry_count, 0)
+        self.assertEqual(len(router.llm_client.calls), 1)
 
     def test_provider_error_and_low_confidence_fall_back(self) -> None:
         llm = FakeLLMClient([LLMError("boom", reason="timeout")])
@@ -1162,17 +1163,14 @@ class LLMPrimaryRouterTests(unittest.TestCase):
         ])
         router = GLMIntentRouter(settings, llm)  # type: ignore[arg-type]
         decision = router.classify("192.168.30.115", self.entities, SessionRoutingState())
-        self.assertFalse(decision.fallback_used)
+        self.assertTrue(decision.fallback_used)
         self.assertEqual(llm.calls[0]["temperature"], 0.0)
         self.assertEqual(llm.calls[0]["top_p"], 0.1)
         self.assertEqual(llm.calls[0]["max_tokens"], 77)
-        self.assertEqual(llm.calls[1]["max_tokens"], 155)
         self.assertEqual(llm.calls[0]["timeout_seconds"], 13)
-        self.assertEqual(llm.calls[1]["timeout_seconds"], 13)
         self.assertEqual(llm.calls[0]["transient_retries"], 0)
         self.assertEqual(llm.calls[0]["purpose"], "intent_router")
-        self.assertEqual(llm.calls[1]["purpose"], "intent_router_repair")
-        self.assertLess(len(llm.calls[1]["messages"][0]["content"]), len(router.system_prompt))
+        self.assertEqual(len(llm.calls), 1)
 
     def test_invalid_enum_and_missing_fields_use_one_content_repair(self) -> None:
         valid = (

@@ -34,7 +34,7 @@ EXPLICIT_MEMORY_RECALL_REQUEST = re.compile(
     r"\b(?:which\s+asset.*remember|what\s+(?:do\s+you\s+)?(?:know|remember).*(?:prior|memory|before\s+the\s+restart)|"
     r"summari[sz]e\s+what\s+you\s+remember|continue\s+with\s+the\s+same\s+asset.*before\s+the\s+restart|"
     r"conversation\s+memory|episodic\s+memory|long[\s-]*term\s+memory|prior\s+investigations?|what(?:'s|\s+is)\s+my\s+name|"
-    r"what\s+(?:do|did)\s+you\s+remember|what\s+you\s+remember|do\s+you\s+remember|"
+    r"what\s+(?:do|did)\s+you\s+remember|what\s+you\s+(?:already\s+)?remember|do\s+you\s+remember|"
     r"what\s+did\s+(?:i|we)\s+(?:tell|say)|what\s+was\s+the\s+previous\s+contradiction|"
     r"from\s+(?:stored\s+(?:context|conversation\s+context)|our\s+previous\s+investigation)|"
     r"what\s+(?:investigation\s+)?state\s+(?:(?:did\s+)?you\s+)?retain(?:ed)?|"
@@ -66,7 +66,7 @@ NO_LIVE_EVIDENCE_REQUEST = re.compile(
     r"do\s+not\s+(?:use|call|retrieve|check|look\s+up)\s+(?:anything|any\s+)?(?:current\s+|live\s+)?(?:product|detection|graph|knowledge|evidence|providers?|refresh|systems?|status|state|data|lookup)?|"
     r"don't\s+use\s+live|do\s+not\s+refresh|don't\s+refresh|no\s+live\s+(?:provider|evidence|refresh)|"
     r"without\s+(?:using\s+)?live\s+(?:sources?|data)|do\s+not\s+use\s+live\s+(?:sources?|data)|"
-    r"use\s+only\s+memory|using\s+only\s+stored\s+(?:conversation\s+)?context|memory\s+only|"
+    r"use\s+only\s+memory|use\s+only\s+what\s+(?:you|we)\s+(?:already\s+)?(?:remember|discussed|concluded|knew)|using\s+only\s+stored\s+(?:conversation\s+)?context|memory\s+only|"
     r"based\s+only\s+on\s+what\s+we\s+(?:discussed|knew|established)|historical\s+only)\b",
     re.IGNORECASE,
 )
@@ -85,7 +85,7 @@ CURRENT_EVIDENCE_REQUEST = re.compile(
 )
 
 NO_LIVE_HISTORICAL_REQUEST = re.compile(
-    r"\b(?:memory\s+only|use\s+only\s+memory|historical\s+only|based\s+only\s+on\s+what\s+we\s+"
+    r"\b(?:memory\s+only|use\s+only\s+memory|use\s+only\s+what\s+(?:you|we)\s+(?:already\s+)?(?:remember|discussed|concluded|knew)|historical\s+only|based\s+only\s+on\s+what\s+we\s+"
     r"(?:discussed|knew|established)|stored\s+(?:context|memory)|previous\s+investigation|retained\s+state)\b",
     re.IGNORECASE,
 )

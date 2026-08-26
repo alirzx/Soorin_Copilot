@@ -387,6 +387,22 @@ class CopilotWorkflowNodes:
             state["execution_plan"],
             state["evidence_gap_plan"],
         )
+        constraints = state.get("request_constraints")
+        if constraints is not None and not constraints.allow_live and plan.steps:
+            return {
+                "plan_validation_result": {
+                    "valid": False,
+                    "fallback_allowed": False,
+                    "error_code": "live_capability_forbidden_by_request",
+                    "step_id": plan.steps[0].id,
+                },
+                "failure_metadata": {
+                    "error_type": "live_capability_forbidden_by_request",
+                    "safe_error_code": "live_capability_forbidden_by_request",
+                    "retryable": False,
+                },
+                "next_edge": "safe_failure",
+            }
         for selection in gap_plan.view_selections:
             logger.info(
                 "event=view_selected request_id=%s capability=%s views=%s entity_count=%s reason=%s",
@@ -445,6 +461,18 @@ class CopilotWorkflowNodes:
         }
 
     def execute_capabilities(self, state: InvestigationState) -> dict[str, Any]:
+        constraints = state.get("request_constraints")
+        if constraints is not None and not constraints.allow_live and state["execution_plan"].steps:
+            return {
+                "tool_results": list(state.get("memory_tool_results") or ()),
+                "capability_results": list(state.get("memory_tool_results") or ()),
+                "failure_metadata": {
+                    "error_type": "live_capability_forbidden_by_request",
+                    "safe_error_code": "live_capability_forbidden_by_request",
+                    "retryable": False,
+                },
+                "next_edge": "safe_failure",
+            }
         _registry, _validator, executor = self.service._capability_runtime_snapshot()
         results = executor.execute(
             state["execution_plan"],
@@ -1151,6 +1179,14 @@ class CopilotWorkflowNodes:
             last_evidence_ids=tuple(item.step_id for item in results if item.step_id),
             last_capability_statuses=tuple(f"{item.source_capability}:{item.status}" for item in results),
         )
+        if self.settings.chat_store_history:
+            self.service.memory_store.compact_if_needed(
+                state["session_id"],
+                self.settings,
+                new_state,
+                route=route,
+                request_id=state["request_id"],
+            )
         self.service.routing_state_store.set(state["session_id"], new_state)
         identity = state.get("request_identity")
         if identity is not None:
