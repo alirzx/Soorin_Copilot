@@ -14,13 +14,16 @@ from src.web.local_simulation import LocalConversation
 from src.web.product_user_chat import (
     ProductChatMessage,
     ProductChatRoom,
+    ProductLoginSession,
     ProductUserChatError,
     ProductUserChatHTTPError,
 )
 from src.web.product_user_ui import (
+    PRODUCT_ROOM_KEY,
     PRODUCT_TOKEN_KEY,
     PRODUCT_TURN_KEY,
     PRODUCT_USER_ID_KEY,
+    PRODUCT_USERNAME_KEY,
     ProductConversationBackend,
     ProductCopilotStreamError,
     clear_product_ui_state,
@@ -214,12 +217,145 @@ def test_failed_assistant_save_is_retryable_without_reappending_user():
     assert client.calls.count(("append", "room-1", "assistant", "answer")) == 2
 
 
-def test_product_401_clears_interactive_session():
+def test_copilot_401_does_not_clear_product_session_or_turn():
     current = state()
     backend = ProductConversationBackend(settings(), Client(), current, http=HTTP(StreamResponse([], 401)))
-    with pytest.raises(ProductCopilotStreamError, match="expired"):
+    with pytest.raises(ProductCopilotStreamError, match="Copilot API authentication"):
         list(backend.stream_chat(conversation(), request_id="r", message="q", selected_ip=None))
-    assert PRODUCT_TOKEN_KEY not in current and PRODUCT_USER_ID_KEY not in current
+    assert current[PRODUCT_TOKEN_KEY] == "product-jwt"
+    assert current[PRODUCT_USER_ID_KEY] == "product-user"
+    assert current[PRODUCT_TURN_KEY]["stream_started"] is True
+
+
+def test_expired_product_token_reauthenticates_and_persists_completed_answer_once(monkeypatch):
+    class ExpiringClient(Client):
+        token = "expired-product-jwt"
+
+        def __init__(self):
+            super().__init__()
+            self.persisted_assistant = []
+
+        def append_message(self, room_id, role, content):
+            self.calls.append(("append", room_id, role, content))
+            if role == "assistant" and self.token == "expired-product-jwt":
+                raise ProductUserChatHTTPError("chat", 401)
+            if role == "assistant":
+                self.persisted_assistant.append((room_id, content))
+            return {}
+
+    client = ExpiringClient()
+    current = state() | {
+        PRODUCT_TOKEN_KEY: client.token,
+        PRODUCT_USERNAME_KEY: "analyst",
+        PRODUCT_ROOM_KEY: "room-1",
+    }
+    refreshes = []
+    runtime_settings = settings()
+    runtime_settings.product_username = "analyst"
+    runtime_settings.product_password = "configured-password"
+
+    def refresh(_client, username, password):
+        refreshes.append((username, password))
+        return ProductLoginSession(
+            access_token="refreshed-product-jwt",
+            user_id="product-user",
+            username="analyst",
+        )
+
+    monkeypatch.setattr(
+        "src.web.product_user_ui.ProductUserChatClient.login",
+        refresh,
+    )
+    backend = ProductConversationBackend(
+        runtime_settings,
+        client,
+        current,
+        http=HTTP(done_response()),
+    )
+    list(backend.stream_chat(conversation(), request_id="r", message="q", selected_ip=None))
+    backend.complete_display_turn(
+        conversation(),
+        request_id="r",
+        user_content="q",
+        assistant_content="answer",
+    )
+
+    assert refreshes == [("analyst", "configured-password")]
+    assert current[PRODUCT_TOKEN_KEY] == "refreshed-product-jwt"
+    assert current[PRODUCT_USER_ID_KEY] == "product-user"
+    assert current[PRODUCT_ROOM_KEY] == "room-1"
+    assert current[PRODUCT_TURN_KEY]["completed"] is True
+    assert client.persisted_assistant == [("room-1", "answer")]
+
+
+def test_completed_turn_survives_rerun_without_duplicate_assistant_persistence():
+    client = Client()
+    current = state() | {PRODUCT_ROOM_KEY: "room-1"}
+    backend = ProductConversationBackend(
+        settings(),
+        client,
+        current,
+        http=HTTP(done_response()),
+    )
+    list(backend.stream_chat(conversation(), request_id="r", message="q", selected_ip=None))
+    backend.complete_display_turn(
+        conversation(),
+        request_id="r",
+        user_content="q",
+        assistant_content="answer",
+    )
+
+    rerun_backend = ProductConversationBackend(settings(), client, current)
+    rerun_backend.complete_display_turn(
+        conversation(),
+        request_id="r",
+        user_content="q",
+        assistant_content="answer",
+    )
+
+    assert current[PRODUCT_ROOM_KEY] == "room-1"
+    assert current[PRODUCT_TURN_KEY]["completed"] is True
+    assert client.calls.count(("append", "room-1", "user", "q")) == 1
+    assert client.calls.count(("append", "room-1", "assistant", "answer")) == 1
+
+
+def test_failed_product_reauthentication_clears_session_without_cross_user_write():
+    class UnauthorizedAssistantClient(Client):
+        def append_message(self, room_id, role, content):
+            self.calls.append(("append", room_id, role, content))
+            if role == "assistant":
+                raise ProductUserChatHTTPError("chat", 401)
+            return {}
+
+    client = UnauthorizedAssistantClient()
+    current = state() | {PRODUCT_ROOM_KEY: "room-1"}
+
+    def reject_reauthentication():
+        raise ProductUserChatHTTPError("login", 401)
+
+    backend = ProductConversationBackend(
+        settings(),
+        client,
+        current,
+        http=HTTP(done_response()),
+        reauthenticate=reject_reauthentication,
+    )
+    list(backend.stream_chat(conversation(), request_id="r", message="q", selected_ip=None))
+
+    with pytest.raises(ProductUserChatHTTPError):
+        backend.complete_display_turn(
+            conversation(),
+            request_id="r",
+            user_content="q",
+            assistant_content="answer",
+        )
+
+    assert PRODUCT_TOKEN_KEY not in current
+    assert PRODUCT_USER_ID_KEY not in current
+    assert PRODUCT_ROOM_KEY not in current
+    assert PRODUCT_TURN_KEY not in current
+    assert client.calls.count(("append", "room-1", "user", "q")) == 1
+    assert client.calls.count(("append", "room-1", "assistant", "answer")) == 1
 
 
 def test_logout_clears_all_product_state():

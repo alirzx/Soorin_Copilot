@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import time
-from collections.abc import Iterator, MutableMapping
+from collections.abc import Callable, Iterator, MutableMapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -21,6 +21,7 @@ from src.web.local_simulation import LocalConversation
 from src.web.pages.topology import build_copilot_ui_context, show_topology_page
 from src.web.product_user_chat import (
     ProductChatRoom,
+    ProductLoginSession,
     ProductUserChatClient,
     ProductUserChatError,
     ProductUserChatHTTPError,
@@ -83,6 +84,7 @@ class ProductConversationBackend:
     client: ProductUserChatClient
     state: MutableMapping[str, Any]
     http: requests.Session | None = None
+    reauthenticate: Callable[[], ProductLoginSession | None] | None = None
 
     def current_user(self) -> str | None:
         value = str(self.state.get(PRODUCT_USER_ID_KEY) or "").strip()
@@ -102,43 +104,85 @@ class ProductConversationBackend:
             raise ProductUserChatError("Product user authentication is required.")
         return user_id
 
-    def _handle_http_error(self, exc: ProductUserChatHTTPError) -> None:
-        if exc.status_code == 401:
-            self.logout()
-        raise exc
+    def _reauthenticate(self) -> ProductLoginSession | None:
+        if self.reauthenticate is not None:
+            return self.reauthenticate()
+        username = str(self.state.get(PRODUCT_USERNAME_KEY) or "").strip()
+        configured_username = str(
+            getattr(self.settings, "product_username", "") or ""
+        ).strip()
+        configured_password = str(
+            getattr(self.settings, "product_password", "") or ""
+        )
+        if not username or username != configured_username or not configured_password:
+            return None
+        return ProductUserChatClient(self.settings).login(
+            username,
+            configured_password,
+        )
+
+    def _apply_reauthenticated_session(self, session: ProductLoginSession) -> bool:
+        if session.user_id != self._user():
+            return False
+        self.client.token = session.access_token
+        self.state[PRODUCT_TOKEN_KEY] = session.access_token
+        self.state[PRODUCT_USERNAME_KEY] = (
+            session.username or self.state.get(PRODUCT_USERNAME_KEY, "")
+        )
+        self.state[PRODUCT_DISPLAY_NAME_KEY] = (
+            session.display_name or self.state.get(PRODUCT_DISPLAY_NAME_KEY, "")
+        )
+        self.state[PRODUCT_ROLE_KEY] = (
+            session.role or self.state.get(PRODUCT_ROLE_KEY, "")
+        )
+        logger.info("event=product_ui_session_reauthenticated user_ref_set=true")
+        return True
+
+    def _product_call(self, operation: Callable[[], Any]) -> Any:
+        try:
+            return operation()
+        except ProductUserChatHTTPError as exc:
+            if exc.status_code != 401:
+                raise
+            try:
+                session = self._reauthenticate()
+            except ProductUserChatHTTPError as reauth_exc:
+                if reauth_exc.status_code in {401, 403}:
+                    self.logout()
+                raise
+            except ProductUserChatError:
+                raise
+            if session is None or not self._apply_reauthenticated_session(session):
+                self.logout()
+                raise exc
+            try:
+                return operation()
+            except ProductUserChatHTTPError as retry_exc:
+                if retry_exc.status_code == 401:
+                    self.logout()
+                raise
 
     def list_conversations(self) -> list[LocalConversation]:
-        try:
-            return [_conversation(room, self._user()) for room in self.client.list_rooms()]
-        except ProductUserChatHTTPError as exc:
-            self._handle_http_error(exc)
+        rooms = self._product_call(self.client.list_rooms)
+        return [_conversation(room, self._user()) for room in rooms]
 
     def create_conversation(self, title: str = "") -> LocalConversation:
         selected_ip = str(self.state.get("selected_copilot_ip") or "").strip()
-        try:
-            room = self.client.create_room(title or "Asset investigation", selected_ip)
-        except ProductUserChatHTTPError as exc:
-            self._handle_http_error(exc)
+        room = self._product_call(
+            lambda: self.client.create_room(title or "Asset investigation", selected_ip)
+        )
         return _conversation(room, self._user())
 
     def get_conversation(self, conversation_id: str) -> LocalConversation:
-        try:
-            return _conversation(self.client.get_room(conversation_id), self._user())
-        except ProductUserChatHTTPError as exc:
-            self._handle_http_error(exc)
+        room = self._product_call(lambda: self.client.get_room(conversation_id))
+        return _conversation(room, self._user())
 
     def get_messages(self, conversation_id: str) -> list[dict[str, Any]]:
-        try:
-            room = self.client.get_room(conversation_id)
-        except ProductUserChatHTTPError as exc:
-            self._handle_http_error(exc)
+        room = self._product_call(lambda: self.client.get_room(conversation_id))
         return [{"role": item.role, "content": item.content} for item in room.messages]
 
     def delete_conversation(self, conversation_id: str) -> None:
-        try:
-            self.client.delete_room(conversation_id)
-        except ProductUserChatHTTPError as exc:
-            self._handle_http_error(exc)
+        self._product_call(lambda: self.client.delete_room(conversation_id))
 
     def _turn(
         self,
@@ -182,10 +226,9 @@ class ProductConversationBackend:
         self._user()
         turn = self._turn(conversation, request_id=request_id, message=message)
         if not turn["user_persisted"]:
-            try:
-                self.client.append_message(conversation.conversation_id, "user", message)
-            except ProductUserChatHTTPError as exc:
-                self._handle_http_error(exc)
+            self._product_call(
+                lambda: self.client.append_message(conversation.conversation_id, "user", message)
+            )
             turn["user_persisted"] = True
         if turn["stream_started"]:
             raise ProductCopilotStreamError("This Product turn was already submitted to Copilot.")
@@ -218,8 +261,7 @@ class ProductConversationBackend:
                 timeout=self.settings.api_timeout_seconds,
             ) as response:
                 if response.status_code == 401:
-                    self.logout()
-                    raise ProductCopilotStreamError("Product session or Copilot authentication expired.")
+                    raise ProductCopilotStreamError("Copilot API authentication failed.")
                 response.raise_for_status()
                 response.encoding = "utf-8"
                 for event in parse_sse_events(
@@ -261,14 +303,13 @@ class ProductConversationBackend:
             raise ProductUserChatError("Product turn was not completed by Copilot.")
         turn["assistant_content"] = assistant_content
         if not turn["assistant_persisted"]:
-            try:
-                self.client.append_message(
+            self._product_call(
+                lambda: self.client.append_message(
                     conversation.conversation_id,
                     "assistant",
                     assistant_content,
                 )
-            except ProductUserChatHTTPError as exc:
-                self._handle_http_error(exc)
+            )
             turn["assistant_persisted"] = True
         turn["completed"] = True
         return self.get_messages(conversation.conversation_id)
@@ -282,7 +323,9 @@ class ProductConversationBackend:
         content = str(turn.get("assistant_content") or "").strip()
         if not content:
             return False
-        self.client.append_message(conversation_id, "assistant", content)
+        self._product_call(
+            lambda: self.client.append_message(conversation_id, "assistant", content)
+        )
         turn["assistant_persisted"] = True
         turn["completed"] = True
         return True
