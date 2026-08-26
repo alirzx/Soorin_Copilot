@@ -738,11 +738,11 @@ Secrets such as API keys, passwords, Product tokens, captcha bypass values, and 
 
 ### `SOORIN_CONVERSATION_MAX_MESSAGES`
 
-`SOORIN_CONVERSATION_MAX_MESSAGES` caps how many conversation messages may be selected into the model-facing history/context stage after memory preparation. Larger values can preserve more conversational continuity but consume input tokens and increase stale-context risk; smaller values prioritize current evidence and the current request.
+`SOORIN_CONVERSATION_MAX_MESSAGES` is the raw-history retention-pressure threshold. When enabled summary maintenance has older complete turns available, crossing this count summarizes them before removal; final model selection remains separately token bounded. Larger values can preserve more conversational continuity but consume input tokens and increase stale-context risk; smaller values prioritize current evidence and the current request.
 
 ### `SOORIN_CONVERSATION_RECENT_RAW_MESSAGES`
 
-`SOORIN_CONVERSATION_RECENT_RAW_MESSAGES` controls how many of the most recent raw messages are preserved directly when the conversation system also has a compact deterministic summary. Increasing it gives the Synthesizer more verbatim recent context at higher token cost; decreasing it relies more heavily on summarized/selected memory.
+`SOORIN_CONVERSATION_RECENT_RAW_MESSAGES` is a message count controlling recent raw preservation alongside a compact deterministic summary. It is rounded up to an even count and never below two, so at least one complete user/assistant pair remains raw. Increasing it gives the Synthesizer more verbatim recent context at higher token cost; decreasing it relies more heavily on summarized/selected memory.
 
 ### `SOORIN_CONVERSATION_SUMMARY_ENABLED`
 
@@ -758,11 +758,11 @@ Secrets such as API keys, passwords, Product tokens, captcha bypass values, and 
 
 ### `SOORIN_CONVERSATION_SUMMARY_TEMPERATURE`
 
-`SOORIN_CONVERSATION_SUMMARY_TEMPERATURE` is retained as configuration for conversation-summary behavior, but the current architecture states that working/episode summaries are deterministic and do not use an LLM. Therefore this variable may be compatibility or inactive configuration in the current implementation. `(double-check current code consumption before treating it as active)`
+`SOORIN_CONVERSATION_SUMMARY_TEMPERATURE` is retained as configuration for conversation-summary behavior, but the current architecture states that working/episode summaries are deterministic and do not use an LLM. It is retained for environment compatibility but is inactive: deterministic summary code does not read it or call an LLM.
 
 ### `SOORIN_CONVERSATION_SUMMARY_TIMEOUT_SECONDS`
 
-`SOORIN_CONVERSATION_SUMMARY_TIMEOUT_SECONDS` historically/configurationally bounds summary generation work, but current architecture describes conversation/episode summaries as deterministic and non-LLM. It may therefore be retained for compatibility or an older summary path rather than the active Gate-8 memory workflow. `(double-check current code consumption before treating it as active)`
+`SOORIN_CONVERSATION_SUMMARY_TIMEOUT_SECONDS` historically/configurationally bounds summary generation work, but current architecture describes conversation/episode summaries as deterministic and non-LLM. It is retained for environment compatibility but is inactive: deterministic summary work has no provider timeout.
 
 ### `SOORIN_SYSTEM_PROMPT_PATH`
 
@@ -778,7 +778,7 @@ Secrets such as API keys, passwords, Product tokens, captcha bypass values, and 
 
 ### `SOORIN_MEMORY_RELEVANT_TURN_LIMIT`
 
-`SOORIN_MEMORY_RELEVANT_TURN_LIMIT` caps how many same-conversation prior turns deterministic relevant-turn selection may include for the current entity/topic context. Increasing it preserves more potentially useful investigation history but consumes more memory-context budget; decreasing it gives stronger recency/compactness.
+`SOORIN_MEMORY_RELEVANT_TURN_LIMIT` caps both retained ThreadState turn references and how many same-conversation prior turns deterministic relevant-turn selection may include for the current entity/topic context. Increasing it preserves more potentially useful investigation history but consumes more memory-context budget; decreasing it gives stronger recency/compactness.
 
 ### `SOORIN_MEMORY_RELEVANT_TURN_TOKEN_BUDGET`
 

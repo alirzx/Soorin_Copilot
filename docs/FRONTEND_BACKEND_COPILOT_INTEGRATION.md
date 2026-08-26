@@ -266,3 +266,5 @@ Retention/deletion must follow Product tenant/user/chatroom policy. Conversation
 - No runtime integration assertion is claimed: the combined pytest execution did not provide a complete terminal summary in this environment, so it is not reported as a passing suite.
 
 This document supersedes historical integration claims where they conflict with the source at the revisions above.
+
+> **Known deployment blocker (2026-08-26):** offline adapter contract tests cover canonical create/search/get and atomic lifecycle request mapping, but the latest real Product deployment returned HTTP 500 for a valid `promote` transition after candidate creation and an empty active lookup. This remains a Product Backend/deployment blocker; Copilot does not change routes, invent alternate payloads, or fall back to SQLite. Product chat-room messages are now read-only canonical transcript input for ThreadState turn-reference reconstruction; Streamlit remains the sole Product transcript writer.

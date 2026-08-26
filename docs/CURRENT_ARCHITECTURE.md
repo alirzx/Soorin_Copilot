@@ -647,24 +647,24 @@ Conversation history is trimmed to fit budget, preferring current evidence over 
 
 Implemented in `app/src/core/memory`.
 
-The default remains in-memory per process. When explicitly enabled for local
-development, SQLite persists Product-chat simulation records and bounded thread
-memory across process restarts. Full workflow execution state remains process-local.
+The default remains in-memory per process. In local simulation, SQLite persists the owner-scoped transcript and bounded thread state. In Product mode, Product chat-room messages are the canonical transcript and Product/PostgreSQL ThreadState is the canonical bounded state; Copilot reads the transcript to reconstruct referenced recent turns but never duplicates UI transcript writes. Full workflow execution state remains process-local.
 
 Conversation memory:
 
 - Stores user and assistant messages when enabled.
-- Truncates to configured maximum messages.
+- Treats the configured maximum as compaction pressure: older complete turns are deterministically summarized before raw retention drops them.
 - Uses a typed `MemoryContextKey` over normalized entities, topic family, relationship mode, and scope family.
 - Keeps bounded current Working Memory and in-process Episodic Session Memory.
-- Builds deterministic compact summaries when token thresholds are exceeded or an episode closes.
+- Builds deterministic compact summaries when token thresholds are exceeded, raw-message retention is pressured, or an episode closes. The configured recent-raw count is a message count rounded up to at least one complete user/assistant pair.
 - Detaches raw history when entity, pair, or topic changes; a previous episode summary re-enters only for a matching context key.
 - Retains bounded old episode records without treating them as current provider evidence.
-- Does not use an LLM for summaries.
+- Does not use an LLM for summaries; the shared token estimator enforces the configured summary-token cap.
 - Selects same-conversation turns deterministically by active topic/entity,
   investigation relevance, and recency, with strict turn, episode, and total budgets.
 - Produces a storage-neutral `MemoryContextPackage` before final model context;
   fresh operational evidence remains authoritative over memory.
+
+Memory-only wording is resolved before semantic routing. `allow_live=false` is also enforced at plan validation/execution, so router repair or fallback cannot authorize Product, Detection, Graph, or Knowledge calls. Active episodes are not counted as archived episodes; their recent text is reconstructed from Product/SQLite transcript rows and ThreadState turn references. `EpisodeRecord.supported_findings` remains a reserved, unpopulated compatibility field; conclusions continue to use the existing deterministic `key_findings`/contradiction/summary fields rather than inventing duplicate semantics.
 
 Typed long-term memory (Gate 6/7, disabled by default):
 
