@@ -201,10 +201,15 @@ class ProductApiClient:
         *,
         request_id: str = "",
         operation: str = "other",
+        extra_headers: dict[str, str] | None = None,
     ) -> tuple[Any, int, float]:
         """Fetch JSON from a product endpoint without logging sensitive data."""
         return self._request_json(
-            "GET", endpoint_path, request_id=request_id, operation=operation
+            "GET",
+            endpoint_path,
+            request_id=request_id,
+            operation=operation,
+            extra_headers=extra_headers,
         )
 
     def post_json(

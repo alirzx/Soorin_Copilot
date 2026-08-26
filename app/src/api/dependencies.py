@@ -45,5 +45,7 @@ def get_graph_refresh_service() -> GraphRefreshService:
 def get_local_persistence() -> LocalPersistenceAdapters:
     """Build disabled-by-default local simulation adapters once per process."""
     return build_local_persistence(
-        get_settings(), product_memory_client=get_product_memory_client()
+        get_settings(),
+        product_memory_client=get_product_memory_client(),
+        product_client=get_product_api_client(),
     )

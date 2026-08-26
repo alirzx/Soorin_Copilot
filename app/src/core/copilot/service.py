@@ -29,7 +29,12 @@ from src.core.memory.routing_state import SessionRoutingStateStore
 from src.core.memory.episodes import MemoryContextKey
 from src.core.identity import RequestIdentity
 from src.core.memory.persistence import ThreadMemoryState
-from src.core.memory.ports import ChatRepository, LongTermMemoryStore, ThreadStateStore
+from src.core.memory.ports import (
+    ChatRepository,
+    LongTermMemoryStore,
+    ThreadStateStore,
+    TranscriptRepository,
+)
 from src.core.memory.retrieval import (
     LazyCrossEncoderReranker,
     LongTermMemoryCoordinator,
@@ -91,6 +96,7 @@ class CopilotService:
         product_client: ProductApiClient | None = None,
         usage_reporter: ProductUsageReporter | None = None,
         chat_repository: ChatRepository | None = None,
+        transcript_repository: TranscriptRepository | None = None,
         thread_state_store: ThreadStateStore | None = None,
         long_term_memory_store: LongTermMemoryStore | None = None,
         long_term_memory_retriever: LongTermMemoryRetriever | None = None,
@@ -100,6 +106,7 @@ class CopilotService:
         self.memory_store = memory_store
         self.routing_state_store = routing_state_store or SessionRoutingStateStore()
         self.chat_repository = chat_repository
+        self.transcript_repository = transcript_repository or chat_repository
         self.thread_state_store = thread_state_store
         self.long_term_memory_store = long_term_memory_store
         self._persistence_lock = RLock()
@@ -319,12 +326,16 @@ class CopilotService:
             )
             transcript: tuple[Any, ...] = ()
             local_identity = self._local_chat_identity(identity)
-            if self.chat_repository is not None and local_identity is not None:
+            transcript_repository = getattr(
+                self, "transcript_repository", self.chat_repository
+            )
+            if transcript_repository is not None and local_identity is not None:
                 try:
-                    transcript = self.chat_repository.recent(
+                    transcript = transcript_repository.recent(
                         user_id=local_identity[0],
                         conversation_id=local_identity[1],
-                        limit=max(2, self.settings.memory_relevant_turn_limit * 2),
+                        limit=max(3, self.settings.memory_relevant_turn_limit * 2 + 1),
+                        request_id=identity.request_id,
                     )
                 except Exception as exc:
                     logger.warning(

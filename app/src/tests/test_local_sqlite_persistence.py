@@ -159,8 +159,14 @@ def test_product_thread_without_sqlite_subsystem_creates_no_sqlite_file(tmp_path
         get_settings(), local_product_simulation_enabled=False, thread_state_backend="product",
         long_term_memory_enabled=False, local_sqlite_path=str(path), langgraph_checkpoint_backend="none",
     )
-    adapters = build_local_persistence(settings, product_memory_client=ProductMemoryClient(object()))
+    adapters = build_local_persistence(
+        settings,
+        product_memory_client=ProductMemoryClient(object()),
+        product_client=object(),
+    )
     assert adapters.thread_state_store is not None
+    assert adapters.transcript_repository is not None
+    assert adapters.chat_repository is None
     assert not path.exists() and not path.parent.exists()
 
 

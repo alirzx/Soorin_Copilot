@@ -974,6 +974,7 @@ class SQLiteChatRepository:
         user_id: str,
         conversation_id: str,
         limit: int = 50,
+        request_id: str = "",
     ) -> tuple[LocalChatMessage, ...]:
         user = _identifier(user_id, "user_id")
         conversation = _identifier(conversation_id, "conversation_id")

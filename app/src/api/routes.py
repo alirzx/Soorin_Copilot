@@ -40,6 +40,7 @@ memory_store = MemoryStore(
     settings.conversation_max_messages,
     max_episodes=settings.memory_episode_retention_limit,
     max_working_facts=settings.memory_working_fact_retention_limit,
+    relevant_turn_limit=settings.memory_relevant_turn_limit,
 )
 routing_state_store = SessionRoutingStateStore()
 product_client = get_product_api_client()
@@ -54,6 +55,7 @@ copilot_service = CopilotService(
     product_client=product_client,
     usage_reporter=usage_reporter,
     chat_repository=local_persistence.chat_repository,
+    transcript_repository=local_persistence.transcript_repository,
     thread_state_store=local_persistence.thread_state_store,
     long_term_memory_store=local_persistence.long_term_memory_store,
 )

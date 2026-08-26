@@ -23,7 +23,20 @@ from src.core.memory.long_term import (
 )
 
 
-class ChatRepository(Protocol):
+class TranscriptRepository(Protocol):
+    """Read-only bounded transcript boundary used to restore recent turns."""
+
+    def recent(
+        self,
+        *,
+        user_id: str,
+        conversation_id: str,
+        limit: int = 50,
+        request_id: str = "",
+    ) -> tuple[LocalChatMessage, ...]: ...
+
+
+class ChatRepository(TranscriptRepository, Protocol):
     """Product-owned transcript boundary; SQLite is local simulation only."""
 
     def create_user(
@@ -75,14 +88,6 @@ class ChatRepository(Protocol):
         content: str,
         status: str = "completed",
     ) -> LocalChatMessage: ...
-
-    def recent(
-        self,
-        *,
-        user_id: str,
-        conversation_id: str,
-        limit: int = 50,
-    ) -> tuple[LocalChatMessage, ...]: ...
 
     def delete_conversation(self, *, user_id: str, conversation_id: str) -> bool: ...
 

@@ -98,9 +98,19 @@ class MemoryStore:
         *,
         max_episodes: int = 20,
         max_working_facts: int = 20,
+        relevant_turn_limit: int | None = None,
     ) -> None:
         self.max_messages = max(0, max_messages)
         self.max_working_facts = max(1, int(max_working_facts))
+        self.relevant_turn_limit = max(
+            1,
+            int(
+                relevant_turn_limit
+                if relevant_turn_limit is not None
+                else max(1, self.max_messages // 2)
+            ),
+        )
+        self._history_staging_limit = max(self.max_messages + 2, self.relevant_turn_limit * 2)
         self._history: dict[str, list[dict[str, str]]] = {}
         self._latest_completed_turns: dict[str, list[dict[str, str]]] = {}
         self._summaries: dict[str, dict[str, Any]] = {}
@@ -116,7 +126,7 @@ class MemoryStore:
             return
         history = self._history.setdefault(session_id, [])
         history.append({"role": role, "content": content})
-        self._history[session_id] = history[-self.max_messages :]
+        self._history[session_id] = history[-self._history_staging_limit :]
 
     def clear_session(self, session_id: str) -> None:
         """Remove process-local continuity when an identity binding changes."""
@@ -234,7 +244,7 @@ class MemoryStore:
                 estimated_tokens=approx_tokens(user_content) + approx_tokens(assistant_content),
             )
         )
-        self._turns[session_id] = self._turns[session_id][-max(1, self.max_messages // 2) :]
+        self._turns[session_id] = self._turns[session_id][-self.relevant_turn_limit :]
         if request_id:
             recorded.add(request_id)
 
@@ -605,15 +615,48 @@ class MemoryStore:
         for episode in state.recent_episodes:
             self.repository.add_episode(episode)
 
-        refs = {item.request_id: item for item in state.recent_turn_references}
+        references = tuple(state.recent_turn_references)
+        if state.summary_source_request_id:
+            summary_index = next(
+                (index for index, item in enumerate(references)
+                 if item.request_id == state.summary_source_request_id),
+                None,
+            )
+            if summary_index is not None:
+                references = (
+                    references[summary_index + 1 :]
+                    if summary_index < len(references) - 1
+                    else references[summary_index:]
+                )
+        refs = {item.request_id: item for item in references}
         grouped: dict[str, dict[str, Any]] = {}
+        uncorrelated: list[Any] = []
         for message in transcript:
             request = str(getattr(message, "request_id", ""))
             role = str(getattr(message, "role", ""))
             if request in refs and role in {"user", "assistant"}:
                 grouped.setdefault(request, {})[role] = message
+            elif not request and role in {"user", "assistant"}:
+                uncorrelated.append(message)
+
+        complete_pairs: list[tuple[Any, Any]] = []
+        pending_user: Any | None = None
+        for message in uncorrelated:
+            role = str(getattr(message, "role", ""))
+            if role == "user":
+                pending_user = message
+            elif role == "assistant" and pending_user is not None:
+                complete_pairs.append((pending_user, message))
+                pending_user = None
+        unmatched = [
+            reference for reference in references
+            if not {"user", "assistant"}.issubset(grouped.get(reference.request_id, {}))
+        ]
+        for reference, pair in zip(unmatched[-len(complete_pairs) :], complete_pairs[-len(unmatched) :]):
+            grouped[reference.request_id] = {"user": pair[0], "assistant": pair[1]}
+
         restored: list[RelevantTurn] = []
-        for reference in state.recent_turn_references:
+        for reference in references:
             pair = grouped.get(reference.request_id, {})
             if "user" not in pair or "assistant" not in pair:
                 continue
@@ -642,6 +685,11 @@ class MemoryStore:
             self._recorded_request_ids[session_id] = {
                 item.request_id for item in restored if item.request_id
             }
+            working = self.repository.get_working(session_id)
+            if working is not None:
+                working.latest_user_turn = compact_preview(latest.user_content, limit=400)
+                working.latest_assistant_turn = compact_preview(latest.assistant_content, limit=600)
+                self.repository.set_working(working)
 
     def _activate_context(
         self,
@@ -738,7 +786,7 @@ class MemoryStore:
                             payload[key] = prior_summary[key]
             summary = self._serialize_summary_payload(
                 payload,
-                max_chars=max(200, settings.conversation_summary_max_tokens * 4),
+                max_tokens=max(1, settings.conversation_summary_max_tokens),
             )
         episode_facts = tuple(
             item
@@ -792,33 +840,46 @@ class MemoryStore:
         if not settings.conversation_summary_enabled or not history:
             return False
         tokens = sum(approx_tokens(item.get("content", "")) for item in history)
-        if tokens <= settings.conversation_summary_trigger_tokens:
-            return False
-        existing = self._summaries.get(session_id)
-        if existing and int(existing.get("summary_source_message_count", 0)) >= len(history):
+        retention_pressure = len(history) > self.max_messages
+        if tokens <= settings.conversation_summary_trigger_tokens and not retention_pressure:
             return False
 
-        recent_count = max(2, settings.conversation_recent_raw_messages)
+        # This setting is a message count. Round it up to complete user/assistant pairs.
+        recent_count = max(2, int(settings.conversation_recent_raw_messages))
+        if recent_count % 2:
+            recent_count += 1
         older = history[:-recent_count]
         recent = history[-recent_count:]
-        latest_completed = self._latest_completed_turn(history)
-        if latest_completed:
-            recent_keys = {(item.get("role"), item.get("content")) for item in recent}
-            for item in latest_completed:
-                key = (item.get("role"), item.get("content"))
-                if key not in recent_keys:
-                    recent.append(item)
-                    recent_keys.add(key)
-        summary_payload = self._build_summary_payload(older, routing_state, route=route, graph_context=graph_context)
+        existing = self._summaries.get(session_id)
+        source_messages = older or history
+        if not older and existing and int(existing.get("summary_source_message_count", 0)) >= len(history):
+            return False
+        summary_payload = self._build_summary_payload(
+            source_messages, routing_state, route=route, graph_context=graph_context
+        )
+        if existing:
+            try:
+                prior = json.loads(str(existing.get("text") or ""))
+            except (TypeError, ValueError):
+                prior = {}
+            if isinstance(prior, dict):
+                summary_payload = self._merge_summary_payload(prior, summary_payload)
         text = self._serialize_summary_payload(
             summary_payload,
-            max_chars=max(200, settings.conversation_summary_max_tokens * 4),
+            max_tokens=max(1, settings.conversation_summary_max_tokens),
         )
+        summary_source_request_id = request_id
+        turns = self._turns.get(session_id, ())
+        recent_turn_count = sum(1 for item in recent if item.get("role") == "user")
+        if older and len(turns) > recent_turn_count:
+            summary_source_request_id = turns[-recent_turn_count - 1].request_id
+        elif not older and turns:
+            summary_source_request_id = turns[-1].request_id
         self._summaries[session_id] = {
             "text": text,
             "summary_updated_at": datetime.now(timezone.utc).isoformat(),
-            "summary_source_message_count": len(history),
-            "summary_source_request_id": request_id,
+            "summary_source_message_count": len(source_messages),
+            "summary_source_request_id": summary_source_request_id,
         }
         self._history[session_id] = recent
         working = self.repository.get_working(session_id)
@@ -826,13 +887,14 @@ class MemoryStore:
             working.compact_summary = text
             self.repository.set_working(working)
         logger.info(
-            "event=conversation_summary_updated request_id=%s session_id=%s source_messages=%s recent_messages=%s summary_tokens=%s tokens_before=%s",
+            "event=conversation_summary_updated request_id=%s session_id=%s source_messages=%s recent_messages=%s summary_tokens=%s tokens_before=%s retention_pressure=%s",
             request_id,
             session_id,
-            len(history),
+            len(source_messages),
             len(recent),
             approx_tokens(text),
             tokens,
+            retention_pressure,
         )
         return True
 
@@ -840,36 +902,59 @@ class MemoryStore:
         return sum(approx_tokens(item.get("content", "")) for item in self.get(session_id))
 
     @staticmethod
-    def _serialize_summary_payload(payload: dict[str, Any], *, max_chars: int) -> str:
-        """Keep compact summaries valid while prioritizing recall-critical facts."""
-        text = json.dumps(payload, ensure_ascii=False)
-        if len(text) <= max_chars:
+    def _merge_summary_payload(prior: dict[str, Any], current: dict[str, Any]) -> dict[str, Any]:
+        merged = dict(prior)
+        for key, value in current.items():
+            if isinstance(value, list):
+                previous = merged.get(key)
+                values = [*(previous if isinstance(previous, list) else ()), *value]
+                merged[key] = list(dict.fromkeys(str(item) for item in values if str(item).strip()))[-8:]
+            elif value not in (None, "", {}, ()):
+                merged[key] = value
+        return merged
+
+    @staticmethod
+    def _serialize_summary_payload(payload: dict[str, Any], *, max_tokens: int) -> str:
+        """Keep valid deterministic JSON within the configured token estimate."""
+        budget = max(1, int(max_tokens))
+        text = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+        if approx_tokens(text) <= budget:
             return text
         compact: dict[str, Any] = {}
         for key in (
-            "active_entities",
-            "sticky_user_facts",
-            "contradictions",
-            "inferred_role",
-            "key_findings",
-            "next_checks",
-            "limitations",
-            "evidence_scope",
+            "active_entities", "sticky_user_facts", "contradictions", "inferred_role",
+            "key_findings", "next_checks", "limitations", "evidence_scope",
         ):
             value = payload.get(key)
             if isinstance(value, list):
                 compact[key] = [compact_preview(str(item), limit=100) for item in value[:2]]
             elif value:
                 compact[key] = value
-        text = json.dumps(compact, ensure_ascii=False)
-        return text if len(text) <= max_chars else json.dumps(
-            {
-                "active_entities": compact.get("active_entities", []),
-                "sticky_user_facts": compact.get("sticky_user_facts", []),
-                "contradictions": compact.get("contradictions", []),
-            },
-            ensure_ascii=False,
-        )
+        text = json.dumps(compact, ensure_ascii=False, separators=(",", ":"))
+        for key in ("evidence_scope", "limitations", "next_checks", "key_findings", "inferred_role"):
+            if approx_tokens(text) <= budget:
+                return text
+            compact.pop(key, None)
+            text = json.dumps(compact, ensure_ascii=False, separators=(",", ":"))
+        for key in ("contradictions", "sticky_user_facts", "active_entities"):
+            values = compact.get(key)
+            if isinstance(values, list):
+                compact[key] = [compact_preview(str(item), limit=60) for item in values]
+        text = json.dumps(compact, ensure_ascii=False, separators=(",", ":"))
+        while approx_tokens(text) > budget and compact:
+            changed = False
+            for key in ("contradictions", "sticky_user_facts", "active_entities"):
+                values = compact.get(key)
+                if isinstance(values, list) and values:
+                    values.pop(0)
+                    changed = True
+                    if not values:
+                        compact.pop(key, None)
+                    break
+            if not changed:
+                compact.pop(next(iter(compact)))
+            text = json.dumps(compact, ensure_ascii=False, separators=(",", ":"))
+        return text if approx_tokens(text) <= budget else "{}"
 
     @staticmethod
     def _build_summary_payload(

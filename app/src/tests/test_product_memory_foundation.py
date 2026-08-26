@@ -196,3 +196,109 @@ def test_product_ltm_local_test_owner_is_transport_only():
     assert fake.calls[0][2]["extra_headers"]["X-User-ID"] == "product-test-user-abc"
     assert stored.user_id == "local-user-123"
     assert stored.entity_ids == ("192.0.2.1",)
+
+
+def _canonical_wire(record, *, status="candidate", revision=None, epistemic_status=None):
+    return {
+        "memoryId": record.memory_id, "memoryType": record.memory_type, "userId": record.user_id,
+        "entityIds": list(record.entity_ids), "statement": record.statement,
+        "epistemicStatus": epistemic_status or record.epistemic_status, "confidence": record.confidence,
+        "sourceRequestId": record.source_request_id, "sourceConversationId": record.source_conversation_id,
+        "evidenceRefs": [{"type": "canonical_ref", "id": item} for item in record.evidence_refs],
+        "provenanceCategory": record.provenance_category, "validFrom": record.valid_from,
+        "validUntil": record.valid_until, "createdAt": record.created_at, "updatedAt": record.updated_at,
+        "revision": record.revision if revision is None else revision, "status": status,
+        "indexStatus": record.index_status, "idempotencyFingerprint": record.idempotency_fingerprint,
+        "logicalMemoryKey": record.logical_memory_key, "policyVersion": record.policy_version,
+    }
+
+
+def _candidate():
+    return __import__("src.core.memory.long_term", fromlist=["LongTermMemoryRecord"]).LongTermMemoryRecord.candidate(
+        memory_type="validated_finding", user_id="owner", entity_ids=("192.0.2.1",), statement="{\"value\":\"new\"}",
+        source_request_id="request-1", source_conversation_id="chat-1",
+        evidence_refs=("evidence_class_asset_identity",),
+    )
+
+
+@pytest.mark.parametrize(
+    ("method_name", "action", "reason", "actor"),
+    (
+        ("invalidate", "invalidate", "explicit_invalidation", "copilot"),
+        ("expire", "expire", "retention_or_validity_expired", "system"),
+    ),
+)
+def test_product_ltm_terminal_transition_bodies_are_exact(method_name, action, reason, actor):
+    record = _candidate()
+    canonical = _canonical_wire(record, status="invalidated" if action == "invalidate" else "expired", revision=2)
+    fake = FakeProductClient(canonical)
+    store = ProductLongTermMemoryStore(ProductMemoryClient(fake))
+    getattr(store, method_name)(user_id=record.user_id, memory_id=record.memory_id, expected_revision=1)
+    body = fake.calls[0][2]["json_body"]
+    assert body == {
+        "action": action, "reasonCode": reason, "actor": actor,
+        "policyVersion": "ltm-promotion-v1", "sourceRequestId": "", "expectedRevision": 1,
+    }
+
+
+def test_product_ltm_reject_transition_body_is_exact():
+    record = _candidate()
+    canonical = _canonical_wire(record, status="rejected", revision=2)
+    fake = FakeProductClient(lambda method, path, kwargs: {"items": []} if path.endswith("/search") else canonical)
+    decision = PromotionDecision(
+        "reject", "insufficient_authority", "reject", confidence=record.confidence,
+        epistemic_status=record.epistemic_status, provenance_category=record.provenance_category,
+    )
+    ProductLongTermMemoryStore(ProductMemoryClient(fake)).apply_promotion(
+        candidate=record, decision=decision, actor="copilot", request_id="request-current"
+    )
+    body = next(call[2]["json_body"] for call in fake.calls if call[1].endswith("/transition"))
+    assert body["action"] == "reject"
+    assert body["reasonCode"] == "insufficient_authority"
+    assert body["expectedRevision"] == record.revision
+    assert body["sourceRequestId"] == record.source_request_id
+
+
+def test_product_ltm_delete_reads_revision_then_sends_delete_transition():
+    record = _candidate()
+    fake = FakeProductClient(lambda method, path, kwargs: _canonical_wire(record) if method == "GET" else {"memoryId": record.memory_id})
+    assert ProductLongTermMemoryStore(ProductMemoryClient(fake)).delete(
+        user_id=record.user_id, memory_id=record.memory_id
+    )
+    body = fake.calls[1][2]["json_body"]
+    assert body == {
+        "action": "delete", "reasonCode": "quota_or_manual_cleanup", "actor": "copilot",
+        "policyVersion": record.policy_version, "sourceRequestId": "", "expectedRevision": record.revision,
+    }
+
+
+@pytest.mark.parametrize(("same_statement", "expected_action"), ((True, "confirm"), (False, "supersede")))
+def test_product_ltm_existing_active_transition_body_is_exact(same_statement, expected_action):
+    candidate = _candidate()
+    active_base = candidate if same_statement else candidate.__class__.candidate(
+        memory_type=candidate.memory_type, user_id=candidate.user_id, entity_ids=candidate.entity_ids,
+        statement="{\"older\":true}", source_request_id="older-request",
+        source_conversation_id=candidate.source_conversation_id, evidence_refs=candidate.evidence_refs,
+    )
+    active = replace(
+        active_base, memory_id="active-memory", status="active", revision=5,
+        epistemic_status="source_validated",
+    )
+    canonical = _canonical_wire(candidate, status="active", revision=2, epistemic_status="source_validated")
+    fake = FakeProductClient(
+        lambda method, path, kwargs: {"items": [_canonical_wire(active, status="active", revision=5)]}
+        if path.endswith("/search") else canonical
+    )
+    decision = PromotionDecision(
+        "auto_promote", "validated_product_fact", "eligible", confidence=0.95,
+        epistemic_status="source_validated", provenance_category="product",
+    )
+    ProductLongTermMemoryStore(ProductMemoryClient(fake)).apply_promotion(
+        candidate=candidate, decision=decision, actor="copilot", request_id="current-request"
+    )
+    body = next(call[2]["json_body"] for call in fake.calls if call[1].endswith("/transition"))
+    assert body["action"] == expected_action
+    assert body["relatedMemoryId"] == active.memory_id
+    assert body["relatedExpectedRevision"] == active.revision
+    assert body["expectedRevision"] == candidate.revision
+    assert body["sourceRequestId"] == candidate.source_request_id
