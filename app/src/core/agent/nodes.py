@@ -773,13 +773,6 @@ class CopilotWorkflowNodes:
         pack = state["evidence_pack"]
         package = context_package_from_evidence(pack, state["resolved_entities"])
         context_key = state.get("memory_context_key") or MemoryContextKey.from_task(task)
-        active_entities = tuple(state["active_entity_state"].active_entities)
-        historical_recall_of_other_entity = (
-            task.evidence_mode in {"memory_only", "no_live_refresh"}
-            and bool(task.entities)
-            and bool(active_entities)
-            and set(task.entities) != set(active_entities)
-        )
         long_term_selection = state.get("long_term_memory_selection")
         long_term_memories = tuple(
             getattr(long_term_selection, "memories", ()) or ()
@@ -796,8 +789,7 @@ class CopilotWorkflowNodes:
                 request_id=state["request_id"],
                 long_term_memories=long_term_memories,
                 activate_context=(
-                    not historical_recall_of_other_entity
-                    and getattr(state.get("turn_policy"), "episode_transition", "switch") in {"switch", "detach"}
+                    getattr(state.get("turn_policy"), "episode_transition", "switch") in {"switch", "detach"}
                 ),
             )
             if self.settings.chat_store_history or long_term_memories

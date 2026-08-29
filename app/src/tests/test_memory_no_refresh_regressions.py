@@ -8,7 +8,14 @@ from types import SimpleNamespace
 import pytest
 
 from src.config.settings import get_settings
-from src.core.agent.contracts import ExecutionPlan, PlanStep, RequestConstraints, TaskSpec
+from src.core.agent.contracts import (
+    EvidencePack,
+    ExecutionPlan,
+    PlanStep,
+    RequestConstraints,
+    ReviewDecision,
+    TaskSpec,
+)
 from src.core.agent.nodes import CopilotWorkflowNodes
 from src.core.agent.task_mapping import (
     classify_historical_recall,
@@ -22,8 +29,10 @@ from src.core.agent.task_mapping import (
 from src.core.context.entities import EntityResolver
 from src.core.context.models import EntityResolution, IntentDecision, ResolvedEntity
 from src.core.context.router import DeterministicFallbackRouter
-from src.core.memory.episodes import MemoryContextKey
-from src.core.memory.routing_state import SessionRoutingState
+from src.core.identity import RequestIdentity
+from src.core.memory.episodes import EpisodeRecord, MemoryContextKey
+from src.core.memory.persistence import THREAD_STATE_SCHEMA_VERSION, ThreadMemoryState
+from src.core.memory.routing_state import SessionRoutingState, SessionRoutingStateStore
 from src.core.memory.store import MemoryStore, extract_working_facts
 
 
@@ -536,6 +545,377 @@ def test_asset_switch_archives_a_and_broad_historical_recall_reuses_a_context() 
         not set(item.entity_ids).intersection(asset_b.entities)
         for item in recalled.memory_context.working_facts
     )
+
+
+def test_explicit_memory_only_return_reactivates_archived_a_after_product_style_reload() -> None:
+    asset_a = "192.168.0.62"
+    asset_b = "192.168.30.115"
+    session_id = "session-product-a-b-a"
+    settings = replace(
+        get_settings(),
+        conversation_summary_enabled=True,
+        conversation_summary_trigger_tokens=10_000,
+    )
+    key_a = MemoryContextKey((asset_a,), "asset_investigation", "none", "asset")
+    key_b = MemoryContextKey((asset_b,), "asset_investigation", "none", "asset")
+    memory = MemoryStore(20)
+    memory.prepare_for_model(
+        session_id,
+        settings,
+        SessionRoutingState(active_entities=(asset_a,)),
+        context_key=key_a,
+    )
+    memory.record_turn(
+        session_id,
+        "Investigate A.",
+        "A historical conclusion: profile role is workstation-A.",
+        key_a,
+        request_id="a-1",
+    )
+    episode_a = memory.repository.get_working(session_id).episode_id  # type: ignore[union-attr]
+    memory.prepare_for_model(
+        session_id,
+        settings,
+        SessionRoutingState(active_entities=(asset_b,)),
+        context_key=key_b,
+        request_id="switch-b",
+    )
+    memory.record_turn(
+        session_id,
+        "Investigate B.",
+        "B historical conclusion: profile role is server-B.",
+        key_b,
+        request_id="b-1",
+    )
+    episode_b = memory.repository.get_working(session_id).episode_id  # type: ignore[union-attr]
+
+    identity = RequestIdentity.resolve(
+        user_id="user-a",
+        conversation_id="67",
+        session_id=session_id,
+        request_id="recall-a",
+    )
+    persisted = ThreadMemoryState.from_routing_state(
+        identity,
+        SessionRoutingState(active_ip=asset_b, active_entities=(asset_b,)),
+        **memory.durable_components(session_id, turn_limit=4, episode_limit=4),
+    )
+    # Product keeps wire schema v3 while the Copilot runtime normalizes it to v4.
+    loaded = ThreadMemoryState.from_payload(
+        persisted.to_payload(),
+        thread_key=identity.thread_key,
+        user_id=identity.user_id,
+        conversation_id=identity.conversation_id,
+        session_id=identity.session_id,
+        updated_at=persisted.updated_at,
+        revision=3,
+        schema_version=3,
+    )
+    loaded = replace(loaded, schema_version=THREAD_STATE_SCHEMA_VERSION)
+    restored = MemoryStore(20)
+    restored.restore_durable_state(
+        loaded,
+        (
+            SimpleNamespace(request_id="a-1", role="user", content="Investigate A."),
+            SimpleNamespace(
+                request_id="a-1",
+                role="assistant",
+                content="A historical conclusion: profile role is workstation-A.",
+            ),
+            SimpleNamespace(request_id="b-1", role="user", content="Investigate B."),
+            SimpleNamespace(
+                request_id="b-1",
+                role="assistant",
+                content="B historical conclusion: profile role is server-B.",
+            ),
+        ),
+    )
+    archived_a = restored.repository.list_episodes(session_id)
+    assert [(item.episode_id, item.context_key) for item in archived_a] == [(episode_a, key_a)]
+
+    message = (
+        "What did we previously conclude about 192.168.0.62 before switching to the other asset? "
+        "Use only what you already remember from this conversation. "
+        "Do not use any live tools or fresh evidence."
+    )
+    routing_b = loaded.to_routing_state()
+    resolution = EntityResolver().resolve(
+        message,
+        {"selected_ip": asset_b},
+        routing_b,
+        request_id="recall-a",
+    )
+    constraints = derive_request_constraints(message)
+    policy = derive_turn_policy(message, constraints, resolution, routing_b)
+    assert [item.value for item in resolution.entities] == [asset_a]
+    assert resolution.entities[0].source == "message"
+    assert constraints.memory_only and not constraints.allow_live
+    assert policy.episode_transition == "switch"
+    assert not policy.requires_domain_router
+
+    service = SimpleNamespace(
+        settings=settings,
+        memory_store=restored,
+        routing_state_store=SessionRoutingStateStore(),
+        intent_router=SimpleNamespace(
+            classify=lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                AssertionError("semantic router called")
+            )
+        ),
+        fallback_router=SimpleNamespace(),
+        long_term_memory_coordinator=None,
+        persist_thread_continuity=lambda *_args, **_kwargs: None,
+        persist_completed_local_turn=lambda *_args, **_kwargs: None,
+    )
+    nodes = CopilotWorkflowNodes(service)
+    route_update = nodes.route(
+        {
+            "message": message,
+            "resolved_entities": resolution,
+            "active_entity_state": routing_b,
+            "recent_messages": [],
+            "request_constraints": constraints,
+            "turn_policy": policy,
+            "pending_working_facts": (),
+            "trace_id": "trace-recall-a",
+            "request_id": "recall-a",
+        }
+    )
+    route = route_update["routing_result"]
+    validated = nodes.validate_task(
+        {
+            "routing_result": route,
+            "resolved_entities": route_update["resolved_entities"],
+            "message": message,
+            "request_constraints": constraints,
+            "turn_policy": policy,
+            "session_id": session_id,
+            "request_id": "recall-a",
+        }
+    )
+    task = validated["task"]
+    context_key = validated["memory_context_key"]
+    assert route.semantic_router_called is False
+    assert validated["planner_called"] is False
+    assert compile_direct_plan(task).steps == ()
+    assert context_key == key_a
+
+    snapshot = restored.prepare_for_model(
+        session_id,
+        settings,
+        routing_b,
+        context_key=context_key,
+        request_id="recall-a",
+        activate_context=policy.episode_transition == "switch",
+    )
+    working = restored.repository.get_working(session_id)
+    assert snapshot.episode_transition
+    assert working is not None
+    assert working.episode_id == episode_a
+    assert working.context_key == key_a
+    assert "workstation-A" in snapshot.memory_context.working_summary  # type: ignore[union-attr]
+    assert [item.request_id for item in snapshot.memory_context.relevant_turns] == ["a-1"]  # type: ignore[union-attr]
+    assert "server-B" not in "\n".join(item["content"] for item in snapshot.messages)
+
+    update = nodes.update_memory(
+        {
+            "task": task,
+            "tool_results": [],
+            "synthesis_result": {"answer": "A recalled conclusion: workstation-A."},
+            "memory_context_key": context_key,
+            "pending_working_facts": (),
+            "session_id": session_id,
+            "request_id": "recall-a",
+            "request_identity": None,
+            "message": message,
+            "evidence_pack": SimpleNamespace(limitations=()),
+            "active_entity_state": routing_b,
+            "resolved_entities": route_update["resolved_entities"],
+            "routing_result": route,
+            "execution_plan": compile_direct_plan(task),
+            "review_decision": ReviewDecision(outcome="sufficient"),
+            "turn_policy": policy,
+            "conversation_snapshot": snapshot,
+        }
+    )
+    active_a = update["active_entity_state"]
+    working = restored.repository.get_working(session_id)
+    assert active_a.active_entities == (asset_a,)
+    assert working is not None and working.context_key == key_a
+    assert working.episode_id == episode_a
+    assert [(item.episode_id, item.context_key) for item in restored.repository.list_episodes(session_id)] == [
+        (episode_b, key_b)
+    ]
+
+    saved_again = ThreadMemoryState.from_routing_state(
+        identity,
+        active_a,
+        **restored.durable_components(session_id, turn_limit=4, episode_limit=4),
+    )
+    reloaded_again = ThreadMemoryState.from_payload(
+        saved_again.to_payload(),
+        thread_key=identity.thread_key,
+        user_id=identity.user_id,
+        conversation_id=identity.conversation_id,
+        session_id=identity.session_id,
+        updated_at=saved_again.updated_at,
+        revision=4,
+        schema_version=THREAD_STATE_SCHEMA_VERSION,
+    )
+    assert reloaded_again.working_memory is not None
+    assert reloaded_again.working_memory.episode_id == episode_a
+    assert reloaded_again.working_memory.context_key == key_a
+    assert [(item.episode_id, item.context_key) for item in reloaded_again.recent_episodes] == [
+        (episode_b, key_b)
+    ]
+
+
+def test_explicit_memory_recall_without_archived_match_never_reuses_active_episode() -> None:
+    settings = replace(get_settings(), conversation_summary_trigger_tokens=10_000)
+    memory = MemoryStore(20)
+    active = MemoryContextKey(("192.168.30.115",), "asset_investigation", "none", "asset")
+    missing = MemoryContextKey(("192.168.0.99",), "asset_investigation", "none", "asset")
+    memory.prepare_for_model("missing", settings, SessionRoutingState(), context_key=active)
+    memory.record_turn("missing", "Investigate B.", "Only B history exists.", active, request_id="b")
+    active_episode = memory.repository.get_working("missing").episode_id  # type: ignore[union-attr]
+
+    snapshot = memory.prepare_for_model(
+        "missing",
+        settings,
+        SessionRoutingState(active_entities=active.entities),
+        context_key=missing,
+        activate_context=True,
+    )
+
+    working = memory.repository.get_working("missing")
+    assert working is not None
+    assert working.context_key == missing
+    assert working.episode_id != active_episode
+    assert snapshot.memory_context.relevant_turns == ()  # type: ignore[union-attr]
+    assert "Only B history" not in "\n".join(item["content"] for item in snapshot.messages)
+
+
+def test_compose_context_activates_an_explicit_cross_entity_memory_recall() -> None:
+    asset_a = "192.168.0.62"
+    asset_b = "192.168.30.115"
+    message = f"What did we previously conclude about {asset_a}? Use only memory."
+    active_b = SessionRoutingState(active_entities=(asset_b,))
+    resolution = EntityResolver().resolve(message, routing_state=active_b)
+    constraints = derive_request_constraints(message)
+    policy = derive_turn_policy(message, constraints, resolution, active_b)
+    task = task_spec_from_route(_asset_route(asset_a), message, constraints, policy)
+    captured: dict[str, object] = {}
+
+    def observe_activation(*_args, **kwargs):
+        captured.update(kwargs)
+        raise RuntimeError("activation_observed")
+
+    nodes = CopilotWorkflowNodes(
+        SimpleNamespace(
+            settings=get_settings(),
+            memory_store=SimpleNamespace(prepare_for_model=observe_activation),
+        )
+    )
+    with pytest.raises(RuntimeError, match="activation_observed"):
+        nodes.compose_context(
+            {
+                "task": task,
+                "evidence_pack": EvidencePack(task, (), (), ()),
+                "resolved_entities": resolution,
+                "memory_context_key": MemoryContextKey.from_task(task),
+                "active_entity_state": active_b,
+                "session_id": "compose-activation",
+                "request_id": "recall-a",
+                "turn_policy": policy,
+            }
+        )
+
+    assert policy.episode_transition == "switch"
+    assert captured["context_key"] == MemoryContextKey.from_task(task)
+    assert captured["activate_context"] is True
+
+
+def test_normal_explicit_return_to_a_reactivates_the_archived_a_episode() -> None:
+    asset_a = "192.168.0.62"
+    asset_b = "192.168.30.115"
+    session_id = "normal-a-b-a"
+    settings = replace(get_settings(), conversation_summary_trigger_tokens=10_000)
+    key_a = MemoryContextKey((asset_a,), "asset_investigation", "none", "asset")
+    key_b = MemoryContextKey((asset_b,), "asset_investigation", "none", "asset")
+    memory = MemoryStore(20)
+    memory.prepare_for_model(session_id, settings, SessionRoutingState(), context_key=key_a)
+    memory.record_turn(session_id, "Investigate A.", "A conclusion.", key_a, request_id="a")
+    episode_a = memory.repository.get_working(session_id).episode_id  # type: ignore[union-attr]
+    memory.prepare_for_model(
+        session_id,
+        settings,
+        SessionRoutingState(active_entities=(asset_b,)),
+        context_key=key_b,
+    )
+
+    message = f"Analyze {asset_a}."
+    active_b = SessionRoutingState(active_entities=(asset_b,))
+    resolution = EntityResolver().resolve(message, routing_state=active_b)
+    policy = derive_turn_policy(
+        message,
+        derive_request_constraints(message),
+        resolution,
+        active_b,
+    )
+    task = task_spec_from_route(
+        _asset_route(asset_a),
+        message,
+        derive_request_constraints(message),
+        policy,
+    )
+    snapshot = memory.prepare_for_model(
+        session_id,
+        settings,
+        active_b,
+        context_key=MemoryContextKey.from_task(task),
+        activate_context=policy.episode_transition == "switch",
+    )
+
+    working = memory.repository.get_working(session_id)
+    assert policy.episode_transition == "switch"
+    assert snapshot.episode_transition
+    assert working is not None
+    assert working.episode_id == episode_a
+    assert working.context_key == key_a
+
+
+def test_episode_reactivation_selects_latest_exact_archived_match() -> None:
+    settings = replace(get_settings(), conversation_summary_trigger_tokens=10_000)
+    memory = MemoryStore(20)
+    session_id = "multiple-archived"
+    target = MemoryContextKey(("192.168.0.62",), "asset_investigation", "none", "asset")
+    active = MemoryContextKey(("192.168.30.115",), "asset_investigation", "none", "asset")
+    memory.repository.add_episode(
+        EpisodeRecord("a-old", session_id, target, compact_summary="older A conclusion")
+    )
+    memory.repository.add_episode(
+        EpisodeRecord("a-new", session_id, target, compact_summary="newer A conclusion")
+    )
+    memory.prepare_for_model(session_id, settings, SessionRoutingState(), context_key=active)
+    active_episode = memory.repository.get_working(session_id).episode_id  # type: ignore[union-attr]
+
+    snapshot = memory.prepare_for_model(
+        session_id,
+        settings,
+        SessionRoutingState(active_entities=active.entities),
+        context_key=target,
+        activate_context=True,
+    )
+
+    working = memory.repository.get_working(session_id)
+    assert working is not None
+    assert working.episode_id == "a-new"
+    assert working.compact_summary == "newer A conclusion"
+    assert snapshot.previous_episode_summary_included
+    assert [item.episode_id for item in memory.repository.list_episodes(session_id)] == [
+        "a-old",
+        active_episode,
+    ]
 
 
 @pytest.mark.parametrize(

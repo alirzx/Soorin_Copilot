@@ -577,6 +577,11 @@ class MemoryStore:
         selected.sort(key=lambda item: item.created_at)
 
         episodes = list(self.repository.list_episodes(session_id))
+        episode_entities = (
+            set(context_key.entities)
+            if context_key is not None and context_key.entities
+            else active
+        )
         matching_episodes = [
             item
             for item in reversed(episodes)
@@ -585,7 +590,7 @@ class MemoryStore:
             and (
                 context_key is None
                 or item.context_key == context_key
-                or bool(active.intersection(item.context_key.entities))
+                or bool(episode_entities.intersection(item.context_key.entities))
             )
         ]
         selected_episodes: list[EpisodeRecord] = []
@@ -822,36 +827,63 @@ class MemoryStore:
         if working.context_key == context_key:
             return False, False
 
+        archived_candidates = sum(
+            1
+            for episode in self.repository.list_episodes(session_id)
+            if episode.context_key == context_key
+        )
+        logger.info(
+            "event=episode_lookup_started request_id=%s session_id=%s target_entities=%s "
+            "active_episode_ref=%s archived_candidate_count=%s",
+            request_id,
+            session_id,
+            ",".join(context_key.entities) or "none",
+            working.episode_id,
+            archived_candidates,
+        )
         latest_completed = self._latest_completed_turn(self.get(session_id))
         if latest_completed:
             self._latest_completed_turns[session_id] = latest_completed
         self._archive_current_episode(session_id, working, settings)
         self._history[session_id] = []
         self._summaries.pop(session_id, None)
-        matching = next(
-            (
-                episode
-                for episode in reversed(self.repository.list_episodes(session_id))
-                if episode.context_key == context_key and (episode.compact_summary or episode.baseline)
-            ),
-            None,
-        )
+        matching = self.repository.take_episode(session_id, context_key)
         if matching:
             self._summaries[session_id] = {
                 "text": matching.compact_summary,
                 "summary_updated_at": matching.updated_at,
                 "summary_source_message_count": 0,
             }
-        episode = EpisodeRecord.create(session_id, context_key)
+        episode = matching or EpisodeRecord.create(session_id, context_key)
+        restored_facts = {
+            (item.key, item.scope, item.entity_ids): item
+            for item in (matching.working_facts if matching else ())
+        }
+        for item in working.working_facts:
+            if item.scope == "conversation":
+                restored_facts[(item.key, item.scope, item.entity_ids)] = item
         self.repository.set_working(
             WorkingMemory(
                 session_id=session_id,
                 context_key=context_key,
                 episode_id=episode.episode_id,
                 compact_summary=matching.compact_summary if matching else "",
-                working_facts=working.working_facts,
+                last_providers=matching.last_providers if matching else (),
+                last_scope=matching.last_scope if matching else "none",
+                limitations=matching.limitations if matching else (),
+                working_facts=tuple(restored_facts.values()),
                 baseline=matching.baseline if matching else None,
             )
+        )
+        logger.info(
+            "event=episode_lookup_completed request_id=%s session_id=%s selected_episode_ref=%s "
+            "selected_episode_state=%s selected_entities=%s reason=%s",
+            request_id,
+            session_id,
+            episode.episode_id,
+            "archived" if matching else "new",
+            ",".join(context_key.entities) or "none",
+            "exact_context_match" if matching else "no_archived_match",
         )
         logger.info(
             "event=memory_episode_transition request_id=%s session_id=%s context_identity=%s previous_summary_reused=%s",
@@ -868,7 +900,19 @@ class MemoryStore:
         working: WorkingMemory,
         settings: Settings,
     ) -> None:
-        history = self.get(session_id)
+        context_turns = [
+            item
+            for item in self._turns.get(session_id, ())
+            if item.context_key == working.context_key
+        ]
+        history = [
+            message
+            for turn in context_turns
+            for message in (
+                {"role": "user", "content": turn.user_content},
+                {"role": "assistant", "content": turn.assistant_content},
+            )
+        ] or self.get(session_id)
         summary = self._summaries.get(session_id, {}).get("text", "")
         if history:
             payload = self._build_summary_payload(

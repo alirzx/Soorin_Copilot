@@ -216,12 +216,17 @@ def derive_turn_policy(
     broad_recall = bool(BROAD_CONVERSATION_RECALL_REQUEST.search(request))
     if constraints.memory_only or broad_recall:
         values = resolved or active
+        explicit_switch = bool(
+            resolved
+            and source in {"message", "ui"}
+            and tuple(resolved) != tuple(active)
+        )
         return TurnPolicy(
             operation="memory_write" if constraints.memory_write else "memory_recall",
             target=(target_for(values, source) if resolved else "conversation"),  # type: ignore[arg-type]
             target_entities=values,
             requires_domain_router=False,
-            episode_transition="keep",
+            episode_transition="switch" if explicit_switch else "keep",
             reason_codes=("deterministic_conversation_memory_recall",) if broad_recall else constraints.reason_codes,
         )
 
