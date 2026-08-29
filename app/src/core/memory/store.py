@@ -252,8 +252,9 @@ class MemoryStore:
         working.baseline = baseline
         self.repository.set_working(working)
         logger.info(
-            "event=investigation_baseline_persisted request_id=%s projection_count=%s",
+            "event=investigation_baseline_persisted request_id=%s entity=%s projection_count=%s",
             request_id,
+            ",".join(baseline.entity_ids) or "none",
             len(baseline.projections),
         )
         return True

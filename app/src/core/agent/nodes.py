@@ -1145,6 +1145,39 @@ class CopilotWorkflowNodes:
             return "skipped"
         return matches[0] if len(set(matches)) == 1 else "partial"
 
+    @staticmethod
+    def _baseline_capture_rejection_reason(
+        task: Any,
+        results: tuple[Any, ...],
+        identity: Any,
+        review: Any,
+    ) -> str:
+        if task.evidence_mode not in {"normal", "current_verification", "verify_if_stale"}:
+            return "ineligible_evidence_mode"
+        if identity is None or not getattr(identity, "user_id", None):
+            return "missing_owner_identity"
+        if getattr(review, "outcome", None) != "sufficient":
+            return "evidence_review_not_sufficient"
+        operational = tuple(
+            item
+            for item in results
+            if item.source_capability in {"asset.get_profile", "asset.get_detection"}
+            or item.source_capability.startswith("graph.")
+        )
+        if not operational:
+            return "no_operational_evidence"
+        if any(item.status != "ok" for item in operational):
+            return "operational_evidence_not_successful"
+        if any(item.completeness != "complete" for item in operational):
+            return "operational_evidence_incomplete"
+        if any(item.truncated or item.projection_truncated for item in operational):
+            return "operational_evidence_truncated"
+        if any(not item.source_payload_complete or not item.projection_usable for item in operational):
+            return "operational_projection_unusable"
+        if any(not item.context_included for item in operational):
+            return "operational_evidence_context_excluded"
+        return ""
+
     def update_memory(self, state: InvestigationState) -> dict[str, Any]:
         if (state.get("memory_update_result") or {}).get("completed"):
             return {"next_edge": "terminal"}
@@ -1155,6 +1188,14 @@ class CopilotWorkflowNodes:
         pending_facts = tuple(state.get("pending_working_facts") or ())
         identity = state.get("request_identity")
         baseline_written = False
+        baseline_rejection_reason = self._baseline_capture_rejection_reason(
+            task,
+            tuple(results),
+            identity,
+            state.get("review_decision"),
+        )
+        if not self.settings.chat_store_history:
+            baseline_rejection_reason = "working_memory_disabled"
         if pending_facts:
             self.service.memory_store.upsert_working_facts(
                 state["session_id"],
@@ -1178,7 +1219,7 @@ class CopilotWorkflowNodes:
                 scope=task.scope,
                 request_id=state["request_id"],
             )
-            if identity is not None and getattr(identity, "user_id", None):
+            if not baseline_rejection_reason:
                 baseline = investigation_baseline_from_results(
                     tuple(results),
                     owner_id=str(identity.user_id),
@@ -1193,6 +1234,17 @@ class CopilotWorkflowNodes:
                         baseline,
                         request_id=state["request_id"],
                     )
+                    if not baseline_written:
+                        baseline_rejection_reason = "working_episode_rejected_baseline"
+                else:
+                    baseline_rejection_reason = "normalized_projection_set_ineligible"
+        if baseline_rejection_reason:
+            logger.info(
+                "event=investigation_baseline_rejected request_id=%s entity=%s reason=%s",
+                state["request_id"],
+                ",".join(context_key.entities) or "none",
+                baseline_rejection_reason,
+            )
         previous = state["active_entity_state"]
         resolved = state["resolved_entities"]
         route = state["routing_result"]

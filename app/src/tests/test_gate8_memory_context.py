@@ -49,6 +49,7 @@ from src.core.context.product_views import build_product_view, payload_inventory
 from src.core.copilot.service import CopilotService
 from src.core.memory.episodes import BaselineProjection, InvestigationBaseline, MemoryContextKey
 from src.core.memory.long_term import LongTermMemoryRecord, MemoryPromotionPolicy, RetrievedLongTermMemory
+from src.core.memory.persistence import THREAD_STATE_SCHEMA_VERSION, ThreadMemoryState
 from src.core.memory.retrieval import LongTermMemorySelection
 from src.core.memory.routing_state import SessionRoutingState, SessionRoutingStateStore
 from src.core.memory.store import MemoryStore
@@ -697,6 +698,33 @@ def _complete_product_result(
     )
 
 
+def _complete_graph_result() -> ToolResult:
+    return ToolResult(
+        status="ok",
+        entities=(IP,),
+        source_capability="graph.get_summary",
+        retrieved_at="2026-08-20T00:00:00+00:00",
+        valid_at="2026-08-20T00:00:00+00:00",
+        freshness="current",
+        completeness="complete",
+        context_included=True,
+        projection_usable=True,
+        source_payload_complete=True,
+        provider_result=SimpleNamespace(context={
+            "target_ip": IP,
+            "requested_scope": "node_summary",
+            "direction": "both",
+            "depth": 0,
+            "inbound_total": 1,
+            "outbound_total": 1,
+            "bidirectional_total": 0,
+            "complete_for_user_request": True,
+            "retrieval_truncated": False,
+            "nodes": [{"id": IP}],
+        }),
+    )
+
+
 @pytest.mark.parametrize(
     ("result", "capability"),
     (
@@ -1112,3 +1140,169 @@ def test_update_memory_captures_baseline_from_tool_results_not_assistant_prose()
     assert baseline.source_request_id == identity.request_id
     assert baseline.projections[0].payload == {"role": "server", "risk": 7}
     assert "assistant prose" not in str(baseline.projections[0].payload)
+
+
+def _run_baseline_update(
+    task: TaskSpec,
+    results: tuple[ToolResult, ...],
+    *,
+    request_id: str,
+    fallback_used: bool = False,
+    limitations: tuple[str, ...] = (),
+) -> tuple[dict[str, Any], MemoryStore, RequestIdentity]:
+    key = MemoryContextKey.from_task(task)
+    memory = MemoryStore(20)
+    service = SimpleNamespace(
+        settings=get_settings(),
+        memory_store=memory,
+        routing_state_store=SessionRoutingStateStore(),
+        long_term_memory_coordinator=None,
+        persist_thread_continuity=lambda *_args, **_kwargs: None,
+        persist_completed_local_turn=lambda *_args, **_kwargs: None,
+    )
+    identity = RequestIdentity.resolve(
+        user_id="user_test",
+        conversation_id="conversation-test",
+        session_id=f"session-{request_id}",
+        request_id=request_id,
+    )
+    state = {
+        "task": task,
+        "tool_results": list(results),
+        "synthesis_result": {
+            "answer": "Grounded current investigation.",
+            "status": "completed_with_limitations" if fallback_used else "completed",
+        },
+        "memory_context_key": key,
+        "pending_working_facts": (),
+        "session_id": identity.session_id,
+        "request_id": identity.request_id,
+        "request_identity": identity,
+        "message": task.request,
+        "evidence_pack": SimpleNamespace(limitations=limitations),
+        "active_entity_state": SessionRoutingState(active_entities=(IP,)),
+        "resolved_entities": EntityResolver().resolve(IP),
+        "routing_result": SimpleNamespace(
+            intent="asset_investigation",
+            scope="node_summary",
+            direction="both",
+            depth=0,
+            use_detection=True,
+            use_asset_profile=True,
+        ),
+        "execution_plan": ExecutionPlan(
+            task=task,
+            steps=tuple(
+                PlanStep(f"step-{index}", capability)
+                for index, capability in enumerate(task.required_capabilities)
+            ),
+            plan_id="baseline-plan",
+        ),
+        "review_decision": ReviewDecision(outcome="sufficient"),
+        "fallback_used": fallback_used,
+        "limitation_reasons": list(limitations),
+    }
+    return CopilotWorkflowNodes(service).update_memory(state), memory, identity
+
+
+def test_complete_sufficient_multisource_baseline_survives_fallback_and_thread_state_roundtrip(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level("INFO")
+    task = _task(
+        "Analyze the current asset.",
+        ("asset.get_profile", "asset.get_detection", "graph.get_summary"),
+    )
+    results = (
+        _complete_product_result(),
+        _complete_product_result(
+            "asset.get_detection",
+            payload={"classification": "server", "confidence": 0.9},
+        ),
+        _complete_graph_result(),
+    )
+
+    update, memory, identity = _run_baseline_update(
+        task,
+        results,
+        request_id="complete-fallback-baseline",
+        fallback_used=True,
+        limitations=("validated_plan_fallback_used",),
+    )
+    baseline = memory.repository.get_working(identity.session_id).baseline  # type: ignore[union-attr]
+
+    assert update["memory_update_result"]["investigation_baseline_write_count"] == 1
+    assert baseline is not None
+    assert {item.capability for item in baseline.projections} == {
+        "asset.get_profile",
+        "asset.get_detection",
+        "graph.get_summary",
+    }
+    assert "event=investigation_baseline_persisted" in caplog.text
+    assert f"entity={IP}" in caplog.text
+
+    state = ThreadMemoryState.from_routing_state(
+        identity,
+        update["active_entity_state"],
+        **memory.durable_components(identity.session_id, turn_limit=4, episode_limit=4),
+    )
+    restored_state = ThreadMemoryState.from_payload(
+        state.to_payload(),
+        thread_key=identity.thread_key,
+        user_id=identity.user_id,
+        conversation_id=identity.conversation_id,
+        session_id=identity.session_id,
+        updated_at=state.updated_at,
+        revision=1,
+        schema_version=THREAD_STATE_SCHEMA_VERSION,
+    )
+    restored_memory = MemoryStore(20)
+    restored_memory.restore_durable_state(restored_state)
+    restored = restored_memory.repository.get_working(identity.session_id)
+    assert restored is not None
+    assert restored.baseline == baseline
+
+
+def test_memory_only_update_does_not_capture_baseline(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level("INFO")
+    task = replace(
+        _task("Use memory only.", ("asset.get_profile",)),
+        evidence_mode="memory_only",
+        temporal_mode="historical",
+    )
+
+    update, memory, identity = _run_baseline_update(
+        task,
+        (_complete_product_result(),),
+        request_id="memory-only-no-baseline",
+    )
+    working = memory.repository.get_working(identity.session_id)
+
+    assert update["memory_update_result"]["investigation_baseline_write_count"] == 0
+    assert working is not None and working.baseline is None
+    assert "reason=ineligible_evidence_mode" in caplog.text
+
+
+@pytest.mark.parametrize(
+    "unsafe_result",
+    (
+        replace(_complete_product_result(), status="unavailable", completeness="unknown"),
+        replace(_complete_product_result(), status="partial", completeness="partial"),
+    ),
+)
+def test_failed_or_partial_update_does_not_capture_baseline(
+    unsafe_result: ToolResult,
+) -> None:
+    task = _task("Analyze the current asset.", ("asset.get_profile",))
+
+    update, memory, identity = _run_baseline_update(
+        task,
+        (unsafe_result,),
+        request_id=f"unsafe-{unsafe_result.status}",
+    )
+    working = memory.repository.get_working(identity.session_id)
+
+    assert update["memory_update_result"]["investigation_baseline_write_count"] == 0
+    assert working is not None and working.baseline is None
