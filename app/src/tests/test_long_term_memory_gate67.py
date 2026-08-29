@@ -109,6 +109,7 @@ def structured_candidate(
         source_conversation_id="conversation-a",
         evidence_refs=("evidence_class_asset_role", "complete"),
         provenance_category=provenance,
+        epistemic_status="source_validated" if provenance == "product" else "candidate",
     )
 
 
@@ -1046,3 +1047,158 @@ def test_offline_retrieval_quality_fixture_metrics(sqlite_store) -> None:
     assert sum(recalls) / len(recalls) == 1.0
     assert sum(reciprocal_ranks) / len(reciprocal_ranks) >= 0.5
     assert sum(ndcgs) / len(ndcgs) >= 0.6
+
+
+# ---------------------------------------------------------------------------
+# Regression: product-derived LTM lifecycle compatibility
+# ---------------------------------------------------------------------------
+
+
+def test_eligible_product_evidence_auto_promotes_with_source_validated(sqlite_store) -> None:
+    """Eligible validated Product evidence: candidate status, source_validated epistemic, auto-promote allowed."""
+    memory = structured_candidate()
+    assert memory.epistemic_status == "source_validated"
+    assert memory.status == "candidate"
+
+    coordinator = LongTermMemoryCoordinator(sqlite_store, None)
+    result = coordinator.process_candidate(memory, product_evidence())
+
+    assert result.decision.action == "auto_promote"
+    assert result.decision.reason_code == "validated_product_fact"
+    assert result.memory.status == "active"
+    assert result.memory.epistemic_status == "source_validated"
+    assert result.memory.authoritative
+
+
+def test_review_required_evidence_remains_candidate_with_candidate_epistemic(sqlite_store) -> None:
+    """Review-required evidence: candidate status, candidate epistemic, no auto-promote."""
+    memory = structured_candidate(provenance="analyst")
+    assert memory.epistemic_status == "candidate"
+    assert memory.status == "candidate"
+
+    coordinator = LongTermMemoryCoordinator(sqlite_store, None)
+    result = coordinator.process_candidate(memory, product_evidence())
+
+    assert result.decision.action == "requires_review"
+    assert result.memory.status == "candidate"
+    assert result.memory.epistemic_status == "candidate"
+    assert not result.memory.authoritative
+
+
+def test_analyst_confirmed_memory_preserves_epistemic_status(sqlite_store) -> None:
+    """Analyst-confirmed memory: epistemic_status=analyst_confirmed preserved through promotion."""
+    item = candidate()
+    promoted = MemoryPromotionPolicy.promote(
+        item,
+        epistemic_status="analyst_confirmed",
+        confidence=0.95,
+        provenance_category="analyst",
+    )
+    stored = sqlite_store.put(memory=promoted)
+    assert stored.epistemic_status == "analyst_confirmed"
+    assert stored.status == "active"
+    assert stored.authoritative
+
+
+def test_candidate_epistemic_status_never_enters_auto_promote(sqlite_store) -> None:
+    """A candidate with epistemic_status=candidate can never reach auto_promote path."""
+    memory = LongTermMemoryRecord.candidate(
+        memory_type="validated_finding",
+        user_id="user-a",
+        entity_ids=("192.0.2.10",),
+        statement="{}",
+        source_request_id="req-test",
+        source_conversation_id="conv-test",
+        evidence_refs=("finding-x",),
+        epistemic_status="candidate",
+    )
+    assert memory.epistemic_status == "candidate"
+    coordinator = LongTermMemoryCoordinator(sqlite_store, None)
+    result = coordinator.process_candidate(memory, product_evidence())
+    assert result.decision.action != "auto_promote"
+    assert result.memory.status == "candidate"
+
+
+def test_product_candidate_epistemic_status_set_at_creation() -> None:
+    """Product-provenance candidates get source_validated epistemic status at creation time."""
+    memory = LongTermMemoryRecord.candidate(
+        memory_type="validated_finding",
+        user_id="user-a",
+        entity_ids=("192.0.2.10",),
+        statement="{}",
+        source_request_id="req-test",
+        source_conversation_id="conv-test",
+        evidence_refs=("evidence_class_asset_role",),
+        provenance_category="product",
+        epistemic_status="source_validated",
+    )
+    assert memory.epistemic_status == "source_validated"
+    assert memory.provenance_category == "product"
+    assert memory.status == "candidate"
+
+
+def test_non_product_candidate_keeps_candidate_epistemic() -> None:
+    """Non-product candidates without explicit epistemic_status remain candidate."""
+    memory = LongTermMemoryRecord.candidate(
+        memory_type="validated_finding",
+        user_id="user-a",
+        entity_ids=("192.0.2.10",),
+        statement="{}",
+        source_request_id="req-test",
+        source_conversation_id="conv-test",
+        evidence_refs=("finding-y",),
+        provenance_category="investigation",
+    )
+    assert memory.epistemic_status == "candidate"
+    assert memory.provenance_category == "investigation"
+
+
+def test_no_qdrant_indexing_before_successful_activation(sqlite_store) -> None:
+    """Semantic index is only called after the memory reaches active status."""
+    class TrackingIndex:
+        def __init__(self):
+            self.calls = []
+        def index(self, memory):
+            self.calls.append(memory)
+            return memory
+
+    index = TrackingIndex()
+    coordinator = LongTermMemoryCoordinator(sqlite_store, index)
+    result = coordinator.process_candidate(structured_candidate(), product_evidence())
+
+    assert result.memory.status == "active"
+    assert len(index.calls) == 1
+    assert index.calls[0].memory_id == result.memory.memory_id
+
+    review_memory = structured_candidate(provenance="analyst")
+    review_result = LongTermMemoryCoordinator(sqlite_store, index).process_candidate(
+        review_memory, product_evidence()
+    )
+    assert review_result.memory.status == "candidate"
+    assert len(index.calls) == 1
+
+
+def test_product_candidate_confidence_preserved_from_evidence_if_deterministic() -> None:
+    """If a candidate carries a deterministic confidence, it is preserved; otherwise not invented."""
+    memory_with_confidence = LongTermMemoryRecord.candidate(
+        memory_type="validated_finding",
+        user_id="user-a",
+        entity_ids=("192.0.2.10",),
+        statement="{}",
+        source_request_id="req-test",
+        source_conversation_id="conv-test",
+        evidence_refs=("finding-z",),
+        confidence=0.42,
+    )
+    assert memory_with_confidence.confidence == 0.42
+
+    memory_default = LongTermMemoryRecord.candidate(
+        memory_type="validated_finding",
+        user_id="user-a",
+        entity_ids=("192.0.2.10",),
+        statement="{}",
+        source_request_id="req-test",
+        source_conversation_id="conv-test",
+        evidence_refs=("finding-z",),
+    )
+    assert memory_default.confidence == 0.0
