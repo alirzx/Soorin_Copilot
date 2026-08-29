@@ -10,6 +10,21 @@ Audit date: 2026-08-05.
 > In particular, current `dev` does not validate Product JWTs and `X-User-ID`
 > remains untrusted metadata; its SQLite transcript, user, and chatroom records
 > are local simulation only.
+>
+> **2026-08-28 memory/control-plane addendum:** deterministic `TurnPolicy` now
+> resolves conversation operation, target authority, and `KEEP`/`SWITCH`/`DETACH`
+> episode policy before semantic routing. High-confidence broad conversation
+> recall bypasses the Router; the existing semantic Router is used only when
+> ambiguity remains. A request with `require_current=True` fails closed when no
+> live capability is authorized. Complete normalized Profile, Detection, and
+> bounded Graph projections can form an owner/entity-bound
+> `InvestigationBaseline` persisted inside the existing Product ThreadState
+> `stateJson`. Baselines are bounded, versioned, and compared by the
+> deterministic DeltaEngine; current operational evidence remains mandatory for
+> current verification. See
+> [MEMORY_WORKFLOW_CURRENT_DEV_AUDIT.md](MEMORY_WORKFLOW_CURRENT_DEV_AUDIT.md)
+> for the exact lifecycle and compatibility rules.
+>
 
 This document describes the implemented repository state. It distinguishes working behavior from partial foundations, placeholders, and deferred work. It should be updated after architecture-changing code changes.
 

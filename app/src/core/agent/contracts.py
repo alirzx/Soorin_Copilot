@@ -15,6 +15,24 @@ ReviewOutcome = Literal["sufficient", "answer_with_limitations", "missing_requir
 WorkflowMode = Literal["direct", "multi_step"]
 TemporalMode = Literal["current", "historical", "mixed", "compare_previous_current"]
 EvidenceMode = Literal["normal", "memory_only", "no_live_refresh", "current_verification", "verify_if_stale"]
+ConversationOperation = Literal[
+    "new_task",
+    "follow_up",
+    "memory_recall",
+    "current_verification",
+    "compare_previous_current",
+    "memory_write",
+    "topic_detach",
+]
+TurnTarget = Literal[
+    "explicit_entity",
+    "ui_entity",
+    "active_entity",
+    "active_pair",
+    "conversation",
+    "none",
+]
+EpisodeTransition = Literal["keep", "switch", "detach"]
 ResponseDepth = Literal["brief", "standard", "deep", "report"]
 StepRequirement = Literal["required", "optional"]
 PlanSource = Literal["deterministic", "llm", "deterministic_fallback"]
@@ -125,6 +143,18 @@ class RequestConstraints:
     require_current: bool = False
     memory_only: bool = False
     memory_write: bool = False
+    reason_codes: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class TurnPolicy:
+    """Authoritative deterministic control decision for one conversation turn."""
+
+    operation: ConversationOperation
+    target: TurnTarget
+    target_entities: tuple[str, ...] = ()
+    requires_domain_router: bool = True
+    episode_transition: EpisodeTransition = "keep"
     reason_codes: tuple[str, ...] = ()
 
 
@@ -290,6 +320,7 @@ class InvestigationState(TypedDict, total=False):
     active_entity_state: Any
     recent_messages: list[dict[str, str]]
     request_constraints: RequestConstraints
+    turn_policy: TurnPolicy
     pending_working_facts: tuple[Any, ...]
     routing_result: Any
     plan_validation_result: dict[str, Any]

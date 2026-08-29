@@ -2,12 +2,21 @@
 
 from __future__ import annotations
 
+import hashlib
 import ipaddress
+import json
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
 from src.core.identity import RequestIdentity, normalize_identifier
+from src.core.memory.baselines import (
+    MAX_BASELINE_PROJECTIONS,
+    MAX_BASELINE_PROJECTION_BYTES,
+    MAX_BASELINE_TOTAL_BYTES,
+    BaselineProjection,
+    InvestigationBaseline,
+)
 from src.core.memory.episodes import (
     EpisodeRecord,
     MemoryContextKey,
@@ -19,7 +28,8 @@ from src.core.memory.routing_state import SessionRoutingState
 
 
 LOCAL_SCHEMA_VERSION = 7
-THREAD_STATE_SCHEMA_VERSION = 3
+THREAD_STATE_SCHEMA_VERSION = 4
+_COMPATIBLE_THREAD_STATE_SCHEMA_VERSIONS = frozenset({3, 4})
 MAX_THREAD_STATE_BYTES = 16_384
 MAX_CHAT_CONTENT_CHARS = 100_000
 MAX_CONVERSATION_TITLE_CHARS = 256
@@ -176,20 +186,30 @@ def _bounded_strings(value: Any, *, field_name: str, maximum_items: int, maximum
     return tuple(_bounded_text(item, maximum=maximum_chars) for item in value)
 
 
-def _working_memory_from_payload(value: Any, session_id: str) -> WorkingMemory | None:
+def _working_memory_from_payload(
+    value: Any,
+    session_id: str,
+    owner_id: str,
+) -> WorkingMemory | None:
     if value is None:
         return None
     if not isinstance(value, dict):
         raise LocalPersistenceSchemaError("Invalid persisted working memory.")
+    context_key = _context_key_from_payload(value.get("context_key"))
     return WorkingMemory(
         session_id=session_id,
-        context_key=_context_key_from_payload(value.get("context_key")),
+        context_key=context_key,
         episode_id=_bounded_optional(value.get("episode_id"), field_name="episode_id") or "",
         compact_summary=_bounded_text(value.get("compact_summary"), maximum=4_000),
         last_providers=_bounded_strings(value.get("last_providers", []), field_name="last_providers", maximum_items=8, maximum_chars=64),
         last_scope=_bounded_optional(value.get("last_scope"), field_name="last_scope") or "none",
         limitations=_bounded_strings(value.get("limitations", []), field_name="limitations", maximum_items=8, maximum_chars=200),
         working_facts=_working_facts_from_payload(value.get("working_facts", [])),
+        baseline=_baseline_from_payload(
+            value.get("baseline"),
+            owner_id=owner_id,
+            context_entities=context_key.entities,
+        ),
     )
 
 
@@ -232,6 +252,127 @@ def _working_facts_payload(value: tuple[WorkingFact, ...]) -> list[dict[str, Any
     ]
 
 
+def _baseline_payload(value: InvestigationBaseline) -> dict[str, Any] | None:
+    if not value.projections or len(value.projections) > MAX_BASELINE_PROJECTIONS:
+        return None
+    projections: list[dict[str, Any]] = []
+    used_bytes = 0
+    for item in value.projections:
+        encoded = json.dumps(
+            item.payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+        used_bytes += len(encoded)
+        if (
+            len(encoded) > MAX_BASELINE_PROJECTION_BYTES
+            or used_bytes > MAX_BASELINE_TOTAL_BYTES
+            or hashlib.sha256(encoded).hexdigest() != item.fingerprint
+        ):
+            return None
+        projections.append({
+            "capability": item.capability,
+            "entity_ids": list(item.entity_ids),
+            "view": item.view,
+            "schema_version": item.schema_version,
+            "evidence_classes": list(item.evidence_classes),
+            "payload": item.payload,
+            "valid_at": item.valid_at,
+            "completeness": item.completeness,
+            "fingerprint": item.fingerprint,
+            "scope": item.scope,
+            "direction": item.direction,
+            "depth": item.depth,
+            "truncated": item.truncated,
+        })
+    return {
+        "entity_ids": list(value.entity_ids),
+        "captured_at": value.captured_at,
+        "source_request_id": value.source_request_id,
+        "scope": value.scope,
+        "owner_id": value.owner_id,
+        "projections": projections,
+    }
+
+
+def _baseline_from_payload(
+    value: Any,
+    *,
+    owner_id: str,
+    context_entities: tuple[str, ...],
+) -> InvestigationBaseline | None:
+    if value is None:
+        return None
+    try:
+        if not isinstance(value, dict):
+            raise LocalPersistenceSchemaError("Invalid persisted investigation baseline.")
+        entities = _ipv4_values(value.get("entity_ids", []), field_name="baseline entities")
+        persisted_owner = _bounded_optional(
+            value.get("owner_id"), field_name="baseline owner", maximum=128
+        ) or ""
+        if (owner_id and persisted_owner != owner_id) or (
+            context_entities and set(entities) != set(context_entities)
+        ):
+            return None
+        raw_projections = value.get("projections", [])
+        if not isinstance(raw_projections, list) or len(raw_projections) > MAX_BASELINE_PROJECTIONS:
+            raise LocalPersistenceSchemaError("Invalid persisted baseline projections.")
+        projections: list[BaselineProjection] = []
+        used_bytes = 0
+        for item in raw_projections:
+            if not isinstance(item, dict):
+                raise LocalPersistenceSchemaError("Invalid persisted baseline projection.")
+            payload = item.get("payload")
+            if not isinstance(payload, dict):
+                raise LocalPersistenceSchemaError("Invalid persisted baseline payload.")
+            encoded = json.dumps(
+                payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+            ).encode("utf-8")
+            if len(encoded) > MAX_BASELINE_PROJECTION_BYTES:
+                return None
+            used_bytes += len(encoded)
+            if used_bytes > MAX_BASELINE_TOTAL_BYTES:
+                return None
+            projection_entities = _ipv4_values(
+                item.get("entity_ids", []), field_name="baseline projection entities"
+            )
+            if not projection_entities or not set(projection_entities).issubset(entities):
+                return None
+            completeness = str(item.get("completeness") or "")
+            if completeness not in {"complete", "partial"}:
+                return None
+            expected_fingerprint = hashlib.sha256(encoded).hexdigest()
+            supplied_fingerprint = _bounded_text(item.get("fingerprint"), maximum=64)
+            if supplied_fingerprint != expected_fingerprint:
+                return None
+            depth = item.get("depth", 0)
+            if not isinstance(depth, int) or not 0 <= depth <= 10:
+                return None
+            projections.append(BaselineProjection(
+                capability=_bounded_optional(item.get("capability"), field_name="baseline capability", maximum=128) or "",
+                entity_ids=projection_entities,
+                view=_bounded_optional(item.get("view"), field_name="baseline view", maximum=128) or "",
+                schema_version=_bounded_optional(item.get("schema_version"), field_name="baseline schema", maximum=128) or "",
+                evidence_classes=_bounded_strings(item.get("evidence_classes", []), field_name="baseline evidence classes", maximum_items=8, maximum_chars=128),
+                payload=payload,
+                valid_at=_bounded_text(item.get("valid_at"), maximum=64),
+                completeness=completeness,
+                fingerprint=supplied_fingerprint,
+                scope=_bounded_optional(item.get("scope"), field_name="baseline scope", maximum=128) or "none",
+                direction=_bounded_optional(item.get("direction"), field_name="baseline direction", maximum=32) or "none",
+                depth=depth,
+                truncated=_boolean(item.get("truncated", False), field_name="baseline truncated"),
+            ))
+        if not projections:
+            return None
+        return InvestigationBaseline(
+            entity_ids=entities,
+            captured_at=_bounded_text(value.get("captured_at"), maximum=64),
+            source_request_id=_bounded_optional(value.get("source_request_id"), field_name="baseline request id", maximum=128) or "",
+            scope=_bounded_optional(value.get("scope"), field_name="baseline scope", maximum=128) or "none",
+            projections=tuple(projections),
+            owner_id=persisted_owner,
+        )
+    except (LocalPersistenceSchemaError, TypeError, ValueError):
+        return None
 def _turn_references_from_payload(value: Any) -> tuple[TurnReference, ...]:
     if not isinstance(value, list) or len(value) > 20:
         raise LocalPersistenceSchemaError("Invalid persisted recent turn references.")
@@ -250,7 +391,7 @@ def _turn_references_from_payload(value: Any) -> tuple[TurnReference, ...]:
 
 
 def _episode_payload(value: EpisodeRecord) -> dict[str, Any]:
-    return {
+    payload = {
         "episode_id": value.episode_id,
         "context_key": _context_key_payload(value.context_key),
         "created_at": value.created_at,
@@ -268,9 +409,17 @@ def _episode_payload(value: EpisodeRecord) -> dict[str, Any]:
         "last_scope": value.last_scope,
         "turn_count": value.turn_count,
     }
+    baseline = _baseline_payload(value.baseline) if value.baseline is not None else None
+    if baseline is not None:
+        payload["baseline"] = baseline
+    return payload
 
 
-def _episodes_from_payload(value: Any, session_id: str) -> tuple[EpisodeRecord, ...]:
+def _episodes_from_payload(
+    value: Any,
+    session_id: str,
+    owner_id: str,
+) -> tuple[EpisodeRecord, ...]:
     if not isinstance(value, list) or len(value) > 20:
         raise LocalPersistenceSchemaError("Invalid persisted recent episodes.")
     records: list[EpisodeRecord] = []
@@ -280,11 +429,12 @@ def _episodes_from_payload(value: Any, session_id: str) -> tuple[EpisodeRecord, 
         turn_count = item.get("turn_count", 0)
         if not isinstance(turn_count, int) or turn_count < 0:
             raise LocalPersistenceSchemaError("Invalid persisted episode turn count.")
+        context_key = _context_key_from_payload(item.get("context_key"))
         records.append(
             EpisodeRecord(
                 episode_id=_bounded_optional(item.get("episode_id"), field_name="episode_id") or "",
                 session_id=session_id,
-                context_key=_context_key_from_payload(item.get("context_key")),
+                context_key=context_key,
                 created_at=_bounded_text(item.get("created_at"), maximum=64),
                 updated_at=_bounded_text(item.get("updated_at"), maximum=64),
                 compact_summary=_bounded_text(item.get("compact_summary"), maximum=4_000),
@@ -299,6 +449,11 @@ def _episodes_from_payload(value: Any, session_id: str) -> tuple[EpisodeRecord, 
                 last_providers=_bounded_strings(item.get("last_providers", []), field_name="last_providers", maximum_items=8, maximum_chars=64),
                 last_scope=_bounded_optional(item.get("last_scope"), field_name="last_scope") or "none",
                 turn_count=turn_count,
+                baseline=_baseline_from_payload(
+                    item.get("baseline"),
+                    owner_id=owner_id,
+                    context_entities=context_key.entities,
+                ),
             )
         )
     return tuple(records)
@@ -428,6 +583,25 @@ class ThreadMemoryState:
                 "last_scope": self.working_memory.last_scope,
                 "limitations": list(self.working_memory.limitations),
             }
+            baseline = (
+                _baseline_payload(self.working_memory.baseline)
+                if self.working_memory.baseline is not None
+                else None
+            )
+            if baseline is not None:
+                payload["working_memory"]["baseline"] = baseline
+
+        def payload_size() -> int:
+            return len(json.dumps(
+                payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+            ).encode("utf-8"))
+
+        for episode in payload["recent_episodes"]:
+            if payload_size() <= MAX_THREAD_STATE_BYTES:
+                break
+            episode.pop("baseline", None)
+        if payload_size() > MAX_THREAD_STATE_BYTES and "working_memory" in payload:
+            payload["working_memory"].pop("baseline", None)
         return payload
 
     @classmethod
@@ -443,7 +617,7 @@ class ThreadMemoryState:
         revision: int,
         schema_version: int,
     ) -> "ThreadMemoryState":
-        if schema_version != THREAD_STATE_SCHEMA_VERSION:
+        if schema_version not in _COMPATIBLE_THREAD_STATE_SCHEMA_VERSIONS:
             raise LocalPersistenceSchemaError(
                 "Persisted thread-state schema version is incompatible."
             )
@@ -492,9 +666,14 @@ class ThreadMemoryState:
             raise LocalPersistenceSchemaError("Invalid persisted previous_depth.")
         if revision < 0:
             raise LocalPersistenceSchemaError("Invalid persisted revision.")
-        working_memory = _working_memory_from_payload(payload.get("working_memory"), session_id)
+        normalized_owner = normalize_identifier(user_id, field_name="user_id") if user_id else ""
+        working_memory = _working_memory_from_payload(
+            payload.get("working_memory"), session_id, normalized_owner
+        )
         turn_references = _turn_references_from_payload(payload.get("recent_turn_references", []))
-        episodes = _episodes_from_payload(payload.get("recent_episodes", []), session_id)
+        episodes = _episodes_from_payload(
+            payload.get("recent_episodes", []), session_id, normalized_owner
+        )
         summary_size = payload.get("summary_size_tokens", 0)
         if not isinstance(summary_size, int) or not 0 <= summary_size <= 16_384:
             raise LocalPersistenceSchemaError("Invalid persisted summary_size_tokens.")

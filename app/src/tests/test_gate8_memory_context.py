@@ -11,7 +11,13 @@ from unittest.mock import patch
 import pytest
 
 from src.config.settings import get_settings
-from src.core.agent.contracts import ExecutionPlan, PlanStep, TaskSpec, ToolResult
+from src.core.agent.contracts import (
+    ExecutionPlan,
+    PlanStep,
+    ReviewDecision,
+    TaskSpec,
+    ToolResult,
+)
 from src.core.agent.nodes import CopilotWorkflowNodes
 from src.core.agent.reviewer import EvidenceReviewer
 from src.core.agent.evidence_policy import (
@@ -23,7 +29,14 @@ from src.core.agent.evidence_policy import (
     evidence_refs_from_validated_result,
     structured_memory_statement,
 )
-from src.core.context.compaction import build_delta_context, deduplicate_payloads
+from src.core.context.compaction import (
+    CurrentEvidenceProjection,
+    build_delta_context,
+    deduplicate_payloads,
+    episodic_baseline_projections,
+    fingerprint,
+    investigation_baseline_from_results,
+)
 from src.core.context.compaction import (
     HistoricalBaselineProjection,
     current_evidence_projections,
@@ -33,7 +46,12 @@ from src.core.context.composer import ContextComposer
 from src.core.context.entities import EntityResolver
 from src.core.context.models import CopilotContextPackage
 from src.core.context.product_views import build_product_view, payload_inventory, select_product_views
+from src.core.copilot.service import CopilotService
+from src.core.memory.episodes import BaselineProjection, InvestigationBaseline, MemoryContextKey
 from src.core.memory.long_term import LongTermMemoryRecord, MemoryPromotionPolicy, RetrievedLongTermMemory
+from src.core.memory.retrieval import LongTermMemorySelection
+from src.core.memory.routing_state import SessionRoutingState, SessionRoutingStateStore
+from src.core.memory.store import MemoryStore
 from src.core.identity import RequestIdentity
 from src.core.product_client import ProductApiClient
 
@@ -653,6 +671,379 @@ def test_production_composer_fails_closed_for_incompatible_baseline(
     assert composer.last_delta_contexts == ()
     assert composer.last_delta_skip_reason == expected_reason
 
+def _complete_product_result(
+    capability: str = "asset.get_profile",
+    *,
+    view: str = "overview",
+    payload: dict[str, Any] | None = None,
+) -> ToolResult:
+    return ToolResult(
+        status="ok",
+        entities=(IP,),
+        source_capability=capability,
+        retrieved_at="2026-08-20T00:00:00+00:00",
+        valid_at="2026-08-20T00:00:00+00:00",
+        freshness="current",
+        completeness="complete",
+        context_included=True,
+        selected_views=(view,),
+        view_payload={
+            "provider": capability,
+            "views": {view: payload or {"role": "server", "risk": 7}},
+        },
+        projection_schema_version="product-view-v1",
+        projection_usable=True,
+        source_payload_complete=True,
+    )
+
+
+@pytest.mark.parametrize(
+    ("result", "capability"),
+    (
+        (_complete_product_result(), "asset.get_profile"),
+        (
+            _complete_product_result(
+                "asset.get_detection",
+                payload={"classification": "server", "confidence": 0.9},
+            ),
+            "asset.get_detection",
+        ),
+        (
+            ToolResult(
+                status="ok",
+                entities=(IP,),
+                source_capability="graph.get_summary",
+                retrieved_at="2026-08-20T00:00:00+00:00",
+                valid_at="2026-08-20T00:00:00+00:00",
+                freshness="current",
+                completeness="complete",
+                context_included=True,
+                projection_usable=True,
+                source_payload_complete=True,
+                provider_result=SimpleNamespace(context={
+                    "target_ip": IP,
+                    "requested_scope": "one_hop",
+                    "direction": "both",
+                    "depth": 1,
+                    "inbound_total": 1,
+                    "outbound_total": 1,
+                    "bidirectional_total": 0,
+                    "complete_for_user_request": True,
+                    "retrieval_truncated": False,
+                    "nodes": [
+                        {"id": IP},
+                        {"id": "192.0.2.11", "inbound": True, "hop": 1},
+                        {"id": "192.0.2.12", "outbound": True, "hop": 1},
+                    ],
+                }),
+            ),
+            "graph.get_summary",
+        ),
+    ),
+)
+def test_complete_normalized_evidence_captures_bounded_baseline(
+    result: ToolResult,
+    capability: str,
+) -> None:
+    baseline = investigation_baseline_from_results(
+        (result,),
+        owner_id="user_test",
+        source_request_id="capture-request",
+        scope="one_hop",
+        required_capabilities=(capability,),
+    )
+
+    assert baseline is not None
+    assert baseline.owner_id == "user_test"
+    assert {item.capability for item in baseline.projections} == {capability}
+    assert all(item.completeness == "complete" for item in baseline.projections)
+    if capability.startswith("graph."):
+        projection = baseline.projections[0]
+        assert projection.scope == "one_hop"
+        assert projection.direction == "both"
+        assert projection.depth == 1
+        assert {item["direction"] for item in projection.payload["peers"]} == {
+            "inbound", "outbound"
+        }
+
+
+def test_weak_or_memory_only_turn_cannot_create_baseline() -> None:
+    complete = _complete_product_result()
+    failed = replace(complete, status="unavailable", completeness="unknown")
+    partial = replace(complete, status="partial", completeness="partial")
+    excluded = replace(complete, context_included=False)
+
+    for results in ((), (failed,), (partial,), (excluded,)):
+        assert investigation_baseline_from_results(
+            results,
+            owner_id="user_test",
+            source_request_id="weak-request",
+            scope="node_summary",
+            required_capabilities=("asset.get_profile",),
+        ) is None
+
+
+def test_recursive_delta_classifies_nested_keyed_and_ambiguous_values() -> None:
+    baseline = {
+        "counts": {"inbound": 1, "outbound": 2},
+        "role": "server",
+        "peers": [
+            {"id": "peer-a", "direction": "outbound"},
+            {"id": "peer-b", "direction": "inbound"},
+        ],
+        "path_nodes": ["source", "old", "target"],
+        "removed_field": True,
+    }
+    current = {
+        "counts": {"inbound": 2, "outbound": 2},
+        "role": "server",
+        "peers": [
+            {"id": "peer-a", "direction": "bidirectional"},
+            {"id": "peer-c", "direction": "outbound"},
+        ],
+        "path_nodes": ["source", "new", "target"],
+        "new_field": True,
+    }
+    delta = build_delta_context(
+        current,
+        baseline=baseline,
+        current_identity="graph",
+        baseline_identity="graph",
+        schema_version="graph-baseline-v1",
+        baseline_schema_version="graph-baseline-v1",
+        baseline_accessible=True,
+    )
+
+    states = delta.payload["states"]
+    assert delta.created
+    assert any(item["path"] == "counts.inbound" for item in states["changed"])
+    assert any(item["path"] == "role" for item in states["unchanged"])
+    assert any(item["path"] == "peers[id=peer-c]" for item in states["new"])
+    assert any(item["path"] == "peers[id=peer-b]" for item in states["missing"])
+    assert any(
+        item["path"] == "peers[id=peer-a].direction"
+        for item in states["changed"]
+    )
+    assert any(item["path"] == "path_nodes" for item in states["incomparable"])
+
+
+def test_partial_current_delta_never_turns_unobserved_data_into_removal() -> None:
+    delta = build_delta_context(
+        {"peers": [{"id": "peer-a", "direction": "outbound"}]},
+        baseline={
+            "peers": [
+                {"id": "peer-a", "direction": "outbound"},
+                {"id": "peer-b", "direction": "inbound"},
+            ],
+            "count": 2,
+        },
+        current_identity="graph",
+        baseline_identity="graph",
+        schema_version="graph-baseline-v1",
+        baseline_schema_version="graph-baseline-v1",
+        baseline_accessible=True,
+        current_complete=False,
+    )
+
+    assert delta.created
+    assert delta.reason == "compatible_partial_current_baseline"
+    assert delta.payload["removed"] == {}
+    assert delta.payload["states"]["missing"] == []
+    assert delta.payload["states"]["incomparable"]
+
+
+def _episode_graph_projection(
+    *,
+    payload: dict[str, Any] | None = None,
+    completeness: str = "complete",
+) -> BaselineProjection:
+    data = payload or {
+        "counts": {"inbound_total": 1, "outbound_total": 1},
+        "peers": [{"id": "192.0.2.11", "direction": "inbound", "hop": 1}],
+    }
+    return BaselineProjection(
+        capability="graph.get_summary",
+        entity_ids=(IP,),
+        view="graph",
+        schema_version="graph-baseline-v1",
+        evidence_classes=("graph_topology",),
+        payload=data,
+        valid_at="2026-08-19T00:00:00+00:00",
+        completeness=completeness,  # type: ignore[arg-type]
+        fingerprint=fingerprint(data),
+        scope="one_hop",
+        direction="both",
+        depth=1,
+    )
+
+
+def test_episodic_graph_baseline_is_selected_and_not_reported_absent() -> None:
+    projection = _episode_graph_projection()
+    baseline = InvestigationBaseline(
+        entity_ids=(IP,),
+        captured_at=projection.valid_at,
+        source_request_id="episode-baseline",
+        scope="one_hop",
+        projections=(projection,),
+        owner_id="user_test",
+    )
+    current = CurrentEvidenceProjection(
+        owner_id="user_test",
+        entity=IP,
+        entity_ids=(IP,),
+        capability="graph.get_summary",
+        view="graph",
+        schema_version="graph-baseline-v1",
+        payload={
+            "counts": {"inbound_total": 2, "outbound_total": 1},
+            "peers": [
+                {"id": "192.0.2.11", "direction": "inbound", "hop": 1},
+                {"id": "192.0.2.12", "direction": "outbound", "hop": 1},
+            ],
+        },
+        retrieved_at="2026-08-20T00:00:00+00:00",
+        complete=True,
+        scope="one_hop",
+        direction="both",
+        depth=1,
+    )
+    composer = ContextComposer(get_settings())
+    composer.compose(
+        CopilotContextPackage(entities=EntityResolver().resolve(IP)),
+        current_projections=(current,),
+        historical_baselines=episodic_baseline_projections((baseline,)),
+        request_id="episode-delta",
+    )
+
+    assert composer.last_baseline_status == "available"
+    assert composer.last_baseline_present
+    assert composer.last_baseline_compatible
+    assert composer.last_delta_contexts
+
+
+@pytest.mark.parametrize(
+    ("change", "reason"),
+    (
+        ({"scope": "two_hop"}, "wrong_scope"),
+        ({"direction": "inbound"}, "wrong_direction"),
+        ({"depth": 2}, "wrong_depth"),
+        ({"schema_version": "graph-baseline-v0"}, "wrong_schema"),
+        ({"entity_ids": ("192.0.2.99",), "entity": "192.0.2.99"}, "wrong_entity"),
+        ({"owner_id": "other-user"}, "wrong_owner"),
+    ),
+)
+def test_graph_baseline_requires_exact_operational_compatibility(
+    change: dict[str, Any],
+    reason: str,
+) -> None:
+    baseline = episodic_baseline_projections((
+        InvestigationBaseline(
+            entity_ids=(IP,),
+            captured_at="2026-08-19T00:00:00+00:00",
+            source_request_id="graph-compatible",
+            scope="one_hop",
+            projections=(_episode_graph_projection(),),
+            owner_id="user_test",
+        ),
+    ))[0]
+    current = CurrentEvidenceProjection(
+        owner_id="user_test",
+        entity=IP,
+        entity_ids=(IP,),
+        capability="graph.get_summary",
+        view="graph",
+        schema_version="graph-baseline-v1",
+        payload={"counts": {"inbound_total": 2}},
+        retrieved_at="2026-08-20T00:00:00+00:00",
+        scope="one_hop",
+        direction="both",
+        depth=1,
+    )
+    composer = ContextComposer(get_settings())
+    composer.compose(
+        CopilotContextPackage(entities=EntityResolver().resolve(IP)),
+        current_projections=(current,),
+        historical_baselines=(replace(baseline, **change),),
+        request_id="graph-incompatible",
+    )
+
+    assert composer.last_delta_skip_reason == reason
+    assert composer.last_baseline_status == "incompatible"
+
+
+def test_partial_graph_observation_uses_baseline_without_false_removal() -> None:
+    baseline = InvestigationBaseline(
+        entity_ids=(IP,),
+        captured_at="2026-08-19T00:00:00+00:00",
+        source_request_id="graph-partial",
+        scope="one_hop",
+        projections=(_episode_graph_projection(),),
+        owner_id="user_test",
+    )
+    current = CurrentEvidenceProjection(
+        owner_id="user_test",
+        entity=IP,
+        entity_ids=(IP,),
+        capability="graph.get_summary",
+        view="graph",
+        schema_version="graph-baseline-v1",
+        payload={"counts": {"inbound_total": 1}},
+        retrieved_at="2026-08-20T00:00:00+00:00",
+        complete=False,
+        scope="one_hop",
+        direction="both",
+        depth=1,
+    )
+    composer = ContextComposer(get_settings())
+    composer.compose(
+        CopilotContextPackage(entities=EntityResolver().resolve(IP)),
+        current_projections=(current,),
+        historical_baselines=episodic_baseline_projections((baseline,)),
+    )
+
+    assert composer.last_baseline_status == "partial"
+    assert composer.last_delta_contexts
+    states = composer.last_delta_contexts[0]["delta"]["states"]
+    assert states["missing"] == []
+    assert states["incomparable"]
+
+
+def test_active_structured_ltm_baseline_is_independent_of_prose_budget() -> None:
+    active_baseline = _structured_baseline()
+    selection = LongTermMemorySelection(
+        status="empty",
+        memories=(),
+        limitations=("long_term_memory_context_truncated",),
+    )
+
+    class Retriever:
+        def retrieve(self, **_kwargs: Any) -> LongTermMemorySelection:
+            return selection
+
+    class Store:
+        def list(self, *, statuses: tuple[str, ...], **_kwargs: Any) -> tuple[Any, ...]:
+            return (active_baseline.memory,) if statuses == ("active",) else ()
+
+    service = SimpleNamespace(
+        long_term_memory_retriever=Retriever(),
+        long_term_memory_store=Store(),
+    )
+    resolved = CopilotService.retrieve_long_term_memory(
+        service,
+        identity=RequestIdentity.resolve(
+            user_id="user_test",
+            conversation_id="conversation-test",
+            session_id="session-test",
+            request_id="request-test",
+        ),
+        message="Verify it now.",
+        entity_ids=(IP,),
+    )
+
+    assert resolved.memories == ()
+    assert [item.memory.memory_id for item in resolved.baseline_memories] == [
+        active_baseline.memory.memory_id
+    ]
 
 def test_candidate_ltm_never_becomes_authoritative_delta_baseline() -> None:
     baseline = historical_baseline_projections((_structured_baseline(candidate=True),))[0]
@@ -664,3 +1055,60 @@ def test_candidate_ltm_never_becomes_authoritative_delta_baseline() -> None:
         historical_baselines=(baseline,),
     )
     assert composer.last_delta_skip_reason == "candidate_only"
+
+
+def test_update_memory_captures_baseline_from_tool_results_not_assistant_prose() -> None:
+    task = _task("Analyze this asset.", ("asset.get_profile",))
+    key = MemoryContextKey.from_task(task)
+    memory = MemoryStore(20)
+    service = SimpleNamespace(
+        settings=get_settings(),
+        memory_store=memory,
+        routing_state_store=SessionRoutingStateStore(),
+        long_term_memory_coordinator=None,
+        persist_thread_continuity=lambda *_args, **_kwargs: None,
+        persist_completed_local_turn=lambda *_args, **_kwargs: None,
+    )
+    identity = RequestIdentity.resolve(
+        user_id="user_test",
+        conversation_id="conversation-test",
+        session_id="baseline-update",
+        request_id="baseline-update-request",
+    )
+    state = {
+        "task": task,
+        "tool_results": [_complete_product_result()],
+        "synthesis_result": {"answer": "assistant prose must not become baseline"},
+        "memory_context_key": key,
+        "pending_working_facts": (),
+        "session_id": identity.session_id,
+        "request_id": identity.request_id,
+        "request_identity": identity,
+        "message": "Analyze this asset.",
+        "evidence_pack": SimpleNamespace(limitations=()),
+        "active_entity_state": SessionRoutingState(active_entities=(IP,)),
+        "resolved_entities": EntityResolver().resolve(IP),
+        "routing_result": SimpleNamespace(
+            intent="asset_investigation",
+            scope="node_summary",
+            direction="both",
+            depth=0,
+            use_detection=False,
+            use_asset_profile=True,
+        ),
+        "execution_plan": ExecutionPlan(
+            task=task,
+            steps=(PlanStep("profile", "asset.get_profile"),),
+            plan_id="baseline-plan",
+        ),
+        "review_decision": ReviewDecision(outcome="sufficient"),
+    }
+
+    update = CopilotWorkflowNodes(service).update_memory(state)
+    baseline = memory.repository.get_working(identity.session_id).baseline  # type: ignore[union-attr]
+
+    assert update["memory_update_result"]["investigation_baseline_write_count"] == 1
+    assert baseline is not None
+    assert baseline.source_request_id == identity.request_id
+    assert baseline.projections[0].payload == {"role": "server", "risk": 7}
+    assert "assistant prose" not in str(baseline.projections[0].payload)

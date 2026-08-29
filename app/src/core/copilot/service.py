@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import time
 from collections.abc import Callable, Iterator
@@ -27,6 +28,7 @@ from src.core.llm.errors import LLMError
 from src.core.llm.providers.base import LLMProviderResult, LLMStreamEvent
 from src.core.memory.routing_state import SessionRoutingStateStore
 from src.core.memory.episodes import MemoryContextKey
+from src.core.memory.long_term import RetrievedLongTermMemory
 from src.core.identity import RequestIdentity
 from src.core.memory.persistence import ThreadMemoryState
 from src.core.memory.ports import (
@@ -268,8 +270,29 @@ class CopilotService:
                     selected_count=len(selection.memories),
                     limitations=tuple(dict.fromkeys((*selection.limitations, "long_term_memory_inventory_unavailable"))),
                 )
+            structured_baselines: list[RetrievedLongTermMemory] = []
+            for memory in active:
+                if not LongTermMemoryRetriever._eligible(memory):
+                    continue
+                try:
+                    statement = json.loads(memory.statement)
+                except (TypeError, ValueError):
+                    continue
+                if not isinstance(statement, dict) or not isinstance(
+                    statement.get("evidence"), dict
+                ):
+                    continue
+                structured_baselines.append(RetrievedLongTermMemory(
+                    memory=memory,
+                    relevance_score=1.0,
+                    retrieval_reason="active_baseline_inventory",
+                    freshness=memory.freshness(),
+                ))
+                if len(structured_baselines) >= 20:
+                    break
             return replace(
                 selection,
+                baseline_memories=tuple(structured_baselines),
                 candidate_record_count=len(candidates),
                 active_record_count=len(active),
                 selected_count=len(selection.memories),

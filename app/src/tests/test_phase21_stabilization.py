@@ -922,6 +922,7 @@ def test_unsafe_final_window_blocks_chat_provider_after_recomposition():
     service = CopilotService(
         _settings(
             chat_store_history=False,
+            llm_usage_reporting_enabled=False,
             llm_context_window_tokens=160,
             llm_context_safety_margin_tokens=100,
             llm_reserved_output_tokens=120,

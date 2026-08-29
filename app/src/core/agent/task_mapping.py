@@ -13,8 +13,11 @@ from src.core.agent.contracts import (
     PlanStep,
     RequestConstraints,
     TaskSpec,
+    TurnPolicy,
 )
+from src.core.context.models import EntityResolution, ResolvedEntity
 from src.core.context.product_views import select_product_views
+from src.core.memory.routing_state import SessionRoutingState
 
 
 MULTI_STEP_WORDING = re.compile(
@@ -111,6 +114,13 @@ PREVIOUS_CURRENT_COMPARISON_REQUEST = re.compile(
     re.IGNORECASE,
 )
 
+BROAD_CONVERSATION_RECALL_REQUEST = re.compile(
+    r"\b(?:what\s+(?:do\s+you\s+)?(?:know|remember)|summari[sz]e|recall|tell\s+me)\b"
+    r".{0,100}\b(?:our\s+chats?|our\s+conversations?|chat\s+history|conversation\s+history|"
+    r"everything\s+we(?:'ve|\s+have)?\s+discussed)\b",
+    re.IGNORECASE,
+)
+
 RecallClassification = Literal["none", "explicit_memory", "historical_summary"]
 
 
@@ -172,6 +182,120 @@ def derive_request_constraints(request: str) -> RequestConstraints:
         reason_codes=tuple(reasons),
     )
 
+def derive_turn_policy(
+    request: str,
+    constraints: RequestConstraints,
+    entities: EntityResolution,
+    routing_state: SessionRoutingState,
+) -> TurnPolicy:
+    """Resolve operation, target authority, router need, and episode mutation once."""
+    resolved = tuple(item.value for item in entities.entities)
+    source = entities.entities[0].source if entities.entities else ""
+    active = tuple(routing_state.active_entities)
+
+    def target_for(values: tuple[str, ...], entity_source: str) -> str:
+        if entity_source == "message":
+            return "explicit_entity"
+        if entity_source == "ui":
+            return "ui_entity"
+        if len(values) == 2:
+            return "active_pair"
+        if values:
+            return "active_entity"
+        return "none"
+
+    if entities.reference_suppressed:
+        return TurnPolicy(
+            operation="topic_detach",
+            target="none",
+            requires_domain_router=True,
+            episode_transition="detach",
+            reason_codes=("explicit_topic_detachment",),
+        )
+
+    broad_recall = bool(BROAD_CONVERSATION_RECALL_REQUEST.search(request))
+    if constraints.memory_only or broad_recall:
+        values = resolved or active
+        return TurnPolicy(
+            operation="memory_write" if constraints.memory_write else "memory_recall",
+            target=(target_for(values, source) if resolved else "conversation"),  # type: ignore[arg-type]
+            target_entities=values,
+            requires_domain_router=False,
+            episode_transition="keep",
+            reason_codes=("deterministic_conversation_memory_recall",) if broad_recall else constraints.reason_codes,
+        )
+
+    if constraints.require_current:
+        values = resolved or active
+        source_target = target_for(resolved, source) if resolved else (
+            "active_pair" if len(active) == 2 else "active_entity" if active else "none"
+        )
+        explicit_switch = bool(
+            resolved
+            and source in {"message", "ui"}
+            and tuple(resolved) != tuple(active)
+        )
+        return TurnPolicy(
+            operation=(
+                "compare_previous_current"
+                if PREVIOUS_CURRENT_COMPARISON_REQUEST.search(request)
+                else "current_verification"
+            ),
+            target=source_target,  # type: ignore[arg-type]
+            target_entities=values,
+            requires_domain_router=True,
+            episode_transition="switch" if explicit_switch else "keep",
+            reason_codes=(*constraints.reason_codes, "state_aware_current_verification"),
+        )
+
+    if resolved:
+        transition = (
+            "switch"
+            if source in {"message", "ui"} and tuple(resolved) != tuple(active)
+            else "keep"
+        )
+        return TurnPolicy(
+            operation="follow_up" if source == "conversation" else "new_task",
+            target=target_for(resolved, source),  # type: ignore[arg-type]
+            target_entities=resolved,
+            requires_domain_router=True,
+            episode_transition=transition,
+            reason_codes=("resolved_target_authority",),
+        )
+    return TurnPolicy(
+        operation="new_task",
+        target="none",
+        requires_domain_router=True,
+        episode_transition="keep",
+        reason_codes=("no_operational_target_established",),
+    )
+
+
+def materialize_turn_policy_target(
+    entities: EntityResolution,
+    policy: TurnPolicy,
+) -> EntityResolution:
+    """Materialize only a target already authorized by deterministic turn policy."""
+    if entities.entities or not policy.target_entities or policy.target not in {"active_entity", "active_pair"}:
+        return entities
+    materialized = [
+        ResolvedEntity(type="ip", value=value, source="conversation")
+        for value in policy.target_entities
+    ]
+    return EntityResolution(
+        status="resolved",
+        entities=materialized,
+        primary_entity=materialized[0] if len(materialized) == 1 else None,
+        entity_mode="single" if len(materialized) == 1 else "multiple",
+        candidate_count=len(materialized),
+        explicit_candidate_count=entities.explicit_candidate_count,
+        valid_entity_count=len(materialized),
+        reference_detected=True,
+        reference_type="state_aware_turn_policy",
+        reference_suppressed=False,
+        subnet_constraints=entities.subnet_constraints,
+        unsupported_constraints=entities.unsupported_constraints,
+    )
 
 def evidence_mode_from_request(request: str) -> EvidenceMode:
     """Recognize explicit recall scope without delegating tool authority to the model."""
@@ -189,10 +313,13 @@ def task_spec_from_route(
     route: Any,
     request: str,
     constraints: RequestConstraints | None = None,
+    turn_policy: TurnPolicy | None = None,
 ) -> TaskSpec:
     request_lower = request.lower()
     constraints = constraints or derive_request_constraints(request)
     evidence_mode = evidence_mode_from_request(request)
+    if turn_policy is not None and turn_policy.operation == "memory_recall" and evidence_mode == "normal":
+        evidence_mode = "no_live_refresh"
     allow_capabilities = constraints.allow_live
     entities = tuple(dict.fromkeys(getattr(route, "materialized_entities", ()) or ()))
     if getattr(route, "scope", "none") == "multi_entity_comparison" and len(entities) != 2:
@@ -249,7 +376,11 @@ def task_spec_from_route(
     )
     return TaskSpec(
         request=request,
-        intent="memory_recall" if evidence_mode == "memory_only" else str(getattr(route, "intent", "unclear")),
+        intent=(
+            "memory_recall"
+            if evidence_mode == "memory_only" or (turn_policy is not None and turn_policy.operation == "memory_recall")
+            else str(getattr(route, "intent", "unclear"))
+        ),
         scope=str(getattr(route, "scope", "none")),
         direction=str(getattr(route, "direction", "none")),
         entities=entities,

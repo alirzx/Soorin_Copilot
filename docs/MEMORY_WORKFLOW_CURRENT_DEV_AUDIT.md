@@ -24,6 +24,73 @@
 > Product/PostgreSQL adapters, identity boundary, and canonical/vector split are
 > documented in
 > [FRONTEND_BACKEND_COPILOT_INTEGRATION.md](FRONTEND_BACKEND_COPILOT_INTEGRATION.md).
+>
+> **2026-08-28 control-plane and structured-baseline implementation:** the
+> current working tree supersedes older statements below that describe Product
+> ThreadState/LTM or deterministic delta integration as future/partial. This
+> update was implemented and tested offline; no Product, model, Profile,
+> Detection, graph-source, Qdrant, or other live API was called.
+>
+> The implemented control path is:
+>
+> ```text
+> hard deterministic constraints/signals
+> -> state-aware TurnPolicy
+> -> semantic Router only when ambiguity remains
+> -> validated live evidence authority
+> -> bounded structured baseline/delta
+> -> synthesis
+> -> controlled episode and ThreadState update
+> ```
+>
+> `TurnPolicy` owns the conversation operation, target authority, and episode
+> transition. `KEEP` preserves the active investigation and its baseline;
+> `SWITCH` archives the prior episode with its baseline and opens/reuses the
+> selected target context; `DETACH` records a general turn without mutating the
+> prior operational episode or deleting its archived evidence. A small,
+> high-confidence broad-conversation-recall lexical signal bypasses the Router;
+> it is not a semantic phrase catalogue. Router timeout/malformed fallback
+> receives request constraints and may inherit only previously authorized
+> operational scope. `require_current=True` cannot succeed with zero authorized
+> live capabilities, and historical memory never satisfies current-evidence
+> authority.
+>
+> `InvestigationBaseline` stores only bounded normalized successful
+> `ToolResult` projections, never assistant prose or raw provider artifacts.
+> Profile/Detection use selected Product views. Graph stores bounded counts,
+> peers/directions/hops, relationship/path facts, scope, direction, depth,
+> completeness, truncation, capability, entity set, and projection schema.
+> Memory-only/general/router-failure/failed/partial retrieval does not create or
+> weaken a baseline. New complete observations merge by compatible projection
+> identity so a narrower turn cannot erase a stronger baseline.
+>
+> Active and archived episode baselines persist inside the unchanged Product
+> ThreadState `stateJson` envelope. Internal ThreadState schema v4 accepts v3
+> payloads. The serializer enforces eight projections, 6,000 bytes per
+> projection, 10,000 bytes total baseline data, 48 graph peers, and the existing
+> 16,384-byte ThreadState ceiling. Under pressure it drops older archived
+> baselines, then the active baseline, before continuity state; an oversized or
+> invalid baseline cannot fail the whole thread state.
+>
+> Baseline selection is owner-, conversation/episode-, entity-set-, capability-,
+> view-, scope-, direction-, depth-, completeness-, freshness-, and
+> schema-aware. Internal state distinguishes `absent`, `available`,
+> `incompatible`, `partial`, and `stale`, while separately exposing
+> baseline presence, compatibility, and delta availability. The DeltaEngine
+> compares normalized structures only with depth/record bounds and emits
+> `changed`, `unchanged`, `new`, `missing`, and `incomparable`.
+> Stable-ID collections compare by canonical ID; ambiguous unkeyed collections
+> are incomparable; partial current data cannot create false removals.
+>
+> Product/PostgreSQL remains canonical for active LTM and ThreadState. Candidate
+> LTM is never authoritative. Active structured Product LTM baselines are
+> selected independently of the small generative LTM prose budget; Qdrant
+> remains a derivative semantic index. No Product endpoint, request envelope,
+> ownership rule, or database schema changed, and no mandatory LLM call was
+> added. The known Product `POST /memory/ltm/{id}/transition` 500 remains a
+> separate backend issue; this implementation does not route around or redesign
+> that lifecycle.
+>
 
 ## Stabilization result (current working tree)
 

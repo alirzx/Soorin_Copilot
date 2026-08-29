@@ -95,6 +95,9 @@ class ContextComposer:
         self._product_projection_stats: dict[str, tuple[int, int]] = {}
         self.last_delta_contexts: tuple[dict[str, Any], ...] = ()
         self.last_delta_skip_reason: str | None = None
+        self.last_baseline_status = "absent"
+        self.last_baseline_present = False
+        self.last_baseline_compatible = False
 
     def compose(
         self,
@@ -387,6 +390,9 @@ class ContextComposer:
         """Build only exact compatible Product-view deltas and preserve provenance."""
         self.last_delta_contexts = ()
         self.last_delta_skip_reason = None
+        self.last_baseline_present = bool(baselines)
+        self.last_baseline_compatible = False
+        self.last_baseline_status = "absent" if not baselines else "incompatible"
         reason = "current_projection_unavailable"
         payloads: list[dict[str, Any]] = []
         if current and not baselines:
@@ -413,7 +419,7 @@ class ContextComposer:
             type_eligible = [
                 item
                 for item in candidates
-                if item.memory_type in {"validated_finding", "approved_asset_fact"}
+                if item.memory_type in {"validated_finding", "approved_asset_fact", "investigation_baseline"}
             ]
             if not type_eligible:
                 reason = "wrong_memory_type"
@@ -443,7 +449,11 @@ class ContextComposer:
             if not same_capability:
                 reason = "wrong_capability"
                 continue
-            same_entity = [item for item in same_capability if item.entity == projection.entity]
+            projection_entities = set(projection.entity_ids or (projection.entity,))
+            same_entity = [
+                item for item in same_capability
+                if set(item.entity_ids or (item.entity,)) == projection_entities
+            ]
             if not same_entity:
                 reason = "wrong_entity"
                 continue
@@ -451,8 +461,24 @@ class ContextComposer:
             if not same_view:
                 reason = "wrong_view"
                 continue
+            same_scope = [item for item in same_view if item.scope == projection.scope]
+            if not same_scope:
+                reason = "wrong_scope"
+                continue
+            same_direction = [
+                item for item in same_scope if item.direction == projection.direction
+            ]
+            if not same_direction:
+                reason = "wrong_direction"
+                continue
+            same_depth = [item for item in same_direction if item.depth == projection.depth]
+            if not same_depth:
+                reason = "wrong_depth"
+                continue
             compatible = [
-                item for item in same_view if item.schema_version == projection.schema_version
+                item
+                for item in same_depth
+                if item.schema_version == projection.schema_version
             ]
             if not compatible:
                 reason = "wrong_schema"
@@ -484,6 +510,19 @@ class ContextComposer:
                 "current_retrieved_at": projection.retrieved_at,
                 "delta": delta.payload,
             })
+        if payloads:
+            self.last_baseline_compatible = True
+            self.last_baseline_status = (
+                "available"
+                if len(payloads) == len(current) and all(item.complete for item in current)
+                else "partial"
+            )
+        elif reason == "stale":
+            self.last_baseline_status = "stale"
+        elif reason == "incomplete_baseline":
+            self.last_baseline_status = "partial"
+        elif baselines:
+            self.last_baseline_status = "incompatible"
         while payloads:
             text = "[SOORIN_DELTA_CONTEXT_JSON]\n" + json.dumps(
                 {"comparisons": payloads},

@@ -25,8 +25,10 @@ from src.core.agent.task_mapping import (
     compile_direct_plan,
     compile_supplemental_plan,
     derive_request_constraints,
+    derive_turn_policy,
     evidence_mode_from_request,
     historical_evidence_classes_for_request,
+    materialize_turn_policy_target,
     task_spec_from_route,
 )
 from src.core.agent.specialists import AssetInvestigationSpecialist, GraphAnalysisSpecialist
@@ -38,7 +40,9 @@ from src.core.context.intent import (
 from src.core.context.models import RouteDecision, approx_tokens
 from src.core.context.compaction import (
     current_evidence_projections,
+    episodic_baseline_projections,
     historical_baseline_projections,
+    investigation_baseline_from_results,
 )
 from src.core.context.synthesizer_prompt import SynthesizerPromptBuilder
 from src.core.copilot.fallback_answer import build_evidence_fallback_answer
@@ -91,6 +95,10 @@ class CopilotWorkflowNodes:
             request_id=state["request_id"],
         )
         constraints = derive_request_constraints(state["message"])
+        turn_policy = derive_turn_policy(
+            state["message"], constraints, resolution, routing_state
+        )
+        resolution = materialize_turn_policy_target(resolution, turn_policy)
         pending_facts = extract_working_facts(state["message"]) if constraints.memory_write else ()
         resolved_values = tuple(item.value for item in resolution.entities)
         pending_facts = tuple(
@@ -130,6 +138,7 @@ class CopilotWorkflowNodes:
             "recent_messages": recent,
             "long_term_memory_selection": long_term_selection,
             "request_constraints": constraints,
+            "turn_policy": turn_policy,
             "pending_working_facts": pending_facts,
             "next_edge": "route",
         }
@@ -151,7 +160,10 @@ class CopilotWorkflowNodes:
         routing_state = state["active_entity_state"]
         recent = state.get("recent_messages") or []
         constraints = state.get("request_constraints") or derive_request_constraints(state["message"])
-        if constraints.memory_only:
+        turn_policy = state.get("turn_policy") or derive_turn_policy(
+            state["message"], constraints, entities, routing_state
+        )
+        if not turn_policy.requires_domain_router:
             values = tuple(item.value for item in entities.entities)
             source = entities.entities[0].source if entities.entities else ""
             binding = (
@@ -216,6 +228,8 @@ class CopilotWorkflowNodes:
                 routing_state,
                 fallback_reason=decision.fallback_reason or decision.error_reason or "router_failed",
                 request_id=state["request_id"],
+                constraints=constraints,
+                turn_policy=turn_policy,
             )
             route = replace(
                 route,
@@ -299,6 +313,7 @@ class CopilotWorkflowNodes:
                 route,
                 state["message"].strip(),
                 state.get("request_constraints"),
+                state.get("turn_policy"),
             )
         except Exception as exc:
             return {
@@ -309,6 +324,19 @@ class CopilotWorkflowNodes:
                 },
                 "next_edge": "safe_failure",
             }
+        constraints = state.get("request_constraints") or derive_request_constraints(state["message"])
+        if constraints.require_current and not task.required_capabilities:
+            return {
+                "workflow_status": "failed",
+                "failure_metadata": {
+                    "error_type": "current_verification_requires_live_evidence",
+                    "safe_error_code": "current_verification_requires_live_evidence",
+                    "retryable": False,
+                },
+                "limitation_reasons": ["current_verification_requires_live_evidence"],
+                "next_edge": "safe_failure",
+            }
+
         planner_selected = (
             task.workflow_mode == "multi_step"
             and bool((state.get("request_constraints") or derive_request_constraints(state["message"])).allow_live)
@@ -324,7 +352,7 @@ class CopilotWorkflowNodes:
             "task": task,
             "workflow_mode": task.workflow_mode,
             "planner_called": planner_selected,
-            "memory_context_key": MemoryContextKey.from_task(task),
+            "memory_context_key": self._authorized_memory_context_key(state, task),
             "evidence_requirements": requirements,
             "evidence_gap_plan": gap_plan,
             "memory_tool_results": [],
@@ -339,6 +367,15 @@ class CopilotWorkflowNodes:
             "clarification": {"answer": answer, "code": code},
             "next_edge": "clarification",
         }
+
+    def _authorized_memory_context_key(self, state: InvestigationState, task: Any) -> MemoryContextKey:
+        candidate = MemoryContextKey.from_task(task)
+        policy = state.get("turn_policy")
+        if getattr(policy, "episode_transition", "switch") != "keep":
+            return candidate
+        working = self.service.memory_store.repository.get_working(state["session_id"])
+        return working.context_key if working is not None else candidate
+
 
     def build_direct_plan(self, state: InvestigationState) -> dict[str, Any]:
         return {
@@ -747,6 +784,9 @@ class CopilotWorkflowNodes:
         long_term_memories = tuple(
             getattr(long_term_selection, "memories", ()) or ()
         )
+        structured_long_term_baselines = tuple(
+            getattr(long_term_selection, "baseline_memories", ()) or ()
+        ) or long_term_memories
         snapshot = (
             self.service.memory_store.prepare_for_model(
                 state["session_id"],
@@ -755,7 +795,10 @@ class CopilotWorkflowNodes:
                 context_key=context_key,
                 request_id=state["request_id"],
                 long_term_memories=long_term_memories,
-                activate_context=not historical_recall_of_other_entity,
+                activate_context=(
+                    not historical_recall_of_other_entity
+                    and getattr(state.get("turn_policy"), "episode_transition", "switch") in {"switch", "detach"}
+                ),
             )
             if self.settings.chat_store_history or long_term_memories
             else None
@@ -792,7 +835,16 @@ class CopilotWorkflowNodes:
             tuple(state.get("tool_results") or ()),
             owner_id=str(getattr(identity, "user_id", "") or ""),
         )
-        historical_baselines = historical_baseline_projections(long_term_memories)
+        owner_id = str(getattr(identity, "user_id", "") or "")
+        episode_baselines = self.service.memory_store.investigation_baselines(
+            state["session_id"],
+            context_key,
+            owner_id=owner_id,
+        )
+        historical_baselines = (
+            *historical_baseline_projections(structured_long_term_baselines),
+            *episodic_baseline_projections(episode_baselines),
+        )
         dynamic_context = self.context_composer.compose(
             package,
             request_id=state["request_id"],
@@ -825,6 +877,9 @@ class CopilotWorkflowNodes:
             request_constraints=state.get("request_constraints"),
             accepted_working_fact_count=len(state.get("pending_working_facts") or ()),
             delta_contexts=self.context_composer.last_delta_contexts,
+            baseline_status=self.context_composer.last_baseline_status,
+            baseline_present=self.context_composer.last_baseline_present,
+            baseline_compatible=self.context_composer.last_baseline_compatible,
         )
         rendered_prompt = self.synthesizer_prompt_builder.render_messages(
             static_core=self.service.system_prompt,
@@ -1106,6 +1161,8 @@ class CopilotWorkflowNodes:
         synthesis = state["synthesis_result"]
         context_key = state.get("memory_context_key") or MemoryContextKey.from_task(task)
         pending_facts = tuple(state.get("pending_working_facts") or ())
+        identity = state.get("request_identity")
+        baseline_written = False
         if pending_facts:
             self.service.memory_store.upsert_working_facts(
                 state["session_id"],
@@ -1129,12 +1186,28 @@ class CopilotWorkflowNodes:
                 scope=task.scope,
                 request_id=state["request_id"],
             )
+            if identity is not None and getattr(identity, "user_id", None):
+                baseline = investigation_baseline_from_results(
+                    tuple(results),
+                    owner_id=str(identity.user_id),
+                    source_request_id=state["request_id"],
+                    scope=task.scope,
+                    required_capabilities=task.required_capabilities,
+                )
+                if baseline is not None:
+                    baseline_written = self.service.memory_store.set_investigation_baseline(
+                        state["session_id"],
+                        context_key,
+                        baseline,
+                        request_id=state["request_id"],
+                    )
         previous = state["active_entity_state"]
         resolved = state["resolved_entities"]
         route = state["routing_result"]
         active_entities = previous.active_entities
         active_ip = previous.active_ip
         last_resolved = previous.last_resolved_entities
+        transition = getattr(state.get("turn_policy"), "episode_transition", "switch")
         can_update = (
             resolved.status == "resolved"
             and bool(resolved.entities)
@@ -1147,6 +1220,7 @@ class CopilotWorkflowNodes:
                 "graph_followup",
             }
             and not resolved.reference_suppressed
+            and transition != "detach"
         )
         if can_update:
             values = tuple(item.value for item in resolved.entities)
@@ -1188,7 +1262,6 @@ class CopilotWorkflowNodes:
                 request_id=state["request_id"],
             )
         self.service.routing_state_store.set(state["session_id"], new_state)
-        identity = state.get("request_identity")
         if identity is not None:
             self.service.persist_thread_continuity(identity, new_state)
             self.service.persist_completed_local_turn(
@@ -1221,6 +1294,7 @@ class CopilotWorkflowNodes:
                 "long_term_candidate_count": proposed_count,
                 "ltm_candidate_processed_count": proposed_count,
                 "thread_state_persistence_attempted": thread_state_persistence_attempted,
+                "investigation_baseline_write_count": int(baseline_written),
             },
             "terminal": True,
             "completed_at": state.get("updated_at"),

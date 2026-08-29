@@ -4,11 +4,21 @@ from __future__ import annotations
 
 from dataclasses import replace
 from pathlib import Path
+import json
 from types import SimpleNamespace
 
 from src.core.identity import RequestIdentity
-from src.core.memory.episodes import EpisodeRecord, MemoryContextKey, WorkingFact, WorkingMemory
+from src.core.context.compaction import fingerprint
+from src.core.memory.episodes import (
+    BaselineProjection,
+    EpisodeRecord,
+    InvestigationBaseline,
+    MemoryContextKey,
+    WorkingFact,
+    WorkingMemory,
+)
 from src.core.memory.persistence import (
+    MAX_THREAD_STATE_BYTES,
     THREAD_STATE_SCHEMA_VERSION,
     LocalChatMessage,
     ThreadMemoryState,
@@ -262,3 +272,265 @@ def test_local_backend_uses_shared_controller_and_user_switch_clears_state() -> 
     ) == [{"type": "done"}]
     backend.logout()
     assert state == {}
+def investigation_baseline(
+    *,
+    owner: str = "user-a",
+    request_id: str = "baseline-request",
+    completeness: str = "complete",
+    payload: dict | None = None,
+) -> InvestigationBaseline:
+    evidence = payload or {"role": "server", "risk": 4}
+    projection = BaselineProjection(
+        capability="asset.get_profile",
+        entity_ids=("192.0.2.2",),
+        view="overview",
+        schema_version="product-view-v1",
+        evidence_classes=("asset_identity", "asset_role"),
+        payload=evidence,
+        valid_at="2026-08-20T00:00:00+00:00",
+        completeness=completeness,  # type: ignore[arg-type]
+        fingerprint=fingerprint(evidence),
+    )
+    return InvestigationBaseline(
+        entity_ids=("192.0.2.2",),
+        captured_at=projection.valid_at,
+        source_request_id=request_id,
+        scope="node_summary",
+        projections=(projection,),
+        owner_id=owner,
+    )
+
+
+def test_active_and_archived_episode_baselines_roundtrip_in_thread_state() -> None:
+    request_identity = identity()
+    key = context("192.0.2.2")
+    active = investigation_baseline(request_id="active-baseline")
+    archived = investigation_baseline(request_id="archived-baseline")
+    state = ThreadMemoryState.from_routing_state(
+        request_identity,
+        SessionRoutingState(active_entities=("192.0.2.2",)),
+        working_memory=WorkingMemory(
+            session_id=request_identity.session_id,
+            context_key=key,
+            episode_id="active-episode",
+            baseline=active,
+        ),
+        recent_episodes=(
+            EpisodeRecord(
+                episode_id="archived-episode",
+                session_id=request_identity.session_id,
+                context_key=key,
+                baseline=archived,
+            ),
+        ),
+    )
+
+    restored = ThreadMemoryState.from_payload(
+        state.to_payload(),
+        thread_key=request_identity.thread_key,
+        user_id=request_identity.user_id,
+        conversation_id=request_identity.conversation_id,
+        session_id=request_identity.session_id,
+        updated_at=state.updated_at,
+        revision=1,
+        schema_version=THREAD_STATE_SCHEMA_VERSION,
+    )
+
+    assert restored.working_memory is not None
+    assert restored.working_memory.baseline == active
+    assert restored.recent_episodes[0].baseline == archived
+
+
+def test_schema_v3_thread_state_without_baseline_remains_loadable() -> None:
+    request_identity = identity()
+    state = ThreadMemoryState.from_routing_state(
+        request_identity,
+        SessionRoutingState(active_entities=("192.0.2.2",)),
+    )
+
+    restored = ThreadMemoryState.from_payload(
+        state.to_payload(),
+        thread_key=request_identity.thread_key,
+        user_id=request_identity.user_id,
+        conversation_id=request_identity.conversation_id,
+        session_id=request_identity.session_id,
+        updated_at=state.updated_at,
+        revision=1,
+        schema_version=3,
+    )
+
+    assert restored.active_entities == ("192.0.2.2",)
+    assert restored.working_memory is None
+
+
+def test_wrong_owner_baseline_is_dropped_without_losing_thread_continuity() -> None:
+    request_identity = identity()
+    key = context("192.0.2.2")
+    state = ThreadMemoryState.from_routing_state(
+        request_identity,
+        SessionRoutingState(active_entities=("192.0.2.2",)),
+        working_memory=WorkingMemory(
+            session_id=request_identity.session_id,
+            context_key=key,
+            episode_id="owner-bound",
+            baseline=investigation_baseline(owner="user-a"),
+        ),
+    )
+
+    restored = ThreadMemoryState.from_payload(
+        state.to_payload(),
+        thread_key=request_identity.thread_key,
+        user_id="user-b",
+        conversation_id=request_identity.conversation_id,
+        session_id=request_identity.session_id,
+        updated_at=state.updated_at,
+        revision=1,
+        schema_version=THREAD_STATE_SCHEMA_VERSION,
+    )
+
+    assert restored.working_memory is not None
+    assert restored.working_memory.episode_id == "owner-bound"
+    assert restored.working_memory.baseline is None
+
+
+def test_oversized_baseline_is_shed_before_thread_continuity() -> None:
+    request_identity = identity()
+    key = context("192.0.2.2")
+    oversized = investigation_baseline(payload={"value": "x" * 20_000})
+    state = ThreadMemoryState.from_routing_state(
+        request_identity,
+        SessionRoutingState(active_entities=("192.0.2.2",)),
+        working_memory=WorkingMemory(
+            session_id=request_identity.session_id,
+            context_key=key,
+            episode_id="bounded-episode",
+            compact_summary="continuity survives",
+            baseline=oversized,
+        ),
+    )
+
+    payload = state.to_payload()
+
+    assert payload["working_memory"]["compact_summary"] == "continuity survives"
+    assert "baseline" not in payload["working_memory"]
+    assert len(json.dumps(payload).encode("utf-8")) <= MAX_THREAD_STATE_BYTES
+
+
+def test_strong_baseline_survives_partial_turn_and_episode_switch() -> None:
+    memory = MemoryStore(20)
+    key = context("192.0.2.2")
+    baseline = investigation_baseline()
+    memory.record_turn("baseline-session", "investigate", "answer", key, request_id="r1")
+    assert memory.set_investigation_baseline(
+        "baseline-session", key, baseline, request_id="r1"
+    )
+    detection_payload = {"classification": "server", "confidence": 0.9}
+    detection_projection = BaselineProjection(
+        capability="asset.get_detection",
+        entity_ids=("192.0.2.2",),
+        view="overview",
+        schema_version="product-view-v1",
+        evidence_classes=("detection_classification",),
+        payload=detection_payload,
+        valid_at="2026-08-21T00:00:00+00:00",
+        completeness="complete",
+        fingerprint=fingerprint(detection_payload),
+    )
+    narrower_complete = InvestigationBaseline(
+        entity_ids=("192.0.2.2",),
+        captured_at=detection_projection.valid_at,
+        source_request_id="narrower-complete",
+        scope="node_summary",
+        projections=(detection_projection,),
+        owner_id="user-a",
+    )
+    assert memory.set_investigation_baseline(
+        "baseline-session", key, narrower_complete, request_id="r2"
+    )
+    strong = memory.repository.get_working("baseline-session").baseline  # type: ignore[union-attr]
+    assert strong is not None
+    assert {item.capability for item in strong.projections} == {
+        "asset.get_profile", "asset.get_detection"
+    }
+
+    partial = investigation_baseline(
+        request_id="partial",
+        completeness="partial",
+        payload={"role": "unknown"},
+    )
+    partial = replace(partial, captured_at="2026-08-22T00:00:00+00:00")
+    assert not memory.set_investigation_baseline(
+        "baseline-session", key, partial, request_id="r3"
+    )
+    assert memory.repository.get_working("baseline-session").baseline == strong  # type: ignore[union-attr]
+
+    other = context("192.0.2.3")
+    memory.prepare_for_model(
+        "baseline-session",
+        settings(conversation_summary_trigger_tokens=10_000),
+        SessionRoutingState(active_entities=("192.0.2.3",)),
+        context_key=other,
+        activate_context=True,
+        request_id="switch-away",
+    )
+    archived = memory.repository.list_episodes("baseline-session")
+    assert archived[-1].baseline == strong
+
+    memory.prepare_for_model(
+        "baseline-session",
+        settings(conversation_summary_trigger_tokens=10_000),
+        SessionRoutingState(active_entities=("192.0.2.2",)),
+        context_key=key,
+        activate_context=True,
+        request_id="switch-back",
+    )
+    restored = memory.investigation_baselines(
+        "baseline-session", key, owner_id="user-a"
+    )
+    assert restored
+    assert restored[0] == strong
+
+
+def test_baseline_restores_after_simulated_thread_state_restart() -> None:
+    request_identity = identity()
+    key = context("192.0.2.2")
+    memory = MemoryStore(20)
+    memory.record_turn(
+        request_identity.session_id,
+        "investigate",
+        "answer",
+        key,
+        request_id="restart-turn",
+    )
+    baseline = investigation_baseline()
+    assert memory.set_investigation_baseline(
+        request_identity.session_id, key, baseline
+    )
+    state = ThreadMemoryState.from_routing_state(
+        request_identity,
+        SessionRoutingState(active_entities=("192.0.2.2",)),
+        **memory.durable_components(
+            request_identity.session_id,
+            turn_limit=4,
+            episode_limit=4,
+        ),
+    )
+    restored_state = ThreadMemoryState.from_payload(
+        state.to_payload(),
+        thread_key=request_identity.thread_key,
+        user_id=request_identity.user_id,
+        conversation_id=request_identity.conversation_id,
+        session_id=request_identity.session_id,
+        updated_at=state.updated_at,
+        revision=1,
+        schema_version=THREAD_STATE_SCHEMA_VERSION,
+    )
+    restarted = MemoryStore(20)
+    restarted.restore_durable_state(restored_state)
+
+    selected = restarted.investigation_baselines(
+        request_identity.session_id,
+        key,
+        owner_id="user-a",
+    )
+    assert selected == (baseline,)

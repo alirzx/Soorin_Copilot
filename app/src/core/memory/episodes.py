@@ -8,6 +8,7 @@ from typing import Literal, Protocol
 from uuid import uuid4
 
 from src.core.agent.contracts import TaskSpec
+from src.core.memory.baselines import BaselineProjection, InvestigationBaseline
 from src.core.memory.long_term import RetrievedLongTermMemory
 
 
@@ -103,6 +104,7 @@ class EpisodeRecord:
     last_providers: tuple[str, ...] = ()
     last_scope: str = "none"
     turn_count: int = 0
+    baseline: InvestigationBaseline | None = None
 
     @classmethod
     def create(cls, session_id: str, context_key: MemoryContextKey) -> "EpisodeRecord":
@@ -121,6 +123,7 @@ class WorkingMemory:
     last_scope: str = "none"
     limitations: tuple[str, ...] = ()
     working_facts: tuple[WorkingFact, ...] = ()
+    baseline: InvestigationBaseline | None = None
 
 
 @dataclass(frozen=True)

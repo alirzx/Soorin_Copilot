@@ -36,6 +36,9 @@ class SynthesizerMemoryState:
     ltm_selected_count: int = 0
     historical_only: bool = False
     compatible_previous_baseline_available: bool = False
+    baseline_status: str = "absent"
+    baseline_present: bool = False
+    baseline_compatible: bool = False
 
 
 @dataclass(frozen=True)
@@ -193,6 +196,9 @@ class SynthesizerPromptBuilder:
         request_constraints: RequestConstraints | None = None,
         accepted_working_fact_count: int = 0,
         delta_contexts: tuple[dict[str, Any], ...] = (),
+        baseline_status: str = "absent",
+        baseline_present: bool = False,
+        baseline_compatible: bool = False,
     ) -> SynthesizerTaskContext:
         memory_package = getattr(snapshot, "memory_context", None)
         selected_count = max(
@@ -212,7 +218,10 @@ class SynthesizerPromptBuilder:
             ltm_active_count=int(getattr(long_term_selection, "active_record_count", 0) or 0),
             ltm_selected_count=selected_count,
             historical_only=task.evidence_mode == "memory_only",
-            compatible_previous_baseline_available=bool(delta_contexts),
+            compatible_previous_baseline_available=baseline_compatible,
+            baseline_status=baseline_status,
+            baseline_present=baseline_present,
+            baseline_compatible=baseline_compatible,
         )
         provider_states = {
             "profile": self._provider_state(results, "asset.get_profile"),
@@ -271,7 +280,7 @@ class SynthesizerPromptBuilder:
             current_vs_historical_relationship=(
                 "compatible_deterministic_delta_supplied"
                 if delta_contexts
-                else "compatible_baseline_unavailable"
+                else f"baseline_{baseline_status}_delta_unavailable"
             ),
             deterministic_delta_available=bool(delta_contexts),
             selected_analytical_lenses=self._analytical_lenses(task),

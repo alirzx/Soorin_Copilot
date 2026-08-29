@@ -11,6 +11,12 @@ from typing import Any
 
 from src.config.settings import Settings
 from src.core.context.models import approx_tokens, compact_preview
+from src.core.memory.baselines import (
+    MAX_BASELINE_PROJECTIONS,
+    MAX_BASELINE_PROJECTION_BYTES,
+    MAX_BASELINE_TOTAL_BYTES,
+    InvestigationBaseline,
+)
 from src.core.memory.episodes import (
     EpisodeRecord,
     InMemoryMemoryRepository,
@@ -179,6 +185,113 @@ class MemoryStore:
             len(facts),
             len(working.working_facts),
         )
+
+    def set_investigation_baseline(
+        self,
+        session_id: str,
+        context_key: MemoryContextKey,
+        baseline: InvestigationBaseline,
+        *,
+        request_id: str = "",
+    ) -> bool:
+        """Replace a matching episode baseline only with a complete newer snapshot."""
+        working = self.repository.get_working(session_id)
+        if (
+            working is None
+            or working.context_key != context_key
+            or set(baseline.entity_ids) != set(context_key.entities)
+            or not baseline.owner_id
+            or not baseline.projections
+            or any(
+                item.completeness != "complete" or item.truncated
+                for item in baseline.projections
+            )
+        ):
+            return False
+        existing = working.baseline
+        if existing is not None:
+            if (
+                existing.owner_id != baseline.owner_id
+                or existing.captured_at > baseline.captured_at
+            ):
+                return False
+            merged = {item.identity: item for item in existing.projections}
+            merged.update({item.identity: item for item in baseline.projections})
+            projections = tuple(merged.values())
+            used_bytes = sum(
+                len(json.dumps(
+                    item.payload,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8"))
+                for item in projections
+            )
+            if (
+                len(projections) > MAX_BASELINE_PROJECTIONS
+                or used_bytes > MAX_BASELINE_TOTAL_BYTES
+                or any(
+                    len(json.dumps(
+                        item.payload,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ).encode("utf-8")) > MAX_BASELINE_PROJECTION_BYTES
+                    for item in projections
+                )
+            ):
+                return False
+            baseline = InvestigationBaseline(
+                entity_ids=baseline.entity_ids,
+                captured_at=baseline.captured_at,
+                source_request_id=baseline.source_request_id,
+                scope=baseline.scope,
+                projections=projections,
+                owner_id=baseline.owner_id,
+            )
+        working.baseline = baseline
+        self.repository.set_working(working)
+        logger.info(
+            "event=investigation_baseline_persisted request_id=%s projection_count=%s",
+            request_id,
+            len(baseline.projections),
+        )
+        return True
+
+    def investigation_baselines(
+        self,
+        session_id: str,
+        context_key: MemoryContextKey,
+        *,
+        owner_id: str,
+    ) -> tuple[InvestigationBaseline, ...]:
+        """Return bounded owner/context-compatible active and archived baselines."""
+        if not owner_id:
+            return ()
+        selected: list[InvestigationBaseline] = []
+        working = self.repository.get_working(session_id)
+        if (
+            working is not None
+            and working.context_key == context_key
+            and working.baseline is not None
+            and working.baseline.owner_id == owner_id
+        ):
+            selected.append(working.baseline)
+        for episode in reversed(self.repository.list_episodes(session_id)):
+            baseline = episode.baseline
+            if (
+                episode.context_key != context_key
+                or baseline is None
+                or baseline.owner_id != owner_id
+                or baseline.source_request_id in {
+                    item.source_request_id for item in selected
+                }
+            ):
+                continue
+            selected.append(baseline)
+            if len(selected) >= 4:
+                break
+        return tuple(selected)
 
     def record_turn(
         self,
@@ -719,7 +832,7 @@ class MemoryStore:
             (
                 episode
                 for episode in reversed(self.repository.list_episodes(session_id))
-                if episode.context_key == context_key and episode.compact_summary
+                if episode.context_key == context_key and (episode.compact_summary or episode.baseline)
             ),
             None,
         )
@@ -737,6 +850,7 @@ class MemoryStore:
                 episode_id=episode.episode_id,
                 compact_summary=matching.compact_summary if matching else "",
                 working_facts=working.working_facts,
+                baseline=matching.baseline if matching else None,
             )
         )
         logger.info(
@@ -817,6 +931,7 @@ class MemoryStore:
                 last_providers=working.last_providers,
                 last_scope=working.last_scope,
                 turn_count=sum(1 for item in history if item.get("role") == "user"),
+                baseline=working.baseline,
             )
         )
         logger.info(

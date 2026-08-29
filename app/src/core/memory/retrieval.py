@@ -156,6 +156,7 @@ class MemorySemanticIndex:
 class LongTermMemorySelection:
     status: str
     memories: tuple[RetrievedLongTermMemory, ...] = ()
+    baseline_memories: tuple[RetrievedLongTermMemory, ...] = ()
     exact_candidate_count: int = 0
     semantic_candidate_count: int = 0
     reranked_count: int = 0

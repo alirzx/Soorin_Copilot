@@ -14,11 +14,14 @@ from src.core.agent.task_mapping import (
     classify_historical_recall,
     compile_direct_plan,
     derive_request_constraints,
+    derive_turn_policy,
+    materialize_turn_policy_target,
     historical_evidence_classes_for_request,
     task_spec_from_route,
 )
 from src.core.context.entities import EntityResolver
 from src.core.context.models import EntityResolution, IntentDecision, ResolvedEntity
+from src.core.context.router import DeterministicFallbackRouter
 from src.core.memory.episodes import MemoryContextKey
 from src.core.memory.routing_state import SessionRoutingState
 from src.core.memory.store import MemoryStore, extract_working_facts
@@ -648,3 +651,156 @@ def test_execution_guard_refuses_live_steps_when_request_disallows_live() -> Non
     assert result["next_edge"] == "safe_failure"
     assert result["tool_results"] == []
     assert result["failure_metadata"]["safe_error_code"] == "live_capability_forbidden_by_request"
+
+
+CURRENT_FOLLOWUP = (
+    "Verify whether those conclusions are still true now. Use what you remember as "
+    "the previous baseline, then check the current live evidence and tell me what "
+    "has changed, if anything."
+)
+
+
+def test_state_aware_current_followup_retains_active_entity_without_lexical_reference() -> None:
+    active = SessionRoutingState(
+        active_entities=("192.168.21.142",),
+        previous_intent="asset_investigation",
+        previous_scope="node_summary",
+        last_providers=("asset_profile", "detection", "graph"),
+        previous_requires_asset_profile=True,
+        previous_requires_detection=True,
+    )
+    raw = EntityResolver().resolve(CURRENT_FOLLOWUP, routing_state=active)
+    constraints = derive_request_constraints(CURRENT_FOLLOWUP)
+    policy = derive_turn_policy(CURRENT_FOLLOWUP, constraints, raw, active)
+    resolved = materialize_turn_policy_target(raw, policy)
+
+    assert raw.status == "none"
+    assert constraints.require_current and constraints.allow_live
+    assert policy.operation == "compare_previous_current"
+    assert policy.target == "active_entity"
+    assert policy.target_entities == active.active_entities
+    assert policy.episode_transition == "keep"
+    assert [item.value for item in resolved.entities] == ["192.168.21.142"]
+
+
+def test_router_timeout_fallback_keeps_target_and_requires_live_evidence() -> None:
+    active = SessionRoutingState(
+        active_entities=("192.168.21.142",),
+        previous_intent="asset_investigation",
+        previous_scope="node_summary",
+        last_providers=("asset_profile", "detection", "graph"),
+        previous_requires_asset_profile=True,
+        previous_requires_detection=True,
+    )
+    raw = EntityResolver().resolve(CURRENT_FOLLOWUP, routing_state=active)
+    constraints = derive_request_constraints(CURRENT_FOLLOWUP)
+    policy = derive_turn_policy(CURRENT_FOLLOWUP, constraints, raw, active)
+    resolved = materialize_turn_policy_target(raw, policy)
+
+    route = DeterministicFallbackRouter().route(
+        CURRENT_FOLLOWUP,
+        resolved,
+        active,
+        fallback_reason="transport_timeout",
+        constraints=constraints,
+        turn_policy=policy,
+    )
+    task = task_spec_from_route(route, CURRENT_FOLLOWUP, constraints, policy)
+
+    assert route.materialized_entities == active.active_entities
+    assert route.intent != "general_knowledge"
+    assert route.use_graph and route.use_asset_profile and route.use_detection
+    assert set(task.required_capabilities) == {
+        "asset.get_profile", "asset.get_detection", "graph.get_summary"
+    }
+
+
+def test_current_verification_with_no_authorized_live_scope_fails_closed() -> None:
+    settings = get_settings()
+    memory = MemoryStore(20)
+    service = SimpleNamespace(settings=settings, memory_store=memory)
+    nodes = CopilotWorkflowNodes(service)
+    constraints = derive_request_constraints("Verify this now.")
+    policy = derive_turn_policy(
+        "Verify this now.", constraints, EntityResolution(status="none"), SessionRoutingState()
+    )
+    route = SimpleNamespace(
+        materialized_entities=(), intent="general_knowledge", scope="none", direction="none",
+        use_asset_profile=False, use_detection=False, use_graph=False, use_knowledge=False,
+        requires_multiple_entities=False, relationship_mode="none", decision_source="deterministic_fallback",
+        matched_signals=(), followup_detected=False, depth=0,
+    )
+
+    update = nodes.validate_task({
+        "routing_result": route,
+        "resolved_entities": EntityResolution(status="none"),
+        "message": "Verify this now.",
+        "request_constraints": constraints,
+        "turn_policy": policy,
+        "session_id": "fail-closed",
+    })
+
+    assert update["next_edge"] == "safe_failure"
+    assert update["failure_metadata"]["safe_error_code"] == "current_verification_requires_live_evidence"
+
+
+def test_episode_policy_keeps_failures_switches_explicit_target_and_detaches_explicitly() -> None:
+    active = SessionRoutingState(active_entities=("192.168.21.142",))
+    constraints = derive_request_constraints(CURRENT_FOLLOWUP)
+    current = derive_turn_policy(
+        CURRENT_FOLLOWUP,
+        constraints,
+        EntityResolver().resolve(CURRENT_FOLLOWUP, routing_state=active),
+        active,
+    )
+    explicit = EntityResolver().resolve("Analyze 192.168.21.143.", routing_state=active)
+    switched = derive_turn_policy(
+        "Analyze 192.168.21.143.", derive_request_constraints("Analyze 192.168.21.143."), explicit, active
+    )
+    detached_resolution = EntityResolver().resolve(
+        "Not about this asset; explain Kerberos.", routing_state=active
+    )
+    detached = derive_turn_policy(
+        "Not about this asset; explain Kerberos.",
+        derive_request_constraints("Not about this asset; explain Kerberos."),
+        detached_resolution,
+        active,
+    )
+
+    assert current.episode_transition == "keep"
+    assert switched.target_entities == ("192.168.21.143",)
+    assert switched.episode_transition == "switch"
+    assert detached.operation == "topic_detach"
+    assert detached.episode_transition == "detach"
+
+
+def test_broad_conversation_recall_bypasses_router_and_planner() -> None:
+    message = "what do you know at all about our chats?"
+    active = SessionRoutingState(active_entities=("192.168.21.142",))
+    raw = EntityResolver().resolve(message, routing_state=active)
+    constraints = derive_request_constraints(message)
+    policy = derive_turn_policy(message, constraints, raw, active)
+    service = SimpleNamespace(
+        settings=get_settings(),
+        intent_router=SimpleNamespace(classify=lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("router called"))),
+        fallback_router=SimpleNamespace(),
+    )
+    update = CopilotWorkflowNodes(service).route({
+        "message": message,
+        "resolved_entities": raw,
+        "active_entity_state": active,
+        "recent_messages": [],
+        "ui_context": None,
+        "trace_id": "trace",
+        "request_id": "request",
+        "request_constraints": constraints,
+        "turn_policy": policy,
+    })
+    task = task_spec_from_route(update["routing_result"], message, constraints, policy)
+
+    assert policy.operation == "memory_recall"
+    assert not policy.requires_domain_router
+    assert update["routing_result"].semantic_router_called is False
+    assert task.intent == "memory_recall"
+    assert task.workflow_mode == "direct"
+    assert compile_direct_plan(task).steps == ()
