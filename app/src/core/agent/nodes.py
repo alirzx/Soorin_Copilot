@@ -1367,6 +1367,7 @@ class CopilotWorkflowNodes:
             if statement is None:
                 continue
             try:
+                is_product = result.source_capability in {"asset.get_profile", "asset.get_detection"}
                 candidate = LongTermMemoryRecord.candidate(
                     memory_type="validated_finding",
                     user_id=identity.user_id,
@@ -1375,11 +1376,8 @@ class CopilotWorkflowNodes:
                     source_request_id=identity.request_id,
                     source_conversation_id=identity.thread_key,
                     evidence_refs=refs,
-                    provenance_category=(
-                        "product"
-                        if result.source_capability in {"asset.get_profile", "asset.get_detection"}
-                        else "investigation"
-                    ),
+                    provenance_category="product" if is_product else "investigation",
+                    epistemic_status="source_validated" if is_product else "candidate",
                 )
                 if hasattr(coordinator, "process_candidate"):
                     lifecycle = coordinator.process_candidate(

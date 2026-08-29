@@ -324,6 +324,7 @@ class LongTermMemoryRecord:
         evidence_refs: tuple[str, ...] = (),
         provenance_category: str = "investigation",
         confidence: float = 0.0,
+        epistemic_status: EpistemicStatus = "candidate",
     ) -> "LongTermMemoryRecord":
         return cls(
             memory_id=f"mem_{uuid4().hex}",
@@ -331,7 +332,7 @@ class LongTermMemoryRecord:
             user_id=user_id,
             entity_ids=entity_ids,
             statement=statement,
-            epistemic_status="candidate",
+            epistemic_status=epistemic_status,
             confidence=confidence,
             source_request_id=source_request_id,
             source_conversation_id=source_conversation_id,
@@ -370,7 +371,7 @@ class MemoryPromotionPolicy:
             "evidence_refs": refs,
             "policy_version": policy_version,
         }
-        if candidate.status != "candidate" or candidate.epistemic_status != "candidate":
+        if candidate.status != "candidate" or candidate.epistemic_status not in {"candidate", "source_validated"}:
             return PromotionDecision("reject", "candidate_status_ineligible", "Record is not an eligible candidate.", **base)
         if not candidate.user_id or len(candidate.entity_ids) != 1:
             return PromotionDecision("reject", "owner_or_entity_invalid", "Exact owner and single-entity scope are required.", **base)

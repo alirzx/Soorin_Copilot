@@ -435,7 +435,7 @@ class LongTermMemoryCoordinator:
         self.active_validity_seconds = max(60, int(active_validity_seconds))
 
     def create_candidate(self, memory: LongTermMemoryRecord) -> LongTermMemoryRecord:
-        if memory.status != "candidate" or memory.epistemic_status != "candidate":
+        if memory.status != "candidate" or memory.epistemic_status not in {"candidate", "source_validated"}:
             raise ValueError("Only explicit candidate records can use create_candidate")
         try:
             stored = self.store.put(memory=memory)
