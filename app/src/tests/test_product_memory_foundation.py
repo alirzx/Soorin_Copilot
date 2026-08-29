@@ -1,15 +1,35 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import json
 from types import SimpleNamespace
 
 import pytest
 
+from src.core.agent.contracts import ToolResult
+from src.core.context.compaction import fingerprint
 from src.core.identity import RequestIdentity
-from src.core.memory.long_term import PromotionDecision
-from src.core.memory.persistence import ThreadMemoryState
-from src.core.memory.product import ProductLongTermMemoryStore, ProductThreadStateStore
-from src.core.product_client.memory_client import ProductMemoryClient, ProductMemoryNotFoundError
+from src.core.memory.baselines import BaselineProjection, InvestigationBaseline
+from src.core.memory.episodes import MemoryContextKey, WorkingFact, WorkingMemory
+from src.core.memory.long_term import LongTermMemoryRecord, PromotionDecision
+from src.core.memory.retrieval import LongTermMemoryCoordinator
+from src.core.memory.persistence import (
+    MAX_THREAD_STATE_BYTES,
+    LocalPersistenceConflictError,
+    THREAD_STATE_SCHEMA_VERSION,
+    ThreadMemoryState,
+)
+from src.core.memory.product import (
+    PRODUCT_THREAD_STATE_SCHEMA_VERSION,
+    ProductLongTermMemoryStore,
+    ProductThreadStateStore,
+)
+from src.core.memory.routing_state import SessionRoutingState
+from src.core.product_client.memory_client import (
+    ProductMemoryClient,
+    ProductMemoryConflictError,
+    ProductMemoryNotFoundError,
+)
 
 
 class FakeProductClient:
@@ -45,12 +65,163 @@ def test_product_thread_state_save_uses_canonical_payload_and_revision():
     fake = FakeProductClient({"revision": 1, "sessionId": "session-1", "updatedAt": "2026-01-01T00:00:00+00:00"})
     store = ProductThreadStateStore(ProductMemoryClient(fake))
     identity = RequestIdentity.resolve(user_id="owner", conversation_id="chat-1", session_id="session-1")
-    state = ThreadMemoryState.from_routing_state(identity, __import__("src.core.memory.routing_state", fromlist=["SessionRoutingState"]).SessionRoutingState())
+    state = ThreadMemoryState.from_routing_state(identity, SessionRoutingState())
     saved = store.save(identity=identity, state=state, expected_revision=0)
     assert saved.revision == 1
     body = fake.calls[0][2]["json_body"]
-    assert body["conversationId"] == "chat-1" and body["stateJson"] == state.to_payload()
+    assert body == {
+        "sessionId": "session-1",
+        "expectedRevision": 0,
+        "schemaVersion": PRODUCT_THREAD_STATE_SCHEMA_VERSION,
+        "conversationId": "chat-1",
+        "stateJson": state.to_payload(),
+    }
 
+
+def _thread_state_with_baseline():
+    identity = RequestIdentity.resolve(
+        user_id="owner",
+        conversation_id="chat-1",
+        session_id="session-1",
+    )
+    entity = "192.0.2.1"
+    captured_at = "2026-08-20T08:00:00+00:00"
+    evidence = {"role": "server", "risk": 4}
+    projection = BaselineProjection(
+        capability="asset.get_profile",
+        entity_ids=(entity,),
+        view="overview",
+        schema_version="product-view-v1",
+        evidence_classes=("asset_identity", "asset_role"),
+        payload=evidence,
+        valid_at=captured_at,
+        completeness="complete",
+        fingerprint=fingerprint(evidence),
+    )
+    baseline = InvestigationBaseline(
+        entity_ids=(entity,),
+        captured_at=captured_at,
+        source_request_id="baseline-request",
+        scope="node_summary",
+        projections=(projection,),
+        owner_id="owner",
+    )
+    context_key = MemoryContextKey(
+        entities=(entity,),
+        topic_family="asset_investigation",
+        scope_family="asset",
+    )
+    state = ThreadMemoryState.from_routing_state(
+        identity,
+        SessionRoutingState(
+            active_entities=(entity,),
+            previous_intent="asset_investigation",
+            previous_scope="node_summary",
+        ),
+        working_memory=WorkingMemory(
+            session_id=identity.session_id,
+            context_key=context_key,
+            episode_id="active-episode",
+            compact_summary="Asset appears to be a web endpoint",
+            working_facts=(
+                WorkingFact(
+                    key="tcp-443",
+                    value="Host responds on TCP/443",
+                    scope="entity",
+                    entity_ids=(entity,),
+                ),
+            ),
+            last_providers=("product_profile",),
+            last_scope="node_summary",
+            baseline=baseline,
+        ),
+    )
+    return identity, state, baseline
+
+
+def test_product_thread_state_baseline_uses_v3_wire_and_current_internal_schema():
+    identity, state, baseline = _thread_state_with_baseline()
+    fake = FakeProductClient(
+        {
+            "revision": 1,
+            "sessionId": identity.session_id,
+            "updatedAt": "2026-08-20T08:01:00+00:00",
+        }
+    )
+
+    ProductThreadStateStore(ProductMemoryClient(fake)).save(
+        identity=identity,
+        state=state,
+        expected_revision=0,
+    )
+
+    body = fake.calls[0][2]["json_body"]
+    assert state.schema_version == THREAD_STATE_SCHEMA_VERSION == 4
+    assert body["schemaVersion"] == PRODUCT_THREAD_STATE_SCHEMA_VERSION == 3
+    assert body["stateJson"]["working_memory"]["baseline"]["source_request_id"] == (
+        baseline.source_request_id
+    )
+    assert len(
+        json.dumps(body["stateJson"], separators=(",", ":")).encode("utf-8")
+    ) <= MAX_THREAD_STATE_BYTES
+
+
+def test_product_v3_load_normalizes_baseline_state_to_current_internal_schema():
+    identity, state, baseline = _thread_state_with_baseline()
+    fake = FakeProductClient(
+        {
+            "schemaVersion": PRODUCT_THREAD_STATE_SCHEMA_VERSION,
+            "revision": 1,
+            "sessionId": identity.session_id,
+            "updatedAt": "2026-08-20T08:01:00+00:00",
+            "stateJson": state.to_payload(),
+        }
+    )
+
+    restored = ProductThreadStateStore(ProductMemoryClient(fake)).load(identity=identity)
+
+    assert restored is not None
+    assert restored.schema_version == THREAD_STATE_SCHEMA_VERSION
+    assert restored.active_entities == ("192.0.2.1",)
+    assert restored.previous_intent == "asset_investigation"
+    assert restored.working_memory is not None
+    assert restored.working_memory.episode_id == "active-episode"
+    assert restored.working_memory.compact_summary == "Asset appears to be a web endpoint"
+    assert restored.working_memory.working_facts[0].value == "Host responds on TCP/443"
+    assert restored.working_memory.baseline == baseline
+
+
+def test_product_old_v3_state_without_baseline_remains_loadable():
+    identity = RequestIdentity.resolve(
+        user_id="owner",
+        conversation_id="chat-legacy",
+        session_id="session-legacy",
+    )
+    legacy = ThreadMemoryState.from_routing_state(
+        identity,
+        SessionRoutingState(
+            active_entities=("192.0.2.9",),
+            previous_intent="asset_investigation",
+        ),
+    )
+    payload = legacy.to_payload()
+    assert payload.get("working_memory") is None
+    fake = FakeProductClient(
+        {
+            "schemaVersion": PRODUCT_THREAD_STATE_SCHEMA_VERSION,
+            "revision": 7,
+            "sessionId": identity.session_id,
+            "stateJson": payload,
+        }
+    )
+
+    restored = ProductThreadStateStore(ProductMemoryClient(fake)).load(identity=identity)
+
+    assert restored is not None
+    assert restored.schema_version == THREAD_STATE_SCHEMA_VERSION
+    assert restored.revision == 7
+    assert restored.active_entities == ("192.0.2.9",)
+    assert restored.working_memory is None
 
 def test_product_ltm_create_preserves_candidate_domain_values_and_lossless_refs():
     record = __import__("src.core.memory.long_term", fromlist=["LongTermMemoryRecord"]).LongTermMemoryRecord.candidate(
@@ -171,9 +342,15 @@ def test_product_ltm_promotion_uses_one_atomic_transition_request():
     assert len(transition_calls) == 1
     method, path, kwargs = transition_calls[0]
     assert (method, path) == ("POST", f"/configured/ltm/{record.memory_id}/transition")
-    assert kwargs["json_body"]["action"] == "promote"
-    assert kwargs["json_body"]["reasonCode"] == "validated_product_fact"
-    assert kwargs["json_body"]["expectedRevision"] == record.revision
+    assert kwargs["json_body"] == {
+        "expectedRevision": record.revision,
+        "action": "promote",
+        "reasonCode": "validated_product_fact",
+        "actor": "copilot",
+        "policyVersion": "ltm-promotion-v1",
+        "resolution": "compatible_change",
+    }
+    assert kwargs["extra_headers"] == {"X-User-ID": "owner", "Content-Type": "application/json"}
     assert kwargs["operation"] == "memory_transition"
 
 
@@ -237,7 +414,7 @@ def test_product_ltm_terminal_transition_bodies_are_exact(method_name, action, r
     body = fake.calls[0][2]["json_body"]
     assert body == {
         "action": action, "reasonCode": reason, "actor": actor,
-        "policyVersion": "ltm-promotion-v1", "sourceRequestId": "", "expectedRevision": 1,
+        "policyVersion": "ltm-promotion-v1", "expectedRevision": 1,
     }
 
 
@@ -256,7 +433,7 @@ def test_product_ltm_reject_transition_body_is_exact():
     assert body["action"] == "reject"
     assert body["reasonCode"] == "insufficient_authority"
     assert body["expectedRevision"] == record.revision
-    assert body["sourceRequestId"] == record.source_request_id
+    assert "sourceRequestId" not in body
 
 
 def test_product_ltm_delete_reads_revision_then_sends_delete_transition():
@@ -268,12 +445,20 @@ def test_product_ltm_delete_reads_revision_then_sends_delete_transition():
     body = fake.calls[1][2]["json_body"]
     assert body == {
         "action": "delete", "reasonCode": "quota_or_manual_cleanup", "actor": "copilot",
-        "policyVersion": record.policy_version, "sourceRequestId": "", "expectedRevision": record.revision,
+        "policyVersion": record.policy_version, "expectedRevision": record.revision,
     }
 
 
-@pytest.mark.parametrize(("same_statement", "expected_action"), ((True, "confirm"), (False, "supersede")))
-def test_product_ltm_existing_active_transition_body_is_exact(same_statement, expected_action):
+@pytest.mark.parametrize(
+    ("same_statement", "expected_action", "expected_reason", "expected_resolution"),
+    (
+        (True, "confirm", "same_value_refresh", "same_value"),
+        (False, "promote", "newer_compatible_value", "compatible_change"),
+    ),
+)
+def test_product_ltm_existing_active_transition_body_is_exact(
+    same_statement, expected_action, expected_reason, expected_resolution
+):
     candidate = _candidate()
     active_base = candidate if same_statement else candidate.__class__.candidate(
         memory_type=candidate.memory_type, user_id=candidate.user_id, entity_ids=candidate.entity_ids,
@@ -297,8 +482,202 @@ def test_product_ltm_existing_active_transition_body_is_exact(same_statement, ex
         candidate=candidate, decision=decision, actor="copilot", request_id="current-request"
     )
     body = next(call[2]["json_body"] for call in fake.calls if call[1].endswith("/transition"))
-    assert body["action"] == expected_action
-    assert body["relatedMemoryId"] == active.memory_id
-    assert body["relatedExpectedRevision"] == active.revision
-    assert body["expectedRevision"] == candidate.revision
-    assert body["sourceRequestId"] == candidate.source_request_id
+    assert body == {
+        "action": expected_action,
+        "reasonCode": expected_reason,
+        "actor": "copilot",
+        "policyVersion": candidate.policy_version,
+        "expectedRevision": candidate.revision,
+        "resolution": expected_resolution,
+    }
+
+def test_product_ltm_terse_create_hydrates_canonical_id_and_revision():
+    candidate = _candidate()
+    canonical = replace(candidate, memory_id="canonical-memory", revision=4)
+
+    def payload(method, path, kwargs):
+        if method == "POST":
+            return {"memoryId": canonical.memory_id}
+        return _canonical_wire(canonical)
+
+    fake = FakeProductClient(payload)
+    stored = ProductLongTermMemoryStore(ProductMemoryClient(fake)).put(memory=candidate)
+
+    assert stored.memory_id == canonical.memory_id
+    assert stored.revision == 4
+    assert [(method, path) for method, path, _ in fake.calls] == [
+        ("POST", "/configured/ltm"),
+        ("GET", f"/configured/ltm/{canonical.memory_id}"),
+    ]
+    assert fake.calls[1][2]["request_id"] == candidate.source_request_id
+
+
+def test_product_ltm_deduplicated_full_create_reuses_canonical_active_record():
+    candidate = _candidate()
+    canonical = replace(
+        candidate,
+        memory_id="existing-active-memory",
+        revision=8,
+        status="active",
+        epistemic_status="source_validated",
+        index_status="pending",
+    )
+    fake = FakeProductClient(
+        _canonical_wire(
+            canonical,
+            status="active",
+            revision=8,
+            epistemic_status="source_validated",
+        )
+    )
+
+    stored = ProductLongTermMemoryStore(ProductMemoryClient(fake)).put(memory=candidate)
+
+    assert stored.memory_id == canonical.memory_id
+    assert stored.revision == 8
+    assert stored.status == "active"
+    assert len(fake.calls) == 1
+
+
+def test_product_ltm_transition_conflict_maps_stale_canonical_revision():
+    candidate = _candidate()
+
+    def payload(method, path, kwargs):
+        if path.endswith("/search"):
+            return {"items": []}
+        if path.endswith("/transition"):
+            raise ProductMemoryConflictError("stale")
+        raise AssertionError(f"unexpected Product call: {method} {path}")
+
+    fake = FakeProductClient(payload)
+    decision = PromotionDecision(
+        "auto_promote",
+        "validated_product_fact",
+        "eligible",
+        confidence=0.95,
+        epistemic_status="source_validated",
+        provenance_category="product",
+    )
+
+    with pytest.raises(LocalPersistenceConflictError, match="revision is stale"):
+        ProductLongTermMemoryStore(ProductMemoryClient(fake)).apply_promotion(
+            candidate=candidate,
+            decision=decision,
+            actor="copilot",
+            request_id="current-request",
+        )
+
+    transition = next(call for call in fake.calls if call[1].endswith("/transition"))
+    assert transition[2]["json_body"]["expectedRevision"] == candidate.revision
+
+def test_product_ltm_unresolved_conflict_stays_candidate_without_unsupported_transition():
+    candidate = _candidate()
+    active = replace(
+        candidate,
+        memory_id="active-memory",
+        status="active",
+        revision=5,
+        epistemic_status="source_validated",
+    )
+    fake = FakeProductClient(
+        lambda method, path, kwargs: {
+            "items": [_canonical_wire(active, status="active", revision=5)]
+        }
+    )
+    decision = PromotionDecision(
+        "requires_review",
+        "unresolved_material_conflict",
+        "review required",
+        confidence=candidate.confidence,
+        epistemic_status=candidate.epistemic_status,
+        provenance_category=candidate.provenance_category,
+    )
+
+    result = ProductLongTermMemoryStore(ProductMemoryClient(fake)).apply_promotion(
+        candidate=candidate,
+        decision=decision,
+        request_id="current-request",
+    )
+
+    assert result.memory is candidate
+    assert result.previous_memory == active
+    assert result.conflict_count == 1
+    assert [path for _, path, _ in fake.calls] == ["/configured/ltm/search"]
+
+def test_product_candidate_is_not_indexed_before_successful_active_transition():
+    entity = "192.0.2.10"
+    statement = json.dumps(
+        {
+            "source_capability": "asset.get_profile",
+            "entities": [entity],
+            "evidence_classes": ["asset_role"],
+            "selected_views": ["overview"],
+            "schema_version": "product-view-v1",
+            "completeness": "complete",
+            "projection_complete": True,
+            "evidence": {"views": {"overview": {"role": "server"}}},
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    candidate = LongTermMemoryRecord.candidate(
+        memory_type="validated_finding",
+        user_id="owner",
+        entity_ids=(entity,),
+        statement=statement,
+        source_request_id="request-index-order",
+        source_conversation_id="chat-1",
+        evidence_refs=("evidence_class_asset_role", "complete"),
+        provenance_category="product",
+    )
+
+    def payload(method, path, kwargs):
+        if path.endswith("/search"):
+            return {"items": []}
+        if path.endswith("/transition"):
+            raise ProductMemoryConflictError("stale")
+        if method == "POST":
+            return _canonical_wire(candidate)
+        raise AssertionError(f"unexpected Product call: {method} {path}")
+
+    class RecordingIndex:
+        def __init__(self):
+            self.memory_ids = []
+
+        def index(self, memory):
+            self.memory_ids.append(memory.memory_id)
+            return memory
+
+    fake = FakeProductClient(payload)
+    index = RecordingIndex()
+    coordinator = LongTermMemoryCoordinator(
+        ProductLongTermMemoryStore(ProductMemoryClient(fake)),
+        index,
+    )
+    evidence = ToolResult(
+        status="ok",
+        entities=(entity,),
+        source_capability="asset.get_profile",
+        retrieved_at="2026-08-20T08:00:00+00:00",
+        freshness="current",
+        completeness="complete",
+        selected_views=("overview",),
+        view_payload={"views": {"overview": {"role": "server"}}},
+        projection_schema_version="product-view-v1",
+        source_payload_complete=True,
+        projection_usable=True,
+    )
+
+    with pytest.raises(LocalPersistenceConflictError):
+        coordinator.process_candidate(candidate, evidence)
+
+    assert index.memory_ids == []
+    transition = next(call for call in fake.calls if call[1].endswith("/transition"))
+    assert transition[2]["json_body"] == {
+        "expectedRevision": candidate.revision,
+        "action": "promote",
+        "reasonCode": "validated_product_fact",
+        "actor": "system",
+        "policyVersion": "ltm-promotion-v1",
+        "resolution": "compatible_change",
+    }

@@ -8,9 +8,20 @@ from typing import Any
 
 from src.core.identity import RequestIdentity
 from src.core.memory.long_term import LongTermMemoryRecord, MemoryLifecycleAuditEvent, MemoryLifecycleResult, PromotionDecision
-from src.core.memory.persistence import LocalPersistenceConflictError, LocalPersistenceError, LocalPersistenceOwnershipError, ThreadMemoryState
+from src.core.memory.persistence import (
+    THREAD_STATE_SCHEMA_VERSION,
+    LocalPersistenceConflictError,
+    LocalPersistenceError,
+    LocalPersistenceOwnershipError,
+    ThreadMemoryState,
+)
 from src.core.observability.metrics import get_metrics
 from src.core.product_client.memory_client import ProductMemoryClient, ProductMemoryConflictError, ProductMemoryNotFoundError
+
+
+# Product's deployed outer DTO remains v3. This is deliberately independent
+# from Copilot's internal ThreadMemoryState representation/version.
+PRODUCT_THREAD_STATE_SCHEMA_VERSION = 3
 
 
 logger = logging.getLogger(__name__)
@@ -81,15 +92,28 @@ class ProductThreadStateStore:
         try: item = _object(self.client.get_thread_state(user_id=owner, conversation_id=conversation_id, request_id=identity.request_id))
         except ProductMemoryNotFoundError: return None
         try:
-            return ThreadMemoryState.from_payload(item["stateJson"], thread_key=identity.thread_key, user_id=identity.user_id, conversation_id=conversation_id, session_id=item.get("sessionId", identity.session_id), updated_at=item.get("updatedAt", ""), revision=int(item["revision"]), schema_version=int(item["schemaVersion"]))
+            wire_schema_version = int(item["schemaVersion"])
+            if wire_schema_version != PRODUCT_THREAD_STATE_SCHEMA_VERSION:
+                raise LocalPersistenceError("Product thread-state wire schema version is incompatible.")
+            state = ThreadMemoryState.from_payload(
+                item["stateJson"],
+                thread_key=identity.thread_key,
+                user_id=identity.user_id,
+                conversation_id=conversation_id,
+                session_id=item.get("sessionId", identity.session_id),
+                updated_at=item.get("updatedAt", ""),
+                revision=int(item["revision"]),
+                schema_version=wire_schema_version,
+            )
+            return replace(state, schema_version=THREAD_STATE_SCHEMA_VERSION)
         except (KeyError, TypeError, ValueError) as exc: raise LocalPersistenceError("Product thread state was invalid.") from exc
     def save(self, *, identity: RequestIdentity, state: ThreadMemoryState, expected_revision: int) -> ThreadMemoryState:
         owner, conversation_id = self._owner(identity)
-        if expected_revision < 0 or state.schema_version < 1:
+        if expected_revision < 0 or state.schema_version != THREAD_STATE_SCHEMA_VERSION:
             raise LocalPersistenceConflictError("Product thread-state revision or schema version is invalid.")
         if state.thread_key != identity.thread_key or state.user_id != identity.user_id or state.conversation_id != conversation_id or state.session_id != identity.session_id:
             raise LocalPersistenceOwnershipError("Product thread-state identity does not match the request.")
-        body = {"sessionId": identity.session_id, "expectedRevision": expected_revision, "schemaVersion": state.schema_version, "conversationId": conversation_id, "stateJson": state.to_payload()}
+        body = {"sessionId": identity.session_id, "expectedRevision": expected_revision, "schemaVersion": PRODUCT_THREAD_STATE_SCHEMA_VERSION, "conversationId": conversation_id, "stateJson": state.to_payload()}
         try: item = _object(self.client.put_thread_state(user_id=owner, conversation_id=conversation_id, body=body, request_id=identity.request_id))
         except ProductMemoryConflictError as exc: raise LocalPersistenceConflictError("Thread state revision is stale.") from exc
         try: return replace(state, session_id=item.get("sessionId", identity.session_id), revision=int(item["revision"]), updated_at=item.get("updatedAt", state.updated_at))
@@ -253,23 +277,20 @@ class ProductLongTermMemoryStore:
         expected_revision: int,
         policy_version: str,
         request_id: str = "",
-        source_request_id: str = "",
-        related_memory_id: str | None = None,
-        related_expected_revision: int | None = None,
+        resolution: str | None = None,
         hydrate: bool = True,
     ) -> tuple[LongTermMemoryRecord | None, dict[str, Any]]:
+        if isinstance(expected_revision, bool) or not isinstance(expected_revision, int) or expected_revision < 1:
+            raise LocalPersistenceConflictError("Long-term memory revision is invalid.")
         body = {
             "action": action,
             "reasonCode": reason_code,
             "actor": actor,
             "policyVersion": policy_version,
-            "sourceRequestId": source_request_id or request_id,
             "expectedRevision": expected_revision,
         }
-        if related_memory_id:
-            body["relatedMemoryId"] = related_memory_id
-        if related_expected_revision is not None:
-            body["relatedExpectedRevision"] = related_expected_revision
+        if resolution is not None:
+            body["resolution"] = resolution
         try: response = _object(self.client.transition_ltm(user_id=self._owner(user_id), memory_id=memory_id, body=body, request_id=request_id))
         except ProductMemoryConflictError as exc: raise LocalPersistenceConflictError("Long-term memory revision is stale.") from exc
         if "memoryType" in response:
@@ -317,25 +338,24 @@ class ProductLongTermMemoryStore:
         ):
             active = self._active_for(candidate, request_id=current_request_id)
         if decision.action in {"keep_candidate", "requires_review"}:
-            if decision.reason_code != "unresolved_material_conflict" or active is None:
-                return MemoryLifecycleResult(
-                    candidate,
-                    decision,
-                    previous_memory=active,
-                )
-            action, reason_code = "conflict", decision.reason_code
-        elif decision.action == "reject":
-            action, reason_code = "reject", decision.reason_code
+            conflict_count = (
+                1
+                if decision.reason_code == "unresolved_material_conflict" and active is not None
+                else 0
+            )
+            return MemoryLifecycleResult(candidate, decision, previous_memory=active, conflict_count=conflict_count)
+        if decision.action == "reject":
+            action, reason_code, resolution = "reject", decision.reason_code, None
         elif active is None:
-            action, reason_code = "promote", decision.reason_code
+            action, reason_code, resolution = "promote", decision.reason_code, "compatible_change"
         elif active.statement == candidate.statement:
-            action, reason_code = "confirm", "same_value_revalidated"
+            action, reason_code, resolution = "confirm", "same_value_refresh", "same_value"
         else:
-            action, reason_code = "supersede", "newer_compatible_value"
-        current, result = self._transition(user_id=candidate.user_id, memory_id=candidate.memory_id, action=action, reason_code=reason_code, actor=actor or "copilot", expected_revision=candidate.revision, policy_version=decision.policy_version, request_id=current_request_id, source_request_id=candidate.source_request_id, related_memory_id=active.memory_id if active is not None else None, related_expected_revision=active.revision if active is not None else None)
+            action, reason_code, resolution = "promote", "newer_compatible_value", "compatible_change"
+        current, result = self._transition(user_id=candidate.user_id, memory_id=candidate.memory_id, action=action, reason_code=reason_code, actor=actor or "copilot", expected_revision=candidate.revision, policy_version=decision.policy_version, request_id=current_request_id, resolution=resolution)
         if current is None: raise LocalPersistenceError("Product promotion did not return a canonical memory.")
         previous = result.get("relatedRecord", result.get("related_record"))
-        return MemoryLifecycleResult(current, decision, previous_memory=self._domain_record(previous, domain_user_id=candidate.user_id) if isinstance(previous, dict) else active, deduplicated=action == "confirm" or bool(result.get("deduplicated", False)), superseded_count=1 if action == "supersede" else int(result.get("supersededCount", 0)), conflict_count=1 if action == "conflict" else int(result.get("conflictCount", 0)))
+        return MemoryLifecycleResult(current, decision, previous_memory=self._domain_record(previous, domain_user_id=candidate.user_id) if isinstance(previous, dict) else active, deduplicated=action == "confirm" or bool(result.get("deduplicated", False)), superseded_count=1 if active is not None and action == "promote" else int(result.get("supersededCount", 0)), conflict_count=int(result.get("conflictCount", 0)))
     def update(self, *, memory: LongTermMemoryRecord, expected_revision: int) -> LongTermMemoryRecord:
         if memory.revision != expected_revision + 1: raise LocalPersistenceConflictError("Long-term memory revision is invalid.")
         logger.info("event=product_ltm_index_status_local_only memory_id_present=true")
@@ -349,7 +369,9 @@ class ProductLongTermMemoryStore:
         if updated is None: raise LocalPersistenceError("Product expiration did not return a canonical memory.")
         return updated
     def supersede(self, *, user_id: str, memory_id: str, replacement: LongTermMemoryRecord, expected_revision: int) -> tuple[LongTermMemoryRecord, LongTermMemoryRecord]:
-        current, result = self._transition(user_id=user_id, memory_id=replacement.memory_id, action="supersede", reason_code="newer_compatible_value", expected_revision=replacement.revision, policy_version=replacement.policy_version, request_id=replacement.source_request_id, related_memory_id=memory_id, related_expected_revision=expected_revision)
+        if expected_revision < 1 or not memory_id:
+            raise LocalPersistenceConflictError("Long-term memory revision is invalid.")
+        current, result = self._transition(user_id=user_id, memory_id=replacement.memory_id, action="promote", reason_code="newer_compatible_value", expected_revision=replacement.revision, policy_version=replacement.policy_version, request_id=replacement.source_request_id, resolution="compatible_change")
         if current is None: raise LocalPersistenceError("Product supersession did not return a canonical memory.")
         previous = result.get("relatedRecord", result.get("related_record"))
         if not isinstance(previous, dict):
