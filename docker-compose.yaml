@@ -116,20 +116,16 @@ services:
       - --server.headless=true
       - --browser.gatherUsageStats=false
 
+    env_file:
+      - ./.env
+
     environment:
       PYTHONPATH: /workspace/app
 
+      # UI talks to the Copilot API through Docker service DNS.
+      # These intentionally override any host/local values from .env.
       SOORIN_API_BASE_URL: http://api:6998
       SOORIN_COPILOT_API_URL: http://api:6998
-      SOORIN_COPILOT_API_KEY: "${SOORIN_COPILOT_API_KEY:?SOORIN_COPILOT_API_KEY is required}"
-      SOORIN_API_TIMEOUT_SECONDS: "${SOORIN_API_TIMEOUT_SECONDS:-600}"
-
-      SOORIN_LOCAL_PRODUCT_SIMULATION_ENABLED: "${SOORIN_LOCAL_PRODUCT_SIMULATION_ENABLED:-false}"
-      SOORIN_STREAMLIT_AUTH_BACKEND: "${SOORIN_STREAMLIT_AUTH_BACKEND:-none}"
-      SOORIN_LOCAL_TEST_USER_CREATION_ENABLED: "${SOORIN_LOCAL_TEST_USER_CREATION_ENABLED:-false}"
-      SOORIN_THREAD_STATE_BACKEND: "${SOORIN_THREAD_STATE_BACKEND:-memory}"
-      SOORIN_LOCAL_SQLITE_PATH: "${SOORIN_LOCAL_SQLITE_PATH:-/workspace/data/runtime/copilot-local.sqlite3}"
-      SOORIN_LANGGRAPH_CHECKPOINT_BACKEND: "${SOORIN_LANGGRAPH_CHECKPOINT_BACKEND:-none}"
 
       STREAMLIT_SERVER_ADDRESS: 0.0.0.0
       STREAMLIT_SERVER_PORT: "8501"
