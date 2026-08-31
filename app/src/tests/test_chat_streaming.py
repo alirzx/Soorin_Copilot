@@ -363,6 +363,72 @@ class CopilotServiceStreamingTests(unittest.TestCase):
         self.assertEqual([event.text for event in emitted], ["fallback"])
         self.assertFalse(metrics["streaming_used"])
 
+    def test_reasoning_only_stream_uses_one_bounded_answer_first_fallback(self) -> None:
+        llm = FakeStreamingLLM(
+            [
+                LLMStreamEvent("reasoning_delta", text="long internal reasoning"),
+                LLMStreamEvent(
+                    "done",
+                    data={
+                        "finish_reason": "length",
+                        "usage": {"completion_tokens": 100},
+                        "stream_terminated": True,
+                    },
+                ),
+            ],
+            fallback_text="recovered answer",
+        )
+        service = CopilotService(
+            service_settings(llm_expose_reasoning=False), llm, MemoryStore(0)
+        )  # type: ignore[arg-type]
+        emitted: list[LLMStreamEvent] = []
+        metrics = self._metrics()
+
+        result = service._stream_final_model(
+            [{"role": "system", "content": "answer with evidence"}],
+            request_id="reasoning-only",
+            max_tokens=4096,
+            temperature=0.2,
+            top_p=0.9,
+            timeout_seconds=10,
+            sink=emitted.append,
+            metrics=metrics,
+        )
+
+        self.assertEqual(result.text, "recovered answer")
+        self.assertEqual(len(llm.chat_calls), 1)
+        self.assertEqual(llm.chat_calls[0]["max_tokens"], 2048)
+        self.assertIn("FINAL ANSWER RECOVERY", llm.chat_calls[0]["messages"][0]["content"])
+        self.assertEqual(metrics["fallback_reason"], "provider_stream_reasoning_exhausted")
+        self.assertEqual([event.text for event in emitted], ["recovered answer"])
+
+    def test_empty_non_streaming_recovery_is_reported_without_retry_loop(self) -> None:
+        class EmptyRecoveryLLM(FakeStreamingLLM):
+            def chat(self, messages, **kwargs):
+                self.chat_calls.append({"messages": messages, **kwargs})
+                return LLMProviderResult(
+                    text="",
+                    provider="fake",
+                    model="fixture-chat-model",
+                    deployment="glm",
+                )
+
+        llm = EmptyRecoveryLLM([])
+        service = CopilotService(service_settings(), llm, MemoryStore(0))  # type: ignore[arg-type]
+
+        with self.assertRaisesRegex(LLMError, "recovery response was empty"):
+            service._stream_final_model(
+                [{"role": "user", "content": "hello"}],
+                request_id="empty-recovery",
+                max_tokens=100,
+                temperature=0.2,
+                top_p=0.9,
+                timeout_seconds=10,
+                sink=lambda event: None,
+                metrics=self._metrics(),
+            )
+        self.assertEqual(len(llm.chat_calls), 1)
+
     def test_partial_stream_failure_does_not_call_non_streaming_model(self) -> None:
         llm = FakeStreamingLLM(
             [

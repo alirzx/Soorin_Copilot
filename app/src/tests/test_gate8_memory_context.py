@@ -44,12 +44,13 @@ from src.core.context.compaction import (
 )
 from src.core.context.composer import ContextComposer
 from src.core.context.entities import EntityResolver
-from src.core.context.models import CopilotContextPackage
+from src.core.context.models import CopilotContextPackage, EntityResolution
 from src.core.context.product_views import build_product_view, payload_inventory, select_product_views
 from src.core.copilot.service import CopilotService
 from src.core.memory.episodes import BaselineProjection, InvestigationBaseline, MemoryContextKey
 from src.core.memory.long_term import LongTermMemoryRecord, MemoryPromotionPolicy, RetrievedLongTermMemory
 from src.core.memory.persistence import THREAD_STATE_SCHEMA_VERSION, ThreadMemoryState
+from src.core.memory.persistence import LocalPersistenceError
 from src.core.memory.retrieval import LongTermMemorySelection
 from src.core.memory.routing_state import SessionRoutingState, SessionRoutingStateStore
 from src.core.memory.store import MemoryStore
@@ -795,6 +796,25 @@ def test_complete_normalized_evidence_captures_bounded_baseline(
         }
 
 
+def test_mapping_provider_result_is_supported_for_graph_baseline_projection() -> None:
+    result = _complete_graph_result()
+    mapped = replace(
+        result,
+        provider_result={"context": result.provider_result.context},  # type: ignore[union-attr]
+    )
+
+    baseline = investigation_baseline_from_results(
+        (mapped,),
+        owner_id="user_test",
+        source_request_id="mapping-graph-request",
+        scope="node_summary",
+        required_capabilities=("graph.get_summary",),
+    )
+
+    assert baseline is not None
+    assert baseline.projections[0].capability == "graph.get_summary"
+
+
 def test_weak_or_memory_only_turn_cannot_create_baseline() -> None:
     complete = _complete_product_result()
     failed = replace(complete, status="unavailable", completeness="unknown")
@@ -1072,6 +1092,106 @@ def test_active_structured_ltm_baseline_is_independent_of_prose_budget() -> None
     assert [item.memory.memory_id for item in resolved.baseline_memories] == [
         active_baseline.memory.memory_id
     ]
+
+
+def test_inventory_failure_preserves_retrieved_canonical_memory() -> None:
+    retrieved = _memory("Canonical exact memory survives inventory failure.")
+    selection = LongTermMemorySelection(status="ok", memories=(retrieved,), selected_count=1)
+
+    class Retriever:
+        def retrieve(self, **_kwargs: Any) -> LongTermMemorySelection:
+            return selection
+
+    class BrokenInventory:
+        def list(self, **_kwargs: Any) -> tuple[Any, ...]:
+            raise LocalPersistenceError("inventory unavailable")
+
+    service = SimpleNamespace(
+        long_term_memory_retriever=Retriever(),
+        long_term_memory_store=BrokenInventory(),
+    )
+    resolved = CopilotService.retrieve_long_term_memory(
+        service,
+        identity=RequestIdentity.resolve(
+            user_id="user_test",
+            conversation_id="conversation-test",
+            session_id="session-inventory-failure",
+            request_id="inventory-failure-request",
+        ),
+        message="What did we validate?",
+        entity_ids=(IP,),
+    )
+
+    assert resolved.status == "ok"
+    assert resolved.memories == (retrieved,)
+    assert "long_term_memory_inventory_unavailable" in resolved.limitations
+
+
+def test_detach_clears_prior_routing_state_but_failed_turn_keeps_it() -> None:
+    def run_update(transition: str) -> SessionRoutingState:
+        task = TaskSpec(
+            request="Explain Kerberos generally.",
+            intent="general_knowledge",
+            scope="none",
+            direction="none",
+            entities=(),
+            required_capabilities=(),
+        )
+        identity = RequestIdentity.resolve(
+            user_id="user_test",
+            conversation_id=f"conversation-{transition}",
+            session_id=f"session-{transition}",
+            request_id=f"request-{transition}",
+        )
+        previous = SessionRoutingState(
+            active_ip=IP,
+            active_entities=(IP,),
+            last_resolved_entities=(IP,),
+            previous_entity_count=1,
+            previous_entity_mode="single",
+        )
+        service = SimpleNamespace(
+            settings=get_settings(),
+            memory_store=MemoryStore(20),
+            routing_state_store=SessionRoutingStateStore(),
+            long_term_memory_coordinator=None,
+            persist_thread_continuity=lambda *_args, **_kwargs: None,
+            persist_completed_local_turn=lambda *_args, **_kwargs: None,
+        )
+        state = {
+            "task": task,
+            "tool_results": (),
+            "synthesis_result": {"answer": "General answer."},
+            "memory_context_key": MemoryContextKey.from_task(task),
+            "pending_working_facts": (),
+            "session_id": identity.session_id,
+            "request_id": identity.request_id,
+            "request_identity": identity,
+            "message": task.request,
+            "evidence_pack": SimpleNamespace(limitations=()),
+            "active_entity_state": previous,
+            "resolved_entities": EntityResolution(status="none"),
+            "routing_result": SimpleNamespace(
+                intent="general_knowledge", scope="none", direction="none", depth=0,
+                use_detection=False, use_asset_profile=False,
+            ),
+            "execution_plan": ExecutionPlan(task=task, steps=(), plan_id=f"plan-{transition}"),
+            "review_decision": ReviewDecision(outcome="sufficient"),
+            "turn_policy": SimpleNamespace(episode_transition=transition),
+        }
+        return CopilotWorkflowNodes(service).update_memory(state)["active_entity_state"]
+
+    detached = run_update("detach")
+    failed = run_update("keep")
+
+    assert detached.active_entities == ()
+    assert detached.active_ip is None
+    assert detached.last_resolved_entities == ()
+    assert detached.previous_entity_count == 0
+    assert detached.previous_entity_mode == "none"
+    assert failed.active_entities == (IP,)
+    assert failed.active_ip == IP
+    assert failed.last_resolved_entities == (IP,)
 
 def test_candidate_ltm_never_becomes_authoritative_delta_baseline() -> None:
     baseline = historical_baseline_projections((_structured_baseline(candidate=True),))[0]

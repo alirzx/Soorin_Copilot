@@ -71,6 +71,9 @@ Do not add fields.
 
 An empty `steps` array is valid when no unresolved retrieval requirement remains.
 
+Begin the response with the JSON object immediately. Do not spend the response on
+analysis or explanation; keep the plan compact and use short strings.
+
 ---
 
 ## Planning Principle

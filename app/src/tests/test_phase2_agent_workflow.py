@@ -243,6 +243,31 @@ class TestPlanner:
         assert not planner.last_repair_used
         assert llm.purposes == ["planner"]
 
+    def test_reasoning_only_length_output_fails_with_specific_code(self):
+        class ReasoningOnlyLLM:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def chat(self, messages, **kwargs):
+                del messages, kwargs
+                self.calls += 1
+                return SimpleNamespace(
+                    text="",
+                    finish_reason="length",
+                    reasoning_present=True,
+                )
+
+        llm = ReasoningOnlyLLM()
+        with pytest.raises(PlannerError) as captured:
+            BoundedPlanner(llm).plan(
+                task("a", mode="multi_step"),
+                (self.capability(),),
+                request_id="reasoning-only",
+            )
+
+        assert captured.value.code == "planner_reasoning_exhausted"
+        assert llm.calls == 1
+
     def test_extra_prose_fails_without_second_planner_call(self):
         valid = (
             '{"goal":"check","target_entities":["192.0.2.10"],'

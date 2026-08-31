@@ -125,6 +125,11 @@ class CopilotWorkflowNodes:
                 identity=state["request_identity"],
                 message=state["message"].strip(),
                 entity_ids=tuple(item.value for item in resolution.entities),
+                allow_entity_scoped=bool(
+                    resolution.entities
+                    and turn_policy.operation != "topic_detach"
+                    and turn_policy.target != "conversation"
+                ),
                 required_evidence_classes=historical_evidence_classes_for_request(
                     state["message"]
                 ),
@@ -1152,7 +1157,7 @@ class CopilotWorkflowNodes:
         identity: Any,
         review: Any,
     ) -> str:
-        if task.evidence_mode not in {"normal", "current_verification", "verify_if_stale"}:
+        if getattr(task, "evidence_mode", "normal") not in {"normal", "current_verification", "verify_if_stale"}:
             return "ineligible_evidence_mode"
         if identity is None or not getattr(identity, "user_id", None):
             return "missing_owner_identity"
@@ -1252,6 +1257,12 @@ class CopilotWorkflowNodes:
         active_ip = previous.active_ip
         last_resolved = previous.last_resolved_entities
         transition = getattr(state.get("turn_policy"), "episode_transition", "switch")
+        if transition == "detach":
+            # The episode transition is authoritative: a general turn must not
+            # leave the prior asset available to the next resolver invocation.
+            active_entities = ()
+            active_ip = None
+            last_resolved = ()
         can_update = (
             resolved.status == "resolved"
             and bool(resolved.entities)
@@ -1282,8 +1293,16 @@ class CopilotWorkflowNodes:
             active_ip=active_ip,
             active_entities=active_entities,
             last_resolved_entities=last_resolved,
-            previous_entity_count=len(resolved.entities) if can_update else previous.previous_entity_count,
-            previous_entity_mode=resolved.entity_mode if can_update else previous.previous_entity_mode,
+            previous_entity_count=(
+                0 if transition == "detach"
+                else len(resolved.entities) if can_update
+                else previous.previous_entity_count
+            ),
+            previous_entity_mode=(
+                "none" if transition == "detach"
+                else resolved.entity_mode if can_update
+                else previous.previous_entity_mode
+            ),
             last_provider=("combined" if len(provider_names) > 1 else provider_names[0] if provider_names else previous.last_provider),
             last_providers=provider_names or previous.last_providers,
             previous_intent=route.intent if provider_names else previous.previous_intent,

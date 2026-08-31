@@ -92,10 +92,28 @@ class BoundedPlanner:
                 transient_retries=0,
                 trace_id=trace_id,
             )
+            if not str(getattr(result, "text", "") or "").strip():
+                finish_reason = str(getattr(result, "finish_reason", "") or "")
+                reasoning_present = bool(getattr(result, "reasoning_present", False))
+                code = (
+                    "planner_reasoning_exhausted"
+                    if finish_reason == "length" and reasoning_present
+                    else "planner_empty_output"
+                )
+                logger.warning(
+                    "event=planner_output_unusable request_id=%s reason=%s finish_reason=%s reasoning_present=%s",
+                    request_id,
+                    code,
+                    finish_reason or "none",
+                    reasoning_present,
+                )
+                raise PlannerError(code, "Planner did not produce a usable structured plan.")
             return self._parse(result.text, task)
         except LLMError as exc:
             raise PlannerError("planner_failed", "Planner provider call failed safely.") from exc
-        except (PlannerError, ValueError) as exc:
+        except PlannerError:
+            raise
+        except ValueError as exc:
             raise PlannerError("planner_schema_invalid", "Planner did not produce one valid JSON plan.") from exc
 
     def _messages(self, task: TaskSpec, capabilities: tuple[CapabilitySpec, ...]) -> list[dict[str, str]]:

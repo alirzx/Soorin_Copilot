@@ -24,6 +24,7 @@ from src.core.agent.contracts import ToolResult
 from src.core.memory.persistence import (
     LOCAL_SCHEMA_VERSION,
     LocalPersistenceConflictError,
+    LocalPersistenceError,
     LocalPersistenceOwnershipError,
     LocalPersistenceQuotaError,
     MemoryStoragePolicy,
@@ -793,6 +794,101 @@ def test_exact_historical_retrieval_preserves_complementary_required_classes(sql
         profile.memory_id,
         detection.memory_id,
     }
+
+
+def test_canonical_exact_failure_returns_no_fabricated_memory() -> None:
+    class BrokenCanonicalStore:
+        def list(self, **_kwargs):
+            raise LocalPersistenceError("canonical store unavailable")
+
+        def get(self, **_kwargs):
+            raise LocalPersistenceError("canonical store unavailable")
+
+    selection = LongTermMemoryRetriever(
+        BrokenCanonicalStore(), None, min_score=0.0  # type: ignore[arg-type]
+    ).retrieve(query="scanner", user_id="user-a", entity_ids=("192.0.2.10",))
+
+    assert selection.memories == ()
+    assert selection.status == "empty"
+    assert "exact_memory_unavailable" in selection.limitations
+
+
+def test_semantic_hydration_failure_preserves_exact_canonical_hit() -> None:
+    memory = active(entity="192.0.2.10")
+    semantic_only = active(entity="192.0.2.11", statement="Validated domain behavior.")
+
+    class BrokenHydrationStore:
+        def list(self, **_kwargs):
+            return (memory,)
+
+        def get(self, **_kwargs):
+            raise LocalPersistenceError("canonical hydration unavailable")
+
+    vectors = FakeVectorStore()
+    index = MemorySemanticIndex(FakeEmbedder(), vectors)
+    index.index(memory)
+    index.index(semantic_only)
+    selection = LongTermMemoryRetriever(
+        BrokenHydrationStore(), index, min_score=0.0  # type: ignore[arg-type]
+    ).retrieve(query="domain", user_id="user-a", entity_ids=("192.0.2.10",))
+
+    assert [item.memory.memory_id for item in selection.memories] == [memory.memory_id]
+    assert "semantic_memory_unavailable" in selection.limitations
+
+
+def test_entity_scope_requires_matching_entity_or_conversation_provenance(sqlite_store) -> None:
+    asset_a = active(entity="192.0.2.10")
+    sqlite_store.put(memory=asset_a)
+    vectors = FakeVectorStore()
+    index = MemorySemanticIndex(FakeEmbedder(), vectors)
+    index.index(asset_a)
+    retriever = LongTermMemoryRetriever(sqlite_store, index, min_score=0.0)
+
+    same_asset = retriever.retrieve(
+        query="scanner", user_id="user-a", entity_ids=("192.0.2.10",), conversation_id="conv-1"
+    )
+    other_asset = retriever.retrieve(
+        query="scanner", user_id="user-a", entity_ids=("192.0.2.11",), conversation_id="conv-2"
+    )
+    detached = retriever.retrieve(
+        query="scanner", user_id="user-a", allow_entity_scoped=False
+    )
+
+    assert [item.memory.memory_id for item in same_asset.memories] == [asset_a.memory_id]
+    assert other_asset.memories == ()
+    assert detached.memories == ()
+    assert "scope_mismatch" not in same_asset.limitations
+
+
+def test_unbound_memory_is_allowed_only_for_its_conversation(sqlite_store) -> None:
+    unbound = LongTermMemoryRecord.candidate(
+        memory_type="investigation_outcome",
+        user_id="user-a",
+        entity_ids=(),
+        statement="The prior conversation established the investigation scope.",
+        source_request_id="req-conversation",
+        source_conversation_id="conv-1",
+        evidence_refs=("conversation",),
+        confidence=0.4,
+    )
+    unbound = MemoryPromotionPolicy.promote(
+        unbound, epistemic_status="analyst_confirmed", confidence=0.95, provenance_category="analyst"
+    )
+    sqlite_store.put(memory=unbound)
+    vectors = FakeVectorStore()
+    index = MemorySemanticIndex(FakeEmbedder(), vectors)
+    index.index(unbound)
+    retriever = LongTermMemoryRetriever(sqlite_store, index, min_score=0.0)
+
+    same_conversation = retriever.retrieve(
+        query="investigation scope", user_id="user-a", entity_ids=("192.0.2.10",), conversation_id="conv-1"
+    )
+    other_conversation = retriever.retrieve(
+        query="investigation scope", user_id="user-a", entity_ids=("192.0.2.10",), conversation_id="conv-2"
+    )
+
+    assert [item.memory.memory_id for item in same_conversation.memories] == [unbound.memory_id]
+    assert other_conversation.memories == ()
 
 
 def test_reranker_is_bounded_and_failure_falls_back(sqlite_store) -> None:

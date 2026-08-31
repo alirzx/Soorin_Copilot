@@ -89,6 +89,14 @@ def test_new_static_prompt_is_default_and_legacy_is_byte_stable(monkeypatch, tmp
         settings_module.get_settings.cache_clear()
 
 
+def test_static_prompt_uses_user_facing_memory_language() -> None:
+    static = Path("app/prompts/synthesizer/synthesizer_static_prompt.md").read_text(encoding="utf-8")
+
+    assert "our earlier discussion" in static
+    assert "do not expose internal workflow, storage, retrieval" in static
+    assert "Translate evidence limitations into honest plain language" in static
+
+
 def test_missing_new_prompt_uses_unchanged_legacy_compatibility_fallback(tmp_path: Path) -> None:
     service = object.__new__(CopilotService)
     service.settings = SimpleNamespace(system_prompt_path=str(tmp_path / "missing.md"))

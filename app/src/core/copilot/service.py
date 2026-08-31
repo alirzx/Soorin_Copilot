@@ -224,6 +224,7 @@ class CopilotService:
         identity: RequestIdentity,
         message: str,
         entity_ids: tuple[str, ...],
+        allow_entity_scoped: bool = True,
         required_evidence_classes: tuple[str, ...] = (),
     ) -> LongTermMemorySelection:
         """Retrieve owner-scoped context without influencing route or tool selection."""
@@ -237,6 +238,8 @@ class CopilotService:
                 query=query,
                 user_id=identity.user_id,
                 entity_ids=entity_ids,
+                conversation_id=identity.thread_key,
+                allow_entity_scoped=allow_entity_scoped,
                 required_evidence_classes=required_evidence_classes,
                 request_id=identity.request_id,
             )
@@ -580,6 +583,64 @@ class CopilotService:
         path = Path(value)
         return path if path.is_absolute() else Path.cwd() / path
 
+    @staticmethod
+    def _synthesis_fallback_messages(messages: list[dict[str, str]]) -> list[dict[str, str]]:
+        """Add a concise answer-first instruction without replaying the same request."""
+        fallback = (
+            "[FINAL ANSWER RECOVERY]\n"
+            "Return the concise analyst-facing answer immediately. Do not explain your reasoning "
+            "or repeat the evidence contract. Preserve uncertainty and mention only the most "
+            "important supporting facts and limitations."
+        )
+        rendered = [dict(message) for message in messages]
+        for index, message in enumerate(rendered):
+            if message.get("role") == "system":
+                rendered[index]["content"] = f"{message.get('content', '')}\n\n{fallback}"
+                return rendered
+        return [{"role": "system", "content": fallback}, *rendered]
+
+    @staticmethod
+    def _synthesis_fallback_max_tokens(max_tokens: int) -> int:
+        """Bound the one recovery attempt so it cannot repeat a large exhaustion."""
+        return max(1, min(int(max_tokens), 2048))
+
+    def _synthesis_non_stream_fallback(
+        self,
+        messages: list[dict[str, str]],
+        *,
+        request_id: str,
+        max_tokens: int,
+        temperature: float | None,
+        top_p: float | None,
+        timeout_seconds: int,
+        sink: Callable[[LLMStreamEvent], None],
+        metrics: dict[str, Any],
+        reason: str,
+        trace_id: str = "",
+    ) -> LLMProviderResult:
+        fallback_max_tokens = self._synthesis_fallback_max_tokens(max_tokens)
+        metrics["fallback_used"] = True
+        metrics["fallback_max_tokens"] = fallback_max_tokens
+        metrics["fallback_reason"] = reason
+        result = self.llm_client.chat(
+            self._synthesis_fallback_messages(messages),
+            request_id=request_id,
+            max_tokens=fallback_max_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            timeout_seconds=timeout_seconds,
+            purpose="chat",
+            trace_id=trace_id,
+        )
+        if not str(getattr(result, "text", "") or "").strip():
+            raise LLMError(
+                "The Copilot recovery response was empty.",
+                reason="provider_empty_answer",
+                details={"error_type": "fallback_empty_answer", "fallback": True},
+            )
+        sink(LLMStreamEvent("answer_delta", text=result.text))
+        return result
+
     def _stream_final_model(
         self,
         messages: list[dict[str, str]],
@@ -677,20 +738,25 @@ class CopilotService:
                 deployment.model,
                 metrics["stream_error_type"],
             )
-            result = self.llm_client.chat(
+            return self._synthesis_non_stream_fallback(
                 messages,
                 request_id=request_id,
                 max_tokens=max_tokens,
                 temperature=temperature,
                 top_p=top_p,
                 timeout_seconds=timeout_seconds,
-                purpose="chat",
+                sink=sink,
+                metrics=metrics,
+                reason=metrics["stream_error_type"],
+                trace_id=trace_id,
             )
-            sink(LLMStreamEvent("answer_delta", text=result.text))
-            return result
 
         if not answer_parts:
-            metrics["stream_error_type"] = "provider_stream_empty_answer"
+            metrics["stream_error_type"] = (
+                "provider_stream_reasoning_exhausted"
+                if finish_reason == "length" and metrics["reasoning_chunk_count"]
+                else "provider_stream_empty_answer"
+            )
             logger.warning(
                 "event=main_model_stream_fallback request_id=%s deployment=%s provider=%s model=%s error_type=%s fallback=non_stream",
                 request_id,
@@ -699,17 +765,18 @@ class CopilotService:
                 deployment.model,
                 metrics["stream_error_type"],
             )
-            result = self.llm_client.chat(
+            return self._synthesis_non_stream_fallback(
                 messages,
                 request_id=request_id,
                 max_tokens=max_tokens,
                 temperature=temperature,
                 top_p=top_p,
                 timeout_seconds=timeout_seconds,
-                purpose="chat",
+                sink=sink,
+                metrics=metrics,
+                reason=metrics["stream_error_type"],
+                trace_id=trace_id,
             )
-            sink(LLMStreamEvent("answer_delta", text=result.text))
-            return result
 
         stream_terminated = bool(done_data.get("stream_terminated"))
         if not stream_terminated and not finish_reason:

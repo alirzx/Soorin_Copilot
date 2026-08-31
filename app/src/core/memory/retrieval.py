@@ -211,33 +211,58 @@ class LongTermMemoryRetriever:
         query: str,
         user_id: str,
         entity_ids: tuple[str, ...] = (),
+        conversation_id: str | None = None,
+        allow_entity_scoped: bool | None = None,
         required_evidence_classes: tuple[str, ...] = (),
         request_id: str = "",
     ) -> LongTermMemorySelection:
         started = time.perf_counter()
         exact_started = time.perf_counter()
-        exact = self.store.list(
-            user_id=user_id,
-            entity_ids=entity_ids,
-            statuses=("active",),
-            limit=self.candidate_k,
-            request_id=request_id,
-            purpose="exact_active_retrieval",
-        ) if entity_ids else ()
-        logger.info(
-            "event=memory_exact_search_completed request_id=%s status=ok candidate_count=%s",
-            request_id,
-            len(exact),
-        )
-        get_metrics().observe_memory_retrieval(
-            "exact",
-            "hit" if exact else "miss",
-            time.perf_counter() - exact_started,
-        )
+        exact: tuple[LongTermMemoryRecord, ...] = ()
+        exact_error: str | None = None
+        if entity_ids:
+            try:
+                exact = self.store.list(
+                    user_id=user_id,
+                    entity_ids=entity_ids,
+                    statuses=("active",),
+                    limit=self.candidate_k,
+                    request_id=request_id,
+                    purpose="exact_active_retrieval",
+                )
+                logger.info(
+                    "event=memory_exact_search_completed request_id=%s status=ok candidate_count=%s",
+                    request_id,
+                    len(exact),
+                )
+                get_metrics().observe_memory_retrieval(
+                    "exact",
+                    "hit" if exact else "miss",
+                    time.perf_counter() - exact_started,
+                )
+            except (OSError, RuntimeError, ValueError) as exc:
+                exact_error = type(exc).__name__
+                logger.warning(
+                    "event=memory_exact_search_completed request_id=%s status=error error_type=%s",
+                    request_id,
+                    exact_error,
+                )
+                get_metrics().observe_memory_retrieval("exact", "error", time.perf_counter() - exact_started)
+                get_metrics().observe_error("memory", exact_error)
+        else:
+            get_metrics().observe_memory_retrieval("exact", "skipped")
         candidates: dict[str, RetrievedLongTermMemory] = {}
         rejected_reasons: list[str] = []
+        limitations: list[str] = []
+        if exact_error:
+            limitations.append("exact_memory_unavailable")
         for memory in exact:
-            if self._eligible(memory):
+            if self._eligible(memory) and self._scope_allows(
+                memory,
+                entity_ids=entity_ids,
+                conversation_id=conversation_id,
+                allow_entity_scoped=allow_entity_scoped,
+            ):
                 candidates[memory.memory_id] = RetrievedLongTermMemory(
                     memory=memory,
                     relevance_score=1.0,
@@ -245,10 +270,13 @@ class LongTermMemoryRetriever:
                     freshness=memory.freshness(),
                 )
             else:
-                rejected_reasons.append(self._eligibility_reason(memory))
+                rejected_reasons.append(
+                    self._eligibility_reason(memory)
+                    if not self._eligible(memory)
+                    else "scope_mismatch"
+                )
 
         semantic_hits: list[VectorSearchHit] = []
-        limitations: list[str] = []
         if self.semantic_index is not None:
             semantic_started = time.perf_counter()
             try:
@@ -272,7 +300,13 @@ class LongTermMemoryRetriever:
                         if memory is not None:
                             rejected_reasons.append(self._eligibility_reason(memory))
                         continue
-                    if entity_ids and memory.entity_ids and not set(entity_ids).intersection(memory.entity_ids):
+                    if not self._scope_allows(
+                        memory,
+                        entity_ids=entity_ids,
+                        conversation_id=conversation_id,
+                        allow_entity_scoped=allow_entity_scoped,
+                    ):
+                        rejected_reasons.append("scope_mismatch")
                         continue
                     candidates[memory.memory_id] = RetrievedLongTermMemory(
                         memory=memory,
@@ -414,6 +448,30 @@ class LongTermMemoryRetriever:
             selected_count=len(selected),
             limitations=tuple(dict.fromkeys(limitations)),
         )
+
+    @staticmethod
+    def _scope_allows(
+        memory: LongTermMemoryRecord,
+        *,
+        entity_ids: tuple[str, ...],
+        conversation_id: str | None,
+        allow_entity_scoped: bool | None,
+    ) -> bool:
+        """Validate scope independently of semantic similarity."""
+        if memory.entity_ids:
+            if not entity_ids:
+                # Preserve the retriever's existing broad-query API. Workflow
+                # callers opt into strict general-context behavior explicitly.
+                return allow_entity_scoped is not False
+            return bool(
+                allow_entity_scoped is not False
+                and set(entity_ids).intersection(memory.entity_ids)
+            )
+        if entity_ids:
+            # An unbound record is usable for an entity request only when its
+            # declared conversation provenance matches this conversation.
+            return bool(conversation_id and memory.source_conversation_id == conversation_id)
+        return True
 
 
 class LongTermMemoryCoordinator:

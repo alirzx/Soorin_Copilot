@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
@@ -16,6 +18,16 @@ from src.core.memory.baselines import (
     BaselineProjection,
     InvestigationBaseline,
 )
+
+
+logger = logging.getLogger(__name__)
+
+
+def _field(value: Any, name: str, default: Any = None) -> Any:
+    """Read a normalized provider field from either an object or a mapping."""
+    if isinstance(value, Mapping):
+        return value.get(name, default)
+    return getattr(value, name, default)
 
 _TIME_KEY = re.compile(r"(?:time|date|at|timestamp)$", re.IGNORECASE)
 _DEDUP_KEYS = frozenset({
@@ -94,7 +106,7 @@ class HistoricalBaselineProjection:
         ))
 
 
-def _graph_projection_payload(context: dict[str, Any]) -> dict[str, Any]:
+def _graph_projection_payload(context: Mapping[str, Any]) -> dict[str, Any]:
     """Return stable bounded graph counts, peers, and path/relationship facts."""
     count_keys = (
         "inbound_total", "outbound_total", "bidirectional_total", "total_peer_count",
@@ -186,9 +198,9 @@ def current_evidence_projections(
             continue
         if not capability.startswith("graph.") or status not in {"ok", "partial"} or not entities:
             continue
-        provider_result = getattr(result, "provider_result", None)
-        context = getattr(provider_result, "context", None)
-        if not isinstance(context, dict):
+        provider_result = _field(result, "provider_result")
+        context = _field(provider_result, "context")
+        if not isinstance(context, Mapping):
             continue
         scope = str(context.get("requested_scope") or context.get("scope") or "none")
         direction = str(context.get("direction") or "none")
@@ -293,22 +305,44 @@ def investigation_baseline_from_results(
 ) -> InvestigationBaseline | None:
     """Capture only a complete bounded normalized operational evidence set."""
     current = current_evidence_projections(results, owner_id=owner_id)
-    if not current or any(not item.complete for item in current):
+    if not current:
+        logger.info(
+            "event=baseline_rejected request_id=%s reason=no_current_projections",
+            source_request_id,
+        )
+        return None
+    incomplete = [item for item in current if not item.complete]
+    if incomplete:
+        logger.info(
+            "event=baseline_rejected request_id=%s reason=incomplete_projections capabilities=%s",
+            source_request_id,
+            ",".join(item.capability for item in incomplete),
+        )
         return None
     complete = current
     required_operational = {
         item for item in required_capabilities
         if item in _EVIDENCE_CLASSES_BY_CAPABILITY
     }
-    if not complete or required_operational.difference(item.capability for item in complete):
+    missing_required = required_operational.difference(item.capability for item in complete)
+    if missing_required:
+        logger.info(
+            "event=baseline_rejected request_id=%s reason=missing_required_capabilities capabilities=%s",
+            source_request_id,
+            ",".join(missing_required),
+        )
         return None
     retained: list[BaselineProjection] = []
     used_bytes = 0
+    dropped_oversized: list[str] = []
+    dropped_budget: list[str] = []
+    dropped_limit: list[str] = []
     for item in complete:
         encoded = json.dumps(
             item.payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
         ).encode("utf-8")
         if len(encoded) > MAX_BASELINE_PROJECTION_BYTES:
+            dropped_oversized.append(item.capability)
             continue
         projected = BaselineProjection(
             capability=item.capability,
@@ -338,19 +372,52 @@ def investigation_baseline_from_results(
             separators=(",", ":"),
         ).encode("utf-8"))
         if used_bytes + projection_bytes > MAX_BASELINE_TOTAL_BYTES:
+            dropped_budget.append(item.capability)
             continue
         retained.append(projected)
         used_bytes += projection_bytes
         if len(retained) >= MAX_BASELINE_PROJECTIONS:
+            dropped_limit.extend(p.capability for p in complete[len(retained):])
             break
+    if dropped_oversized:
+        logger.info(
+            "event=baseline_projection_dropped request_id=%s reason=oversized capabilities=%s",
+            source_request_id,
+            ",".join(dropped_oversized),
+        )
+    if dropped_budget:
+        logger.info(
+            "event=baseline_projection_dropped request_id=%s reason=total_budget_exceeded capabilities=%s",
+            source_request_id,
+            ",".join(dropped_budget),
+        )
+    if dropped_limit:
+        logger.info(
+            "event=baseline_projection_dropped request_id=%s reason=projection_limit_exceeded capabilities=%s",
+            source_request_id,
+            ",".join(dropped_limit),
+        )
     if len(retained) != len(complete) or required_operational.difference(
         item.capability for item in retained
     ):
+        missing_final = required_operational.difference(item.capability for item in retained)
+        logger.info(
+            "event=baseline_rejected request_id=%s reason=required_capabilities_dropped missing=%s retained=%s",
+            source_request_id,
+            ",".join(missing_final) if missing_final else "none",
+            ",".join(item.capability for item in retained),
+        )
         return None
     entities = tuple(dict.fromkeys(
         entity for projection in retained for entity in projection.entity_ids
     ))
     captured_at = max((item.valid_at for item in retained), default="")
+    logger.info(
+        "event=baseline_captured request_id=%s entity_count=%s projection_count=%s",
+        source_request_id,
+        len(entities),
+        len(retained),
+    )
     return InvestigationBaseline(
         entity_ids=entities,
         captured_at=captured_at,
