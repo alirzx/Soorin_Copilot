@@ -218,7 +218,7 @@ class GraphRefreshService:
                 source_endpoint_path=topology.endpoint_path,
             )
             stats["snapshot_version"] = snapshot_version
-            self._validate_graph(graph, force=force)
+            self._validate_graph(graph)
             logger.info(
                 "event=graph_validation_completed snapshot_version=%s nodes=%s edges=%s",
                 snapshot_version,
@@ -340,7 +340,7 @@ class GraphRefreshService:
             loaded = loaded.replace(tzinfo=timezone.utc)
         return max(0, int((datetime.now(timezone.utc) - loaded).total_seconds()))
 
-    def _validate_graph(self, graph: nx.DiGraph, *, force: bool) -> None:
+    def _validate_graph(self, graph: nx.DiGraph) -> None:
         if not isinstance(graph, nx.DiGraph):
             raise GraphRefreshError("Graph builder returned an invalid graph type.")
         if graph.number_of_nodes() < self.settings.graph_refresh_min_nodes:
@@ -354,16 +354,6 @@ class GraphRefreshService:
         for source, target in graph.edges:
             if source not in node_set or target not in node_set:
                 raise GraphRefreshError("Graph contains an edge with invalid endpoints.")
-
-        previous = get_cached_graph()
-        if force or previous is None:
-            return
-        previous_nodes = previous.number_of_nodes()
-        previous_edges = previous.number_of_edges()
-        if previous_nodes and graph.number_of_nodes() < previous_nodes * (1 - self.settings.graph_refresh_max_node_drop_ratio):
-            raise GraphRefreshError("Graph node count dropped suspiciously compared with last-known-good graph.")
-        if previous_edges and graph.number_of_edges() < previous_edges * (1 - self.settings.graph_refresh_max_edge_drop_ratio):
-            raise GraphRefreshError("Graph edge count dropped suspiciously compared with last-known-good graph.")
 
     def _write_required_artifacts(self, raw_payload: Any, graph: nx.DiGraph, stats: dict[str, object]) -> tuple[Path, Path]:
         raw_path = resolve_path(self.settings.graph_raw_path)

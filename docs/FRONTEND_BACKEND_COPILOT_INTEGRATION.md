@@ -64,12 +64,12 @@ The Copilot repository does **not** decode, validate, or authorize a Product JWT
   "conversation_id": "<optional>",
   "session_id": "<optional>",
   "request_id": "<optional>",
-  "message": "<required, non-empty>",
-  "ui_context": {"selected_ip": "<optional IPv4>"}
+  "message": "<required string, min length 1>",
+  "ui_context": {"selected_ip": "<optional non-blank string>"}
 }
 ```
 
-`RequestIdentity.resolve` preserves supplied IDs; absent `session_id` becomes `uuid4().hex`, absent `request_id` becomes `uuid4().hex[:12]`, and:
+`message` has no trimming, maximum length, or semantic validation at the API boundary. `selected_ip` is trimmed and blank values become `null`; it is not parsed or validated as an IP address. `RequestIdentity.resolve` preserves supplied IDs; absent `session_id` becomes `uuid4().hex`, absent `request_id` becomes `uuid4().hex[:12]`, and:
 
 ```text
 thread_key = conversation_id when supplied, otherwise session_id
@@ -120,7 +120,30 @@ It reloads local conversations/messages, supports local create/open/delete, and 
 
 `SOORIN_STREAMLIT_AUTH_BACKEND=product` dispatches before local graph/SQLite initialization. The browser session performs real Product login and Product-owned chatroom/message CRUD through `SOORIN_PRODUCT_CHAT_ROOMS_PATH`. The selected Product room ID is reused as both `conversation_id` and `session_id`; the authenticated Product user ID is sent as `X-User-ID`. `/chat/stream` receives the interactive JWT in `Authorization`, the static Copilot key in `Soorin_copilot_api_key`, and a stable per-turn `request_id`.
 
-The Product workspace reuses the canonical shared chat renderer and SSE parser. It appends the user message before starting the stream, requires a terminal `done` event before appending the assistant message, and guards both writes against duplicate reruns. A selected topology IP is preserved in `ui_context`; new Product rooms use that IP as `assetIp`, or an explicit empty value when no asset is selected. Product mode has no local transcript or SQLite fallback; a `401` clears the Product browser session and returns to login.
+The exact Product-mode stream request is:
+
+```http
+POST /chat/stream
+Authorization: Bearer <interactive Product JWT>
+Soorin_copilot_api_key: <configured Copilot API key>
+X-User-ID: <Product login user ID>
+Accept: text/event-stream
+Content-Type: application/json
+```
+
+```json
+{
+  "conversation_id": "<Product room ID>",
+  "session_id": "<same Product room ID>",
+  "request_id": "<browser-generated uuid4 hex>",
+  "message": "<user message>",
+  "ui_context": {"selected_ip": "<selected topology value>"}
+}
+```
+
+`ui_context` is omitted when no selected value is present. The Product workspace reuses the canonical shared chat renderer and SSE parser. It appends the user message before starting the stream, requires a terminal `done` event before appending the assistant message, and guards both writes against duplicate reruns. A selected topology value is preserved in `ui_context`; new Product rooms use that value as `assetIp`, or an explicit empty value when no asset is selected. Product mode has no local transcript or SQLite fallback. A Product API `401` clears the Product browser session; a Copilot `/chat/stream` `401` leaves that Product session and pending turn intact for diagnosis/retry.
+
+The response is UTF-8 SSE. Every record has `event: <type>` and one JSON `data:` line, terminated by a blank line. The Streamlit parser ignores the `event:` line and consumes the JSON `type`; supported API event types are `reasoning_delta`, `answer_delta`, `usage`, `done`, and `error`.
 
 ### 3.3 Current SQLite schema (version 7; thread-state payload version 3)
 
