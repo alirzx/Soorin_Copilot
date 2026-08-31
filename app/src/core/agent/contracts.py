@@ -6,11 +6,34 @@ from dataclasses import dataclass, field
 from typing import Annotated, Any, Literal, TypedDict
 import operator
 
+from src.core.identity import RequestIdentity
+
 
 ToolStatus = Literal["ok", "empty", "not_configured", "unavailable", "invalid", "partial", "not_found"]
 Completeness = Literal["complete", "partial", "unknown"]
 ReviewOutcome = Literal["sufficient", "answer_with_limitations", "missing_required_evidence", "safe_failure"]
 WorkflowMode = Literal["direct", "multi_step"]
+TemporalMode = Literal["current", "historical", "mixed", "compare_previous_current"]
+EvidenceMode = Literal["normal", "memory_only", "no_live_refresh", "current_verification", "verify_if_stale"]
+ConversationOperation = Literal[
+    "new_task",
+    "follow_up",
+    "memory_recall",
+    "current_verification",
+    "compare_previous_current",
+    "memory_write",
+    "topic_detach",
+]
+TurnTarget = Literal[
+    "explicit_entity",
+    "ui_entity",
+    "active_entity",
+    "active_pair",
+    "conversation",
+    "none",
+]
+EpisodeTransition = Literal["keep", "switch", "detach"]
+ResponseDepth = Literal["brief", "standard", "deep", "report"]
 StepRequirement = Literal["required", "optional"]
 PlanSource = Literal["deterministic", "llm", "deterministic_fallback"]
 WorkflowStatus = Literal[
@@ -81,6 +104,7 @@ class ToolResult:
     usable_fact_count: int = 0
     projection_truncated: bool = False
     projection_omitted_count: int = 0
+    projection_schema_version: str = ""
 
 
 @dataclass(frozen=True)
@@ -101,11 +125,37 @@ class TaskSpec:
     is_followup: bool = False
     graph_depth: int = 0
     relationship_mode: str = "none"
+    temporal_mode: TemporalMode = "current"
+    evidence_mode: EvidenceMode = "normal"
+    response_depth: ResponseDepth = "standard"
 
     @property
     def max_steps(self) -> int:
         """Temporary read-only compatibility alias; plan limits live elsewhere."""
         return self.recommended_steps
+
+
+@dataclass(frozen=True)
+class RequestConstraints:
+    """Deterministic request authority resolved before semantic routing."""
+
+    allow_live: bool = True
+    require_current: bool = False
+    memory_only: bool = False
+    memory_write: bool = False
+    reason_codes: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class TurnPolicy:
+    """Authoritative deterministic control decision for one conversation turn."""
+
+    operation: ConversationOperation
+    target: TurnTarget
+    target_entities: tuple[str, ...] = ()
+    requires_domain_router: bool = True
+    episode_transition: EpisodeTransition = "keep"
+    reason_codes: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -172,6 +222,8 @@ class ReviewDecision:
     supplemental_allowed: bool = False
     next_capability: str | None = None
     next_arguments: dict[str, Any] | None = None
+    caveats: tuple[str, ...] = ()
+    material_limitations: tuple[str, ...] = ()
 
 
 SpecialistStatus = Literal["completed", "completed_with_limitations", "skipped", "failed"]
@@ -248,6 +300,7 @@ class CapabilitySpec:
 
 
 class InvestigationState(TypedDict, total=False):
+    request_identity: RequestIdentity
     request_id: str
     trace_id: str
     session_id: str
@@ -266,14 +319,24 @@ class InvestigationState(TypedDict, total=False):
     resolved_entities: Any
     active_entity_state: Any
     recent_messages: list[dict[str, str]]
+    request_constraints: RequestConstraints
+    turn_policy: TurnPolicy
+    pending_working_facts: tuple[Any, ...]
     routing_result: Any
     plan_validation_result: dict[str, Any]
     capability_results: list[ToolResult]
     supplemental_retrieval_state: dict[str, Any]
     composed_context: str
+    synthesizer_task_context: Any
+    synthesizer_dynamic_prompt: str
+    synthesizer_module_names: tuple[str, ...]
     model_messages: list[dict[str, str]]
     conversation_snapshot: Any
     memory_context_key: Any
+    long_term_memory_selection: Any
+    evidence_requirements: Any
+    evidence_gap_plan: Any
+    memory_tool_results: list[ToolResult]
     synthesis_request: dict[str, Any]
     context_review: dict[str, Any]
     synthesis_result: dict[str, Any]

@@ -6,35 +6,47 @@ import json
 import logging
 import time
 from collections.abc import Iterator
-from typing import Any
-from uuid import uuid4
+from typing import Annotated, Any
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Header
 from pydantic import BaseModel, Field, field_validator
 from starlette.responses import StreamingResponse
 
 from src.api.auth import verify_api_key
-from src.api.dependencies import get_product_api_client
+from src.api.dependencies import get_local_persistence, get_product_api_client
 from src.api.schemas.chat import ChatResponse, HealthResponse, LLMHealthResponse
 from src.config.settings import get_settings
 from src.core.copilot.service import CopilotService
-from src.core.context.models import approx_tokens, compact_preview
+from src.core.context.models import approx_tokens
 from src.core.llm.client import LLMClient
 from src.core.llm.errors import LLMError
 from src.core.llm.providers.base import LLMStreamEvent
 from src.core.memory.routing_state import SessionRoutingStateStore
+from src.core.identity import (
+    IDENTIFIER_MAX_LENGTH,
+    IDENTIFIER_PATTERN,
+    RequestIdentity,
+    normalize_identifier,
+)
 from src.core.memory.store import MemoryStore
 from src.core.observability.llm_usage import ProductUsageReporter
+from src.core.observability.metrics import get_metrics
 
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
 settings = get_settings()
-memory_store = MemoryStore(settings.conversation_max_messages)
+memory_store = MemoryStore(
+    settings.conversation_max_messages,
+    max_episodes=settings.memory_episode_retention_limit,
+    max_working_facts=settings.memory_working_fact_retention_limit,
+    relevant_turn_limit=settings.memory_relevant_turn_limit,
+)
 routing_state_store = SessionRoutingStateStore()
 product_client = get_product_api_client()
 usage_reporter = ProductUsageReporter(settings, product_client)
 llm_client = LLMClient(settings, usage_recorder=usage_reporter)
+local_persistence = get_local_persistence()
 copilot_service = CopilotService(
     settings,
     llm_client,
@@ -42,6 +54,10 @@ copilot_service = CopilotService(
     routing_state_store,
     product_client=product_client,
     usage_reporter=usage_reporter,
+    chat_repository=local_persistence.chat_repository,
+    transcript_repository=local_persistence.transcript_repository,
+    thread_state_store=local_persistence.thread_state_store,
+    long_term_memory_store=local_persistence.long_term_memory_store,
 )
 
 
@@ -59,8 +75,35 @@ class ChatUIContext(BaseModel):
 
 class ChatRequest(BaseModel):
     session_id: str | None = Field(default=None)
+    conversation_id: str | None = Field(default=None)
+    request_id: str | None = Field(default=None)
     message: str = Field(min_length=1)
     ui_context: ChatUIContext | None = Field(default=None)
+
+    @field_validator("session_id", "conversation_id", "request_id")
+    @classmethod
+    def validate_identifiers(cls, value: str | None, info: Any) -> str | None:
+        return normalize_identifier(value, field_name=info.field_name)
+
+
+UserIdHeader = Annotated[
+    str | None,
+    Header(
+        alias="X-User-ID",
+        min_length=1,
+        max_length=IDENTIFIER_MAX_LENGTH,
+        pattern=IDENTIFIER_PATTERN,
+    ),
+]
+
+
+def resolve_request_identity(request: ChatRequest, user_id: str | None) -> RequestIdentity:
+    return RequestIdentity.resolve(
+        user_id=user_id,
+        conversation_id=request.conversation_id,
+        session_id=request.session_id,
+        request_id=request.request_id,
+    )
 
 
 def envelope(
@@ -107,9 +150,11 @@ def llm_health(
 @router.post("/chat", response_model=ChatResponse)
 def chat(
     request: ChatRequest,
+    x_user_id: UserIdHeader = None,
     _auth: None = Depends(verify_api_key),
 ) -> dict[str, Any]:
-    request_id = uuid4().hex[:12]
+    identity = resolve_request_identity(request, x_user_id)
+    request_id = identity.request_id
     started = time.perf_counter()
     selected_ip_present = bool(request.ui_context and request.ui_context.selected_ip)
     session_for_log = (request.session_id or "").strip()
@@ -119,14 +164,13 @@ def chat(
         session_for_log,
     )
     logger.info(
-        "event=http_chat_request request_id=%s session_id=%s message_chars=%s approx_tokens=%s ui_context_present=%s selected_ip_present=%s user_preview=%r",
+        "event=http_chat_request request_id=%s session_id=%s message_chars=%s approx_tokens=%s ui_context_present=%s selected_ip_present=%s",
         request_id,
         session_for_log,
         len(request.message),
         approx_tokens(request.message),
         bool(request.ui_context),
         selected_ip_present,
-        compact_preview(request.message),
     )
     try:
         result = copilot_service.chat(
@@ -134,6 +178,7 @@ def chat(
             request.session_id,
             ui_context=request.ui_context.model_dump() if request.ui_context else None,
             request_id=request_id,
+            request_identity=identity,
         )
     except LLMError as exc:
         latency_ms = int((time.perf_counter() - started) * 1000)
@@ -206,10 +251,12 @@ def chat(
 )
 def chat_stream(
     request: ChatRequest,
+    x_user_id: UserIdHeader = None,
     _auth: None = Depends(verify_api_key),
 ) -> StreamingResponse:
     """Stream only final-model events while preserving the existing chat route."""
-    request_id = uuid4().hex[:12]
+    identity = resolve_request_identity(request, x_user_id)
+    request_id = identity.request_id
     session_for_log = (request.session_id or "").strip()
     started = time.perf_counter()
     logger.info(
@@ -223,24 +270,39 @@ def chat_stream(
     )
 
     def events() -> Iterator[str]:
-        status = "error"
+        status = "interrupted"
+        first_output_seconds: float | None = None
         try:
             for event in copilot_service.chat_stream(
                 request.message,
                 request.session_id,
                 ui_context=request.ui_context.model_dump() if request.ui_context else None,
                 request_id=request_id,
+                request_identity=identity,
             ):
+                if first_output_seconds is None and event.type in {"reasoning_delta", "answer_delta"}:
+                    first_output_seconds = time.perf_counter() - started
                 if event.type == "done":
-                    status = "ok"
+                    status = "completed"
+                elif event.type == "error":
+                    status = "error"
                 yield encode_sse_event(event)
+        except Exception:
+            status = "error"
+            raise
         finally:
+            duration_seconds = time.perf_counter() - started
+            get_metrics().observe_stream(
+                duration_seconds=duration_seconds,
+                status=status,
+                first_output_seconds=first_output_seconds,
+            )
             logger.info(
                 "event=http_chat_stream_response request_id=%s session_id=%s status=%s latency_ms=%s",
                 request_id,
                 session_for_log,
                 status,
-                int((time.perf_counter() - started) * 1000),
+                int(duration_seconds * 1000),
             )
 
     return StreamingResponse(

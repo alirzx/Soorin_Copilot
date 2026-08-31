@@ -12,7 +12,9 @@ from src.config.llm_deployments import LLMRoleConfig
 
 
 APP_DIR = Path(__file__).resolve().parents[2]
-ENV_PATH = APP_DIR / ".env"
+PROJECT_ROOT = APP_DIR.parent
+ENV_PATH = PROJECT_ROOT / ".env"
+LEGACY_ENV_PATH = APP_DIR / ".env"
 logger = logging.getLogger(__name__)
 
 DEFAULT_RAG_EMBEDDING_MODEL = "BAAI/bge-base-en-v1.5"
@@ -159,6 +161,8 @@ class Settings:
     log_file_level: str
     log_file_max_bytes: int
     log_file_backup_count: int
+    metrics_enabled: bool
+    metrics_path: str
     api_base_url: str
     api_timeout_seconds: int
     streamlit_server_port: int
@@ -225,10 +229,47 @@ class Settings:
     conversation_summary_max_tokens: int
     conversation_summary_temperature: float
     conversation_summary_timeout_seconds: int
+    durable_working_memory_enabled: bool
+    memory_relevant_turn_limit: int
+    memory_relevant_turn_token_budget: int
+    memory_episode_retention_limit: int
+    memory_episode_context_limit: int
+    memory_episode_context_token_budget: int
+    memory_context_token_budget: int
+    long_term_memory_enabled: bool
+    long_term_memory_backend: str
+    memory_vector_index_enabled: bool
+    memory_qdrant_collection: str
+    memory_retrieval_candidate_k: int
+    memory_retrieval_top_k: int
+    memory_min_score: float
+    memory_rerank_enabled: bool
+    memory_rerank_model: str
+    memory_rerank_timeout_seconds: float
+    memory_context_long_term_token_budget: int
+    memory_auto_promotion_enabled: bool
+    memory_promotion_policy_version: str
+    memory_active_validity_seconds: int
+    local_product_simulation_enabled: bool
+    streamlit_auth_backend: str
+    local_test_user_creation_enabled: bool
+    local_product_test_user_id: str
+    thread_state_backend: str
+    local_sqlite_path: str
+    local_max_conversations_per_user: int
+    local_max_messages_per_conversation: int
+    memory_working_fact_retention_limit: int
+    memory_max_active_records_per_user: int
+    memory_max_candidate_records_per_user: int
+    langgraph_checkpoint_backend: str
     system_prompt_path: str
     product_api_base_url: str
     product_topology_path: str
     product_asset_detection_path: str
+    product_asset_detection_overview_path: str
+    product_asset_detection_evidence_path: str
+    product_asset_detection_similarity_path: str
+    product_asset_detection_cluster_path: str
     product_asset_profile_path: str
     product_login_path: str
     product_api_token: str
@@ -241,6 +282,9 @@ class Settings:
     product_read_timeout_seconds: int
     product_max_retries: int
     product_retry_backoff_seconds: float
+    product_memory_thread_state_path: str
+    product_memory_ltm_path: str
+    product_chat_rooms_path: str
     detection_cache_enabled: bool
     detection_cache_ttl_seconds: int
     detection_stale_on_error: bool
@@ -397,10 +441,91 @@ class Settings:
             raise ValueError(
                 "SOORIN_EVIDENCE_SNAPSHOT_MODE must be none, metadata, summary, or redacted."
             )
+        if not self.metrics_path.startswith("/") or "{" in self.metrics_path or "}" in self.metrics_path:
+            raise ValueError("SOORIN_METRICS_PATH must be a static absolute API path.")
+
+    def validate_local_persistence_configuration(self) -> None:
+        """Validate only explicitly enabled local-development persistence."""
+        sqlite_required = (
+            self.local_product_simulation_enabled
+            or self.thread_state_backend == "sqlite"
+            or (self.long_term_memory_enabled and self.long_term_memory_backend == "sqlite")
+        )
+        if sqlite_required and not self.local_sqlite_path:
+            raise ValueError(
+                "SOORIN_LOCAL_SQLITE_PATH is required when local SQLite persistence is enabled."
+            )
+        if (
+            self.streamlit_auth_backend == "local_simulation"
+            and not self.local_product_simulation_enabled
+        ):
+            raise ValueError(
+                "SOORIN_STREAMLIT_AUTH_BACKEND=local_simulation requires "
+                "SOORIN_LOCAL_PRODUCT_SIMULATION_ENABLED=true."
+            )
+        if self.streamlit_auth_backend == "product":
+            if self.local_product_simulation_enabled:
+                raise ValueError(
+                    "SOORIN_STREAMLIT_AUTH_BACKEND=product requires "
+                    "SOORIN_LOCAL_PRODUCT_SIMULATION_ENABLED=false."
+                )
+            if self.thread_state_backend != "product":
+                raise ValueError(
+                    "SOORIN_STREAMLIT_AUTH_BACKEND=product requires "
+                    "SOORIN_THREAD_STATE_BACKEND=product."
+                )
+            if not self.long_term_memory_enabled or self.long_term_memory_backend != "product":
+                raise ValueError(
+                    "SOORIN_STREAMLIT_AUTH_BACKEND=product requires enabled Product-backed "
+                    "long-term memory."
+                )
+            required = {
+                "SOORIN_PRODUCT_API_BASE_URL": self.product_api_base_url,
+                "SOORIN_PRODUCT_LOGIN_PATH": self.product_login_path,
+                "SOORIN_PRODUCT_CHAT_ROOMS_PATH": self.product_chat_rooms_path,
+                "SOORIN_PRODUCT_HWID": self.product_hwid,
+                "SOORIN_COPILOT_API_KEY": self.copilot_api_key,
+            }
+            missing = [name for name, value in required.items() if not value]
+            if missing:
+                raise ValueError(
+                    "Product Streamlit mode is missing required configuration: "
+                    + ", ".join(missing)
+                )
+
+    def validate_long_term_memory_configuration(self) -> None:
+        if not self.long_term_memory_enabled:
+            return
+        if self.memory_vector_index_enabled:
+            if not self.memory_qdrant_collection:
+                raise ValueError("SOORIN_MEMORY_QDRANT_COLLECTION must not be blank.")
+            if self.memory_qdrant_collection == self.rag_collection:
+                raise ValueError("Long-term memory and SOC knowledge require separate Qdrant collections.")
+            if self.rag_qdrant_mode == "local" and not self.rag_qdrant_path:
+                raise ValueError("Local memory indexing requires SOORIN_RAG_QDRANT_PATH.")
+            if self.rag_qdrant_mode == "server" and not self.rag_qdrant_url:
+                raise ValueError("Server memory indexing requires SOORIN_RAG_QDRANT_URL.")
+            if self.rag_embedding_model.lower() in LEGACY_RAG_EMBEDDING_MODELS:
+                raise ValueError("SecureBERT is not supported for long-term memory embeddings.")
+            if (
+                self.rag_embedding_model == DEFAULT_RAG_EMBEDDING_MODEL
+                and self.rag_embedding_dimension != DEFAULT_RAG_EMBEDDING_DIMENSION
+            ):
+                raise ValueError("BAAI/bge-base-en-v1.5 long-term memory embeddings require dimension 768.")
+        if self.memory_rerank_enabled and not self.memory_rerank_model:
+            raise ValueError("SOORIN_MEMORY_RERANK_MODEL is required when reranking is enabled.")
 
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:
     env_file_loaded = _load_env_file(ENV_PATH)
+    if not env_file_loaded and LEGACY_ENV_PATH != ENV_PATH:
+        env_file_loaded = _load_env_file(LEGACY_ENV_PATH)
+        if env_file_loaded:
+            logger.warning(
+                "event=legacy_env_fallback path=%s root_env_path=%s",
+                LEGACY_ENV_PATH,
+                ENV_PATH,
+            )
     settings = Settings(
         api_host=os.getenv("API_HOST", "0.0.0.0"),
         api_port=_int("API_PORT", 6998),
@@ -415,6 +540,8 @@ def get_settings() -> Settings:
         log_file_level=os.getenv("SOORIN_LOG_FILE_LEVEL", "INFO").strip().upper(),
         log_file_max_bytes=max(1024, _int("SOORIN_LOG_FILE_MAX_BYTES", 20971520)),
         log_file_backup_count=max(0, _int("SOORIN_LOG_FILE_BACKUP_COUNT", 10)),
+        metrics_enabled=_bool("SOORIN_METRICS_ENABLED", True),
+        metrics_path=os.getenv("SOORIN_METRICS_PATH", "/metrics").strip() or "/metrics",
         api_base_url=os.getenv("SOORIN_API_BASE_URL", "http://127.0.0.1:6998").strip().rstrip("/"),
         api_timeout_seconds=_int("SOORIN_API_TIMEOUT_SECONDS", 120),
         streamlit_server_port=_int("STREAMLIT_SERVER_PORT", 8503),
@@ -487,10 +614,117 @@ def get_settings() -> Settings:
         conversation_summary_max_tokens=_int("SOORIN_CONVERSATION_SUMMARY_MAX_TOKENS", 700),
         conversation_summary_temperature=_float("SOORIN_CONVERSATION_SUMMARY_TEMPERATURE", 0.0),
         conversation_summary_timeout_seconds=_int("SOORIN_CONVERSATION_SUMMARY_TIMEOUT_SECONDS", 30),
-        system_prompt_path=os.getenv("SOORIN_SYSTEM_PROMPT_PATH", "app/prompts/system_prompt.md").strip(),
+        durable_working_memory_enabled=_bool("SOORIN_DURABLE_WORKING_MEMORY_ENABLED", True),
+        memory_relevant_turn_limit=max(0, _int("SOORIN_MEMORY_RELEVANT_TURN_LIMIT", 4)),
+        memory_relevant_turn_token_budget=max(
+            0, _int("SOORIN_MEMORY_RELEVANT_TURN_TOKEN_BUDGET", 900)
+        ),
+        memory_episode_retention_limit=max(
+            1, _int("SOORIN_MEMORY_EPISODE_RETENTION_LIMIT", 12)
+        ),
+        memory_episode_context_limit=max(
+            0, _int("SOORIN_MEMORY_EPISODE_CONTEXT_LIMIT", 2)
+        ),
+        memory_episode_context_token_budget=max(
+            0, _int("SOORIN_MEMORY_EPISODE_CONTEXT_TOKEN_BUDGET", 300)
+        ),
+        memory_context_token_budget=max(
+            0, _int("SOORIN_MEMORY_CONTEXT_TOKEN_BUDGET", 1400)
+        ),
+        long_term_memory_enabled=_bool("SOORIN_LONG_TERM_MEMORY_ENABLED", False),
+        long_term_memory_backend=_choice(
+            "SOORIN_LONG_TERM_MEMORY_BACKEND", "sqlite", {"sqlite", "product"}
+        ),
+        memory_vector_index_enabled=_bool("SOORIN_MEMORY_VECTOR_INDEX_ENABLED", False),
+        memory_qdrant_collection=os.getenv(
+            "SOORIN_MEMORY_QDRANT_COLLECTION", "soorin_copilot_memory_v1"
+        ).strip(),
+        memory_retrieval_candidate_k=max(
+            1, min(100, _int("SOORIN_MEMORY_RETRIEVAL_CANDIDATE_K", 20))
+        ),
+        memory_retrieval_top_k=max(
+            1, min(20, _int("SOORIN_MEMORY_RETRIEVAL_TOP_K", 5))
+        ),
+        memory_min_score=min(1.0, max(0.0, _float("SOORIN_MEMORY_MIN_SCORE", 0.35))),
+        memory_rerank_enabled=_bool("SOORIN_MEMORY_RERANK_ENABLED", False),
+        memory_rerank_model=os.getenv("SOORIN_MEMORY_RERANK_MODEL", "").strip(),
+        memory_rerank_timeout_seconds=max(
+            0.1, _float("SOORIN_MEMORY_RERANK_TIMEOUT_SECONDS", 10.0)
+        ),
+        memory_context_long_term_token_budget=max(
+            0, _int("SOORIN_MEMORY_CONTEXT_LONG_TERM_TOKEN_BUDGET", 500)
+        ),
+        memory_auto_promotion_enabled=_bool(
+            "SOORIN_MEMORY_AUTO_PROMOTION_ENABLED", True
+        ),
+        memory_promotion_policy_version=os.getenv(
+            "SOORIN_MEMORY_PROMOTION_POLICY_VERSION", "ltm-promotion-v1"
+        ).strip() or "ltm-promotion-v1",
+        memory_active_validity_seconds=max(
+            60, min(2_592_000, _int("SOORIN_MEMORY_ACTIVE_VALIDITY_SECONDS", 86_400))
+        ),
+        local_product_simulation_enabled=_bool(
+            "SOORIN_LOCAL_PRODUCT_SIMULATION_ENABLED",
+            False,
+        ),
+        streamlit_auth_backend=_choice(
+            "SOORIN_STREAMLIT_AUTH_BACKEND",
+            "none",
+            {"none", "local_simulation", "product", "oidc"},
+        ),
+        local_test_user_creation_enabled=_bool(
+            "SOORIN_LOCAL_TEST_USER_CREATION_ENABLED",
+            False,
+        ),
+        local_product_test_user_id=os.getenv("SOORIN_LOCAL_PRODUCT_TEST_USER_ID", "").strip(),
+        thread_state_backend=_choice(
+            "SOORIN_THREAD_STATE_BACKEND",
+            "memory",
+            {"memory", "sqlite", "product"},
+        ),
+        local_sqlite_path=os.getenv(
+            "SOORIN_LOCAL_SQLITE_PATH",
+            "data/runtime/copilot-local.sqlite3",
+        ).strip(),
+        local_max_conversations_per_user=max(
+            1, _int("SOORIN_LOCAL_MAX_CONVERSATIONS_PER_USER", 100)
+        ),
+        local_max_messages_per_conversation=max(
+            1, _int("SOORIN_LOCAL_MAX_MESSAGES_PER_CONVERSATION", 200)
+        ),
+        memory_working_fact_retention_limit=max(
+            1, _int("SOORIN_MEMORY_WORKING_FACT_RETENTION_LIMIT", 20)
+        ),
+        memory_max_active_records_per_user=max(
+            1, _int("SOORIN_MEMORY_MAX_ACTIVE_RECORDS_PER_USER", 500)
+        ),
+        memory_max_candidate_records_per_user=max(
+            1, _int("SOORIN_MEMORY_MAX_CANDIDATE_RECORDS_PER_USER", 250)
+        ),
+        langgraph_checkpoint_backend=_choice(
+            "SOORIN_LANGGRAPH_CHECKPOINT_BACKEND",
+            "none",
+            {"none", "sqlite"},
+        ),
+        system_prompt_path=os.getenv(
+            "SOORIN_SYSTEM_PROMPT_PATH",
+            "app/prompts/synthesizer/synthesizer_static_prompt.md",
+        ).strip(),
         product_api_base_url=os.getenv("SOORIN_PRODUCT_API_BASE_URL", "").strip().rstrip("/"),
         product_topology_path=os.getenv("SOORIN_PRODUCT_TOPOLOGY_PATH", "/zeek/connections/unique-ip-pairs").strip(),
         product_asset_detection_path=os.getenv("SOORIN_PRODUCT_ASSET_DETECTION_PATH", "/asset-detection/test/{ip}").strip(),
+        product_asset_detection_overview_path=os.getenv(
+            "SOORIN_PRODUCT_ASSET_DETECTION_OVERVIEW_PATH", "/asset-detection/{ip}/overview"
+        ).strip(),
+        product_asset_detection_evidence_path=os.getenv(
+            "SOORIN_PRODUCT_ASSET_DETECTION_EVIDENCE_PATH", "/asset-detection/{ip}/evidence"
+        ).strip(),
+        product_asset_detection_similarity_path=os.getenv(
+            "SOORIN_PRODUCT_ASSET_DETECTION_SIMILARITY_PATH", "/asset-detection/{ip}/similarity"
+        ).strip(),
+        product_asset_detection_cluster_path=os.getenv(
+            "SOORIN_PRODUCT_ASSET_DETECTION_CLUSTER_PATH", "/asset-detection/{ip}/cluster"
+        ).strip(),
         product_asset_profile_path=os.getenv("SOORIN_PRODUCT_ASSET_PROFILE_PATH", "/profile/{ip}").strip(),
         product_login_path=os.getenv("SOORIN_PRODUCT_LOGIN_PATH", "/auth/login").strip(),
         product_api_token=os.getenv("SOORIN_PRODUCT_API_TOKEN", "").strip(),
@@ -503,6 +737,9 @@ def get_settings() -> Settings:
         product_read_timeout_seconds=_int("SOORIN_PRODUCT_READ_TIMEOUT_SECONDS", 300),
         product_max_retries=_int("SOORIN_PRODUCT_MAX_RETRIES", 5),
         product_retry_backoff_seconds=_float("SOORIN_PRODUCT_RETRY_BACKOFF_SECONDS", 3.0),
+        product_memory_thread_state_path=os.getenv("SOORIN_PRODUCT_MEMORY_THREAD_STATE_PATH", "/api/v1/copilot/memory/thread-state").strip(),
+        product_memory_ltm_path=os.getenv("SOORIN_PRODUCT_MEMORY_LTM_PATH", "/api/v1/copilot/memory/ltm").strip(),
+        product_chat_rooms_path=os.getenv("SOORIN_PRODUCT_CHAT_ROOMS_PATH", "/chat-rooms").strip(),
         detection_cache_enabled=_bool("SOORIN_DETECTION_CACHE_ENABLED", True),
         detection_cache_ttl_seconds=max(600, _int("SOORIN_DETECTION_CACHE_TTL_SECONDS", 600)),
         detection_stale_on_error=_bool("SOORIN_DETECTION_STALE_ON_ERROR", True),
@@ -608,8 +845,10 @@ def get_settings() -> Settings:
     )
     settings.validate_product_paths()
     settings.validate_observability_configuration()
+    settings.validate_local_persistence_configuration()
+    settings.validate_long_term_memory_configuration()
     logger.info(
-        "event=settings_loaded env_file_path=%s env_file_loaded=%s router_role=%s synthesizer_role=%s product_base_url_configured=%s product_token_present=%s product_hwid_present=%s product_username_present=%s product_password_present=%s product_captcha_bypass_present=%s rag_enabled=%s rag_backend=%s rag_source_configured=%s rag_qdrant_mode=%s rag_qdrant_configured=%s",
+        "event=settings_loaded env_file_path=%s env_file_loaded=%s router_role=%s synthesizer_role=%s product_base_url_configured=%s product_token_present=%s product_hwid_present=%s product_username_present=%s product_password_present=%s product_captcha_bypass_present=%s rag_enabled=%s rag_backend=%s rag_source_configured=%s rag_qdrant_mode=%s rag_qdrant_configured=%s local_product_simulation_enabled=%s streamlit_auth_backend=%s local_test_user_creation_enabled=%s thread_state_backend=%s langgraph_checkpoint_backend=%s",
         ENV_PATH,
         env_file_loaded,
         "router",
@@ -625,5 +864,10 @@ def get_settings() -> Settings:
         bool(settings.rag_source_root),
         settings.rag_qdrant_mode,
         bool(settings.rag_qdrant_path if settings.rag_qdrant_mode == "local" else settings.rag_qdrant_url),
+        settings.local_product_simulation_enabled,
+        settings.streamlit_auth_backend,
+        settings.local_test_user_creation_enabled,
+        settings.thread_state_backend,
+        settings.langgraph_checkpoint_backend,
     )
     return settings

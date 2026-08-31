@@ -4,20 +4,25 @@ from __future__ import annotations
 
 import logging
 
-from fastapi import FastAPI
+from fastapi import Depends, FastAPI, Response
 from fastapi.middleware.cors import CORSMiddleware
 
+from src.api.auth import verify_api_key
 from src.api.dependencies import get_graph_refresh_service as get_api_graph_refresh_service
 from src.api.graph_routes import router as graph_router
+from src.api.local_simulation_routes import router as local_simulation_router
 from src.api.routes import copilot_service, router
 from src.config.settings import get_settings
 from src.core.graph.refresh import set_graph_refresh_service
+from src.core.observability.metrics import PrometheusASGIMiddleware, configure_metrics
 
 
 logger = logging.getLogger(__name__)
 
 
 def create_app() -> FastAPI:
+    settings = get_settings()
+    metrics = configure_metrics(settings.metrics_enabled)
     app = FastAPI(title="Soorin Copilot API")
     app.add_middleware(
         CORSMiddleware,
@@ -26,12 +31,28 @@ def create_app() -> FastAPI:
         allow_methods=["*"],
         allow_headers=["*"],
     )
+    app.add_middleware(PrometheusASGIMiddleware)
     app.include_router(router)
     app.include_router(graph_router)
+    app.include_router(local_simulation_router)
+
+    if settings.metrics_enabled:
+        def prometheus_metrics(_auth: None = Depends(verify_api_key)) -> Response:
+            return Response(
+                content=metrics.render(),
+                media_type="text/plain; version=0.0.4; charset=utf-8",
+            )
+
+        app.add_api_route(
+            settings.metrics_path,
+            prometheus_metrics,
+            methods=["GET"],
+            tags=["internal"],
+            summary="Prometheus metrics",
+        )
 
     @app.on_event("startup")
     def on_startup() -> None:
-        settings = get_settings()
         settings.validate_selected_llm_deployments()
         router_deployment = settings.deployment_for_purpose("intent_router")
         chat_deployment = settings.deployment_for_purpose("chat")

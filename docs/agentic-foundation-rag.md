@@ -84,7 +84,7 @@ Do not run these commands as part of application startup.
    docker compose --profile rag up -d qdrant
    ```
 
-2. Configure `app/.env` with the external source root, Qdrant URL, collection,
+2. Configure the repository-root `.env` with the external source root, Qdrant URL, collection,
    embedding model/dimension, and `SOORIN_RAG_ENABLED=true`. Inside the Compose
    network use `SOORIN_RAG_QDRANT_URL=http://qdrant:6333`.
 

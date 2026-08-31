@@ -9,7 +9,14 @@ from typing import Any
 
 from src.config.settings import Settings, get_settings
 from src.core.context.models import CopilotContextPackage, approx_tokens
-from src.core.context.product_views import payload_inventory
+from src.core.context.compaction import (
+    CurrentEvidenceProjection,
+    HistoricalBaselineProjection,
+    build_delta_context,
+    deduplicate_payloads,
+)
+from src.core.context.product_views import build_product_view, payload_inventory
+from src.core.observability.metrics import get_metrics
 
 
 logger = logging.getLogger(__name__)
@@ -55,6 +62,13 @@ ONE_HOP_CONTEXT_MAX_TOKENS = 1800
 TWO_HOP_CONTEXT_MAX_TOKENS = 2500
 COMPARISON_CONTEXT_MAX_TOKENS = 2200
 FULL_NEIGHBORS_CONTEXT_MAX_TOKENS = 3000
+PROFILE_CONTEXT_MAX_TOKENS = 3200
+DETECTION_CONTEXT_MAX_TOKENS = 2400
+
+MINIMUM_PRODUCT_VIEWS = {
+    "asset_profile": ("overview", "identity", "security", "network"),
+    "detection": ("overview", "evidence"),
+}
 
 
 class ContextComposer:
@@ -68,6 +82,7 @@ class ContextComposer:
             "detection": "",
             "graph": "",
             "knowledge": "",
+            "delta": "",
             "fusion": "",
         }
         self.last_inclusion: dict[str, tuple[bool, str | None]] = {}
@@ -77,6 +92,12 @@ class ContextComposer:
         self.last_knowledge_included_count = 0
         self.last_recomposition_attempted = False
         self.required_context_missing_reason: str | None = None
+        self._product_projection_stats: dict[str, tuple[int, int]] = {}
+        self.last_delta_contexts: tuple[dict[str, Any], ...] = ()
+        self.last_delta_skip_reason: str | None = None
+        self.last_baseline_status = "absent"
+        self.last_baseline_present = False
+        self.last_baseline_compatible = False
 
     def compose(
         self,
@@ -85,12 +106,16 @@ class ContextComposer:
         request_id: str = "",
         base_input_tokens: int = 0,
         reserved_output_tokens: int | None = None,
+        current_projections: tuple[CurrentEvidenceProjection, ...] = (),
+        historical_baselines: tuple[HistoricalBaselineProjection, ...] = (),
     ) -> str:
         return self._compose_product_first(
             package,
             request_id=request_id,
             base_input_tokens=base_input_tokens,
             reserved_output_tokens=reserved_output_tokens,
+            current_projections=current_projections,
+            historical_baselines=historical_baselines,
         )
 
     def _compose_product_first(
@@ -100,15 +125,30 @@ class ContextComposer:
         request_id: str,
         base_input_tokens: int,
         reserved_output_tokens: int | None,
+        current_projections: tuple[CurrentEvidenceProjection, ...],
+        historical_baselines: tuple[HistoricalBaselineProjection, ...],
     ) -> str:
         """Allocate complete Product evidence before bounded Graph and Knowledge context."""
+        self._product_projection_stats = {}
         profile_sections = self._compose_json_sections(
             package.asset_profiles,
-            "ASSET_PROFILE_FULL_MINIFIED_JSON",
+            "ASSET_PROFILE_CONTEXT_JSON",
         )
         detection_sections = self._compose_json_sections(
             package.detections,
-            "ASSET_DETECTION_FULL_MINIFIED_JSON",
+            "ASSET_DETECTION_CONTEXT_JSON",
+        )
+        profile_sections, detection_sections, dedup_support, collapsed_count = self._deduplicate_product_sections(
+            profile_sections,
+            detection_sections,
+        )
+        profile_minimum_tokens = self._minimum_product_tokens(
+            profile_sections,
+            package.asset_profiles,
+        )
+        detection_minimum_tokens = self._minimum_product_tokens(
+            detection_sections,
+            package.detections,
         )
         output_reserve = (
             self.settings.llm_reserved_output_tokens
@@ -138,12 +178,32 @@ class ContextComposer:
             "calibrated_dynamic_capacity": calibrated_capacity,
         }
 
-        profile_text = "\n\n".join(section for _, _, section in profile_sections)
-        detection_text = "\n\n".join(section for _, _, section in detection_sections)
-        for provider_name, ip, _ in [*profile_sections, *detection_sections]:
-            key = f"{provider_name}:{ip}"
-            self.last_inclusion[key] = (True, None)
-            self.last_representation[key] = "full_minified"
+        graph_reserve = min(
+            max_dynamic_tokens // 2,
+            sum(self._graph_context_cap(item.context) for item in package.graph_results),
+        )
+        minimum_product_tokens = profile_minimum_tokens + detection_minimum_tokens
+        product_global_cap = min(
+            max_dynamic_tokens,
+            max(max(0, max_dynamic_tokens - graph_reserve), minimum_product_tokens),
+        )
+        profile_cap = min(
+            PROFILE_CONTEXT_MAX_TOKENS,
+            max(profile_minimum_tokens, product_global_cap - detection_minimum_tokens),
+        )
+        profile_text, profile_used = self._fit_product_sections(
+            profile_sections,
+            profile_cap,
+            package.asset_profiles,
+        )
+        detection_text, detection_used = self._fit_product_sections(
+            detection_sections,
+            min(DETECTION_CONTEXT_MAX_TOKENS, max(0, product_global_cap - profile_used)),
+            package.detections,
+        )
+        if dedup_support and approx_tokens(dedup_support) <= max(0, product_global_cap - profile_used - detection_used):
+            detection_text = "\n\n".join(part for part in (detection_text, dedup_support) if part)
+            detection_used += approx_tokens(dedup_support)
         for index, graph_result in enumerate(package.graph_results):
             identity = str(graph_result.context.get("context_identity") or f"graph:{index}")
             self.last_inclusion[identity] = (False, "not_included")
@@ -157,40 +217,16 @@ class ContextComposer:
         product_required_tokens = approx_tokens(product_required_text)
         self.last_budget["required_product_tokens"] = approx_tokens(product_text)
         self.last_budget["manifest_tokens"] = approx_tokens(manifest)
-        if product_text and product_required_tokens > max_dynamic_tokens:
-            for provider_name, ip, _ in [*profile_sections, *detection_sections]:
-                key = f"{provider_name}:{ip}"
-                self.last_inclusion[key] = (False, "required_product_payloads_exceed_context")
-                self.last_representation[key] = "excluded"
-            self.required_context_missing = True
-            self.required_context_missing_reason = "required_product_payloads_exceed_context"
-            profile_text = ""
-            detection_text = ""
-            manifest = self._compose_provider_manifest(package, graph_included=False)
-            limitation = (
-                "[SOORIN_CONTEXT_LIMITATION]\nRequired complete Product evidence could not fit "
-                "within the safe model context window and was not truncated.\n"
-                "[/SOORIN_CONTEXT_LIMITATION]"
-            )
-            text = "\n\n".join((manifest, limitation))
-            self.last_parts = {
-                "status": manifest,
-                "asset_profile": "",
-                "detection": "",
-                "graph": "",
-                "knowledge": "",
-                "fusion": "",
-            }
-            logger.error(
-                "event=required_product_context_not_included request_id=%s product_tokens=%s manifest_tokens=%s max_dynamic_tokens=%s safe_failure=true",
-                request_id,
-                self.last_budget["required_product_tokens"],
-                approx_tokens(manifest),
-                max_dynamic_tokens,
-            )
-            return text
+        if product_required_tokens > max_dynamic_tokens:
+            self.required_context_missing_reason = "required_product_projections_exceed_context"
 
-        used_tokens = product_required_tokens
+        delta_text = self._compose_delta_context(
+            current_projections,
+            historical_baselines,
+            request_id=request_id,
+            token_budget=min(1200, max(0, max_dynamic_tokens - product_required_tokens)),
+        )
+        used_tokens = product_required_tokens + approx_tokens(delta_text)
         included_graphs: list[tuple[str, CopilotContextPackage, str]] = []
         for index, graph_result in enumerate(package.graph_results):
             identity = str(graph_result.context.get("context_identity") or f"graph:{index}")
@@ -254,6 +290,7 @@ class ContextComposer:
                     current_manifest,
                     profile_text,
                     detection_text,
+                    delta_text,
                     "\n\n".join(item[2] for item in included_graphs),
                     knowledge_text,
                 )
@@ -284,13 +321,15 @@ class ContextComposer:
             identity = str(package.graph_results[0].context.get("context_identity") or "graph:0")
             self.last_inclusion["graph"] = self.last_inclusion[identity]
             self.last_representation["graph"] = self.last_representation[identity]
+        self._recompute_required_context(package, profile_sections, detection_sections)
         self.last_parts = {
             "status": manifest,
             "asset_profile": profile_text,
             "detection": detection_text,
             "graph": graph_text,
             "knowledge": knowledge_text,
-            "fusion": "",
+            "delta": delta_text,
+            "fusion": delta_text,
         }
         self.last_budget["total_dynamic_tokens"] = approx_tokens(text)
         logger.info(
@@ -305,7 +344,205 @@ class ContextComposer:
             self.required_context_missing,
             self.required_context_missing_reason or "none",
         )
+        logger.info(
+            "event=evidence_deduplicated request_id=%s collapsed_count=%s",
+            request_id,
+            collapsed_count,
+        )
+        logger.info(
+            "event=context_budget_allocated request_id=%s profile_tokens=%s detection_tokens=%s graph_reserved_tokens=%s knowledge_tokens=%s",
+            request_id,
+            approx_tokens(profile_text),
+            approx_tokens(detection_text),
+            graph_reserve,
+            approx_tokens(knowledge_text),
+        )
+        logger.info(
+            "event=context_compaction_completed request_id=%s raw_estimated_tokens=%s compacted_tokens=%s token_savings_estimate=%s",
+            request_id,
+            sum(getattr(item, "raw_json_approx_tokens", 0) for item in [*package.asset_profiles, *package.detections]),
+            approx_tokens(product_text),
+            max(0, sum(getattr(item, "raw_json_approx_tokens", 0) for item in [*package.asset_profiles, *package.detections]) - approx_tokens(product_text)),
+        )
+        metrics = get_metrics()
+        metrics.observe_context("profile", approx_tokens(profile_text), approx_tokens(profile_text))
+        metrics.observe_context("detection", approx_tokens(detection_text), approx_tokens(detection_text))
+        metrics.observe_context("graph", approx_tokens(graph_text), approx_tokens(graph_text))
+        metrics.observe_context("knowledge", approx_tokens(knowledge_text), approx_tokens(knowledge_text))
+        metrics.observe_context(
+            "product",
+            sum(
+                getattr(item, "raw_json_approx_tokens", 0)
+                for item in [*package.asset_profiles, *package.detections]
+            ),
+            approx_tokens(product_text),
+        )
         return text
+
+    def _compose_delta_context(
+        self,
+        current: tuple[CurrentEvidenceProjection, ...],
+        baselines: tuple[HistoricalBaselineProjection, ...],
+        *,
+        request_id: str,
+        token_budget: int,
+    ) -> str:
+        """Build only exact compatible Product-view deltas and preserve provenance."""
+        self.last_delta_contexts = ()
+        self.last_delta_skip_reason = None
+        self.last_baseline_present = bool(baselines)
+        self.last_baseline_compatible = False
+        self.last_baseline_status = "absent" if not baselines else "incompatible"
+        reason = "current_projection_unavailable"
+        payloads: list[dict[str, Any]] = []
+        if current and not baselines:
+            reason = "baseline_absent"
+        for projection in current:
+            candidates = [item for item in baselines if item.owner_id == projection.owner_id]
+            if not candidates:
+                reason = "wrong_owner" if baselines else reason
+                continue
+            status_eligible = [item for item in candidates if item.status == "active"]
+            if not status_eligible:
+                statuses = {item.status for item in candidates}
+                reason = (
+                    "candidate_only" if statuses == {"candidate"} else
+                    "superseded" if "superseded" in statuses else
+                    "invalidated" if "invalidated" in statuses else
+                    "inactive"
+                )
+                continue
+            candidates = status_eligible
+            if any(item.unresolved_conflict for item in candidates):
+                reason = "unresolved_conflict"
+                continue
+            type_eligible = [
+                item
+                for item in candidates
+                if item.memory_type in {"validated_finding", "approved_asset_fact", "investigation_baseline"}
+            ]
+            if not type_eligible:
+                reason = "wrong_memory_type"
+                continue
+            candidates = type_eligible
+            if not any(item.evidence_classes for item in candidates):
+                reason = "wrong_evidence_class"
+                continue
+            candidates = [
+                item
+                for item in candidates
+                if item.accessible
+                and item.authoritative
+                and item.freshness not in {"expired", "inactive"}
+                and item.complete
+            ]
+            if not candidates:
+                reason = (
+                    "stale"
+                    if any(item.freshness in {"expired", "inactive"} for item in type_eligible)
+                    else "incomplete_baseline"
+                    if any(not item.complete for item in type_eligible)
+                    else "inactive"
+                )
+                continue
+            same_capability = [item for item in candidates if item.capability == projection.capability]
+            if not same_capability:
+                reason = "wrong_capability"
+                continue
+            projection_entities = set(projection.entity_ids or (projection.entity,))
+            same_entity = [
+                item for item in same_capability
+                if set(item.entity_ids or (item.entity,)) == projection_entities
+            ]
+            if not same_entity:
+                reason = "wrong_entity"
+                continue
+            same_view = [item for item in same_entity if item.view == projection.view]
+            if not same_view:
+                reason = "wrong_view"
+                continue
+            same_scope = [item for item in same_view if item.scope == projection.scope]
+            if not same_scope:
+                reason = "wrong_scope"
+                continue
+            same_direction = [
+                item for item in same_scope if item.direction == projection.direction
+            ]
+            if not same_direction:
+                reason = "wrong_direction"
+                continue
+            same_depth = [item for item in same_direction if item.depth == projection.depth]
+            if not same_depth:
+                reason = "wrong_depth"
+                continue
+            compatible = [
+                item
+                for item in same_depth
+                if item.schema_version == projection.schema_version
+            ]
+            if not compatible:
+                reason = "wrong_schema"
+                continue
+            baseline = max(compatible, key=lambda item: (item.observed_at, item.memory_id))
+            delta = build_delta_context(
+                projection.payload,
+                baseline=baseline.payload,
+                current_identity=projection.identity,
+                baseline_identity=baseline.identity,
+                schema_version=projection.schema_version,
+                baseline_schema_version=baseline.schema_version,
+                baseline_accessible=True,
+                current_complete=projection.complete,
+            )
+            if not delta.created:
+                reason = delta.reason
+                continue
+            payloads.append({
+                "entity": projection.entity,
+                "capability": projection.capability,
+                "view": projection.view,
+                "schema_version": projection.schema_version,
+                "baseline": {
+                    "memory_id": baseline.memory_id,
+                    "observed_at": baseline.observed_at,
+                    "provenance": baseline.provenance,
+                },
+                "current_retrieved_at": projection.retrieved_at,
+                "delta": delta.payload,
+            })
+        if payloads:
+            self.last_baseline_compatible = True
+            self.last_baseline_status = (
+                "available"
+                if len(payloads) == len(current) and all(item.complete for item in current)
+                else "partial"
+            )
+        elif reason == "stale":
+            self.last_baseline_status = "stale"
+        elif reason == "incomplete_baseline":
+            self.last_baseline_status = "partial"
+        elif baselines:
+            self.last_baseline_status = "incompatible"
+        while payloads:
+            text = "[SOORIN_DELTA_CONTEXT_JSON]\n" + json.dumps(
+                {"comparisons": payloads},
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            ) + "\n[/SOORIN_DELTA_CONTEXT_JSON]"
+            if approx_tokens(text) <= max(0, token_budget):
+                self.last_delta_contexts = tuple(payloads)
+                logger.info(
+                    "event=delta_context_used request_id=%s comparison_count=%s",
+                    request_id,
+                    len(payloads),
+                )
+                return text
+            payloads.pop()
+            reason = "delta_context_budget_exceeded"
+        self.last_delta_skip_reason = reason
+        logger.info("event=delta_context_skipped request_id=%s reason=%s", request_id, reason)
+        return ""
 
     @staticmethod
     def graph_context_cap(context: dict[str, Any]) -> int:
@@ -353,8 +590,7 @@ class ContextComposer:
                 }
             )
 
-    @staticmethod
-    def _compose_json_sections(results: list[Any], tag: str) -> list[tuple[str, str, str]]:
+    def _compose_json_sections(self, results: list[Any], tag: str) -> list[tuple[str, str, str]]:
         sections: list[tuple[str, str, str]] = []
         seen_entities: set[str] = set()
         provider_name = "asset_profile" if "ASSET_PROFILE" in tag else "detection"
@@ -364,14 +600,189 @@ class ContextComposer:
             if result.ip in seen_entities:
                 continue
             seen_entities.add(result.ip)
+            serialized = result.serialized_json
+            try:
+                parsed = json.loads(serialized)
+            except (TypeError, ValueError):
+                parsed = None
+            already_projected = isinstance(parsed, dict) and "views" in parsed and "projection_metadata" in parsed
+            if not result.full_payload_included and not already_projected and result.raw_payload is not None:
+                projected = build_product_view(
+                    result.raw_payload,
+                    provider=provider_name,
+                    views=("overview",),
+                    detail="brief",
+                    max_context_tokens=1000,
+                    purpose="composer_default_projection",
+                )
+                serialized = json.dumps(projected.payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+                parsed = projected.payload
+            source_scalars = payload_inventory(result.raw_payload).scalar_count if result.raw_payload is not None else 0
+            projected_scalars = payload_inventory(parsed).scalar_count if parsed is not None else 0
+            self._product_projection_stats[f"{provider_name}:{result.ip}"] = (source_scalars, projected_scalars)
             sections.append(
                 (
                     provider_name,
                     result.ip,
-                    "\n".join((f'[{tag} ip="{result.ip}"]', result.serialized_json, f'[/{tag}]')),
+                    "\n".join((f'[{tag} ip="{result.ip}"]', serialized, f'[/{tag}]')),
                 )
             )
         return sections
+
+    def _fit_product_sections(
+        self,
+        sections: list[tuple[str, str, str]],
+        token_cap: int,
+        provider_results: list[Any],
+    ) -> tuple[str, int]:
+        selected: list[str] = []
+        used = 0
+        by_ip = {item.ip: item for item in provider_results}
+        for provider, ip, section in sections:
+            tokens = approx_tokens(section)
+            key = f"{provider}:{ip}"
+            result = by_ip.get(ip)
+            if used + tokens <= max(0, token_cap):
+                selected.append(section)
+                used += tokens
+                self.last_inclusion[key] = (True, None)
+                self.last_representation[key] = (
+                    "full_minified" if result and result.full_payload_included else "projected"
+                )
+            else:
+                minimum = self._minimum_product_section(
+                    provider,
+                    ip,
+                    result,
+                    record_stats=True,
+                )
+                minimum_tokens = approx_tokens(minimum) if minimum else 0
+                if minimum and used + minimum_tokens <= max(0, token_cap):
+                    selected.append(minimum)
+                    used += minimum_tokens
+                    self.last_inclusion[key] = (True, "bounded_minimum_projection")
+                    self.last_representation[key] = "bounded_minimum"
+                else:
+                    self.last_inclusion[key] = (False, "evidence_class_budget_exceeded")
+                    self.last_representation[key] = "excluded"
+        return "\n\n".join(selected), used
+
+    def _minimum_product_section(
+        self,
+        provider: str,
+        ip: str,
+        result: Any,
+        *,
+        record_stats: bool = False,
+    ) -> str:
+        if result is None or result.raw_payload is None:
+            return ""
+        try:
+            projected = build_product_view(
+                result.raw_payload,
+                provider=provider,
+                views=MINIMUM_PRODUCT_VIEWS[provider],
+                detail="brief",
+                max_context_tokens=(
+                    PROFILE_CONTEXT_MAX_TOKENS
+                    if provider == "asset_profile"
+                    else DETECTION_CONTEXT_MAX_TOKENS
+                ),
+                purpose="composer_minimum_projection",
+            )
+        except (KeyError, TypeError, ValueError):
+            return ""
+        tag = (
+            "ASSET_PROFILE_CONTEXT_JSON"
+            if provider == "asset_profile"
+            else "ASSET_DETECTION_CONTEXT_JSON"
+        )
+        serialized = json.dumps(
+            projected.payload,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        if record_stats:
+            self._product_projection_stats[f"{provider}:{ip}"] = (
+                projected.inventory.scalar_count,
+                projected.usable_fact_count,
+            )
+        return "\n".join((f'[{tag} ip="{ip}"]', serialized, f'[/{tag}]'))
+
+    def _minimum_product_tokens(
+        self,
+        sections: list[tuple[str, str, str]],
+        provider_results: list[Any],
+    ) -> int:
+        by_ip = {item.ip: item for item in provider_results}
+        total = 0
+        for provider, ip, _ in sections:
+            minimum = self._minimum_product_section(provider, ip, by_ip.get(ip))
+            if minimum:
+                total += approx_tokens(minimum)
+        return total
+
+    def _recompute_required_context(
+        self,
+        package: CopilotContextPackage,
+        profile_sections: list[tuple[str, str, str]],
+        detection_sections: list[tuple[str, str, str]],
+    ) -> None:
+        required_product_keys = {
+            f"{provider}:{ip}"
+            for provider, ip, _ in (*profile_sections, *detection_sections)
+        }
+        product_missing = any(
+            not self.last_inclusion.get(key, (False, None))[0]
+            for key in required_product_keys
+        )
+        graph_missing = any(
+            not self.last_inclusion.get(
+                str(result.context.get("context_identity") or f"graph:{index}"),
+                (False, None),
+            )[0]
+            for index, result in enumerate(package.graph_results)
+        )
+        self.required_context_missing = product_missing or graph_missing
+        self.required_context_missing_reason = (
+            "required_product_projection_excluded"
+            if product_missing
+            else "required_graph_context_excluded"
+            if graph_missing
+            else None
+        )
+
+    @staticmethod
+    def _deduplicate_product_sections(
+        profiles: list[tuple[str, str, str]],
+        detections: list[tuple[str, str, str]],
+    ) -> tuple[list[tuple[str, str, str]], list[tuple[str, str, str]], str, int]:
+        sections = [*profiles, *detections]
+        parsed: list[tuple[str, Any]] = []
+        wrappers: list[tuple[str, str, str, str]] = []
+        for provider, ip, section in sections:
+            lines = section.splitlines()
+            if len(lines) < 3:
+                continue
+            parsed.append((f"{provider}:{ip}", json.loads("\n".join(lines[1:-1]))))
+            wrappers.append((provider, ip, lines[0], lines[-1]))
+        deduped = deduplicate_payloads(parsed)
+        rebuilt = [
+            (provider, ip, "\n".join((opening, json.dumps(payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True), closing)))
+            for (provider, ip, opening, closing), payload in zip(wrappers, deduped.payloads)
+        ]
+        profile_count = len(profiles)
+        supported = [item for item in deduped.canonical_facts if len(item["support"]) > 1]
+        support_text = ""
+        if supported:
+            support_text = "[SOORIN_DEDUPLICATED_FACT_SUPPORT]\n" + json.dumps(
+                supported,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            ) + "\n[/SOORIN_DEDUPLICATED_FACT_SUPPORT]"
+        return rebuilt[:profile_count], rebuilt[profile_count:], support_text, deduped.collapsed_count
 
     @staticmethod
     def _combined_status(results: list[Any]) -> str:
@@ -386,28 +797,24 @@ class ContextComposer:
             key = f"{provider_name}:{item.ip}"
             included = self.last_inclusion.get(key, (False, None))[0]
             representation = self.last_representation.get(key, "excluded")
-            scalar_count = (
-                payload_inventory(item.raw_payload).scalar_count
-                if item.raw_payload is not None
-                else 0
-            )
+            source_scalar_count, projected_scalar_count = self._product_projection_stats.get(key, (0, 0))
             entities[item.ip] = {
                 "status": item.status,
                 "payload_included": included,
                 "payload_complete": bool(
                     included
-                    and item.full_payload_fetched
-                    and representation == "full_minified"
                     and not item.context_truncated
+                    and representation != "bounded_minimum"
                 ),
-                "model_representation_projected": False,
+                "model_representation_projected": representation in {"projected", "bounded_minimum"},
                 "representation": representation,
                 "stale": bool(item.stale),
-                "source_payload_complete": bool(item.full_payload_fetched),
-                "projection_usable": bool(item.full_payload_fetched),
-                "usable_fact_count": scalar_count,
-                "projection_truncated": False,
-                "projection_omitted_count": 0,
+                "source_payload_complete": bool(item.raw_payload_present and not item.context_truncated),
+                "full_payload_fetched": bool(item.full_payload_fetched),
+                "projection_usable": bool(item.serialized_json),
+                "usable_fact_count": projected_scalar_count,
+                "projection_truncated": representation == "bounded_minimum",
+                "projection_omitted_count": max(0, source_scalar_count - projected_scalar_count),
             }
         return {
             "status": self._combined_status(results),

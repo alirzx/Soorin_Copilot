@@ -7,9 +7,11 @@ the test value. No live LLM, graph, Product, or ASGI server calls are made.
 from __future__ import annotations
 
 import os
+import asyncio
 from pathlib import Path
 from unittest.mock import patch
 
+import httpx
 import pytest
 from fastapi import HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -118,8 +120,46 @@ def test_cors_preflight_configuration_allows_custom_copilot_header() -> None:
     assert options["allow_credentials"] is False
     assert options["allow_methods"] == ["*"]
     assert options["allow_headers"] == ["*"]
-    requested_headers = "authorization,content-type,soorin_copilot_api_key"
+    requested_headers = "authorization,content-type,soorin_copilot_api_key,x-user-id"
     assert "soorin_copilot_api_key" in requested_headers
+    assert "x-user-id" in requested_headers
+
+
+def test_cors_preflight_succeeds_with_identity_and_auth_headers() -> None:
+    async def request_preflight():
+        transport = httpx.ASGITransport(app=create_app())
+        async with httpx.AsyncClient(
+            transport=transport,
+            base_url="http://testserver",
+        ) as client:
+            return await client.options(
+                "/chat/stream",
+                headers={
+                    "Origin": "https://product.example",
+                    "Access-Control-Request-Method": "POST",
+                    "Access-Control-Request-Headers": (
+                        "Authorization,Content-Type,"
+                        "Soorin_copilot_api_key,X-User-ID"
+                    ),
+                },
+            )
+
+    response = asyncio.run(request_preflight())
+    assert response.status_code == 200
+    assert response.headers["access-control-allow-origin"] == "*"
+    allowed_headers = response.headers["access-control-allow-headers"].lower()
+    assert "authorization" in allowed_headers
+    assert "content-type" in allowed_headers
+    assert "soorin_copilot_api_key" in allowed_headers
+    assert "x-user-id" in allowed_headers
+
+
+def test_user_id_metadata_alone_does_not_authorize() -> None:
+    assert_unauthorized(
+        expected_detail="Missing Authorization header",
+        credentials=None,
+        copilot_api_key_header=None,
+    )
 
 
 def test_protected_routes_require_auth_dependency_and_health_does_not() -> None:
@@ -152,7 +192,7 @@ def test_streamlit_still_uses_bearer_for_builtin_ui_calls() -> None:
     source = Path(__file__).resolve().parents[2] / "app_st.py"
     text = source.read_text(encoding="utf-8")
 
-    assert 'return {"Authorization": f"Bearer {key}"}' in text
+    assert "return copilot_auth_headers(settings.copilot_api_key)" in text
     assert "requests.get(HEALTH_URL, timeout=10)" in text
     assert "requests.get(\n            LLM_HEALTH_URL,\n            headers=_get_auth_headers()," in text
     assert "requests.post(\n            CHAT_URL,\n            json=payload,\n            headers=_get_auth_headers()," in text

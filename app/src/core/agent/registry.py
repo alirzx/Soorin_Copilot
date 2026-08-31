@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import hashlib
+import json
 import re
 import threading
 from dataclasses import replace
@@ -25,6 +26,7 @@ from src.core.context.product_views import (
     ProductEvidenceView,
     approved_views,
     build_product_view,
+    normalize_product_views,
     normalize_purpose,
 )
 
@@ -41,7 +43,7 @@ class EntityInput(BaseModel):
     direction: str | None = None
     depth: int | None = Field(default=None, ge=0, le=2)
     relationship_mode: str | None = None
-    views: list[str] = Field(default_factory=list, max_length=5)
+    views: list[str] = Field(default_factory=list, max_length=6)
     detail: Literal["brief", "standard", "deep"] = "standard"
     max_context_tokens: int = Field(
         default=3000,
@@ -126,6 +128,13 @@ def _provider_result(
     if payload is None:
         payload = getattr(result, "context", None)
     limitations = tuple(getattr(result, "limitations", ()) or ())
+    if evidence_view and "similarity" in evidence_view.selected_views:
+        limitations = (*limitations, "Similarity is rule/tag/role affinity, not model embedding-space similarity.")
+    if evidence_view and "cluster" in evidence_view.selected_views:
+        limitations = (
+            *limitations,
+            "Cluster is rule/tag/role-affinity grouping, not unsupervised ML clustering; population one is weak cohort evidence.",
+        )
     if invalid_provider_status:
         limitations = (*limitations, "Provider returned an unrecognized status.")
     complete = True
@@ -212,6 +221,7 @@ def _provider_result(
         usable_fact_count=evidence_view.usable_fact_count if evidence_view else int(payload is not None),
         projection_truncated=evidence_view.truncated if evidence_view else False,
         projection_omitted_count=evidence_view.projection_omitted_count if evidence_view else 0,
+        projection_schema_version=evidence_view.schema_version if evidence_view else "",
     )
 
 
@@ -223,16 +233,27 @@ def build_capability_registry(
     knowledge_service: Any,
 ) -> CapabilityRegistry:
     registry = CapabilityRegistry()
-    product_fetches: dict[tuple[str, str, str], Any] = {}
+    product_fetches: dict[tuple[str, str, str, str], Any] = {}
     product_fetch_lock = threading.Lock()
 
-    def fetch_product_once(provider: str, ip: str, request_id: str, session_id: str) -> Any:
-        key = (request_id, provider, ip)
+    def fetch_product_once(
+        provider: str,
+        ip: str,
+        request_id: str,
+        session_id: str,
+        view: str = "full",
+    ) -> Any:
+        key = (request_id, provider, ip, view)
         with product_fetch_lock:
             if key in product_fetches:
                 return product_fetches[key]
             source = asset_profile_provider if provider == "asset_profile" else detection_provider
-            result = source.fetch(ip, request_id, session_id=session_id)
+            try:
+                result = source.fetch(ip, request_id, session_id=session_id, view=view)
+            except TypeError as exc:
+                if "view" not in str(exc):
+                    raise
+                result = source.fetch(ip, request_id, session_id=session_id)
             product_fetches[key] = result
             if len(product_fetches) > 512:
                 product_fetches.pop(next(iter(product_fetches)))
@@ -240,14 +261,38 @@ def build_capability_registry(
 
     def product_result(capability: str, provider: str, payload: EntityInput) -> ToolResult:
         ip = payload.entities[0]
-        result = fetch_product_once(provider, ip, payload.request_id, payload.session_id)
-        if getattr(result, "raw_payload", None) is None:
-            return _provider_result(capability, (ip,), result)
-        selected = tuple(payload.views) or ("overview",)
+        selected = normalize_product_views(provider, tuple(payload.views) or ("overview",))
         if any(view not in approved_views(provider) for view in selected):
             raise ValueError("Product capability requested an unapproved evidence view.")
+        fetch_views = selected if provider == "detection" else ("full",)
+        fetched = [
+            fetch_product_once(provider, ip, payload.request_id, payload.session_id, view)
+            for view in fetch_views
+        ]
+        available = [item for item in fetched if getattr(item, "raw_payload", None) is not None]
+        if not available:
+            return _provider_result(capability, (ip,), fetched[0])
+        if len(available) == 1:
+            result = available[0]
+            source_payload = result.raw_payload
+        else:
+            source_payload = {
+                view_name: item.raw_payload
+                for view_name, item in zip(fetch_views, fetched)
+                if getattr(item, "raw_payload", None) is not None
+            }
+            serialized = json.dumps(source_payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+            result = replace(
+                available[0],
+                raw_payload=source_payload,
+                serialized_json=serialized,
+                raw_json_chars=len(serialized),
+                raw_json_bytes=len(serialized.encode("utf-8")),
+                raw_top_level_key_count=len(source_payload),
+                limitations=list(dict.fromkeys(item for result_item in available for item in result_item.limitations)),
+            )
         view = build_product_view(
-            result.raw_payload,
+            source_payload,
             provider=provider,
             views=selected,
             detail=payload.detail,
@@ -255,7 +300,7 @@ def build_capability_registry(
             purpose=normalize_purpose(payload.purpose, "general_assessment"),
         )
         logger.info(
-            "event=product_evidence_view_built request_id=%s provider=%s target_ip=%s views=%s detail=%s purpose=%s usable_fact_count=%s omitted_paths=0 view_tokens=%s raw_payload_retained_internally=true model_representation=full_minified",
+            "event=profile_projection_completed request_id=%s provider=%s target_ip=%s views=%s detail=%s purpose=%s usable_fact_count=%s omitted_paths=%s view_tokens=%s raw_payload_retained_internally=true model_representation=projected",
             payload.request_id,
             provider,
             ip,
@@ -263,8 +308,18 @@ def build_capability_registry(
             view.detail,
             view.purpose,
             view.usable_fact_count,
+            view.omitted_path_count,
             view.token_estimate,
         )
+        if provider == "detection":
+            logger.info(
+                "event=detection_view_retrieved request_id=%s target_ip=%s views=%s status=%s included_count=%s",
+                payload.request_id,
+                ip,
+                ",".join(view.selected_views),
+                getattr(result, "status", "unavailable"),
+                view.usable_fact_count,
+            )
         return _provider_result(capability, (ip,), result, evidence_view=view)
 
     def profile(payload: EntityInput) -> ToolResult:

@@ -7,11 +7,12 @@ import json
 import logging
 import os
 import time
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
 from src.core.copilot.trace import CopilotRequestTrace, render_human_copilot_trace
-from src.core.observability.logging import configure_application_logging
+from src.core.observability.logging import JsonLogFormatter, configure_application_logging
 from src.core.observability.snapshots import EvidenceSnapshotWriter
 
 
@@ -274,6 +275,33 @@ def test_rotating_file_logging_is_plain_complete_and_idempotent(tmp_path):
     for handler in list(test_logger.handlers):
         test_logger.removeHandler(handler)
         handler.close()
+
+
+def test_json_logging_preserves_bounded_redacted_exception_diagnostics():
+    formatter = JsonLogFormatter()
+    try:
+        raise RuntimeError(
+            "password=do-not-emit access_token=token-secret api_key=key-secret "
+            "x-hwid=hwid-secret"
+        )
+    except RuntimeError:
+        record = logging.LogRecord(
+            "test.json",
+            logging.ERROR,
+            __file__,
+            1,
+            "event=product_call_failed request_id=req-1 status=error",
+            (),
+            sys.exc_info(),
+        )
+    payload = json.loads(formatter.format(record))
+    assert payload["event"] == "product_call_failed"
+    assert payload["request_id"] == "req-1"
+    assert payload["error_type"] == "RuntimeError"
+    assert "RuntimeError" in payload["exception"]
+    assert len(payload["exception"]) <= 2000
+    for secret in ("do-not-emit", "token-secret", "key-secret", "hwid-secret"):
+        assert secret not in json.dumps(payload)
 
 
 def test_metadata_and_summary_snapshots_are_safe_and_private(tmp_path):

@@ -106,6 +106,8 @@ class DeterministicFallbackRouter:
         *,
         fallback_reason: str = "",
         request_id: str = "",
+        constraints: Any = None,
+        turn_policy: Any = None,
     ) -> RouteDecision:
         started = time.perf_counter()
         entity_count = len(entities.entities)
@@ -175,7 +177,12 @@ class DeterministicFallbackRouter:
             use_graph, reason, signal_group = True, "fallback_graph_neighbors", "graph_topology"
         elif target and entity_count == 1 and (profile_signal or detection_signal or comprehensive_signal or security_signal or ASSET_WORDS.search(message or "")):
             intent, reason, signal_group = "asset_investigation", "fallback_asset_investigation", "asset_evidence"
-        elif target and entity_followup_signal and previous_intent in OPERATIONAL_INTENTS and last_providers:
+        elif (
+            target
+            and entity_followup_signal
+            and previous_intent in OPERATIONAL_INTENTS
+            and (last_providers or previous_scope not in {None, "none"})
+        ):
             previous_route_used = True
             intent = previous_intent  # type: ignore[assignment]
             if entity_count == 2 and previous_intent in {"graph_relationships", "graph_path"}:
@@ -185,10 +192,31 @@ class DeterministicFallbackRouter:
                 scope = previous_scope if previous_scope in {"none", "node_summary", "one_hop", "full_neighbors", "two_hop"} else "none"  # type: ignore[assignment]
                 depth = 2 if scope == "two_hop" else 1 if scope in {"one_hop", "full_neighbors"} else 0
                 direction = _direction(message, routing_state.previous_direction if routing_state and routing_state.previous_direction in {"inbound", "outbound", "both"} else "both")  # type: ignore[arg-type]
-                use_graph = "graph" in last_providers
+                use_graph = "graph" in last_providers or previous_scope in {
+                    "node_summary", "one_hop", "full_neighbors", "two_hop"
+                }
             use_detection = bool(routing_state and routing_state.previous_requires_detection)
             use_asset_profile = bool(routing_state and routing_state.previous_requires_asset_profile)
             reason, signal_group = "fallback_previous_operational_route", "previous_operational_route"
+
+        if (
+            bool(getattr(constraints, "require_current", False))
+            and target
+            and not topic_detached
+            and getattr(turn_policy, "episode_transition", "switch") == "keep"
+            and previous_intent in OPERATIONAL_INTENTS
+        ):
+            intent = previous_intent  # type: ignore[assignment]
+            scope = previous_scope if previous_scope in {"none", "node_summary", "one_hop", "full_neighbors", "two_hop"} else "none"  # type: ignore[assignment]
+            use_graph = use_graph or "graph" in last_providers or scope != "none"
+            use_detection = (
+                use_detection or "detection" in last_providers
+                or bool(routing_state and routing_state.previous_requires_detection)
+            )
+            use_asset_profile = (
+                use_asset_profile or "asset_profile" in last_providers
+                or bool(routing_state and routing_state.previous_requires_asset_profile)
+            )
 
         if not topic_detached and 0 < entity_count <= 2:
             if comprehensive_signal or security_signal:

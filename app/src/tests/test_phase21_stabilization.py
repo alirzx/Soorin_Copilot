@@ -356,7 +356,7 @@ def test_general_topic_does_not_receive_asset_episode_history():
     assert "asset-only-answer" not in json.dumps(snapshot.messages)
 
 
-def test_product_view_preserves_complete_payload_as_minified_json():
+def test_product_full_view_preserves_complete_payload_as_minified_json():
     payload = {
         "classification": {"role": "domain_controller", "confidence": 0.98},
         "identity": {"hostname": "dc-01", "conflicts": ["vendor mismatch"]},
@@ -367,7 +367,7 @@ def test_product_view_preserves_complete_payload_as_minified_json():
     view = build_product_view(
         payload,
         provider="detection",
-        views=("overview", "identity_role", "anomaly_risk", "behavior", "evidence_deep"),
+        views=("full",),
         detail="deep",
         max_context_tokens=450,
         purpose="investigation",
@@ -395,7 +395,7 @@ def test_product_view_preserves_complete_payload_as_minified_json():
         )
 
 
-def test_large_product_view_is_not_pruned_to_its_requested_view_budget():
+def test_large_product_payload_is_compacted_for_model_view():
     payload = {
         "classification": {"role": "domain_controller", "confidence": 0.97},
         "identity": {"hostname": "dc-01", "conflicts": ["vendor mismatch"]},
@@ -407,19 +407,19 @@ def test_large_product_view_is_not_pruned_to_its_requested_view_budget():
     view = build_product_view(
         payload,
         provider="detection",
-        views=("overview", "identity_role", "anomaly_risk", "evidence_deep"),
-        detail="deep",
+        views=("overview", "evidence"),
+        detail="standard",
         max_context_tokens=900,
         purpose="live_payload_regression",
     )
 
-    assert view.payload == payload
-    assert set(view.payload) == set(payload)
+    assert view.payload != payload
+    assert set(view.payload) == {"provider", "views", "projection_metadata"}
     assert view.projection_usable
     assert view.usable_fact_count > 0
-    assert view.projection_omitted_count == 0
+    assert view.projection_omitted_count > 0
     assert not view.truncated
-    assert view.token_estimate > 900
+    assert view.token_estimate < 900
 
 
 def test_complete_product_view_preserves_null_false_zero_and_empty_values():
@@ -434,8 +434,8 @@ def test_complete_product_view_preserves_null_false_zero_and_empty_values():
     view = build_product_view(
         payload,
         provider="detection",
-        views=("overview",),
-        detail="brief",
+        views=("full",),
+        detail="deep",
         max_context_tokens=200,
         purpose="summary",
     )
@@ -459,6 +459,17 @@ def test_multiple_product_views_produce_one_complete_context_block_per_entity():
         serialized_json=serialized,
         full_payload_fetched=True,
     )
+    view_payloads = {
+        view: build_product_view(
+            payload,
+            provider="detection",
+            views=(view,),
+            detail="standard",
+            max_context_tokens=500,
+            purpose="test",
+        ).payload
+        for view in ("overview", "evidence")
+    }
     results = [
         ToolResult(
             status="ok",
@@ -470,11 +481,12 @@ def test_multiple_product_views_produce_one_complete_context_block_per_entity():
             raw_payload=payload,
             provider_result=provider_result,
             selected_views=(view,),
+            view_payload=view_payloads[view],
             source_payload_complete=True,
             projection_usable=True,
             usable_fact_count=3,
         )
-        for view in ("overview", "anomaly_risk")
+        for view in ("overview", "evidence")
     ]
     task = _task(capability="asset.get_detection")
     pack = EvidencePack(task, tuple(results), (), ())
@@ -486,9 +498,9 @@ def test_multiple_product_views_produce_one_complete_context_block_per_entity():
     updated = apply_context_inclusion(results, composer.last_inclusion)
 
     assert len(package.detections) == 1
-    assert package.detections[0].serialized_json == serialized
-    assert text.count(f'[ASSET_DETECTION_FULL_MINIFIED_JSON ip="{IP_A}"]') == 1
-    assert all(result.context_representation == "full_minified" for result in updated)
+    assert package.detections[0].serialized_json != serialized
+    assert text.count(f'[ASSET_DETECTION_CONTEXT_JSON ip="{IP_A}"]') == 1
+    assert all(result.context_representation == "projected" for result in updated)
     assert all(result.source_payload_complete for result in updated)
     assert all(not result.projection_truncated for result in updated)
     assert all(result.projection_omitted_count == 0 for result in updated)
@@ -516,7 +528,7 @@ def test_reviewer_rejects_product_without_complete_minified_contract():
     retry = reviewer.review(task, [empty], allow_supplemental=True)
 
     assert final.outcome == "answer_with_limitations"
-    assert "complete minified payload" in final.limitations[0]
+    assert "usable validated projection" in final.limitations[0]
     assert retry.outcome == "answer_with_limitations"
     assert not retry.supplemental_allowed
 
@@ -740,7 +752,7 @@ def test_system_prompt_does_not_force_internal_knowledge_base_label():
     assert "internal provider, tool, context, storage, routing, or prompt names" in prompt
 
 
-def test_detection_anomaly_view_removes_missing_anomaly_provider_limitation():
+def test_detection_evidence_view_removes_missing_anomaly_provider_limitation():
     limitation = (
         "No dedicated anomaly provider evidence is available; only bounded graph structural analysis is supplied."
     )
@@ -755,9 +767,9 @@ def test_detection_anomaly_view_removes_missing_anomaly_provider_limitation():
         retrieved_at="now",
         freshness="current",
         completeness="complete",
-        selected_views=("anomaly_risk",),
+        selected_views=("evidence",),
         context_included=True,
-        context_representation="full_minified",
+        context_representation="projected",
         source_payload_complete=True,
         projection_usable=True,
         usable_fact_count=2,
@@ -910,6 +922,7 @@ def test_unsafe_final_window_blocks_chat_provider_after_recomposition():
     service = CopilotService(
         _settings(
             chat_store_history=False,
+            llm_usage_reporting_enabled=False,
             llm_context_window_tokens=160,
             llm_context_safety_margin_tokens=100,
             llm_reserved_output_tokens=120,

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 import json
+import logging
 from typing import Any
 
 from src.core.agent.contracts import EvidencePack, ToolResult
@@ -22,6 +23,7 @@ from src.core.rag.models import KnowledgeSearchResult
 _NO_DEDICATED_ANOMALY_EVIDENCE = (
     "No dedicated anomaly provider evidence is available; only bounded graph structural analysis is supplied."
 )
+logger = logging.getLogger(__name__)
 
 
 def context_package_from_evidence(
@@ -59,7 +61,7 @@ def context_package_from_evidence(
         knowledge = _merge_knowledge_results(knowledge_results)
     dedicated_anomaly_evidence = any(
         result.source_capability == "asset.get_detection"
-        and "anomaly_risk" in result.selected_views
+        and "evidence" in result.selected_views
         and result.status in {"ok", "partial"}
         and result.source_payload_complete
         and result.projection_usable
@@ -78,6 +80,13 @@ def context_package_from_evidence(
             ]
     detections.extend(_merge_product_context(items) for items in detection_groups.values())
     profiles.extend(_merge_product_context(items) for items in profile_groups.values())
+    logger.info(
+        "event=evidence_context_projected profile_count=%s detection_count=%s graph_count=%s knowledge_included=%s",
+        len(profiles),
+        len(detections),
+        len(graphs),
+        knowledge is not None,
+    )
     return CopilotContextPackage(
         entities=entities,
         graph=graph,
@@ -91,25 +100,40 @@ def context_package_from_evidence(
 
 
 def _merge_product_context(items: list[tuple[ToolResult, Any]]) -> Any:
-    """Serialize one deduplicated complete payload for one provider/entity."""
+    """Serialize projected views while retaining canonical payloads internally."""
     first_result, provider_result = items[0]
-    payload = first_result.raw_payload
-    if payload is None:
+    raw_payload = first_result.raw_payload
+    view_payloads = [result.view_payload for result, _ in items if result.view_payload is not None]
+    if raw_payload is None or not view_payloads:
         return provider_result
-    serialized = json.dumps(payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+    if len(view_payloads) == 1:
+        model_payload = view_payloads[0]
+    else:
+        merged_views: dict[str, Any] = {}
+        metadata: dict[str, Any] = {"normal_compaction": True}
+        for payload in view_payloads:
+            if isinstance(payload, dict):
+                merged_views.update(payload.get("views") or {})
+                metadata.update(payload.get("projection_metadata") or {})
+        model_payload = {
+            "provider": first_result.provider,
+            "views": merged_views,
+            "projection_metadata": metadata,
+        }
+    serialized = json.dumps(model_payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
     return replace(
         provider_result,
-        raw_payload=payload,
+        raw_payload=raw_payload,
         serialized_json=serialized,
         raw_payload_present=True,
-        full_payload_fetched=all(result.source_payload_complete for result, _ in items),
-        full_payload_included=True,
+        full_payload_fetched=bool(getattr(provider_result, "full_payload_fetched", False)),
+        full_payload_included=any("full" in result.selected_views for result, _ in items),
         context_truncated=False,
         context_truncation_reason=None,
         raw_json_chars=len(serialized),
         raw_json_bytes=len(serialized.encode("utf-8")),
         raw_json_approx_tokens=approx_tokens(serialized),
-        raw_top_level_key_count=len(payload) if isinstance(payload, dict) else 0,
+        raw_top_level_key_count=len(model_payload) if isinstance(model_payload, dict) else 0,
     )
 
 
@@ -160,24 +184,18 @@ def apply_context_inclusion(
             key = "graph"
         included, reason = inclusion.get(key, (False, "missing_context_inclusion_decision"))
         is_product = legacy_key in {"asset.get_profile", "asset.get_detection"}
+        if result.provider == "long_term_memory":
+            updated.append(result)
+            continue
         graph_context = (
             result.provider_result.context
             if legacy_key.startswith("graph.")
             and getattr(result.provider_result, "context", None) is not None
             else {}
         )
-        if (
-            included
-            and is_product
-            and (
-                not result.source_payload_complete
-                or not result.projection_usable
-                or result.projection_truncated
-                or result.projection_omitted_count != 0
-            )
-        ):
+        if included and is_product and (not result.source_payload_complete or not result.projection_usable):
             included = False
-            reason = "product_full_payload_contract_invalid"
+            reason = "product_projection_contract_invalid"
         limitations = result.limitations
         if not included and reason:
             limitations = tuple(dict.fromkeys((*limitations, f"Model context omitted this evidence: {reason}.")))
@@ -190,6 +208,8 @@ def apply_context_inclusion(
                 context_representation=(
                     "excluded"
                     if not included
+                    else "projected"
+                    if is_product and "full" not in result.selected_views
                     else "full_minified"
                     if is_product
                     else str(graph_context.get("context_mode") or "included")

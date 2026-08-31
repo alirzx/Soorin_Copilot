@@ -363,6 +363,72 @@ class CopilotServiceStreamingTests(unittest.TestCase):
         self.assertEqual([event.text for event in emitted], ["fallback"])
         self.assertFalse(metrics["streaming_used"])
 
+    def test_reasoning_only_stream_uses_one_bounded_answer_first_fallback(self) -> None:
+        llm = FakeStreamingLLM(
+            [
+                LLMStreamEvent("reasoning_delta", text="long internal reasoning"),
+                LLMStreamEvent(
+                    "done",
+                    data={
+                        "finish_reason": "length",
+                        "usage": {"completion_tokens": 100},
+                        "stream_terminated": True,
+                    },
+                ),
+            ],
+            fallback_text="recovered answer",
+        )
+        service = CopilotService(
+            service_settings(llm_expose_reasoning=False), llm, MemoryStore(0)
+        )  # type: ignore[arg-type]
+        emitted: list[LLMStreamEvent] = []
+        metrics = self._metrics()
+
+        result = service._stream_final_model(
+            [{"role": "system", "content": "answer with evidence"}],
+            request_id="reasoning-only",
+            max_tokens=4096,
+            temperature=0.2,
+            top_p=0.9,
+            timeout_seconds=10,
+            sink=emitted.append,
+            metrics=metrics,
+        )
+
+        self.assertEqual(result.text, "recovered answer")
+        self.assertEqual(len(llm.chat_calls), 1)
+        self.assertEqual(llm.chat_calls[0]["max_tokens"], 2048)
+        self.assertIn("FINAL ANSWER RECOVERY", llm.chat_calls[0]["messages"][0]["content"])
+        self.assertEqual(metrics["fallback_reason"], "provider_stream_reasoning_exhausted")
+        self.assertEqual([event.text for event in emitted], ["recovered answer"])
+
+    def test_empty_non_streaming_recovery_is_reported_without_retry_loop(self) -> None:
+        class EmptyRecoveryLLM(FakeStreamingLLM):
+            def chat(self, messages, **kwargs):
+                self.chat_calls.append({"messages": messages, **kwargs})
+                return LLMProviderResult(
+                    text="",
+                    provider="fake",
+                    model="fixture-chat-model",
+                    deployment="glm",
+                )
+
+        llm = EmptyRecoveryLLM([])
+        service = CopilotService(service_settings(), llm, MemoryStore(0))  # type: ignore[arg-type]
+
+        with self.assertRaisesRegex(LLMError, "recovery response was empty"):
+            service._stream_final_model(
+                [{"role": "user", "content": "hello"}],
+                request_id="empty-recovery",
+                max_tokens=100,
+                temperature=0.2,
+                top_p=0.9,
+                timeout_seconds=10,
+                sink=lambda event: None,
+                metrics=self._metrics(),
+            )
+        self.assertEqual(len(llm.chat_calls), 1)
+
     def test_partial_stream_failure_does_not_call_non_streaming_model(self) -> None:
         llm = FakeStreamingLLM(
             [
@@ -490,15 +556,16 @@ class SSEAndStreamlitContractTests(unittest.TestCase):
 
     def test_previous_sidebar_and_bottom_input_fixes_remain_present(self) -> None:
         source = (Path(__file__).resolve().parents[2] / "app_st.py").read_text(encoding="utf-8")
-        history_loop = source.index("for item in st.session_state.messages:")
-        input_call = source.index('st.chat_input("Ask a cybersecurity question")')
+        chat_ui = (Path(__file__).resolve().parents[1] / "web" / "chat_ui.py").read_text(encoding="utf-8")
+        history_loop = chat_ui.index("for item in messages:")
+        input_call = chat_ui.index("prompt = st.chat_input(")
 
         self.assertLess(history_loop, input_call)
-        self.assertIn("submitted_turn = st.container()", source)
+        self.assertIn("render_conversation_chat(", source)
         self.assertIn("LLM: {get_active_llm_label()}", source)
         self.assertNotIn("RAG: planned", source)
-        self.assertEqual(source.count('st.session_state.messages.append({"role": "user"'), 1)
-        self.assertEqual(source.count('st.session_state.messages.append({"role": "assistant"'), 1)
+        self.assertNotIn('st.session_state.messages.append({"role": "user"', source)
+        self.assertNotIn('st.session_state.messages.append({"role": "assistant"', source)
 
 
 if __name__ == "__main__":

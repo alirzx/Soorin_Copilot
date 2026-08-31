@@ -27,6 +27,7 @@ _DETAILED_SECTION_ORDER = (
     "IDENTITY AND ENTITY RESOLUTION",
     "ROUTING DECISION",
     "TASK AND PLAN",
+    "MEMORY SUFFICIENCY AND EVIDENCE GAP",
     "LANGGRAPH WORKFLOW",
     "SPECIALISTS",
     "CAPABILITY EXECUTION",
@@ -330,6 +331,18 @@ def trace_from_investigation_state(state: dict[str, Any]) -> CopilotRequestTrace
         validated=bool(getattr(plan, "validated", False)),
         step_count=len(getattr(plan, "steps", ()) or ()),
     )
+    gap_plan = state.get("evidence_gap_plan")
+    trace.put(
+        "MEMORY SUFFICIENCY AND EVIDENCE GAP",
+        requirement_count=len(getattr(getattr(gap_plan, "requirements", None), "requirements", ()) or ()),
+        decisions=[item.decision for item in (getattr(gap_plan, "decisions", ()) or ())],
+        reasons=[item.reason_code for item in (getattr(gap_plan, "decisions", ()) or ())],
+        skipped_capabilities=list(getattr(gap_plan, "skipped_capabilities", ()) or ()),
+        selected_views=[
+            f"{item.capability}:{','.join(item.views)}"
+            for item in (getattr(gap_plan, "view_selections", ()) or ())
+        ],
+    )
     trace.put(
         "LANGGRAPH WORKFLOW",
         status=state.get("workflow_status"),
@@ -379,6 +392,12 @@ def trace_from_investigation_state(state: dict[str, Any]) -> CopilotRequestTrace
     trace.put(
         "MEMORY TRANSITION",
         completed=bool(memory.get("completed")),
+        memory_write_count=memory.get("memory_write_count"),
+        working_fact_write_count=memory.get("working_fact_write_count"),
+        ltm_candidate_processed_count=memory.get("ltm_candidate_processed_count"),
+        thread_state_persistence_attempted=memory.get(
+            "thread_state_persistence_attempted"
+        ),
         active_entities=list(getattr(active, "active_entities", ()) or ()),
         previous_scope=getattr(active, "previous_scope", None),
     )

@@ -252,7 +252,7 @@ ROUTER_REPAIR_SYSTEM_PROMPT = (
     "is_followup, classification_confidence, reason. Allowed intents: general_knowledge, asset_investigation, "
     "graph_neighbors, graph_relationships, graph_path, graph_followup, unclear. Allowed scopes: none, "
     "node_summary, one_hop, full_neighbors, two_hop, path, multi_entity_comparison. Allowed directions: none, "
-    "inbound, outbound, both. Never invent entities."
+    "inbound, outbound, both. Allowed entity_binding values: explicit, ui, active_single, active_pair, none. Never invent entities."
 )
 
 
@@ -769,6 +769,19 @@ class SemanticIntentRouter:
             return self._complete(decision, started, 0, finish_reason, bool(content), completion_tokens, request_id)
         except (ValueError, TypeError, json.JSONDecodeError) as exc:
             last_error = str(exc) or "schema_validation_failed"
+
+        if not content and finish_reason == "length":
+            logger.warning(
+                "event=intent_router_truncated_empty request_id=%s repair_attempted=false",
+                request_id,
+            )
+            return self._failure(
+                "empty_content_truncated",
+                int((time.perf_counter() - started) * 1000),
+                0,
+                finish_reason,
+                False,
+            )
 
         if not self.settings.intent_router_retry_enabled:
             return self._failure(

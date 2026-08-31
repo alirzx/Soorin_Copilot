@@ -1,5 +1,55 @@
 """Bounded working and episodic memory package."""
 
-from src.core.memory.episodes import EpisodeRecord, MemoryContextKey, MemoryRepository, WorkingMemory
+from src.core.memory.episodes import (
+    EpisodeRecord,
+    MemoryContextKey,
+    MemoryContextPackage,
+    MemoryRepository,
+    RelevantTurn,
+    TurnReference,
+    WorkingMemory,
+)
+from src.core.memory.persistence import ThreadMemoryState
+from src.core.memory.long_term import (
+    LongTermMemoryRecord,
+    MemoryPromotionPolicy,
+    RetrievedLongTermMemory,
+)
+from src.core.memory.retrieval import (
+    LongTermMemoryCoordinator,
+    LongTermMemoryRetriever,
+    LongTermMemorySelection,
+    MemorySemanticIndex,
+    Reranker,
+)
+from src.core.identity import RequestIdentity
+from src.core.memory.ports import (
+    ChatRepository,
+    LongTermMemoryStore,
+    SemanticMemoryIndex,
+    ThreadStateStore,
+)
 
-__all__ = ["EpisodeRecord", "MemoryContextKey", "MemoryRepository", "WorkingMemory"]
+__all__ = [
+    "ChatRepository",
+    "EpisodeRecord",
+    "LongTermMemoryStore",
+    "LongTermMemoryRecord",
+    "MemoryPromotionPolicy",
+    "RetrievedLongTermMemory",
+    "LongTermMemoryCoordinator",
+    "LongTermMemoryRetriever",
+    "LongTermMemorySelection",
+    "MemorySemanticIndex",
+    "Reranker",
+    "MemoryContextKey",
+    "MemoryContextPackage",
+    "MemoryRepository",
+    "RequestIdentity",
+    "SemanticMemoryIndex",
+    "ThreadStateStore",
+    "WorkingMemory",
+    "RelevantTurn",
+    "TurnReference",
+    "ThreadMemoryState",
+]

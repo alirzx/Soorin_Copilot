@@ -208,6 +208,9 @@ class DetectionProviderResult:
     latency_ms: int = 0
     error_type: str | None = None
     safe_error: str | None = None
+    requested_view: str = "full"
+    returned_view: str = "full"
+    source_endpoint: str = ""
 
 
 @dataclass(frozen=True)
@@ -238,6 +241,9 @@ class AssetProfileProviderResult:
     latency_ms: int = 0
     error_type: str | None = None
     safe_error: str | None = None
+    requested_view: str = "full"
+    returned_view: str = "full"
+    source_endpoint: str = ""
 
 
 @dataclass(frozen=True)

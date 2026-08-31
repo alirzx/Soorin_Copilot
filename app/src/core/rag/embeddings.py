@@ -114,6 +114,7 @@ class HuggingFaceTextEmbedder:
                 int((time.perf_counter() - started) * 1000),
             )
             raise EmbeddingLoadError(code) from exc
+        model.to("cpu")
         model.eval()
         hidden_size = int(getattr(model.config, "hidden_size", 0) or 0)
         if hidden_size != self.dimension:

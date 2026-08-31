@@ -1,6 +1,30 @@
 # Soorin Copilot Current Architecture
 
-Audit date: 2026-07-20.
+Audit date: 2026-08-05.
+
+> **2026-08-17 production-integration addendum:** this document describes the
+> repository architecture, not a deployed Product-memory integration. The
+> source-backed separation of latest tagged/main behavior, current `dev`, and
+> the proposed Product/PostgreSQL memory boundary is in
+> [FRONTEND_BACKEND_COPILOT_INTEGRATION.md](FRONTEND_BACKEND_COPILOT_INTEGRATION.md).
+> In particular, current `dev` does not validate Product JWTs and `X-User-ID`
+> remains untrusted metadata; its SQLite transcript, user, and chatroom records
+> are local simulation only.
+>
+> **2026-08-28 memory/control-plane addendum:** deterministic `TurnPolicy` now
+> resolves conversation operation, target authority, and `KEEP`/`SWITCH`/`DETACH`
+> episode policy before semantic routing. High-confidence broad conversation
+> recall bypasses the Router; the existing semantic Router is used only when
+> ambiguity remains. A request with `require_current=True` fails closed when no
+> live capability is authorized. Complete normalized Profile, Detection, and
+> bounded Graph projections can form an owner/entity-bound
+> `InvestigationBaseline` persisted inside the existing Product ThreadState
+> `stateJson`. Baselines are bounded, versioned, and compared by the
+> deterministic DeltaEngine; current operational evidence remains mandatory for
+> current verification. See
+> [MEMORY_WORKFLOW_CURRENT_DEV_AUDIT.md](MEMORY_WORKFLOW_CURRENT_DEV_AUDIT.md)
+> for the exact lifecycle and compatibility rules.
+>
 
 This document describes the implemented repository state. It distinguishes working behavior from partial foundations, placeholders, and deferred work. It should be updated after architecture-changing code changes.
 
@@ -35,10 +59,10 @@ sequenceDiagram
     participant LLM as Arvan chat deployment
 
     UI->>API: POST /chat or /chat/stream
-    API->>Service: message, session_id, optional ui_context
+    API->>Service: message, resolved request identity, optional ui_context
     Service->>Workflow: invoke request with runtime dependencies
     Workflow->>Entity: resolve explicit/UI/session entities
-    Workflow->>Router: classify with configured Kimi/GLM/GPT deployment
+    Workflow->>Router: classify with configured Router role
     Router->>Workflow: JSON route decision
     Workflow->>Workflow: validate and normalize task
     Workflow->>Planner: multi-step only; one structured proposal
@@ -80,23 +104,32 @@ Current API compatibility:
 - `/chat` keeps the existing envelope shape.
 - `/chat/stream` preserves the existing SSE event schema and adds UTF-8 charset.
 - There are graph read endpoints, but no RAG endpoint and no planner endpoint.
+- `GET /health` is public. Other current API routes require
+  `SOORIN_COPILOT_API_KEY`, accepted either as a standard Bearer credential or
+  as `Soorin_copilot_api_key` when a Product JWT must remain in `Authorization`.
 
 ## 4. Configuration
 
 Implemented in `app/src/config/settings.py`.
 
-Settings are loaded from `app/.env` if present, then from environment variables. The local `.env` file is intentionally not tracked. Sensitive values are represented in logs only as configured/not configured booleans.
+Settings are loaded from the repository-root `.env` if present, then from process environment variables. The local `.env` file is intentionally not tracked. Sensitive values are represented in logs only as configured/not configured booleans.
 
 Major groups:
 
 - API/UI: `API_HOST`, `API_PORT`, `API_RELOAD`, `SOORIN_API_BASE_URL`, `SOORIN_API_TIMEOUT_SECONDS`, `STREAMLIT_SERVER_PORT`.
-- LLM: selected router/chat deployments plus per-deployment Arvan base URL, model, API key, timeouts, token limits, sampling support, and conservative estimate multiplier.
+- LLM: independent Router, Planner, and Synthesizer role settings over one OpenAI-compatible Arvan transport, with per-role URL, model, API key, timeouts, token limits, sampling support, and conservative estimate multiplier.
 - Product API: base URL, topology path, profile path, detection path, login path, token, login credentials, captcha bypass, HWID, retry and timeout settings.
 - Graph: artifact paths, UI limits, API limits, retrieval limits, context limits, refresh policy, validation thresholds.
 - RAG: enabled flag, source root, backend, Qdrant mode/server URL/local path, collection, score threshold, BGE model/dimension/revision/cache/local-only policy, chunking and upsert limits.
 - Prompts and router: system prompt path, router prompt path, confidence threshold, repair retry flag.
 - Conversation: history storage and deterministic summary limits.
+- Local persistence: disabled-by-default Product chat simulation, memory/SQLite
+  thread-state backend, local SQLite path, and reserved LangGraph checkpoint
+  backend selection.
 - Observability: console/JSON terminal logs, bounded rotating UTF-8 file logs, summary/detailed human traces, TTY-aware color, and disabled-by-default evidence snapshots.
+- Optional operations observability: authenticated Prometheus `/metrics`, an
+  `observability` Compose profile for Prometheus/Loki/Alloy/Grafana, and a
+  provisioned low-cardinality operations dashboard. See `docs/OBSERVABILITY.md`.
 
 Validation currently enforces:
 
@@ -107,18 +140,13 @@ Validation currently enforces:
 - BGE default dimension must be 768.
 - Legacy SecureBERT model and collection values are rejected when RAG is enabled.
 - Log format, color, human-trace detail, and evidence snapshot modes are validated.
+- Local chat or SQLite thread-state mode requires a non-empty local database path.
 
 ## 5. LLM Deployments
 
 Implemented in `app/src/config/llm_deployments.py`, `app/src/core/llm/client.py`, and `app/src/core/llm/providers/arvan.py`.
 
-The system supports three named OpenAI-compatible deployments through the existing adapter:
-
-- `kimi`, default model label `kimi-k3`.
-- `glm`, default model label `GLM-5.2`.
-- `gpt55`, default model label `GPT-5.5`.
-
-The LLM configuration is role-based: `SOORIN_ROUTER_*`, `SOORIN_PLANNER_*`, and `SOORIN_SYNTHESIZER_*` independently configure the semantic Router, optional Planner, and final Synthesizer. All roles use the shared OpenAI-compatible transport settings and the typed `LLMRoleConfig` contract. The current example intentionally uses `CHANGE_ME_MODEL` placeholders; real deployment URLs, models, and keys are supplied only through private runtime configuration.
+The LLM configuration is role-based: `SOORIN_ROUTER_*`, `SOORIN_PLANNER_*`, and `SOORIN_SYNTHESIZER_*` independently configure the semantic Router, optional Planner, and final Synthesizer. All roles use the shared OpenAI-compatible transport settings and the typed `LLMRoleConfig` contract. The intended next deployment is DeepSeek V4 Flash for all three roles, but exact provider endpoint/model values have not been guessed; the checked-in example uses `CHANGE_ME_MODEL` placeholders and private runtime configuration supplies approved values.
 
 The provider:
 
@@ -277,7 +305,18 @@ Terminal status is evidence-driven. `completed` means every required validated c
 
 ### Workflow persistence model
 
-This release compiles LangGraph without a checkpointer and provides no SQLite or alternate checkpoint persistence. Request execution remains bounded, all workflow nodes and conditional edges remain active, and memory update remains exactly once per completed request. Conversation and routing state are process-local; interrupted requests cannot resume after a process restart. Durable checkpointing is a future architecture option, not a runtime feature of this release.
+LangGraph still compiles without a checkpointer. The installed official synchronous
+SQLite saver is compatible with the current synchronous invocation API, but the
+current `InvestigationState` contains model messages and rich evidence objects that
+Gate 3 does not permit to be serialized. `SOORIN_LANGGRAPH_CHECKPOINT_BACKEND=sqlite`
+therefore logs an explicit deferral and does not open a checkpoint database.
+Interrupted workflows cannot resume after a restart.
+
+Separately, Gate 5 provides an opt-in local SQLite `ChatRepository` and bounded
+`ThreadStateStore`. These adapters do not persist arbitrary LangGraph state. They
+store owner-scoped transcripts/request status plus one versioned
+`ThreadMemoryState` with routing continuity, working-summary provenance, bounded
+turn references, and bounded episode summaries. They are disabled by default.
 
 ### Service responsibilities after refactor
 
@@ -323,7 +362,25 @@ Already-running synchronous provider threads cannot be forcibly terminated after
 
 ### ToolResult and EvidencePack
 
-`ToolResult` is the canonical capability-output contract. It includes a stable model-context identity plus explicit inclusion, omission reason, representation, and token metadata. Product raw JSON remains internal in `raw_payload`/`provider_result`; only projected facts enter model context. Graph retrieval/serialization completeness, counts, truncation, and limitations survive conversion. Knowledge chunks, scores through the original result, citations, counts, backend, and freshness survive conversion. Unknown provider statuses fail closed as `invalid`; they are never normalized to success.
+`ToolResult` is the canonical capability-output contract. It includes a stable model-context identity plus explicit inclusion, omission reason, representation, and token metadata. Raw provider result objects remain internal in `raw_payload`/`provider_result`; the model receives only the validated Product projection selected for unresolved evidence classes. Full Product JSON is model-facing only for an explicit validated `full` view. Graph retrieval/serialization completeness, counts, truncation, and limitations survive conversion. Knowledge chunks, scores through the original result, citations, counts, backend, and freshness survive conversion. Unknown provider statuses fail closed as `invalid`; they are never normalized to success.
+
+### Memory-first evidence-gap policy (Gate 8)
+
+After `TaskSpec`, deterministic code derives typed evidence requirements. The
+`MemorySufficiencyGate` evaluates coverage, exact entity binding, authority,
+freshness class, completeness, and active contradiction. Its explicit outcomes
+are `memory_sufficient`, `memory_sufficient_verification_required`,
+`live_evidence_required`, `contradictory_memory`, and `memory_unavailable`.
+Semantic similarity never establishes entity identity or authority. Current
+Detection, Graph, risk, and activity requirements normally retain a live
+verification call. Only fully satisfied revision-based or explicitly historical
+requirements may skip a call. A skip is represented by a validated memory-backed
+`ToolResult`, logged, shown in Human Trace, and accepted by PlanValidator; it is
+never treated as an absent capability.
+
+Both direct and Planner plans converge on the same deterministic gap application,
+`ViewSelector`, and `PlanValidator`. Neither Router nor Planner can supply raw
+URLs, disable freshness checks, or force unvalidated full payloads.
 
 `EvidencePack` is constructed only from `ToolResult` records. It carries request/trace/plan IDs, resolved entities, plan summary, capability coverage, identity-keyed result coverage, graph completeness, citations, missing evidence, limitations, contradictions, supplemental history, and review outcome. Repeated capabilities remain separate ToolResults.
 
@@ -412,19 +469,33 @@ Product client behavior:
 Product endpoints:
 
 - Topology: `SOORIN_PRODUCT_TOPOLOGY_PATH`, default `/zeek/connections/unique-ip-pairs`.
-- Detection: `SOORIN_PRODUCT_ASSET_DETECTION_PATH`, default `/asset-detection/test/{ip}`.
+- Detection full: `SOORIN_PRODUCT_ASSET_DETECTION_PATH`, default `/asset-detection/test/{ip}`.
+- Detection overview/evidence/similarity/cluster: the four
+  `SOORIN_PRODUCT_ASSET_DETECTION_*_PATH` settings, defaulting to
+  `/asset-detection/{ip}/{view}`.
 - Asset profile: `SOORIN_PRODUCT_ASSET_PROFILE_PATH`, default `/profile/{ip}`.
 - Login: `SOORIN_PRODUCT_LOGIN_PATH`, default `/auth/login`.
 
 Detection and profile providers:
 
-- Fetch full JSON once per provider/entity/request and preserve the unchanged typed raw provider result.
-- Cache by normalized IP using the detection cache settings.
+- Profile fetches the current full `/profile/{ip}` JSON once per entity/request
+  and preserves it unchanged internally. The Product profile-overview endpoint
+  is intentionally not used.
+- Detection fetches only selected `overview`, `evidence`, `similarity`, `cluster`,
+  or deep `full` views. Every view uses the same Product session, login/token
+  refresh, retry, Bearer authorization, and `x-hwid` machinery.
+- Cache keys include normalized IP and Detection view.
 - Can return stale cached evidence on provider error if configured.
 - Track raw JSON size, approximate tokens, top-level key counts, cache hit/miss/stale status, HTTP status, and safe error classification.
-- Create safe path/type/length payload inventories and deterministic question-specific local projections.
+- Create safe path/type/length inventories and deterministic model projections.
 
-Detection supports exactly `overview`, `identity_role`, `anomaly_risk`, `behavior`, and `evidence_deep`. Profile supports exactly `overview`, `identity_role`, `services_software`, `security_posture`, and `evidence_deep`. Selected fields become canonical path/value facts, ranked by request relevance, confidence, conflict, anomaly/risk severity, and identity importance. Facts are deduplicated before one merged projected block is serialized per provider/entity. `evidence_deep` contributes only remaining facts. Comprehensive requests remain under a hard token budget. A reviewer-approved supplemental Product view reuses the request-scoped raw result and cannot cause another Product fetch.
+Detection supports `overview`, `evidence`, `similarity`, `cluster`, and `full`.
+Similarity means rule/tag/role affinity, not embedding-space similarity. Cluster
+means rule/tag/role-affinity grouping, not unsupervised ML clustering; population
+one is weak cohort evidence. Profile supports deterministic `overview`,
+`identity`, `security`, `network`, `activity`, and `full` projections from the
+current full endpoint. Large lists carry total/included/omitted counts and a
+stable selection rule. `full` is deep/exhaustive-only by default.
 
 ## 11. Graph Topology
 
@@ -548,17 +619,40 @@ The context composer produces a dynamic system message with:
 - Explicit warning that operational evidence outranks documentation.
 - A compact reviewed-EvidencePack summary containing plan identity, provider coverage, graph completeness, review outcome, missing evidence, contradictions, and limitations.
 
-The composer input is rebuilt from canonical reviewed `ToolResult` objects. Complete Product Profile and Detection provider objects remain unchanged, while bounded `view_payload` projections become the exact model-facing Product context. There is no raw provider side channel.
+The composer input is rebuilt from canonical reviewed `ToolResult` objects.
+Complete provider objects remain unchanged internally; `view_payload` is the
+deterministic model projection. Exact same-key/value identity facts are collapsed
+with source/path support, while contradictions, different timestamps, and
+current-versus-historical observations remain distinct. Compatible delta context
+requires an entity/view/schema-matched complete baseline already accessible in
+current memory; otherwise the compact current view is sent.
 
-Final synthesis receives the global system prompt, a compact reviewed EvidencePack summary, dynamic context reconstructed from EvidencePack provider results, bounded conversation history, and the current user request. No old provider loop or raw provider side channel can add current evidence outside that boundary. If retrieval review, context review, or required graph-context budgeting produces a safe-failure condition, the final LLM is not called. Streaming and non-streaming requests share this same orchestration and differ only in final model transport.
+Final synthesis receives the compact static Synthesizer policy core plus a deterministic typed task contract rendered with LangChain `ChatPromptTemplate`, dynamic context reconstructed from reviewed EvidencePack provider results, bounded conversation/episodic/validated-long-term memory, and the current user request. Module selection is deterministic and adds no model call. The legacy `app/prompts/system_prompt.md` remains byte-stable and selectable as a rollback/compatibility prompt. No old provider loop or raw provider side channel can add current evidence outside that boundary. If retrieval review, context review, or required graph-context budgeting produces a safe-failure condition, the final LLM is not called. Streaming and non-streaming requests share this same orchestration and differ only in final model transport.
 
 Budget controls:
 
 - Uses configured context window, reserved output tokens, safety margin, and base input token estimate.
-- Graph exhaustive requests allocate graph context before narrative product detail.
-- Product payloads can be compacted when exhaustive graph context needs priority.
+- Evidence-class caps bound Profile and Detection, and Graph capacity is reserved
+  before Product sections. Operational evidence outranks optional Knowledge.
+- Full Product payloads cannot silently starve required Graph evidence.
 - Required graph context that cannot fit creates a safe context limitation.
 - Knowledge context participates in the same budget and may be omitted with logged reason.
+
+Gate 8 offline fixture measurements use the repository's conservative
+`characters / 4` estimator; they are regression indicators, not measured
+production tokenizer savings:
+
+| Request shape | Selected views | Full estimate | Compact estimate | Estimated reduction |
+| --- | --- | ---: | ---: | ---: |
+| Quick asset summary | Profile overview | 11,306 | 56 | 99.5% |
+| Classification | Detection overview | 11,561 | 59 | 99.5% |
+| Classification explanation | Detection overview + evidence | 11,561 | 165 | 98.6% |
+| Identity / AD analysis | Profile identity | 11,306 | 104 | 99.1% |
+| Risk analysis | Profile security | 11,306 | 126 | 98.9% |
+| Similarity | Detection similarity | 11,561 | 173 | 98.5% |
+| Cluster | Detection cluster | 11,561 | 168 | 98.5% |
+| Network activity | Profile network + activity | 11,306 | 169 | 98.5% |
+| Deep investigation | Detection full | 11,561 | 11,561 | 0.0% |
 
 Input estimates are deployment/model labeled and multiplied by `SOORIN_LLM_TOKEN_ESTIMATE_MULTIPLIER` (default `1.35`). Output reservation is dynamic: brief uses 1,536 tokens, standard uses 4,096, and deep/report uses up to 6,144, always capped by the deployment. Immediately before synthesis, a hard guard enforces `calibrated input + selected output reservation + configured safety margin <= context window`. It removes eligible history, performs one bounded context recomposition, and may reduce output only to a detail-policy floor. If the invariant still fails, the provider is not called. Traces report remaining-before-safety and remaining-usable tokens separately.
 
@@ -568,18 +662,54 @@ Conversation history is trimmed to fit budget, preferring current evidence over 
 
 Implemented in `app/src/core/memory`.
 
-Current state is in-memory per process.
+The default remains in-memory per process. In local simulation, SQLite persists the owner-scoped transcript and bounded thread state. In Product mode, Product chat-room messages are the canonical transcript and Product/PostgreSQL ThreadState is the canonical bounded state; Copilot reads the transcript to reconstruct referenced recent turns but never duplicates UI transcript writes. Full workflow execution state remains process-local.
 
 Conversation memory:
 
 - Stores user and assistant messages when enabled.
-- Truncates to configured maximum messages.
+- Treats the configured maximum as compaction pressure: older complete turns are deterministically summarized before raw retention drops them.
 - Uses a typed `MemoryContextKey` over normalized entities, topic family, relationship mode, and scope family.
 - Keeps bounded current Working Memory and in-process Episodic Session Memory.
-- Builds deterministic compact summaries when token thresholds are exceeded or an episode closes.
+- Builds deterministic compact summaries when token thresholds are exceeded, raw-message retention is pressured, or an episode closes. The configured recent-raw count is a message count rounded up to at least one complete user/assistant pair.
 - Detaches raw history when entity, pair, or topic changes; a previous episode summary re-enters only for a matching context key.
 - Retains bounded old episode records without treating them as current provider evidence.
-- Does not use an LLM for summaries.
+- Does not use an LLM for summaries; the shared token estimator enforces the configured summary-token cap.
+- Selects same-conversation turns deterministically by active topic/entity,
+  investigation relevance, and recency, with strict turn, episode, and total budgets.
+- Produces a storage-neutral `MemoryContextPackage` before final model context;
+  fresh operational evidence remains authoritative over memory.
+
+Memory-only wording is resolved before semantic routing. `allow_live=false` is also enforced at plan validation/execution, so router repair or fallback cannot authorize Product, Detection, Graph, or Knowledge calls. Active episodes are not counted as archived episodes; their recent text is reconstructed from Product/SQLite transcript rows and ThreadState turn references. `EpisodeRecord.supported_findings` remains a reserved, unpopulated compatibility field; conclusions continue to use the existing deterministic `key_findings`/contradiction/summary fields rather than inventing duplicate semantics.
+
+Typed long-term memory (Gate 6/7, disabled by default):
+
+- Canonical records are atomic typed facts/outcomes: validated finding,
+  investigation outcome, analyst correction, approved asset fact, known benign
+  behavior, or hypothesis resolution. Assistant prose is never promoted
+  automatically.
+- `LongTermMemoryStore` owns create/get/revision-checked update, structured list,
+  supersede, invalidate, and delete semantics. Local development uses the v4
+  SQLite schema with user ownership and entity-link tables; SQLite is not a
+  production memory database.
+- Promotion is deterministic. Active authority requires analyst confirmation,
+  trusted structured-source validation, or explicitly historical outcome status.
+- The existing lazy BGE embedder and Qdrant adapter support a separate
+  `soorin_copilot_memory_v1` collection. SQLite/Product remains canonical;
+  Qdrant contains only an atomic retrieval projection and safe filter metadata.
+- Retrieval combines owner-scoped exact entity lookup with dense candidates,
+  canonical reload, validity/freshness policy, deduplication, and bounded Top-K.
+  An optional local-only CrossEncoder reranks only the candidate pool and safely
+  falls back to BGE order when disabled or unavailable.
+- Long-term entries join the existing `MemoryContextPackage` under an independent
+  token budget and carry type, epistemic status, freshness, provenance, and entity
+  binding. Storage/index implementation names are not sent to synthesis.
+- Retrieval occurs before semantic routing. Gate 8 consumes only typed,
+  owner/entity-bound, authoritative records after TaskSpec. It may suppress a
+  fully satisfied revision-based/historical call explicitly; volatile evidence
+  refreshes and current operational evidence still outranks memory.
+- Index failures never roll back canonical memory. Records expose explicit
+  `pending`, `synced`, `stale`, `failed`, or `not_indexed` state, and reconciliation
+  rebuilds from canonical records without startup-time indexing.
 
 Routing state:
 
@@ -589,6 +719,42 @@ Routing state:
 - Knowledge-only routes can be selected and included in trace/provider status, but current persisted `last_provider`/`last_providers` are operational-provider oriented and do not persist `knowledge` as a last provider.
 - Stores safe Phase 2 continuity metadata: last plan ID, last review outcome, step evidence IDs, and capability statuses.
 - Planner output and synthesizer prose cannot mutate routing state.
+
+Local SQLite mode:
+
+- `SOORIN_LOCAL_PRODUCT_SIMULATION_ENABLED=true` enables the owner-scoped local
+  conversation/message repository.
+- `SOORIN_THREAD_STATE_BACKEND=sqlite` enables compact thread continuity keyed by
+  `conversation_id`, with legacy `session_id` fallback.
+- `request_id` is the conversation-scoped turn idempotency key.
+- State uses typed bounded JSON with schema versioning and optimistic revision;
+  credentials, provider payloads, prompts, full EvidencePacks, runtime clients,
+  locks, callbacks, and streams are never persisted.
+- Storage failures are logged by safe error class and remain non-fatal to chat.
+- This is local development/test infrastructure. Production ownership and durable
+  transcripts remain a future Product PostgreSQL or Product API adapter concern.
+
+### Unified internal Streamlit workspace
+
+Gate 5 routes legacy and local-simulation chat through one `ChatBackend` contract,
+`ConversationController`, chronological message renderer, and SSE event loop.
+`LegacyDirectBackend` preserves the existing single-session developer workflow. With
+`SOORIN_LOCAL_PRODUCT_SIMULATION_ENABLED=true` and
+`SOORIN_STREAMLIT_AUTH_BACKEND=local_simulation`, Streamlit shows a password-free
+local user selector, local chatrooms, and the existing topology workspace. It
+calls protected `/local-simulation/*` routes for user and conversation metadata,
+then calls the existing `/chat/stream` endpoint directly for every turn.
+
+Each local conversation receives an opaque `conversation_id` and one stable
+`session_id`. The conversation ID remains the durable thread key; the session ID
+is reused as compatibility/runtime metadata. Completed user/assistant turns are
+committed only by the existing SSE workflow and reloaded after `done`; Streamlit
+does not write transcript messages itself. Local users are development metadata,
+not Product users or authentication claims. OIDC is not configured. Working
+summary, relevant turns, and episodes are restored through the same memory ports.
+Product/PostgreSQL adapters and LangGraph checkpointing remain deferred. Typed
+owner-scoped cross-conversation retrieval is available only when explicitly
+enabled and a trusted `user_id` is present.
 
 Each successful service request constructs one new `SessionRoutingState` and calls the state store once. Explicit-message, UI, and session entity authority remains owned by the resolver/router normalization path. General detached turns preserve useful active entity state. Safe-failure requests preserve prior active state unless the current request supplied a valid explicit or UI-authoritative investigation entity; Planner arguments and final prose are never state inputs.
 
@@ -604,7 +770,7 @@ Phase 3 adds node lifecycle events on the same allowlisted logging path:
 - specialist start/completion/failure/skip and specialist-node lifecycle events
 - workflow start, completion, partial, and failure events
 
-The detailed human workflow trace is adapted from final `InvestigationState`. It includes request/entity authority, routing, task/plan, `LANGGRAPH WORKFLOW`, `SPECIALISTS`, capability execution, evidence coverage, context/token budget, memory transition, bounded LLM-call counts, final status, and limitation reasons. It never renders prompts, model responses, credentials, or evidence payloads.
+The detailed human workflow trace is adapted from final `InvestigationState`. It includes request/entity authority, routing, task/plan, evidence requirements, memory sufficiency/gap decisions, selected views, memory-skipped calls, `LANGGRAPH WORKFLOW`, `SPECIALISTS`, capability execution, evidence coverage, context/token budget, memory transition, bounded LLM-call counts, final status, and limitation reasons. It never renders prompts, model responses, credentials, memory statements, or evidence payloads.
 
 Machine workflow events use compact allowlisted metadata with request, trace, session, plan, and step identifiers and support console or JSON formatting. They never contain complete prompts, full model responses, raw Product JSON, credentials, headers, or hidden reasoning.
 
@@ -656,6 +822,8 @@ Current UI:
 - UI context includes selected graph IP only when one is selected.
 - Help content explains asset authority, evidence sources, example prompts, and precision tips.
 - Topology page is embedded beside the chat area.
+- Legacy and local-simulation modes share one backend protocol, controller,
+  chronological chat renderer, and SSE event-processing path.
 
 ## 19. Deployment
 
@@ -678,7 +846,7 @@ Docker:
   - The host Hugging Face cache is bind-mounted read-only into the API only.
   - Long bind syntax uses `create_host_path: false`, so missing or mistyped host paths fail instead of creating empty storage.
 
-Local `app/.env` keeps repository-relative Graph and local Qdrant paths. Compose overrides only container-specific Qdrant, cache, log, and evidence paths. Host bind sources, image tag, restart policy, UID/GID, ports, and bind addresses are configured in untracked `compose.env`. The UI does not receive `app/.env`, the original source corpus, model cache, or backend credentials.
+The repository-root `.env` keeps application and deployment configuration, while Compose supplies only its existing container-specific runtime overrides. The UI does not receive the original source corpus, model cache, or backend credentials.
 
 Normal retrieval reads indexed Qdrant payloads and does not open original corpus files. `SOORIN_RAG_SOURCE_ROOT` is therefore an indexing-maintenance input, and the source corpus is not mounted during normal API/UI operation. Embedded Qdrant is opened only by the API process.
 
@@ -694,7 +862,7 @@ Current focused tests:
 - `test_context_routing.py`: semantic/fallback routing, entity authority, active single/pair follow-ups, graph scopes, UI authority, subnet formatting, topology UI helpers.
 - `test_detection_integration.py`: product JSON provider and detection/profile behavior.
 - `test_detection_phase12.py`: additional detection/profile/cache/context protections.
-- `test_llm_deployments.py`: multi-deployment settings and LLM health.
+- `test_llm_deployments.py`: independent role settings, transport semantics, and safe LLM health metadata.
 - `test_llm_retry.py`: transient retry and non-retry behavior.
 - `test_phase2_agent_workflow.py`: plan validation, planner JSON/repair boundaries, DAG execution, concurrency, cancellation, safe failures, raw payload preservation, EvidencePack/reviewer behavior, event safety, and typed workflow dispatch.
 
@@ -717,7 +885,7 @@ Implemented:
 
 - FastAPI chat and graph APIs.
 - Streamlit workspace with topology UI and streaming chat.
-- Provider-neutral LLM client with OpenAI-compatible Kimi/GLM/GPT deployment aliases.
+- Provider-neutral LLM client with independent Router/Planner/Synthesizer role configuration.
 - Semantic LLM router with deterministic validation and fallback.
 - Deterministic IPv4 entity authority.
 - Product auth/client for topology, detection, profile, and login.
@@ -726,6 +894,8 @@ Implemented:
 - BGE embedding configuration and lazy Hugging Face embedder.
 - Context composer with provider coverage, budgets, and limitations.
 - In-memory conversation and routing state.
+- Disabled-by-default typed long-term memory with local SQLite canonical storage,
+  separate Qdrant/BGE retrieval, and optional bounded reranking.
 - UTF-8-safe SSE streaming.
 - Bounded typed agent contracts, registry, task mapping, and reviewer foundation.
 - Active deterministic direct-plan compiler and bounded multi-step Planner.
@@ -748,7 +918,6 @@ Deferred or not implemented:
 - SIEM/Splunk integrations.
 - Alert actions.
 - Report-generation endpoints.
-- Long-term durable memory.
 - Durable cross-process episodic conversation memory.
 - Human approval workflows.
 - Automatic remediation.
@@ -756,12 +925,105 @@ Deferred or not implemented:
 
 ## 22. Remaining Risks and Next Step
 
+## 21A. Memory/workflow stabilization invariants
+
+The current request path distinguishes explicit historical recall from current
+verification. Current language wins unless the user explicitly requests no live
+refresh. Identity contradictions require only the Product profile and detection
+capabilities by default; Graph and Knowledge remain opt-in by task relevance.
+
+The deterministic Reviewer separates non-material caveats from material evidence
+failures. The Synthesizer receives an execution-state contract and cannot describe
+a successful live retrieval as unavailable or skipped. Accepted same-conversation
+facts are described as context, not as storage mechanics.
+
+Current-versus-historical comparison is performed before synthesis. Only complete
+Product view projections with identical owner, entity, capability, view, and schema
+may form a delta, and the historical side must be active, accessible, authoritative,
+and unexpired. Candidate memory never becomes a baseline. The delta retains both
+timestamps and baseline provenance; otherwise composition uses full current evidence
+and records an explicit skip reason.
+
+Local SQLite schema v6 adds deterministic LTM write fingerprints. A partial unique
+index applies only to live candidate/active records, so invalidated or superseded
+history does not block later evidence. `MemoryStoragePolicy` enforces owner-scoped
+chat/LTM limits: newest messages are retained, conversations with durable thread
+state are protected, candidate overflow may evict the oldest candidate, and active
+authoritative memory is never deleted to make room.
+
 Remaining risks:
 
 - There is no durable workflow checkpointing; in-flight work cannot resume after a process restart.
 - Synchronous provider calls cannot be killed after a Python future timeout; transport-native timeouts must remain correctly configured.
 - Planner mode is offline-tested with fakes but requires deliberate manual parity testing before broad enablement.
-- Conversation and routing state are process-local and do not coordinate concurrent workers.
+- Raw conversation/episode memory remains process-local. Optional local SQLite
+  continuity does not provide production tenant authorization or multi-replica
+  coordination.
 - RAG availability and freshness depend on an externally maintained Qdrant collection; the application does not index at startup.
 
-The safest next step is offline acceptance and operational parity testing of the stabilized parent/specialist workflow before adding any new capability. A future Neo4j implementation should remain behind the existing graph capability boundary with bounded parameterized read-only queries. GraphRAG, Planner expansion, MCP/vendor tools, bulk enrichment, and side-effecting actions remain deferred.
+The active upgrade roadmap is: validate Gate 6/7 retrieval against local approved
+memory, then add Gate 8 freshness/evidence-gap decisions without weakening live
+evidence authority; after that, introduce an Organization Intelligence Plane that
+remains subordinate to live Product and Graph evidence. Neo4j, GraphRAG, Planner
+expansion, MCP/vendor tools, bulk enrichment, and side-effecting actions remain
+separate deferred capabilities.
+
+## 21B. Typed memory lifecycle (current working tree)
+
+The roadmap paragraph above is retained as history; Gate 8 and the local typed-LTM
+lifecycle are now implemented. The authority hierarchy is raw turns → scoped
+working facts → historical episodes → non-authoritative candidates → active typed
+LTM. Only the last layer can satisfy an evidence requirement, and only after
+canonical owner, entity, evidence class, capability/view/schema, completeness,
+freshness, and conflict validation.
+
+Safe structured Product profile/detection facts can move from candidate to active
+under a deterministic, versioned policy. Unsupported, stale, incomplete,
+contradictory, analyst-authored, hypothesis, and investigation-outcome records do
+not auto-promote. Exact replay is idempotent. Changed values share a logical key:
+the canonical transaction either supersedes the previous value or preserves a
+material conflict and blocks that logical fact from retrieval. Invalidation,
+rejection, expiry, confirmation, conflict, and supersession are audited without
+copying raw provider payloads.
+
+Current-verification requests still require live Product evidence. A historical
+baseline is used only when it is active and exactly compatible with the current
+owner/entity/capability/view/schema projection; otherwise the composer records a
+specific skip reason and emits no delta. No-live negations remain hard constraints.
+Working facts are filtered by conversation/entity scope, and episodes and generic
+Knowledge/RAG passages are labelled historical/contextual rather than operational
+truth.
+
+SQLite schema v7 is the canonical local/test implementation and survives restart.
+Qdrant, when enabled, stores only a recall projection; every hit is canonically
+reloaded. Production PostgreSQL, Redis, and read-replica topology remain design
+targets, not deployed components. A PostgreSQL adapter must preserve Product-owned
+tenant authorization, atomic lifecycle/audit writes, optimistic revisions, unique
+active logical keys, and bounded retention. Redis/read replicas may accelerate
+reads but cannot establish authority or execute lifecycle transitions.
+
+## 21C. Synthesizer prompt architecture
+
+The final Synthesizer uses a small static policy core at
+`app/prompts/synthesizer/synthesizer_static_prompt.md`, plus deterministic
+Markdown modules in the same directory. `SynthesizerPromptBuilder` remains the
+typed selector and renderer: it derives module IDs from validated task,
+temporal/evidence mode, execution truth, provider status, memory state, analysis
+lenses, and response depth; `PromptModuleRegistry` loads and validates grouped
+sections once. The runtime JSON contract and selected module IDs remain logged;
+prompt contents are not logged.
+
+Grouped files are `tasks.md`, `temporal.md`, `evidence_modes.md`,
+`execution.md`, `evidence.md`, `memory.md`, `analysis.md`, `response.md`, and
+`output_constraints.md`. The static core defines identity, scope, authority,
+provenance, injection resistance, isolation, temporal/epistemic discipline, and
+natural user-facing terminology. Dynamic modules add only task-specific rules.
+Router and Planner prompts remain separate and unchanged. `system_prompt.md` is
+still a byte-stable legacy rollback/compatibility fallback, not the normal Synth
+prompt path.
+
+Execution truth outranks the requested boundary in generated descriptions: when a
+bug or partial failure caused live retrieval, the dynamic execution contract says
+what actually ran and does not allow a claim that no lookup occurred. Current
+requirements always retain their live capability; active historical LTM can only
+be context/baseline for them.

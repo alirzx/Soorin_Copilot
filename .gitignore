@@ -87,3 +87,7 @@ desktop.ini
 
 postman/
 huggingface/
+
+AGENTS.md
+# Graphify local repository analysis artifacts
+graphify-out/

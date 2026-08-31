@@ -1,44 +1,39 @@
 # Soorin Copilot Deployment
 
-## Configuration ownership
+## Configuration
 
-- `app/.env`: application behavior, credentials, provider settings, and portable repository-relative application paths.
-- `compose.env`: image tag, restart policy, host bind addresses and ports, UID/GID, host data root, and host Hugging Face cache root.
+The repository-root `.env` is the single private configuration file consumed by
+the application and the current Compose file. `.env.example` is the tracked,
+secret-free schema. Create the private file once and configure its credentials
+locally; do not create `app/.env` or `compose.env`.
 
-Create both private files from their committed examples. Never commit them.
-
-## Persistent host data
-
-The configured `SOORIN_DATA_HOST_PATH` must already contain:
-
-```text
-raw/topology_raw.json
-processed/topology_graph.pkl
-processed/topology_stats.json
-qdrant-local/meta.json
-runtime/
+```bash
+cp .env.example .env
 ```
 
-Compose bind-mounts this root at `/workspace/data`. API access is read/write so
-Graph refresh and runtime storage remain functional. UI access is read-only.
-Embedded Qdrant is opened only by API. `create_host_path: false` prevents a bad
-path from silently masking real data with an empty directory.
+Compose reads the root `.env` for image tags, restart policy, host bindings,
+Copilot authentication, observability profile values, and application settings.
+The API and UI service definitions provide their container-specific paths and
+runtime overrides directly. The root `.env` remains private and ignored.
 
-The BGE cache is mounted read-only from `SOORIN_HF_CACHE_HOST_PATH`. Preflight
-requires revision `a5beb1e3e68b9ab74eb54cfd186867f64f240e1a` and validates a hidden
-size of 768. No model files, Graph artifacts, or Qdrant data are baked into the
-image.
+## Persistent Data
 
-The original SOC source corpus is not required for normal retrieval. It is used
-only by the separate indexing maintenance flow and is not mounted into the API
-or UI containers.
+The current Compose file bind-mounts the repository `data/` directory at
+`/workspace/data`; the API has read/write access and the UI has read-only access.
+That directory must already contain the validated Graph artifacts and, when
+local Qdrant is enabled, the configured Qdrant data. The Hugging Face model cache
+is mounted from the repository `huggingface/` directory and is read-only inside
+the containers. No model, Graph artifact, Qdrant data, or SOC source corpus is
+baked into the image.
 
-## Local deployment
+The original SOC corpus is external to normal runtime retrieval. It is used by
+the separate indexing maintenance flow and is not scanned during application
+import or startup.
 
-Use repository-local data and your existing Hugging Face cache in
-`compose.env`. Keep host bindings on `127.0.0.1` unless LAN exposure is
-intentional. Ensure `APP_UID` and `APP_GID` can traverse and write the data root
-and can read the model cache.
+## Local Compose Workflow
+
+Keep host bindings on `127.0.0.1` unless LAN exposure is intentional. Validate
+the root environment and current data/cache prerequisites before starting:
 
 ```bash
 make preflight
@@ -51,20 +46,21 @@ make health
 ```
 
 `make down` removes containers and the network but does not remove host data.
+The optional observability profile is documented in
+[`docs/OBSERVABILITY.md`](OBSERVABILITY.md).
 
-## Remote image-import deployment
+## Remote Image Import
 
-1. Set the image tag to `dev-<git-short-sha>` before build.
-2. After a validated build, run `make export` and transfer the tar and checksum.
-3. On the server, verify the checksum and run `docker load -i <image>.tar`.
-4. Create `app/.env` and `compose.env` from the same committed examples.
-5. Set `SOORIN_DATA_HOST_PATH=/srv/soorin-copilot/data` and
-   `SOORIN_HF_CACHE_HOST_PATH=/srv/soorin-copilot/huggingface` (or equivalent).
-6. Match `APP_UID`/`APP_GID` to host ownership and copy the validated data/cache
-   trees before running `make preflight`.
-7. Use `0.0.0.0` bind addresses only when LAN access is intentionally required.
-8. Run `make up` only after preflight passes.
+1. Set `SOORIN_IMAGE_TAG` to the validated release tag before building.
+2. Build and export the image with the existing Makefile workflow.
+3. Transfer the image archive and checksum, then verify and load them on the
+   destination host.
+4. Create the root `.env` from the matching `.env.example` and configure the
+   destination's private credentials and bind addresses.
+5. Copy the validated `data/` and `huggingface/` trees before `make preflight`.
+6. Use `0.0.0.0` bind addresses only when remote access is intentionally required.
+7. Run `make up` only after preflight passes.
 
-Compose uses `pull_policy: never`; the exact tagged image must already be
-present on the destination host. Dockerfile, Compose, Makefile, and both
-configuration examples are identical between local and server deployments.
+Compose uses `pull_policy: never`; the exact tagged image must already exist on
+the destination host. Dockerfile, Compose, and Makefile behavior are unchanged
+by the environment normalization documented here.

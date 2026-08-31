@@ -16,6 +16,12 @@ from src.core.product_client.errors import ProductApiConfigError, ProductApiErro
 logger = logging.getLogger(__name__)
 
 
+def _metrics():
+    from src.core.observability.metrics import get_metrics
+
+    return get_metrics()
+
+
 def _normalize_bearer_token(token: str) -> str:
     token = token.strip()
     if token.lower().startswith("bearer "):
@@ -103,7 +109,9 @@ class ProductAuthManager:
                 timeout=(self.settings.product_connect_timeout_seconds, self.settings.product_read_timeout_seconds),
             )
         except requests.RequestException as exc:
-            latency_ms = int((time.perf_counter() - started) * 1000)
+            elapsed = time.perf_counter() - started
+            latency_ms = int(elapsed * 1000)
+            _metrics().observe_product("login", duration_seconds=elapsed)
             logger.warning(
                 "event=product_auth_failed request_id=%s reason=request_exception latency_ms=%s",
                 request_id,
@@ -111,7 +119,13 @@ class ProductAuthManager:
             )
             raise ProductApiError("Product authentication request failed.") from exc
 
-        latency_ms = int((time.perf_counter() - started) * 1000)
+        elapsed = time.perf_counter() - started
+        latency_ms = int(elapsed * 1000)
+        _metrics().observe_product(
+            "login",
+            duration_seconds=elapsed,
+            status_code=response.status_code,
+        )
         if response.status_code >= 400:
             logger.warning(
                 "event=product_auth_failed request_id=%s reason=http_error status_code=%s latency_ms=%s",

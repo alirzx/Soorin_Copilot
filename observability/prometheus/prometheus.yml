@@ -1,0 +1,18 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  external_labels:
+    environment: __SOORIN_OBSERVABILITY_ENVIRONMENT__
+
+scrape_configs:
+  - job_name: soorin-copilot-api
+    metrics_path: /metrics
+    authorization:
+      type: Bearer
+      credentials_file: /run/secrets/copilot_metrics_api_key
+    static_configs:
+      - targets:
+          - api:6998
+        labels:
+          service: soorin-copilot-api
+          environment: __SOORIN_OBSERVABILITY_ENVIRONMENT__

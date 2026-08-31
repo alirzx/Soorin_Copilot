@@ -169,7 +169,11 @@ class SourceAndEmbeddingTests(unittest.TestCase):
     def test_offline_embedding_arguments_are_forwarded_without_network_fallback(self) -> None:
         transformers = ModuleType("transformers")
         tokenizer_loader = MagicMock(return_value=object())
-        model = SimpleNamespace(config=SimpleNamespace(hidden_size=768), eval=MagicMock())
+        model = SimpleNamespace(
+            config=SimpleNamespace(hidden_size=768),
+            eval=MagicMock(),
+            to=MagicMock(),
+        )
         model_loader = MagicMock(return_value=model)
         transformers.AutoTokenizer = SimpleNamespace(from_pretrained=tokenizer_loader)
         transformers.AutoModel = SimpleNamespace(from_pretrained=model_loader)
@@ -190,6 +194,7 @@ class SourceAndEmbeddingTests(unittest.TestCase):
         }
         tokenizer_loader.assert_called_once_with("BAAI/bge-base-en-v1.5", **expected)
         model_loader.assert_called_once_with("BAAI/bge-base-en-v1.5", **expected)
+        model.to.assert_called_once_with("cpu")
 
     def test_missing_offline_revision_has_safe_classification_and_no_retry(self) -> None:
         transformers = ModuleType("transformers")
