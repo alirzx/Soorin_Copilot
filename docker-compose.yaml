@@ -241,6 +241,7 @@ services:
     volumes:
       - ./observability/alloy/config.alloy:/etc/alloy/config.alloy:ro
       - /var/run/docker.sock:/var/run/docker.sock:ro
+      - alloy-data:/var/lib/alloy
     networks:
       - copilot-network
     depends_on:
@@ -253,7 +254,7 @@ services:
     restart: "${SOORIN_RESTART_POLICY:-unless-stopped}"
     environment:
       GF_SECURITY_ADMIN_USER: "${SOORIN_GRAFANA_ADMIN_USER:-admin}"
-      GF_SECURITY_ADMIN_PASSWORD: "${SOORIN_GRAFANA_ADMIN_PASSWORD:-CHANGE_ME}"
+      GF_SECURITY_ADMIN_PASSWORD: "${SOORIN_GRAFANA_ADMIN_PASSWORD:?SOORIN_GRAFANA_ADMIN_PASSWORD is required}"
       GF_USERS_ALLOW_SIGN_UP: "false"
     ports:
       - "${SOORIN_OBSERVABILITY_GRAFANA_BIND_IP:-127.0.0.1}:${SOORIN_OBSERVABILITY_GRAFANA_PORT:-3000}:3000"
@@ -275,6 +276,7 @@ volumes:
   prometheus-data:
   loki-data:
   grafana-data:
+  alloy-data:
 
 secrets:
   copilot_metrics_api_key:

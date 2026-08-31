@@ -24,6 +24,11 @@ discovery.relabel "soorin_copilot" {
 	}
 
 	rule {
+		source_labels = ["__meta_docker_container_label_com_docker_compose_project"]
+		target_label  = "compose_project"
+	}
+
+	rule {
 		source_labels = ["__meta_docker_container_name"]
 		regex         = "/(.*)"
 		target_label  = "service_name"

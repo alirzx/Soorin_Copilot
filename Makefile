@@ -16,7 +16,8 @@ EXPORT_DIR ?= $(ROOT_DIR)/dist
 COMPOSE := docker compose \
 	--project-directory "$(ROOT_DIR)" \
 	-f "$(COMPOSE_FILE)" \
-	--env-file "$(ENV_FILE)"
+	--env-file "$(ENV_FILE)" \
+	--profile observability
 
 # Prefer the project virtual environment locally; fall back to system Python.
 PYTHON ?= $(shell \
