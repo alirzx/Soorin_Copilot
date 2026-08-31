@@ -2317,23 +2317,51 @@ class GraphRefreshTests(unittest.TestCase):
         self.assertEqual(get_cached_graph().number_of_nodes(), 2)
         self.assertEqual(service.status()["consecutive_failures"], 1)
 
-    def test_suspicious_node_drop_rejects_activation(self) -> None:
+    def test_large_to_small_valid_refresh_replaces_active_and_persisted_snapshot(self) -> None:
         initial = nx.DiGraph()
-        for index in range(100):
-            initial.add_edge(f"10.0.0.{index}", f"10.0.1.{index}")
+        initial.add_nodes_from(f"stale-{index}" for index in range(62_815))
         replace_active_graph(initial, {"active_graph_source": "test"})
-        tiny = ProductTopologyResponse(
+        candidate = nx.DiGraph()
+        candidate.add_nodes_from(f"current-{index}" for index in range(350))
+        candidate.add_edge("current-0", "current-1")
+        response = ProductTopologyResponse(
             raw_payload=[{"src_ip": "a", "dst_ip": "b"}],
             records=[TopologyConnectionRecord("a", "b")],
             endpoint_path="/topology",
             status_code=200,
             elapsed_seconds=0.01,
         )
-        service = GraphRefreshService(self.settings, FakeProductClient(tiny))  # type: ignore[arg-type]
-        result = service.refresh_once()
-        self.assertEqual(result.status, "error")
-        self.assertFalse(result.activated)
-        self.assertEqual(get_cached_graph().number_of_nodes(), initial.number_of_nodes())
+        service = GraphRefreshService(self.settings, FakeProductClient(response))  # type: ignore[arg-type]
+        with patch("src.core.graph.refresh.build_topology_graph", return_value=(candidate, 3_084)):
+            result = service.refresh_once()
+        self.assertEqual(result.status, "ok")
+        self.assertTrue(result.activated)
+        self.assertEqual(get_cached_graph().number_of_nodes(), 350)
+        with Path(self.settings.graph_pickle_path).open("rb") as handle:
+            persisted = pickle.load(handle)
+        self.assertEqual(persisted.number_of_nodes(), 350)
+        self.assertTrue(Path(result.processed_snapshot_path).exists())
+
+    def test_small_to_large_valid_refresh_replaces_active_snapshot(self) -> None:
+        initial = nx.DiGraph()
+        initial.add_nodes_from(f"old-{index}" for index in range(350))
+        replace_active_graph(initial, {"active_graph_source": "test"})
+        candidate = nx.DiGraph()
+        candidate.add_nodes_from(f"current-{index}" for index in range(62_815))
+        candidate.add_edge("current-0", "current-1")
+        response = ProductTopologyResponse(
+            raw_payload=[{"src_ip": "a", "dst_ip": "b"}],
+            records=[TopologyConnectionRecord("a", "b")],
+            endpoint_path="/topology",
+            status_code=200,
+            elapsed_seconds=0.01,
+        )
+        service = GraphRefreshService(self.settings, FakeProductClient(response))  # type: ignore[arg-type]
+        with patch("src.core.graph.refresh.build_topology_graph", return_value=(candidate, 3_084)):
+            result = service.refresh_once()
+        self.assertEqual(result.status, "ok")
+        self.assertTrue(result.activated)
+        self.assertEqual(get_cached_graph().number_of_nodes(), 62_815)
 
     def test_failed_required_persistence_preserves_active_graph(self) -> None:
         initial = nx.DiGraph()

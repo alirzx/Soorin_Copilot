@@ -346,8 +346,6 @@ class Settings:
     graph_refresh_lock_timeout_seconds: int
     graph_refresh_min_nodes: int
     graph_refresh_min_edges: int
-    graph_refresh_max_node_drop_ratio: float
-    graph_refresh_max_edge_drop_ratio: float
     copilot_human_trace_enabled: bool
     copilot_human_trace_detail: str
     evidence_snapshot_enabled: bool
@@ -810,8 +808,6 @@ def get_settings() -> Settings:
         graph_refresh_lock_timeout_seconds=_int("SOORIN_GRAPH_REFRESH_LOCK_TIMEOUT_SECONDS", 60),
         graph_refresh_min_nodes=_int("SOORIN_GRAPH_REFRESH_MIN_NODES", 1),
         graph_refresh_min_edges=_int("SOORIN_GRAPH_REFRESH_MIN_EDGES", 0),
-        graph_refresh_max_node_drop_ratio=_float("SOORIN_GRAPH_REFRESH_MAX_NODE_DROP_RATIO", 0.80),
-        graph_refresh_max_edge_drop_ratio=_float("SOORIN_GRAPH_REFRESH_MAX_EDGE_DROP_RATIO", 0.90),
         copilot_human_trace_enabled=_bool(
             "SOORIN_HUMAN_TRACE_ENABLED",
             _bool("SOORIN_COPILOT_HUMAN_TRACE_ENABLED", False),

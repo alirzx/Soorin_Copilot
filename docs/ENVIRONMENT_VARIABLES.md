@@ -628,14 +628,6 @@ Secrets such as API keys, passwords, Product tokens, captcha bypass values, and 
 
 `SOORIN_GRAPH_REFRESH_MIN_EDGES` requires a candidate refreshed graph to contain at least the configured number of edges before activation. Increasing it guards against unexpectedly empty/incomplete topology responses; decreasing it supports genuinely sparse environments but reduces this validation protection.
 
-### `SOORIN_GRAPH_REFRESH_MAX_NODE_DROP_RATIO`
-
-`SOORIN_GRAPH_REFRESH_MAX_NODE_DROP_RATIO` defines the maximum tolerated proportional node-count decrease between the active graph and a candidate refresh. A lower value is stricter and rejects smaller drops as suspicious; a higher value tolerates larger topology shrinkage but increases the risk that a partially incomplete Product response could pass validation. The value is a ratio, normally between `0` and `1`.
-
-### `SOORIN_GRAPH_REFRESH_MAX_EDGE_DROP_RATIO`
-
-`SOORIN_GRAPH_REFRESH_MAX_EDGE_DROP_RATIO` defines the maximum tolerated proportional edge-count decrease during Graph refresh validation. Lower values make activation stricter when many edges disappear; higher values accept larger changes but provide less protection against truncated topology retrieval. The value is a ratio, normally between `0` and `1`.
-
 ---
 
 ## RAG and Embeddings
