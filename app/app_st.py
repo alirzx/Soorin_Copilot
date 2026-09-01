@@ -61,9 +61,8 @@ if settings.streamlit_auth_backend == "oidc":
 # ============================================================
 # INIT GRAPH (Load once at startup)
 # ============================================================
-@st.cache_resource
 def init_graph():
-    """Load and cache the topology graph."""
+    """Load the topology graph through the version-aware graph loader."""
     set_graph_path(settings.graph_pickle_path)
     return load_graph()
 

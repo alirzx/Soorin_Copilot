@@ -49,7 +49,12 @@ from src.core.memory.episodes import MemoryContextKey
 from src.core.memory.store import MemoryStore
 from src.core.product_client.schemas import ProductTopologyResponse, TopologyConnectionRecord
 from src.web.copilot_help import choose_help_ui_pattern, get_copilot_help_content
-from src.web.pages.topology import build_copilot_ui_context, _resolve_graph_selection_event
+from src.web.pages.topology import (
+    _resolve_graph_selection_event,
+    _retained_selected_graph_ip,
+    _should_reload_graph_snapshot,
+    build_copilot_ui_context,
+)
 
 
 class FakeLLMClient:
@@ -1571,6 +1576,32 @@ class TopologyGraphSelectionTests(unittest.TestCase):
         self.assertEqual(select_action, "select")
         self.assertEqual(selected_ip, "192.168.30.115")
         self.assertEqual(event_id, "evt-5")
+
+    def test_snapshot_version_changes_reload_for_large_small_and_small_large_swaps(self) -> None:
+        self.assertTrue(_should_reload_graph_snapshot("large-v1", "small-v2"))
+        self.assertTrue(_should_reload_graph_snapshot("small-v2", "large-v3"))
+        self.assertFalse(_should_reload_graph_snapshot("large-v3", "large-v3"))
+        self.assertFalse(_should_reload_graph_snapshot("large-v3", None))
+
+    def test_snapshot_refresh_retains_selection_when_node_exists_in_replacement_graph(self) -> None:
+        selected_ip = "192.168.30.115"
+        large = nx.DiGraph()
+        large.add_node(selected_ip)
+        large.add_nodes_from(f"large-{index}" for index in range(62_814))
+        small = nx.DiGraph()
+        small.add_node(selected_ip)
+        small.add_nodes_from(f"small-{index}" for index in range(342))
+
+        self.assertEqual(large.number_of_nodes(), 62_815)
+        self.assertEqual(small.number_of_nodes(), 343)
+        self.assertEqual(_retained_selected_graph_ip(selected_ip, small), selected_ip)
+        self.assertEqual(_retained_selected_graph_ip(selected_ip, large), selected_ip)
+
+    def test_snapshot_refresh_clears_selection_when_node_is_absent(self) -> None:
+        replacement = nx.DiGraph()
+        replacement.add_node("192.168.30.116")
+
+        self.assertIsNone(_retained_selected_graph_ip("192.168.30.115", replacement))
 
 
 class CopilotHelpContentTests(unittest.TestCase):
