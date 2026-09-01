@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from ipaddress import ip_address, ip_network
 from typing import Any
+import requests
 import streamlit as st
 import pandas as pd
 import logging
@@ -20,10 +21,57 @@ from src.core.graph.service import (
 )
 from src.core.graph.visualization import generate_pyvis_graph, get_color
 from src.web.components.topology_graph import NO_GRAPH_SELECTION_EVENT, topology_graph_component
+from src.web.local_simulation import copilot_auth_headers
 
 logger = logging.getLogger(__name__)
 SELECTED_COPILOT_IP_KEY = "selected_copilot_ip"
 LAST_GRAPH_SELECTION_EVENT_KEY = "topology_graph_last_selection_event_id"
+TOPOLOGY_GRAPH_VERSION_KEY = "topology_graph_snapshot_version"
+
+
+def _should_reload_graph_snapshot(
+    known_version: str | None,
+    active_version: str | None,
+) -> bool:
+    """Return whether the local UI graph must be reloaded for an API version."""
+    return bool(active_version and active_version != known_version)
+
+
+def _fetch_active_graph_version(settings: Any) -> str | None:
+    """Read the small authoritative graph-version signal without transferring graph data."""
+    try:
+        response = requests.get(
+            f"{settings.api_base_url.rstrip('/')}/graph/status",
+            headers=copilot_auth_headers(settings.copilot_api_key),
+            timeout=min(10, settings.api_timeout_seconds),
+        )
+        response.raise_for_status()
+        payload = response.json()
+    except (requests.RequestException, ValueError, TypeError, AttributeError) as exc:
+        logger.warning("event=ui_graph_snapshot_status_unavailable error_type=%s", type(exc).__name__)
+        return None
+
+    if not payload.get("loaded"):
+        return None
+    version = str(payload.get("active_graph_version") or "").strip()
+    return version or None
+
+
+def _sync_graph_snapshot(settings: Any) -> str | None:
+    """Reload the shared local artifact only after the API publishes a new version."""
+    active_version = _fetch_active_graph_version(settings)
+    known_version = st.session_state.get(TOPOLOGY_GRAPH_VERSION_KEY)
+    if _should_reload_graph_snapshot(known_version, active_version):
+        load_graph(force_reload=True)
+        st.session_state[TOPOLOGY_GRAPH_VERSION_KEY] = active_version
+        logger.info("event=ui_graph_snapshot_reloaded version=%s", active_version)
+    return active_version
+
+
+def _retained_selected_graph_ip(selected_ip: str | None, graph: Any) -> str | None:
+    """Keep a selection only while it remains in the refreshed graph."""
+    normalized = str(selected_ip or "").strip()
+    return normalized if normalized and normalized in graph else None
 
 
 def build_copilot_ui_context(selected_ip: str | None) -> dict[str, str] | None:
@@ -79,6 +127,7 @@ def _resolve_graph_selection_event(selection_event: object, graph: Any) -> tuple
     return ("select", selected_ip, "") if selected_ip else ("none", None, "")
 
 
+@st.fragment(run_every="30s")
 def show_topology_page(*, embedded: bool = False) -> None:
     """Display the network topology analysis page."""
     if embedded:
@@ -93,10 +142,18 @@ def show_topology_page(*, embedded: bool = False) -> None:
 
     settings = get_settings()
     try:
+        snapshot_version = _sync_graph_snapshot(settings)
         G = load_graph()
     except FileNotFoundError:
         st.warning("Graph is not available. Fetch topology data before opening this page.")
         return
+
+    selected_ip = st.session_state.get(SELECTED_COPILOT_IP_KEY)
+    retained_selected_ip = _retained_selected_graph_ip(selected_ip, G)
+    if selected_ip and retained_selected_ip is None:
+        st.session_state[SELECTED_COPILOT_IP_KEY] = None
+        logger.info("event=ui_graph_selection_cleared source=snapshot_refresh")
+        st.rerun(scope="app")
 
     # ---- Tabs ----
     tab_graph, tab_explore, tab_path, tab_nodes = st.tabs(
@@ -156,7 +213,7 @@ def show_topology_page(*, embedded: bool = False) -> None:
         selection_event = topology_graph_component(
             html=html_graph,
             height=680,
-            key=f"topology_graph_{max_nodes}_{min_degree}_{subnet_value or 'all'}",
+            key=f"topology_graph_{snapshot_version or 'unknown'}_{max_nodes}_{min_degree}_{subnet_value or 'all'}",
         )
         selection_action, clicked_ip, selection_event_id = _resolve_graph_selection_event(selection_event, G)
         if (
