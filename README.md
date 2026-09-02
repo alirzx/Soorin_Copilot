@@ -12,20 +12,24 @@ facts.
 ```mermaid
 flowchart TD
     U[User or Product UI] --> API[FastAPI /chat or /chat/stream]
-    API --> ID[Request identity and thread context]
-    ID --> ER[Deterministic entity resolver]
-    ER --> RT[Semantic Router]
+    API --> ID[Request identity and Product ThreadState]
+    ID --> ER[Deterministic entity and reference resolution]
+    ER --> CP[Deterministic constraints and turn policy]
+    CP -->|memory-only or thread recall| MR[Bounded working, episode, and Product LTM retrieval]
+    CP -->|live evidence allowed| RT[Semantic Router with deterministic normalization]
     RT --> TS[Validated TaskSpec]
+    MR --> TS
     TS --> GAP[Memory sufficiency and evidence-gap policy]
     GAP --> PLAN{Direct plan or bounded Planner}
     PLAN --> PV[PlanValidator]
     PV --> EX[Capability executor]
-    EX --> E[Profile, Detection, Graph, Knowledge]
-    E --> EP[ToolResults and EvidencePack]
-    EP --> REV[Deterministic evidence review]
-    REV --> CC[Context Composer, compaction, token budget]
+    EX --> E[Product Profile and Detection, Graph, Knowledge/RAG]
+    E --> EP[ToolResults, EvidencePack, and evidence review]
+    EP --> CC[Memory and evidence context composition]
+    MR --> CC
     CC --> SYN[Synthesizer]
-    SYN --> MU[Working, episodic, and typed memory update]
+    SYN --> MU[ThreadState, working facts, episodes, and Product LTM updates]
+    MU -. canonical records .-> PI[Qdrant semantic index]
     MU --> OUT[Response or UTF-8 SSE]
     OUT --> API
     API -. metrics, traces, logs .-> OBS[Observability]
@@ -49,8 +53,9 @@ limitations rather than as a verified finding.
 - **Knowledge/RAG:** approved SOC documentation and runbooks through the configured
   Qdrant-backed retrieval service; it does not override current Product or Graph
   evidence.
-- **Memory:** bounded working and episodic continuity plus optional typed,
-  evidence-bound long-term memory. Memory reduces repeated work but does not
+- **Memory:** Product-backed ThreadState plus bounded working facts, recent turns,
+  episodes, and typed durable Product LTM. Qdrant is semantic discovery for
+  canonical LTM, not its authority. Memory reduces repeated work but does not
   replace required fresh operational evidence.
 
 The role-based LLM layer separates a semantic Router, a bounded Planner for
@@ -101,6 +106,7 @@ also consumes the root `.env` and is documented in [Deployment](docs/DEPLOYMENT.
 - [Frontend/Backend Integration](docs/FRONTEND_BACKEND_COPILOT_INTEGRATION.md)
 - [Evidence-to-Context Audit](docs/INTERNAL_EVIDENCE_TO_MODEL_CONTEXT_AUDIT.md)
 - [Memory and Context Design](docs/MEMORY_CONTEXT_UPGRADE_DESIGN.md)
+- [Current Memory and Routing Audit](docs/MEMORY_WORKFLOW_CURRENT_DEV_AUDIT.md)
 - [Agentic Foundation and RAG](docs/agentic-foundation-rag.md)
 
 ## Offline Checks
