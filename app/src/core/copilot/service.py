@@ -26,6 +26,7 @@ from src.core.context.providers import AssetProfileContextProvider, DetectionCon
 from src.core.llm.client import LLMClient
 from src.core.llm.errors import LLMError
 from src.core.llm.providers.base import LLMProviderResult, LLMStreamEvent
+from src.core.llm.token_estimator import TokenEstimator
 from src.core.memory.routing_state import SessionRoutingStateStore
 from src.core.memory.episodes import MemoryContextKey
 from src.core.memory.long_term import RetrievedLongTermMemory
@@ -599,10 +600,26 @@ class CopilotService:
                 return rendered
         return [{"role": "system", "content": fallback}, *rendered]
 
-    @staticmethod
-    def _synthesis_fallback_max_tokens(max_tokens: int) -> int:
-        """Bound the one recovery attempt so it cannot repeat a large exhaustion."""
-        return max(1, min(int(max_tokens), 2048))
+    def _synthesis_fallback_max_tokens(self, messages: list[dict[str, str]]) -> int:
+        """Resolve the retry ceiling while preserving the configured context window guard."""
+        deployment = self.settings.deployment_for_purpose("chat")
+        estimator = TokenEstimator(
+            deployment=deployment.name,
+            model=deployment.model,
+            multiplier=self.settings.llm_token_estimate_multiplier,
+        )
+        calibrated_input = estimator.estimate_messages(messages).calibrated_tokens
+        context_ceiling = (
+            self.settings.llm_context_window_tokens
+            - self.settings.llm_context_safety_margin_tokens
+            - calibrated_input
+        )
+        if context_ceiling < 1:
+            raise LLMError(
+                "The Copilot recovery prompt exceeds the configured model context window.",
+                reason="provider_recovery_context_unsafe",
+            )
+        return min(max(1, int(deployment.retry_max_tokens)), context_ceiling)
 
     def _synthesis_non_stream_fallback(
         self,
@@ -618,12 +635,13 @@ class CopilotService:
         reason: str,
         trace_id: str = "",
     ) -> LLMProviderResult:
-        fallback_max_tokens = self._synthesis_fallback_max_tokens(max_tokens)
+        fallback_messages = self._synthesis_fallback_messages(messages)
+        fallback_max_tokens = self._synthesis_fallback_max_tokens(fallback_messages)
         metrics["fallback_used"] = True
         metrics["fallback_max_tokens"] = fallback_max_tokens
         metrics["fallback_reason"] = reason
         result = self.llm_client.chat(
-            self._synthesis_fallback_messages(messages),
+            fallback_messages,
             request_id=request_id,
             max_tokens=fallback_max_tokens,
             temperature=temperature,

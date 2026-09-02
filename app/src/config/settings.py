@@ -206,6 +206,9 @@ class Settings:
     synthesizer_api_key: str
     synthesizer_timeout_seconds: int
     synthesizer_max_tokens: int
+    synthesizer_brief_output_tokens: int
+    synthesizer_standard_output_tokens: int
+    synthesizer_deep_output_tokens: int
     synthesizer_retry_max_tokens: int
     synthesizer_temperature: float | None
     synthesizer_top_p: float | None
@@ -586,6 +589,9 @@ def get_settings() -> Settings:
         synthesizer_api_key=os.getenv("SOORIN_SYNTHESIZER_API_KEY", "").strip(),
         synthesizer_timeout_seconds=_int("SOORIN_SYNTHESIZER_TIMEOUT_SECONDS", 360),
         synthesizer_max_tokens=_int("SOORIN_SYNTHESIZER_MAX_TOKENS", 12288),
+        synthesizer_brief_output_tokens=_int("SOORIN_SYNTHESIZER_BRIEF_OUTPUT_TOKENS", 1536),
+        synthesizer_standard_output_tokens=_int("SOORIN_SYNTHESIZER_STANDARD_OUTPUT_TOKENS", 4096),
+        synthesizer_deep_output_tokens=_int("SOORIN_SYNTHESIZER_DEEP_OUTPUT_TOKENS", 6144),
         synthesizer_retry_max_tokens=_int("SOORIN_SYNTHESIZER_RETRY_MAX_TOKENS", 12288),
         synthesizer_temperature=_optional_float("SOORIN_SYNTHESIZER_TEMPERATURE"),
         synthesizer_top_p=_optional_float("SOORIN_SYNTHESIZER_TOP_P"),

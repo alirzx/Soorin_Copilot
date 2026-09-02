@@ -828,7 +828,13 @@ class CopilotWorkflowNodes:
             model=deployment.model,
             multiplier=self.settings.llm_token_estimate_multiplier,
         )
-        output_reservation = estimator.output_reservation(task.detail_level, request.max_tokens)
+        output_reservation = estimator.output_reservation(
+            task.detail_level,
+            request.max_tokens,
+            brief_output_tokens=self.settings.synthesizer_brief_output_tokens,
+            standard_output_tokens=self.settings.synthesizer_standard_output_tokens,
+            deep_output_tokens=self.settings.synthesizer_deep_output_tokens,
+        )
         base_messages = list(preliminary_prompt.messages)
         base_estimate = estimator.estimate_messages(base_messages)
         identity = state.get("request_identity")

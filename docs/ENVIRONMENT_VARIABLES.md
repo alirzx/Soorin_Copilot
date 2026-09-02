@@ -370,11 +370,23 @@ Secrets such as API keys, passwords, Product tokens, captcha bypass values, and 
 
 ### `SOORIN_SYNTHESIZER_MAX_TOKENS`
 
-`SOORIN_SYNTHESIZER_MAX_TOKENS` is the upper completion budget exposed to normal final synthesis. The context-budgeting layer may select a smaller output reservation for brief or standard responses, so this is an upper role limit rather than a guarantee that every request can emit that many tokens. Larger values support longer reports at greater latency/cost and less potential context headroom.
+`SOORIN_SYNTHESIZER_MAX_TOKENS` is the absolute completion ceiling for normal final synthesis. The normal request budget is selected from the detail-level output reservation below and cannot exceed this role ceiling. Larger values support longer reports at greater latency/cost and less potential context headroom.
+
+### `SOORIN_SYNTHESIZER_BRIEF_OUTPUT_TOKENS`
+
+`SOORIN_SYNTHESIZER_BRIEF_OUTPUT_TOKENS` is the normal requested output reservation for brief Synthesizer responses. It defaults to `1536`, remains capped by `SOORIN_SYNTHESIZER_MAX_TOKENS`, and is checked by the configured model-context guard.
+
+### `SOORIN_SYNTHESIZER_STANDARD_OUTPUT_TOKENS`
+
+`SOORIN_SYNTHESIZER_STANDARD_OUTPUT_TOKENS` is the normal requested output reservation for standard Synthesizer responses. It defaults to `4096`, remains capped by `SOORIN_SYNTHESIZER_MAX_TOKENS`, and is checked by the configured model-context guard.
+
+### `SOORIN_SYNTHESIZER_DEEP_OUTPUT_TOKENS`
+
+`SOORIN_SYNTHESIZER_DEEP_OUTPUT_TOKENS` is the normal requested output reservation for deep and report Synthesizer responses. It defaults to `6144`, remains capped by `SOORIN_SYNTHESIZER_MAX_TOKENS`, and is checked by the configured model-context guard.
 
 ### `SOORIN_SYNTHESIZER_RETRY_MAX_TOKENS`
 
-`SOORIN_SYNTHESIZER_RETRY_MAX_TOKENS` defines the completion budget used for an eligible retried final synthesis request. It should normally be at least large enough for the intended answer detail, but increasing it does not expand the model context window and can increase worst-case retry cost.
+`SOORIN_SYNTHESIZER_RETRY_MAX_TOKENS` is the completion ceiling for the one eligible final-synthesis recovery attempt. Recovery uses this setting instead of the normal detail-level reservation, while still being reduced when the recovery prompt would otherwise exceed the configured model context window. Increasing it does not expand the model context window and can increase worst-case recovery cost.
 
 ### `SOORIN_SYNTHESIZER_TEMPERATURE`
 
