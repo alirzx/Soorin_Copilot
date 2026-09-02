@@ -17,6 +17,7 @@ from src.core.copilot.service import CopilotService
 from src.core.llm.errors import LLMError
 from src.core.llm.providers.arvan import ArvanProvider
 from src.core.llm.providers.base import LLMProviderResult, LLMStreamEvent
+from src.core.llm.token_estimator import TokenEstimator
 from src.core.memory.store import MemoryStore
 from src.web.chat_stream import collect_visible_stream, parse_sse_events
 
@@ -379,7 +380,9 @@ class CopilotServiceStreamingTests(unittest.TestCase):
             fallback_text="recovered answer",
         )
         service = CopilotService(
-            service_settings(llm_expose_reasoning=False), llm, MemoryStore(0)
+            service_settings(llm_expose_reasoning=False, synthesizer_retry_max_tokens=3072),
+            llm,
+            MemoryStore(0),
         )  # type: ignore[arg-type]
         emitted: list[LLMStreamEvent] = []
         metrics = self._metrics()
@@ -397,10 +400,53 @@ class CopilotServiceStreamingTests(unittest.TestCase):
 
         self.assertEqual(result.text, "recovered answer")
         self.assertEqual(len(llm.chat_calls), 1)
-        self.assertEqual(llm.chat_calls[0]["max_tokens"], 2048)
+        self.assertEqual(llm.chat_calls[0]["max_tokens"], 3072)
         self.assertIn("FINAL ANSWER RECOVERY", llm.chat_calls[0]["messages"][0]["content"])
         self.assertEqual(metrics["fallback_reason"], "provider_stream_reasoning_exhausted")
         self.assertEqual([event.text for event in emitted], ["recovered answer"])
+
+    def test_reasoning_only_recovery_retry_budget_is_clamped_to_context_window(self) -> None:
+        llm = FakeStreamingLLM(
+            [
+                LLMStreamEvent("reasoning_delta", text="long internal reasoning"),
+                LLMStreamEvent(
+                    "done",
+                    data={"finish_reason": "length", "stream_terminated": True},
+                ),
+            ],
+            fallback_text="recovered answer",
+        )
+        configured = service_settings(
+            llm_expose_reasoning=False,
+            synthesizer_retry_max_tokens=12000,
+            llm_context_window_tokens=3000,
+            llm_context_safety_margin_tokens=1000,
+            llm_token_estimate_multiplier=1.0,
+        )
+        service = CopilotService(configured, llm, MemoryStore(0))  # type: ignore[arg-type]
+        messages = [{"role": "user", "content": "x" * 4000}]
+        fallback_messages = service._synthesis_fallback_messages(messages)
+        estimated_input = TokenEstimator(
+            deployment="synthesizer",
+            model="fixture-chat-model",
+            multiplier=configured.llm_token_estimate_multiplier,
+        ).estimate_messages(fallback_messages).calibrated_tokens
+        expected_max_tokens = configured.llm_context_window_tokens - configured.llm_context_safety_margin_tokens - estimated_input
+
+        service._stream_final_model(
+            messages,
+            request_id="reasoning-context-clamp",
+            max_tokens=4096,
+            temperature=0.2,
+            top_p=0.9,
+            timeout_seconds=10,
+            sink=lambda _event: None,
+            metrics=self._metrics(),
+        )
+
+        self.assertEqual(len(llm.chat_calls), 1)
+        self.assertEqual(llm.chat_calls[0]["max_tokens"], expected_max_tokens)
+        self.assertLess(llm.chat_calls[0]["max_tokens"], configured.synthesizer_retry_max_tokens)
 
     def test_empty_non_streaming_recovery_is_reported_without_retry_loop(self) -> None:
         class EmptyRecoveryLLM(FakeStreamingLLM):
