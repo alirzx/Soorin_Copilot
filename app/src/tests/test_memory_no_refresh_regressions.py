@@ -27,6 +27,7 @@ from src.core.agent.task_mapping import (
     task_spec_from_route,
 )
 from src.core.context.entities import EntityResolver
+from src.core.context.intent import validate_router_payload
 from src.core.context.models import EntityResolution, IntentDecision, ResolvedEntity
 from src.core.context.router import DeterministicFallbackRouter
 from src.core.identity import RequestIdentity
@@ -405,6 +406,192 @@ def test_m3_typed_working_facts_survive_durable_state_restore() -> None:
     }
 
 
+def test_remember_im_writes_a_typed_conversation_fact_and_survives_restore() -> None:
+    settings = get_settings()
+    message = "Remember, I'm Alireza Hashemi."
+    constraints = derive_request_constraints(message)
+    facts = extract_working_facts(message)
+    key = MemoryContextKey(("192.168.30.115",), "asset_investigation", "none", "asset")
+    memory = MemoryStore(20)
+
+    assert constraints.memory_write and constraints.memory_only and not constraints.allow_live
+    assert [(item.key, item.value, item.fact_type, item.scope) for item in facts] == [
+        ("analyst_name", "Alireza Hashemi", "user_provided", "conversation"),
+    ]
+    assert compile_direct_plan(task_spec_from_route(_asset_route(), message, constraints)).steps == ()
+
+    memory.upsert_working_facts("remember-name", key, facts, request_id="remember-name")
+    identity = RequestIdentity.resolve(
+        user_id="user-a",
+        conversation_id="conversation-a",
+        session_id="remember-name",
+        request_id="persist-name",
+    )
+    persisted = ThreadMemoryState.from_routing_state(
+        identity,
+        SessionRoutingState(active_entities=key.entities),
+        **memory.durable_components("remember-name", turn_limit=4, episode_limit=4),
+    )
+    restored_state = ThreadMemoryState.from_payload(
+        persisted.to_payload(),
+        thread_key=persisted.thread_key,
+        user_id=persisted.user_id,
+        conversation_id=persisted.conversation_id,
+        session_id=persisted.session_id,
+        updated_at=persisted.updated_at,
+        revision=1,
+        schema_version=persisted.schema_version,
+    )
+    restored = MemoryStore(20)
+    restored.restore_durable_state(restored_state)
+    package = restored.compose_memory_context(
+        "remember-name",
+        settings,
+        context_key=key,
+        active_entities=key.entities,
+    )
+
+    assert [(item.key, item.value, item.fact_type, item.scope) for item in package.working_facts] == [
+        ("analyst_name", "Alireza Hashemi", "user_provided", "conversation"),
+    ]
+    assert package.long_term_memories == ()
+
+
+def test_ui_selected_comparison_materializes_pair_for_router_and_fallback() -> None:
+    asset_a = "192.168.20.103"
+    asset_b = "192.168.20.120"
+    message = "Analyze this asset and compare it with the last one."
+    state = SessionRoutingState(active_ip=asset_a, active_entities=(asset_a,))
+    entities = EntityResolver().resolve(message, {"selected_ip": asset_b}, state)
+    constraints = derive_request_constraints(message)
+    policy = derive_turn_policy(message, constraints, entities, state)
+
+    assert [(item.value, item.source) for item in entities.entities] == [
+        (asset_b, "ui"),
+        (asset_a, "conversation"),
+    ]
+    assert entities.entity_mode == "multiple"
+    assert entities.reference_type == "compare_with_reference"
+    assert policy.target == "active_pair"
+    assert policy.target_entities == (asset_b, asset_a)
+
+    semantic = validate_router_payload(
+        {
+            "intent": "asset_investigation",
+            "scope": "node_summary",
+            "direction": "both",
+            "depth": 0,
+            "requires_graph": False,
+            "requires_detection": False,
+            "requires_asset_profile": True,
+            "requires_multiple_entities": False,
+            "is_followup": False,
+            "classification_confidence": 0.95,
+            "reason": "selected asset",
+            "entity_binding": "ui",
+        },
+        entities,
+        min_confidence=0.65,
+        message=message,
+        routing_state=state,
+        ui_context={"selected_ip": asset_b},
+    )
+    assert semantic.materialized_entities == (asset_b, asset_a)
+    assert semantic.scope == "multi_entity_comparison"
+    assert semantic.requires_multiple_entities
+
+    fallback = DeterministicFallbackRouter().route(
+        message,
+        entities,
+        state,
+        fallback_reason="router_timeout",
+        constraints=constraints,
+        turn_policy=policy,
+    )
+    assert fallback.materialized_entities == (asset_b, asset_a)
+    assert fallback.scope == "multi_entity_comparison"
+    assert fallback.requires_multiple_entities
+
+    router_failure = IntentDecision(
+        intent="unclear",
+        scope="none",
+        direction="none",
+        depth=0,
+        requires_graph=False,
+        classification_confidence=0.0,
+        decision_source="deterministic_fallback",
+        router_called=True,
+        fallback_used=True,
+        fallback_reason="router_timeout",
+    )
+    service = SimpleNamespace(
+        settings=get_settings(),
+        intent_router=SimpleNamespace(classify=lambda *_args, **_kwargs: router_failure),
+        fallback_router=DeterministicFallbackRouter(),
+    )
+    recovered = CopilotWorkflowNodes(service).route(
+        {
+            "message": message,
+            "resolved_entities": entities,
+            "active_entity_state": state,
+            "recent_messages": [],
+            "ui_context": {"selected_ip": asset_b},
+            "trace_id": "trace",
+            "request_id": "request",
+            "request_constraints": constraints,
+            "turn_policy": policy,
+        }
+    )
+    assert recovered["routing_fallback_used"] is True
+    assert recovered["routing_result"].materialized_entities == (asset_b, asset_a)
+    assert recovered["routing_result"].scope == "multi_entity_comparison"
+
+
+def test_explicit_no_live_tools_bypasses_router_without_enabling_capabilities() -> None:
+    message = "Analyze this asset, but do not use tools."
+    entity = ResolvedEntity(type="ip", value="192.168.30.115", source="conversation")
+    entities = EntityResolution(
+        status="resolved",
+        entities=[entity],
+        primary_entity=entity,
+        entity_mode="single",
+        candidate_count=1,
+        valid_entity_count=1,
+        reference_detected=True,
+    )
+    state = SessionRoutingState(active_entities=(entity.value,))
+    constraints = derive_request_constraints(message)
+    policy = derive_turn_policy(message, constraints, entities, state)
+    service = SimpleNamespace(
+        settings=get_settings(),
+        intent_router=SimpleNamespace(
+            classify=lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("router called"))
+        ),
+        fallback_router=SimpleNamespace(),
+    )
+
+    update = CopilotWorkflowNodes(service).route(
+        {
+            "message": message,
+            "resolved_entities": entities,
+            "active_entity_state": state,
+            "recent_messages": [],
+            "ui_context": None,
+            "trace_id": "trace",
+            "request_id": "request",
+            "request_constraints": constraints,
+            "turn_policy": policy,
+        }
+    )
+    task = task_spec_from_route(update["routing_result"], message, constraints, policy)
+
+    assert not constraints.allow_live and not constraints.memory_only
+    assert not policy.requires_domain_router
+    assert update["routing_result"].semantic_router_called is False
+    assert task.evidence_mode == "no_live_refresh"
+    assert compile_direct_plan(task).steps == ()
+
+
 def test_m4_current_reassessment_keeps_live_capabilities_and_historical_baseline() -> None:
     message = "Check whether this asset is still showing the same identity contradiction."
     constraints = derive_request_constraints(message)
@@ -545,6 +732,99 @@ def test_asset_switch_archives_a_and_broad_historical_recall_reuses_a_context() 
         not set(item.entity_ids).intersection(asset_b.entities)
         for item in recalled.memory_context.working_facts
     )
+
+
+def test_broad_thread_recall_selects_bounded_archived_and_current_context_with_provenance() -> None:
+    settings = replace(
+        get_settings(),
+        conversation_summary_enabled=True,
+        conversation_summary_trigger_tokens=10_000,
+        memory_relevant_turn_limit=4,
+        memory_relevant_turn_token_budget=1_200,
+        memory_episode_context_limit=2,
+        memory_episode_context_token_budget=1_200,
+        memory_context_token_budget=3_000,
+    )
+    session_id = "thread-recall-a-b"
+    asset_a = MemoryContextKey(("192.168.30.115",), "asset_investigation", "none", "asset")
+    asset_b = MemoryContextKey(("192.168.30.116",), "asset_investigation", "none", "asset")
+    memory = MemoryStore(20)
+    memory.prepare_for_model(
+        session_id,
+        settings,
+        SessionRoutingState(active_entities=asset_a.entities),
+        context_key=asset_a,
+    )
+    memory.upsert_working_facts(
+        session_id,
+        asset_a,
+        extract_working_facts("Remember, I'm Alireza Hashemi."),
+    )
+    memory.record_turn(
+        session_id,
+        "Investigate asset A.",
+        "Asset A conclusion: workstation-A.",
+        asset_a,
+        request_id="asset-a",
+    )
+    memory.prepare_for_model(
+        session_id,
+        settings,
+        SessionRoutingState(active_entities=asset_b.entities),
+        context_key=asset_b,
+    )
+    memory.record_turn(
+        session_id,
+        "Investigate asset B.",
+        "Asset B conclusion: server-B.",
+        asset_b,
+        request_id="asset-b",
+    )
+
+    message = (
+        "Tell me everything we established in this conversation, including previous assets "
+        "and investigations. Do not use live tools."
+    )
+    constraints = derive_request_constraints(message)
+    policy = derive_turn_policy(
+        message,
+        constraints,
+        EntityResolver().resolve(
+            message,
+            routing_state=SessionRoutingState(active_entities=asset_b.entities),
+        ),
+        SessionRoutingState(active_entities=asset_b.entities),
+    )
+    snapshot = memory.prepare_for_model(
+        session_id,
+        settings,
+        SessionRoutingState(active_entities=asset_b.entities),
+        context_key=asset_b,
+        activate_context=False,
+        thread_recall=True,
+    )
+    package = snapshot.memory_context
+    working = memory.repository.get_working(session_id)
+
+    assert constraints.memory_only and not constraints.allow_live
+    assert policy.operation == "memory_recall"
+    assert policy.target == "conversation"
+    assert not policy.requires_domain_router
+    assert package is not None
+    assert [item.request_id for item in package.relevant_turns] == ["asset-a", "asset-b"]
+    assert {item.context_key.entities for item in package.relevant_turns} == {
+        asset_a.entities,
+        asset_b.entities,
+    }
+    assert [(item.context_key.entities, item.retrieval_reason) for item in package.relevant_turns] == [
+        (asset_a.entities, "thread_recall"),
+        (asset_b.entities, "thread_recall"),
+    ]
+    assert [item.context_key.entities for item in package.episode_summaries] == [asset_a.entities]
+    assert [(item.key, item.value, item.fact_type) for item in package.working_facts] == [
+        ("analyst_name", "Alireza Hashemi", "user_provided"),
+    ]
+    assert working is not None and working.context_key == asset_b
 
 
 def test_explicit_memory_only_return_reactivates_archived_a_after_product_style_reload() -> None:

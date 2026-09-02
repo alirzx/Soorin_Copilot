@@ -995,3 +995,37 @@ current Profile, Detection, or Graph capability. Historical exact retrieval may
 select complementary authoritative Profile and Detection records. The runtime
 contract states actual retrieval/partial/baseline/write execution truth, and
 ordinary answers suppress internal memory, tool, and storage terminology.
+
+## 22. 2026-09-02 targeted continuity stabilization
+
+**Fixed and verified by focused offline tests.** The deterministic entity resolver
+now materializes a two-entity pair when a distinct UI-selected asset is explicitly
+compared with the previous/last investigation target. The pair is retained through
+semantic-router binding validation and deterministic fallback; no route may reduce
+that already-resolved comparison to one asset.
+
+**Fixed and verified by focused offline tests.** Broad same-thread recall is now a
+distinct deterministic `TurnPolicy` target (`conversation`), so it bypasses the
+domain Router and retrieves bounded recent turns plus matching archived episode
+summaries across the thread. Normal active-asset and detached-general requests
+remain entity/general scoped. Relevant turns and episode records retain their
+typed `MemoryContextKey` entity binding; analyst/user Working Facts retain their
+`user_provided` fact type and are not LTM candidates.
+
+**Fixed and verified by focused offline tests.** The bounded Working Fact grammar
+accepts explicit analyst-name forms such as `remember, I'm <name>` (including the
+common apostrophe-free spelling). This follows the existing pure-memory-write path:
+no operational capability is planned, the fact remains conversation scoped, and
+it survives `ThreadMemoryState` restore without automatic LTM promotion.
+
+**Fixed and verified by focused offline tests.** Explicit `do not use tools` joins
+the existing no-live grammar. A no-live turn bypasses semantic routing while
+retaining the distinct `no_live_refresh` evidence mode where the request is not a
+historical-memory recall.
+
+Focused verification: `test_memory_no_refresh_regressions.py` (62 tests),
+`test_memory_gate5.py`, and `test_gate8_memory_context.py` (132 combined),
+comparison/detachment routing selection (15 tests), and
+`test_long_term_memory_gate67.py` (43 tests). No Product endpoint, ThreadState,
+frontend/SSE, canonical LTM, Qdrant, or baseline/delta contract was changed. Live
+Product/model/Qdrant validation remains intentionally unperformed.

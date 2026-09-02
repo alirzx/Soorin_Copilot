@@ -66,7 +66,7 @@ NO_LIVE_EVIDENCE_REQUEST = re.compile(
     r"without\s+(?:performing\s+)?(?:any\s+)?live\s+(?:lookup|check|retrieval)|"
     r"without\s+checking\s+(?:any\s+)?current\s+(?:information|status|state|systems?)|"
     r"do\s+not\s+(?:retrieve|look\s+anything\s+up)\b|"
-    r"do\s+not\s+(?:use|call|retrieve|check|look\s+up)\s+(?:anything|any\s+)?(?:current\s+|live\s+)?(?:product|detection|graph|knowledge|evidence|providers?|refresh|systems?|status|state|data|lookup)?|"
+    r"do\s+not\s+(?:use|call|retrieve|check|look\s+up)\s+(?:anything|any\s+)?(?:current\s+|live\s+)?(?:product|detection|graph|knowledge|evidence|providers?|refresh|systems?|status|state|data|lookup|tools?)?|"
     r"don't\s+use\s+live|do\s+not\s+refresh|don't\s+refresh|no\s+live\s+(?:provider|evidence|refresh)|"
     r"without\s+(?:using\s+)?live\s+(?:sources?|data)|do\s+not\s+use\s+live\s+(?:sources?|data)|"
     r"use\s+only\s+memory|use\s+only\s+what\s+(?:you|we)\s+(?:already\s+)?(?:remember|discussed|concluded|knew)|using\s+only\s+stored\s+(?:conversation\s+)?context|memory\s+only|"
@@ -75,7 +75,8 @@ NO_LIVE_EVIDENCE_REQUEST = re.compile(
 )
 
 MEMORY_WRITE_REQUEST = re.compile(
-    r"\b(?:remember\s+that|note\s+that|keep\s+in\s+mind|for\s+this\s+investigation\s+remember)\b|"
+    r"\b(?:remember\s*(?:that\b|[,;:]\s*(?:i(?:'m|m|\s+am)|my\s+(?:analyst\s+)?name\s+is|call\s+me))|"
+    r"note\s+that|keep\s+in\s+mind|for\s+this\s+investigation\s+remember)\b|"
     r"\b(?:remember|keep|retain|store)\b.{0,160}\b(?:for\s+(?:this|the)\s+(?:conversation|investigation)|"
     r"in\s+(?:this|the)\s+(?:conversation|investigation)|my\s+name|tag|owner\s+validation|analyst\s+note|contradiction)\b",
     re.IGNORECASE,
@@ -117,7 +118,10 @@ PREVIOUS_CURRENT_COMPARISON_REQUEST = re.compile(
 BROAD_CONVERSATION_RECALL_REQUEST = re.compile(
     r"\b(?:what\s+(?:do\s+you\s+)?(?:know|remember)|summari[sz]e|recall|tell\s+me)\b"
     r".{0,100}\b(?:our\s+chats?|our\s+conversations?|chat\s+history|conversation\s+history|"
-    r"everything\s+we(?:'ve|\s+have)?\s+discussed)\b",
+    r"(?:this|our)\s+conversation|(?:all\s+)?previous\s+investigations?|"
+    r"everything\s+we(?:'ve|\s+have)?\s+discussed)\b|"
+    r"\b(?:everything|all)\s+(?:you\s+)?(?:remember|established|from)\b.{0,100}"
+    r"\b(?:this|our)\s+conversation\b",
     re.IGNORECASE,
 )
 
@@ -150,7 +154,8 @@ def derive_request_constraints(request: str) -> RequestConstraints:
     """Resolve live-evidence and memory authority without an LLM."""
     no_live = bool(NO_LIVE_EVIDENCE_REQUEST.search(request))
     recall_classification = classify_historical_recall(request)
-    recall = recall_classification != "none"
+    broad_recall = bool(BROAD_CONVERSATION_RECALL_REQUEST.search(request))
+    recall = recall_classification != "none" or broad_recall
     memory_write = bool(MEMORY_WRITE_REQUEST.search(request))
     require_current = bool(CURRENT_EVIDENCE_REQUEST.search(request)) and not no_live
     pure_memory_write = memory_write and not require_current and not re.search(
@@ -169,7 +174,11 @@ def derive_request_constraints(request: str) -> RequestConstraints:
     if no_live:
         reasons.append("explicit_no_live")
     if recall:
-        reasons.append(f"deterministic_memory_recall:{recall_classification}")
+        reasons.append(
+            "deterministic_memory_recall:thread"
+            if broad_recall
+            else f"deterministic_memory_recall:{recall_classification}"
+        )
     if memory_write:
         reasons.append("session_memory_write")
     if require_current:
@@ -194,6 +203,8 @@ def derive_turn_policy(
     active = tuple(routing_state.active_entities)
 
     def target_for(values: tuple[str, ...], entity_source: str) -> str:
+        if len(values) == 2:
+            return "active_pair"
         if entity_source == "message":
             return "explicit_entity"
         if entity_source == "ui":
@@ -214,7 +225,17 @@ def derive_turn_policy(
         )
 
     broad_recall = bool(BROAD_CONVERSATION_RECALL_REQUEST.search(request))
-    if constraints.memory_only or broad_recall:
+    if broad_recall:
+        return TurnPolicy(
+            operation="memory_write" if constraints.memory_write else "memory_recall",
+            target="conversation",
+            target_entities=(),
+            requires_domain_router=False,
+            episode_transition="keep",
+            reason_codes=("deterministic_conversation_memory_recall",),
+        )
+
+    if constraints.memory_only or not constraints.allow_live:
         values = resolved or active
         explicit_switch = bool(
             resolved

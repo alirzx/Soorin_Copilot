@@ -39,7 +39,7 @@ _WORKING_FACT_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     (
         "analyst_name",
         re.compile(
-            r"\b(?:my\s+name\s+is|call\s+me)\s+([A-Za-z][A-Za-z .'-]{0,63}?)(?=\s+for\s+(?:this|the)\s+(?:conversation|investigation)|[,.]|$)",
+            r"\b(?:remember\s*[,;:]?\s*)?(?:i(?:'m|m|\s+am)|my\s+(?:analyst\s+)?name\s+is|call\s+me)\s+([A-Za-z][A-Za-z .'-]{0,63}?)(?=\s+for\s+(?:this|the)\s+(?:conversation|investigation)|[,.]|$)",
             re.IGNORECASE,
         ),
     ),
@@ -400,6 +400,7 @@ class MemoryStore:
         request_id: str = "",
         long_term_memories: tuple[RetrievedLongTermMemory, ...] = (),
         activate_context: bool = True,
+        thread_recall: bool = False,
     ) -> ConversationSnapshot:
         transitioned = False
         previous_episode_summary_included = False
@@ -433,6 +434,7 @@ class MemoryStore:
             active_entities=routing_state.active_entities,
             request_id=request_id,
             long_term_memories=long_term_memories,
+            thread_recall=thread_recall,
         )
         messages = package.model_messages()
         recent = [item for item in messages if item.get("role") in {"user", "assistant"}]
@@ -487,6 +489,7 @@ class MemoryStore:
         active_entities: tuple[str, ...] = (),
         request_id: str = "",
         long_term_memories: tuple[RetrievedLongTermMemory, ...] = (),
+        thread_recall: bool = False,
     ) -> MemoryContextPackage:
         """Select bounded same-conversation continuity without model or embedding calls."""
         started = datetime.now(timezone.utc)
@@ -532,7 +535,9 @@ class MemoryStore:
                     )
                 )
         active = set(active_entities)
-        if context_key is not None and context_key.topic_family == "general":
+        if thread_recall:
+            active.clear()
+        elif context_key is not None and context_key.topic_family == "general":
             active.clear()
             candidates = [
                 item for item in candidates if item.context_key.topic_family == "general"
@@ -561,7 +566,9 @@ class MemoryStore:
             if used_turn_tokens + candidate.estimated_tokens > turn_budget:
                 continue
             reason = (
-                "active_topic"
+                "thread_recall"
+                if thread_recall
+                else "active_topic"
                 if context_key is not None and candidate.context_key == context_key
                 else "active_entity"
                 if active.intersection(candidate.context_key.entities)
@@ -589,7 +596,8 @@ class MemoryStore:
             if item.compact_summary
             and item.compact_summary != summary
             and (
-                context_key is None
+                thread_recall
+                or context_key is None
                 or item.context_key == context_key
                 or bool(episode_entities.intersection(item.context_key.entities))
             )
@@ -641,7 +649,8 @@ class MemoryStore:
                     context_key=context_key or MemoryContextKey(),
                     episode_id="",
                 )).working_facts
-                if item.scope == "conversation"
+                if thread_recall
+                or item.scope == "conversation"
                 or context_key is None
                 or not item.entity_ids
                 or bool(set(item.entity_ids).intersection(context_key.entities))
@@ -669,12 +678,13 @@ class MemoryStore:
             latency_ms,
         )
         logger.info(
-            "event=memory_context_composed request_id=%s selected_turns=%s working_fact_count=%s episode_count=%s long_term_count=%s estimated_tokens=%s omitted_count=%s",
+            "event=memory_context_composed request_id=%s selected_turns=%s working_fact_count=%s episode_count=%s long_term_count=%s thread_recall=%s estimated_tokens=%s omitted_count=%s",
             request_id,
             len(selected),
             len(package.working_facts),
             len(selected_episodes),
             len(selected_long_term),
+            thread_recall,
             package.estimated_tokens,
             len(package.omitted),
         )

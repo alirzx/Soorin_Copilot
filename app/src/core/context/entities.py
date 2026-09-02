@@ -242,8 +242,15 @@ class EntityResolver:
         reference_detected, reference_type = self._detect_reference(message)
         pair_reference_detected, pair_reference_type = self._detect_pair_reference(message)
         comparison_reference_detected = bool(COMPARISON_REFERENCE_RE.search(message or ""))
+        comparison_current = (
+            ResolvedEntity(type="ip", value=message_ips[0], source="message")
+            if len(message_ips) == 1
+            else ResolvedEntity(type="ip", value=ui_selected_ip, source="ui")
+            if not message_ips and ui_selected_ip
+            else None
+        )
         comparative_reference_signal = bool(
-            len(message_ips) == 1
+            comparison_current
             and COMPARATIVE_SIGNAL_RE.search(message or "")
             and (reference_detected or RECENT_REFERENCE_RE.search(message or "") or recent_entity_candidates or active_entities)
         )
@@ -261,24 +268,24 @@ class EntityResolver:
             pair_reference_type = None
 
         if (
-            len(message_ips) == 1
+            comparison_current is not None
             and comparison_reference_detected
             and (active_ip or recent_entity_candidates)
             and next(
                 (
                     ip
                     for ip in [*active_entities, *recent_entity_candidates]
-                    if ip != message_ips[0]
+                    if ip != comparison_current.value
                 ),
                 None,
             )
             and not reference_suppressed
         ):
             comparison_peer = next(
-                ip for ip in [*active_entities, *recent_entity_candidates] if ip != message_ips[0]
+                ip for ip in [*active_entities, *recent_entity_candidates] if ip != comparison_current.value
             )
             entities = [
-                ResolvedEntity(type="ip", value=message_ips[0], source="message"),
+                comparison_current,
                 ResolvedEntity(type="ip", value=comparison_peer, source="conversation"),
             ]
             resolution = EntityResolution(
@@ -295,20 +302,20 @@ class EntityResolver:
                 suppression_reason=suppression_reason,
             )
         elif (
-            len(message_ips) == 1
+            comparison_current is not None
             and comparative_reference_signal
             and not reference_suppressed
             and (comparison_peer := next(
                 (
                     ip
                     for ip in [*active_entities, *recent_entity_candidates]
-                    if ip != message_ips[0]
+                    if ip != comparison_current.value
                 ),
                 None,
             ))
         ):
             entities = [
-                ResolvedEntity(type="ip", value=message_ips[0], source="message"),
+                comparison_current,
                 ResolvedEntity(type="ip", value=comparison_peer, source="conversation"),
             ]
             resolution = EntityResolution(

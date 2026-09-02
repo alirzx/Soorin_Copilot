@@ -796,6 +796,10 @@ class CopilotWorkflowNodes:
                 activate_context=(
                     getattr(state.get("turn_policy"), "episode_transition", "switch") in {"switch", "detach"}
                 ),
+                thread_recall=(
+                    getattr(state.get("turn_policy"), "operation", "") == "memory_recall"
+                    and getattr(state.get("turn_policy"), "target", "") == "conversation"
+                ),
             )
             if self.settings.chat_store_history or long_term_memories
             else None

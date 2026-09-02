@@ -168,11 +168,34 @@ def materialize_entity_binding(
         ui_ip = _valid_ipv4(str((ui_context or {}).get("selected_ip") or ""))
         if ui_ip:
             resolved = [ResolvedEntity(type="ip", value=ui_ip, source="ui")]
-            return _resolution_from_entities(entities, resolved), "ui"
+            if requires_multiple_entities:
+                peer = next(
+                    (
+                        entity
+                        for entity in entities.entities
+                        if entity.value != ui_ip
+                    ),
+                    None,
+                )
+                if peer is not None:
+                    resolved.append(peer)
+            return _resolution_from_entities(entities, resolved[:2]), "ui"
         ui_entities = [entity for entity in entities.entities if entity.source == "ui"]
         if not ui_entities:
             raise ValueError("entity_requirement_failed")
-        return _resolution_from_entities(entities, ui_entities[:1]), "ui"
+        resolved = ui_entities[:1]
+        if requires_multiple_entities:
+            peer = next(
+                (
+                    entity
+                    for entity in entities.entities
+                    if entity.value != resolved[0].value
+                ),
+                None,
+            )
+            if peer is not None:
+                resolved.append(peer)
+        return _resolution_from_entities(entities, resolved[:2]), "ui"
 
     if entity_binding == "active_single":
         active_ip = _valid_ipv4(routing_state.active_ip if routing_state else None)
@@ -430,6 +453,16 @@ def validate_router_payload(
         raise ValueError("schema_validation_failed:requires_knowledge")
     requires_knowledge = bool(payload.get("requires_knowledge", False))
     requires_multiple = payload["requires_multiple_entities"]
+    deterministic_comparison_pair = bool(
+        len(entities.entities) == 2
+        and entities.reference_type == "compare_with_reference"
+        and not entities.reference_suppressed
+    )
+    if deterministic_comparison_pair:
+        intent, scope, direction, depth = "graph_relationships", "multi_entity_comparison", "both", 1
+        requires_graph = True
+        requires_multiple = True
+        normalize("deterministic_comparison_pair_preserved", prefer=True)
     exhaustive_connections = is_exhaustive_connection_request(message)
     graph_like_scope = scope in {"node_summary", "one_hop", "full_neighbors", "two_hop", "path", "multi_entity_comparison"}
     if (
