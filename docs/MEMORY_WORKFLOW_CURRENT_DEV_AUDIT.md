@@ -1314,3 +1314,34 @@ metadata, and fallback policy are represented more than once. The recommended
 path is to make known state structural and immutable, confine LLMs to genuinely
 ambiguous language and open evidence strategy, and use one validated task and
 evidence contract throughout fallback and persistence.
+
+## 19. September 2026 focused reliability addendum
+
+The follow-up stabilization keeps the architecture above and closes the later
+room-118 integration failures without adding a model stage or changing an
+external contract:
+
+- conversational `now` is no longer sufficient by itself to require current
+  evidence; explicit current/status language and bounded `verify ... now/again`
+  forms remain strong current-evidence signals;
+- whole-thread recall is resolved before incidental UI entity context, remains
+  read-only for the active investigation cursor, and receives bounded structural
+  chronology plus thread-wide explicit facts;
+- pair references outrank a single UI selection when a unique active pair exists,
+  and semantic comparison output independently recovers that pair when no
+  different entities were explicitly supplied;
+- recent conversational context contains at most one newest exact turn plus
+  deterministic older digests, deduplicated by request identity; summaries,
+  Working Facts, episode summaries, and Product LTM retain distinct authority;
+- successful Product payloads that violate the LTM DTO/canonical contract now
+  use `ProductMemoryContractError` through hydration, audit, and lifecycle
+  readback paths rather than being mislabeled as local persistence failures;
+- Synth instructions prohibit internal orchestration vocabulary, unsupported
+  exhaustive-recall claims, and negative-history claims inferred from omitted
+  context.
+
+`SOORIN_CONVERSATION_SUMMARY_TEMPERATURE` and
+`SOORIN_CONVERSATION_SUMMARY_TIMEOUT_SECONDS` are still parsed for configuration
+compatibility, but no runtime code consumes them. Conversation compaction is
+deterministic and performs no summary-model call. They remain intentionally
+dormant in this compatibility-preserving change.
