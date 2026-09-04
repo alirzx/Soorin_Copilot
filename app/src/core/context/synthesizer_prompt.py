@@ -280,7 +280,7 @@ class SynthesizerPromptBuilder:
             current_vs_historical_relationship=(
                 "compatible_deterministic_delta_supplied"
                 if delta_contexts
-                else f"baseline_{baseline_status}_delta_unavailable"
+                else "compatible_baseline_unavailable"
             ),
             deterministic_delta_available=bool(delta_contexts),
             selected_analytical_lenses=self._analytical_lenses(task),
