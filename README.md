@@ -14,7 +14,7 @@ flowchart TD
     U[User or Product UI] --> API[FastAPI /chat or /chat/stream]
     API --> ID[Request identity and Product ThreadState]
     ID --> ER[Deterministic entity and reference resolution]
-    ER --> CP[Deterministic constraints and turn policy]
+    ER --> CP[Deterministic constraints, turn policy, and immutable task envelope]
     CP -->|memory-only or thread recall| MR[Bounded working, episode, and Product LTM retrieval]
     CP -->|live evidence allowed| RT[Semantic Router with deterministic normalization]
     RT --> TS[Validated TaskSpec]
@@ -24,7 +24,7 @@ flowchart TD
     PLAN --> PV[PlanValidator]
     PV --> EX[Capability executor]
     EX --> E[Product Profile and Detection, Graph, Knowledge/RAG]
-    E --> EP[ToolResults, EvidencePack, and evidence review]
+    E --> EP[Immutable acquisition receipts, ToolResults, EvidencePack, and evidence review]
     EP --> CC[Memory and evidence context composition]
     MR --> CC
     CC --> SYN[Synthesizer]
@@ -59,10 +59,19 @@ limitations rather than as a verified finding.
   replace required fresh operational evidence.
 
 The role-based LLM layer separates a semantic Router, a bounded Planner for
-multi-step retrieval, and a Synthesizer for the final grounded response. Context
-composition reserves space for current evidence and output, compacts or omits
-lower-priority history when necessary, and preserves source, freshness,
-completeness, limitations, and citations.
+explicit open-ended multi-step retrieval, and a Synthesizer for the final
+grounded response. A deterministic task envelope preserves resolved entity order,
+comparison intent, temporal authority, and live-evidence constraints across
+router fallback and planning. Context composition reserves space for current
+evidence and output, compacts or omits lower-priority history when necessary,
+and preserves source, freshness, completeness, limitations, and citations.
+
+ThreadState stores bounded continuity: active routing state, a chronological
+entity-visit timeline, working facts, compact turn digests, and episodic
+summaries. Product Long-Term Memory is canonical for durable validated findings;
+Qdrant is derivative semantic retrieval only. Evidence acquisition receipts are
+immutable snapshots for baseline comparison, independent of later model-context
+projection or compaction.
 
 ## Run Locally
 

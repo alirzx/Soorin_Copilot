@@ -12,6 +12,42 @@
 
 **Runtime evidence:** no services, models, Product endpoints, Qdrant operations, graph refresh, or UI were run
 
+> **2026-09-04 continuity/routing/evidence simplification update:** The prior
+> observations below remain historical audit evidence. The current `dev`
+> working tree has a source- and fixture-tested resolution for the identified
+> T2/T3/T4/T5/T1 concerns, without invoking an additional memory, extraction,
+> summary, or agent model call. This update was offline only.
+>
+> - `ThreadMemoryState` now persists a bounded chronological entity-visit
+>   timeline (including revisits) and bounded per-turn digests; resolver ordinal
+>   references use that structural timeline, never summary prose.
+> - Explicit memory commands preserve exact bounded generic statements alongside
+>   recognized typed facts, with request provenance and conversation/entity
+>   scope. They remain user-provided assertions, not operational evidence.
+> - The immutable deterministic `TaskEnvelope` carries ordered entities,
+>   comparison requirement, temporal/freshness authority, and live constraints
+>   across semantic routing, deterministic fallback, TaskSpec construction, and
+>   direct planning. Pair comparison fallback now remains
+>   `multi_entity_comparison` and compiles `graph.compare_assets`.
+> - Product and Graph capability results carry immutable acquisition receipts.
+>   Baseline capture reads the receipt/projection boundary; composer mutation or
+>   model-context exclusion cannot corrupt acquisition facts. Full Product views
+>   are normalized under a stable receipt view wrapper while their established
+>   presentation contract remains unchanged.
+> - Product LTM malformed successful responses now raise
+>   `ProductMemoryContractError`, separate from local persistence failures. The
+>   caller logs a safe category and continues with the existing degraded
+>   long-term-memory selection.
+> - Memory sections are explicitly labeled as user-provided working facts,
+>   conversation-derived summaries/history, or Product-canonical durable memory.
+>
+> Focused offline coverage is in
+> `app/src/tests/test_memory_continuity_simplification.py` together with the
+> existing memory, routing, Product-memory, Gate 8, phase 21, and Synthesizer
+> suites. Product remains canonical for LTM, Qdrant remains derivative, active
+> entity state remains bounded to two, and no public API/SSE/Product LTM schema
+> changed.
+
 > **2026-08-16 stabilization update:** The implementation findings below describe
 > the audited starting commit. The E1-E7 changes completed in the current working
 > tree supersede the former delta-path P0 and the related “partially implemented”
