@@ -167,6 +167,7 @@ class RelevantTurn:
     created_at: str
     retrieval_reason: str
     estimated_tokens: int
+    source_representation: str = "raw"
 
 
 @dataclass(frozen=True)
@@ -178,6 +179,7 @@ class MemoryContextPackage:
     episode_summaries: tuple[EpisodeRecord, ...] = ()
     long_term_memories: tuple[RetrievedLongTermMemory, ...] = ()
     working_facts: tuple[WorkingFact, ...] = ()
+    entity_timeline: tuple[EntityVisit, ...] = ()
     active_entities: tuple[str, ...] = ()
     estimated_tokens: int = 0
     omitted: tuple[str, ...] = ()
@@ -238,6 +240,21 @@ class MemoryContextPackage:
                         ),
                     }
                 )
+        if self.entity_timeline:
+            messages.append(
+                {
+                    "role": "system",
+                    "content": (
+                        "[SOORIN THREAD CHRONOLOGY — STRUCTURAL HISTORY]\n"
+                        "Source: ordered investigation visits; historical continuity only.\n"
+                        + "\n".join(
+                            f"- visit {item.sequence}: {', '.join(item.ordered_entity_ids)} "
+                            f"({item.task_family})"
+                            for item in self.entity_timeline
+                        )
+                    ),
+                }
+            )
         if self.long_term_memories:
             messages.append(
                 {

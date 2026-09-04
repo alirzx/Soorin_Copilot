@@ -213,7 +213,7 @@ class ProductLongTermMemoryStore:
     ) -> LongTermMemoryRecord:
         if not isinstance(memory_id, str) or not memory_id:
             get_metrics().observe_memory_canonical_reload("product", "failure")
-            raise LocalPersistenceError("Product memory response omitted memoryId.")
+            raise ProductMemoryContractError("Product memory response omitted memoryId.")
         try:
             memory = self.get(
                 user_id=user_id,
@@ -226,7 +226,7 @@ class ProductLongTermMemoryStore:
             raise
         if memory is None:
             get_metrics().observe_memory_canonical_reload("product", "failure")
-            raise LocalPersistenceError("Product memory canonical readback was unavailable.")
+            raise ProductMemoryContractError("Product memory canonical readback was unavailable.")
         get_metrics().observe_memory_canonical_reload("product", "success")
         return memory
 
@@ -263,13 +263,13 @@ class ProductLongTermMemoryStore:
         )
         return tuple(self._domain_record(item, domain_user_id=user_id) for item in records)
     def list_audit_events(self, *, user_id: str, memory_id: str | None = None, limit: int = 100):
-        if not memory_id: raise LocalPersistenceError("Product audit reads require a memory id.")
+        if not memory_id: raise ValueError("Product audit reads require a memory id.")
         result = _object(self.client.list_ltm_audit(user_id=self._owner(user_id), memory_id=memory_id))
         events = result.get("events", result.get("items"))
-        if not isinstance(events, list): raise LocalPersistenceError("Product memory audit response was invalid.")
+        if not isinstance(events, list): raise ProductMemoryContractError("Product memory audit response was invalid.")
         try:
             return tuple(MemoryLifecycleAuditEvent(event_id=e["eventId"], memory_id=e["memoryId"], logical_memory_key=e["logicalMemoryKey"], idempotency_fingerprint=e["idempotencyFingerprint"], user_id=e["userId"], entity_ids=tuple(e.get("entityIds") or ()), source_request_id=e["sourceRequestId"], action=e["action"], from_status=e["fromStatus"], to_status=e["toStatus"], reason_code=e["reasonCode"], policy_version=e["policyVersion"], evidence_refs=_refs_from_wire(e["evidenceRefs"]), actor=e["actor"], created_at=e["createdAt"]) for e in events[:limit])
-        except (KeyError, TypeError, ValueError) as exc: raise LocalPersistenceError("Product memory audit event was invalid.") from exc
+        except (KeyError, TypeError, ValueError) as exc: raise ProductMemoryContractError("Product memory audit event was invalid.") from exc
     def _transition(
         self,
         *,
@@ -357,7 +357,7 @@ class ProductLongTermMemoryStore:
         else:
             action, reason_code, resolution = "promote", "newer_compatible_value", "compatible_change"
         current, result = self._transition(user_id=candidate.user_id, memory_id=candidate.memory_id, action=action, reason_code=reason_code, actor=actor or "copilot", expected_revision=candidate.revision, policy_version=decision.policy_version, request_id=current_request_id, resolution=resolution)
-        if current is None: raise LocalPersistenceError("Product promotion did not return a canonical memory.")
+        if current is None: raise ProductMemoryContractError("Product promotion did not return a canonical memory.")
         previous = result.get("relatedRecord", result.get("related_record"))
         return MemoryLifecycleResult(current, decision, previous_memory=self._domain_record(previous, domain_user_id=candidate.user_id) if isinstance(previous, dict) else active, deduplicated=action == "confirm" or bool(result.get("deduplicated", False)), superseded_count=1 if active is not None and action == "promote" else int(result.get("supersededCount", 0)), conflict_count=int(result.get("conflictCount", 0)))
     def update(self, *, memory: LongTermMemoryRecord, expected_revision: int) -> LongTermMemoryRecord:
@@ -366,20 +366,20 @@ class ProductLongTermMemoryStore:
         return memory
     def invalidate(self, *, user_id: str, memory_id: str, expected_revision: int) -> LongTermMemoryRecord:
         updated, _ = self._transition(user_id=user_id, memory_id=memory_id, action="invalidate", reason_code="explicit_invalidation", actor="copilot", expected_revision=expected_revision, policy_version="ltm-promotion-v1")
-        if updated is None: raise LocalPersistenceError("Product invalidation did not return a canonical memory.")
+        if updated is None: raise ProductMemoryContractError("Product invalidation did not return a canonical memory.")
         return updated
     def expire(self, *, user_id: str, memory_id: str, expected_revision: int) -> LongTermMemoryRecord:
         updated, _ = self._transition(user_id=user_id, memory_id=memory_id, action="expire", reason_code="retention_or_validity_expired", actor="system", expected_revision=expected_revision, policy_version="ltm-promotion-v1")
-        if updated is None: raise LocalPersistenceError("Product expiration did not return a canonical memory.")
+        if updated is None: raise ProductMemoryContractError("Product expiration did not return a canonical memory.")
         return updated
     def supersede(self, *, user_id: str, memory_id: str, replacement: LongTermMemoryRecord, expected_revision: int) -> tuple[LongTermMemoryRecord, LongTermMemoryRecord]:
         if expected_revision < 1 or not memory_id:
             raise LocalPersistenceConflictError("Long-term memory revision is invalid.")
         current, result = self._transition(user_id=user_id, memory_id=replacement.memory_id, action="promote", reason_code="newer_compatible_value", expected_revision=replacement.revision, policy_version=replacement.policy_version, request_id=replacement.source_request_id, resolution="compatible_change")
-        if current is None: raise LocalPersistenceError("Product supersession did not return a canonical memory.")
+        if current is None: raise ProductMemoryContractError("Product supersession did not return a canonical memory.")
         previous = result.get("relatedRecord", result.get("related_record"))
         if not isinstance(previous, dict):
-            raise LocalPersistenceError("Product supersession response omitted the prior canonical memory.")
+            raise ProductMemoryContractError("Product supersession response omitted the prior canonical memory.")
         return _memory_from_wire(previous), current
     def delete(self, *, user_id: str, memory_id: str) -> bool:
         memory = self.get(user_id=user_id, memory_id=memory_id)

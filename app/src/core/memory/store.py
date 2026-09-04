@@ -20,6 +20,7 @@ from src.core.memory.baselines import (
 )
 from src.core.memory.episodes import (
     EpisodeRecord,
+    EntityVisit,
     InMemoryMemoryRepository,
     MemoryContextPackage,
     MemoryContextKey,
@@ -462,6 +463,7 @@ class MemoryStore:
             request_id=request_id,
             long_term_memories=long_term_memories,
             thread_recall=thread_recall,
+            entity_timeline=routing_state.entity_timeline,
         )
         messages = package.model_messages()
         recent = [item for item in messages if item.get("role") in {"user", "assistant"}]
@@ -517,6 +519,7 @@ class MemoryStore:
         request_id: str = "",
         long_term_memories: tuple[RetrievedLongTermMemory, ...] = (),
         thread_recall: bool = False,
+        entity_timeline: tuple[EntityVisit, ...] = (),
     ) -> MemoryContextPackage:
         """Select bounded same-conversation continuity without model or embedding calls."""
         started = datetime.now(timezone.utc)
@@ -559,6 +562,7 @@ class MemoryStore:
                         created_at=f"legacy-{index:08d}",
                         retrieval_reason="raw_recent_turn",
                         estimated_tokens=approx_tokens(user_content) + approx_tokens(assistant_content),
+                        source_representation="raw",
                     )
                 )
         active = set(active_entities)
@@ -577,6 +581,43 @@ class MemoryStore:
                 if item.context_key == context_key
                 or bool(current_entities.intersection(item.context_key.entities))
             ]
+
+        # Keep exactly one newest complete turn verbatim. Older turns use the
+        # same bounded durable digest shape, preventing transcript/digest
+        # duplication and keeping broad recall useful without becoming a dump.
+        deduplicated: dict[str, RelevantTurn] = {}
+        for item in candidates:
+            key = item.request_id or hashlib.sha256(
+                f"{item.user_content}\0{item.assistant_content}".encode("utf-8")
+            ).hexdigest()
+            existing = deduplicated.get(key)
+            if existing is None or item.created_at >= existing.created_at:
+                deduplicated[key] = item
+        candidates = list(deduplicated.values())
+        latest_key = max(
+            candidates,
+            key=lambda item: item.created_at,
+            default=None,
+        )
+        layered_candidates: list[RelevantTurn] = []
+        for item in candidates:
+            keep_raw = item is latest_key and item.source_representation == "raw"
+            user_content = item.user_content if keep_raw else compact_preview(item.user_content, limit=360)
+            assistant_content = (
+                item.assistant_content
+                if keep_raw
+                else compact_preview(item.assistant_content, limit=560)
+            )
+            layered_candidates.append(
+                replace(
+                    item,
+                    user_content=user_content,
+                    assistant_content=assistant_content,
+                    estimated_tokens=approx_tokens(user_content) + approx_tokens(assistant_content),
+                    source_representation="raw" if keep_raw else "digest",
+                )
+            )
+        candidates = layered_candidates
 
         def priority(item: RelevantTurn) -> tuple[int, int, int, str]:
             exact = int(context_key is not None and item.context_key == context_key)
@@ -664,35 +705,75 @@ class MemoryStore:
             seen_statements.add(normalized)
             used_long_term_tokens += item.estimated_tokens
 
+        working = self.repository.get_working(session_id) or WorkingMemory(
+            session_id=session_id,
+            context_key=context_key or MemoryContextKey(),
+            episode_id="",
+        )
+        fact_candidates = list(working.working_facts)
+        if thread_recall:
+            for episode in reversed(self.repository.list_episodes(session_id)):
+                fact_candidates.extend(episode.working_facts)
+        selected_facts: list[WorkingFact] = []
+        seen_facts: set[tuple[Any, ...]] = set()
+        for item in fact_candidates:
+            fact_key = (
+                item.key,
+                item.scope,
+                item.entity_ids,
+            )
+            if fact_key in seen_facts:
+                continue
+            if (
+                thread_recall
+                or item.scope == "conversation"
+                or context_key is None
+                or not item.entity_ids
+                or bool(set(item.entity_ids).intersection(context_key.entities))
+            ):
+                selected_facts.append(item)
+                seen_facts.add(fact_key)
+        selected_timeline = tuple(entity_timeline[-8:]) if thread_recall else ()
+        timeline_tokens = sum(
+            approx_tokens(
+                f"visit {item.sequence}: {','.join(item.ordered_entity_ids)} {item.task_family}"
+            )
+            for item in selected_timeline
+        )
+        fact_budget = max(0, total_budget - summary_tokens - timeline_tokens)
+        bounded_facts: list[WorkingFact] = []
+        fact_tokens = 0
+        for item in selected_facts:
+            tokens = approx_tokens(f"{item.key}: {item.value}")
+            if fact_tokens + tokens > fact_budget:
+                omitted.append("working_fact_over_budget")
+                continue
+            bounded_facts.append(item)
+            fact_tokens += tokens
+        selected_facts = bounded_facts
+        while selected and used + fact_tokens + timeline_tokens > total_budget:
+            removed = selected.pop(0)
+            used -= removed.estimated_tokens
+            omitted.append("older_relevant_turn_over_budget")
+        while selected_episodes and used + fact_tokens + timeline_tokens > total_budget:
+            removed = selected_episodes.pop()
+            used -= approx_tokens(removed.compact_summary)
+            omitted.append("episode_summary_over_budget")
         package = MemoryContextPackage(
             working_summary=summary,
             relevant_turns=tuple(selected),
             episode_summaries=tuple(selected_episodes),
             long_term_memories=tuple(selected_long_term),
-            working_facts=tuple(
-                item
-                for item in (self.repository.get_working(session_id) or WorkingMemory(
-                    session_id=session_id,
-                    context_key=context_key or MemoryContextKey(),
-                    episode_id="",
-                )).working_facts
-                if thread_recall
-                or item.scope == "conversation"
-                or context_key is None
-                or not item.entity_ids
-                or bool(set(item.entity_ids).intersection(context_key.entities))
-            ),
+            working_facts=tuple(selected_facts),
+            entity_timeline=selected_timeline,
             active_entities=tuple(active_entities),
             estimated_tokens=max(0, used + used_long_term_tokens),
             omitted=tuple(dict.fromkeys(omitted)),
         )
-        fact_tokens = sum(
-            approx_tokens(f"{item.key}: {item.value}") for item in package.working_facts
-        )
         package = MemoryContextPackage(
             **{
                 **package.__dict__,
-                "estimated_tokens": package.estimated_tokens + fact_tokens,
+                "estimated_tokens": package.estimated_tokens + fact_tokens + timeline_tokens,
             }
         )
         latency_ms = int((datetime.now(timezone.utc) - started).total_seconds() * 1000)
@@ -705,9 +786,12 @@ class MemoryStore:
             latency_ms,
         )
         logger.info(
-            "event=memory_context_composed request_id=%s selected_turns=%s working_fact_count=%s episode_count=%s long_term_count=%s thread_recall=%s estimated_tokens=%s omitted_count=%s",
+            "event=memory_context_composed request_id=%s selected_turns=%s raw_turn_count=%s digest_turn_count=%s summary_tokens=%s working_fact_count=%s episode_count=%s long_term_count=%s thread_recall=%s estimated_tokens=%s omitted_count=%s",
             request_id,
             len(selected),
+            sum(item.source_representation == "raw" for item in selected),
+            sum(item.source_representation == "digest" for item in selected),
+            summary_tokens,
             len(package.working_facts),
             len(selected_episodes),
             len(selected_long_term),
@@ -837,7 +921,12 @@ class MemoryStore:
                     assistant_content=assistant_content,
                     created_at=reference.created_at,
                     retrieval_reason=retrieval_reason,
-                    estimated_tokens=approx_tokens(user_content) + approx_tokens(assistant_content),
+                    estimated_tokens=(
+                        approx_tokens(user_content) + approx_tokens(assistant_content)
+                    ),
+                    source_representation=(
+                        "raw" if retrieval_reason == "raw_recent_turn" else "digest"
+                    ),
                 )
             )
         self._turns[session_id] = restored
