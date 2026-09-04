@@ -233,6 +233,7 @@ class EntityResolver:
         *,
         recent_messages: list[dict[str, str]] | None = None,
         request_id: str = "",
+        conversation_scope: bool = False,
     ) -> EntityResolution:
         started = time.perf_counter()
         logger.info(
@@ -390,6 +391,17 @@ class EntityResolver:
                 reference_suppressed=reference_suppressed,
                 suppression_reason=suppression_reason,
             )
+        elif conversation_scope:
+            # Whole-thread recall is not an asset operation. UI selection,
+            # active cursors, timeline ordinals, and implicit references are
+            # incidental unless the user supplied an explicit entity above.
+            resolution = EntityResolution(
+                status="none",
+                explicit_candidate_count=len(explicit_candidates),
+                reference_detected=False,
+                reference_suppressed=reference_suppressed,
+                suppression_reason=suppression_reason,
+            )
         elif timeline_reference is not None:
             timeline_entities, timeline_reference_type = timeline_reference
             entities = [
@@ -408,21 +420,6 @@ class EntityResolver:
                 reference_type=timeline_reference_type,
                 reference_suppressed=False,
             )
-        elif ui_selected_ip and not reference_suppressed:
-            primary = ResolvedEntity(type="ip", value=ui_selected_ip, source="ui")
-            resolution = EntityResolution(
-                status="resolved",
-                entities=[primary],
-                primary_entity=primary,
-                entity_mode="single",
-                candidate_count=1,
-                explicit_candidate_count=len(explicit_candidates),
-                valid_entity_count=1,
-                reference_detected=reference_detected,
-                reference_type=reference_type,
-                reference_suppressed=reference_suppressed,
-                suppression_reason=suppression_reason,
-            )
         elif pair_reference_detected and len(active_entities) >= 2 and not reference_suppressed:
             entities = [
                 ResolvedEntity(type="ip", value=ip, source="conversation")
@@ -438,6 +435,21 @@ class EntityResolver:
                 valid_entity_count=len(entities),
                 reference_detected=True,
                 reference_type=pair_reference_type,
+                reference_suppressed=reference_suppressed,
+                suppression_reason=suppression_reason,
+            )
+        elif ui_selected_ip and not reference_suppressed:
+            primary = ResolvedEntity(type="ip", value=ui_selected_ip, source="ui")
+            resolution = EntityResolution(
+                status="resolved",
+                entities=[primary],
+                primary_entity=primary,
+                entity_mode="single",
+                candidate_count=1,
+                explicit_candidate_count=len(explicit_candidates),
+                valid_entity_count=1,
+                reference_detected=reference_detected,
+                reference_type=reference_type,
                 reference_suppressed=reference_suppressed,
                 suppression_reason=suppression_reason,
             )

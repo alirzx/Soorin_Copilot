@@ -39,6 +39,7 @@ EXPLICIT_MEMORY_RECALL_REQUEST = re.compile(
     r"summari[sz]e\s+what\s+you\s+remember|continue\s+with\s+the\s+same\s+asset.*before\s+the\s+restart|"
     r"conversation\s+memory|episodic\s+memory|long[\s-]*term\s+memory|prior\s+investigations?|what(?:'s|\s+is)\s+my\s+name|"
     r"what\s+(?:do|did)\s+you\s+remember|what\s+you\s+(?:already\s+)?remember|do\s+you\s+remember|"
+    r"what\s+(?:did\s+)?i\s+ask(?:ed)?\s+you\s+to\s+remember|"
     r"what\s+did\s+(?:i|we)\s+(?:tell|say)|what\s+was\s+the\s+previous\s+contradiction|"
     r"from\s+(?:stored\s+(?:context|conversation\s+context)|our\s+previous\s+investigation)|"
     r"what\s+(?:investigation\s+)?state\s+(?:(?:did\s+)?you\s+)?retain(?:ed)?|"
@@ -84,8 +85,8 @@ MEMORY_WRITE_REQUEST = re.compile(
 )
 
 CURRENT_EVIDENCE_REQUEST = re.compile(
-    r"\b(?:fresh|current|currently|now|right\s+now|still|verify\s+(?:now|again)|recheck|refresh|latest|"
-    r"live\s+(?:evidence|data|state))\b",
+    r"\b(?:fresh|current|currently|right\s+now|still|verify\s+(?:now|again)|recheck|refresh|latest|"
+    r"live\s+(?:evidence|data|state))\b|\bverify\b.{0,40}\b(?:now|again)\b",
     re.IGNORECASE,
 )
 
@@ -122,11 +123,28 @@ BROAD_CONVERSATION_RECALL_REQUEST = re.compile(
     r"(?:this|our)\s+conversation|(?:all\s+)?previous\s+investigations?|"
     r"everything\s+we(?:'ve|\s+have)?\s+discussed)\b|"
     r"\b(?:everything|all)\s+(?:you\s+)?(?:remember|established|from)\b.{0,100}"
-    r"\b(?:this|our)\s+conversation\b",
+    r"\b(?:this|our)\s+conversation\b|"
+    r"\bwhat\s+(?:investigations?|analyses)\s+have\s+we\s+(?:done|performed)\b|"
+    r"\bwhat\s+did\s+we\s+talk\s+about(?:\s+earlier)?\b|"
+    r"\bsummari[sz]e\s+what\s+we\s+have\s+done\s+so\s+far\b",
+    re.IGNORECASE,
+)
+
+EXPLICIT_RECALL_ENTITY_SCOPE = re.compile(
+    r"\b(?:about|regarding|for)\s+(?:(?:this|that|the\s+selected)\s+"
+    r"(?:asset|host|node)|(?:\d{1,3}\.){3}\d{1,3})\b",
     re.IGNORECASE,
 )
 
 RecallClassification = Literal["none", "explicit_memory", "historical_summary"]
+
+
+def is_broad_conversation_recall(request: str) -> bool:
+    """Return true only for an explicit request to recall the whole thread."""
+    return bool(
+        BROAD_CONVERSATION_RECALL_REQUEST.search(request)
+        and not EXPLICIT_RECALL_ENTITY_SCOPE.search(request)
+    )
 
 
 def derive_task_envelope(
@@ -236,7 +254,7 @@ def derive_request_constraints(request: str) -> RequestConstraints:
     """Resolve live-evidence and memory authority without an LLM."""
     no_live = bool(NO_LIVE_EVIDENCE_REQUEST.search(request))
     recall_classification = classify_historical_recall(request)
-    broad_recall = bool(BROAD_CONVERSATION_RECALL_REQUEST.search(request))
+    broad_recall = is_broad_conversation_recall(request)
     recall = recall_classification != "none" or broad_recall
     memory_write = bool(MEMORY_WRITE_REQUEST.search(request))
     require_current = bool(CURRENT_EVIDENCE_REQUEST.search(request)) and not no_live
@@ -306,7 +324,7 @@ def derive_turn_policy(
             reason_codes=("explicit_topic_detachment",),
         )
 
-    broad_recall = bool(BROAD_CONVERSATION_RECALL_REQUEST.search(request))
+    broad_recall = is_broad_conversation_recall(request)
     if broad_recall:
         return TurnPolicy(
             operation="memory_write" if constraints.memory_write else "memory_recall",

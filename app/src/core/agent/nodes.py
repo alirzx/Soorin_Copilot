@@ -30,6 +30,7 @@ from src.core.agent.task_mapping import (
     evidence_mode_from_request,
     enforce_task_envelope,
     historical_evidence_classes_for_request,
+    is_broad_conversation_recall,
     materialize_turn_policy_target,
     task_spec_from_route,
 )
@@ -39,7 +40,7 @@ from src.core.context.intent import (
     SECURITY_ANALYSIS_WORDS,
     resolution_from_materialized_decision,
 )
-from src.core.context.models import RouteDecision, approx_tokens
+from src.core.context.models import EntityResolution, ResolvedEntity, RouteDecision, approx_tokens
 from src.core.context.compaction import (
     current_evidence_projections,
     episodic_baseline_projections,
@@ -89,14 +90,15 @@ class CopilotWorkflowNodes:
             "short_term",
             "hit" if recent else "miss",
         )
+        constraints = derive_request_constraints(state["message"])
         resolution = self.service.entity_resolver.resolve(
             state["message"].strip(),
             state.get("ui_context"),
             routing_state,
             recent_messages=recent,
             request_id=state["request_id"],
+            conversation_scope=is_broad_conversation_recall(state["message"]),
         )
-        constraints = derive_request_constraints(state["message"])
         turn_policy = derive_turn_policy(
             state["message"], constraints, resolution, routing_state
         )
@@ -263,6 +265,70 @@ class CopilotWorkflowNodes:
         else:
             route_entities = resolution_from_materialized_decision(decision, entities)
             route = normalize_intent_route(decision, route_entities)
+            active_pair = tuple(dict.fromkeys(routing_state.active_entities))
+            semantic_comparison = bool(
+                route.scope == "multi_entity_comparison"
+                or route.requires_multiple_entities
+                or route.relationship_mode == "compare"
+            )
+            if (
+                semantic_comparison
+                and entities.explicit_candidate_count == 0
+                and not entities.reference_suppressed
+                and len(active_pair) == 2
+                and len({item.value for item in route_entities.entities}) < 2
+            ):
+                recovered = [
+                    ResolvedEntity(type="ip", value=value, source="conversation")
+                    for value in active_pair
+                ]
+                route_entities = EntityResolution(
+                    status="resolved",
+                    entities=recovered,
+                    primary_entity=None,
+                    entity_mode="multiple",
+                    candidate_count=2,
+                    explicit_candidate_count=0,
+                    valid_entity_count=2,
+                    reference_detected=True,
+                    reference_type="semantic_active_pair_recovery",
+                )
+                route = replace(
+                    route,
+                    use_graph=True,
+                    entity_binding="active_pair",
+                    resolved_entity_binding="active_pair",
+                    binding_source="conversation",
+                    binding_available=True,
+                    binding_normalized=True,
+                    binding_normalization_reason="semantic_comparison_recovers_unique_active_pair",
+                    materialized_entity_count=2,
+                    materialized_entities=active_pair,
+                    target_entity=None,
+                    target_entities=recovered,
+                    followup_detected=True,
+                    scope="multi_entity_comparison",
+                    direction="both",
+                    depth=max(1, route.depth),
+                    requires_multiple_entities=True,
+                    relationship_mode="compare",
+                    route_normalized=True,
+                    route_normalization_reason="semantic_comparison_recovers_unique_active_pair",
+                )
+                turn_policy = replace(
+                    turn_policy,
+                    target="active_pair",
+                    target_entities=active_pair,
+                    episode_transition="keep",
+                    reason_codes=tuple(
+                        dict.fromkeys(
+                            (*turn_policy.reason_codes, "semantic_comparison_active_pair_recovered")
+                        )
+                    ),
+                )
+                task_envelope = derive_task_envelope(
+                    route_entities, constraints, turn_policy, routing_state
+                )
         evidence_mode = evidence_mode_from_request(state["message"])
         if (
             evidence_mode in {"memory_only", "no_live_refresh"}
@@ -300,6 +366,8 @@ class CopilotWorkflowNodes:
         return {
             "routing_result": route,
             "resolved_entities": route_entities,
+            "turn_policy": turn_policy,
+            "task_envelope": task_envelope,
             "routing_fallback_used": bool(decision.fallback_used),
             "next_edge": "validate_task",
         }
@@ -1335,13 +1403,18 @@ class CopilotWorkflowNodes:
             if operation not in {"memory_recall", "memory_write"} and (
                 not timeline or timeline[-1].ordered_entity_ids != values
             ):
-                working = self.service.memory_store.repository.get_working(state["session_id"])
+                repository = getattr(self.service.memory_store, "repository", None)
+                working = (
+                    repository.get_working(state["session_id"])
+                    if repository is not None
+                    else None
+                )
                 timeline = (
                     *timeline,
                     EntityVisit(
                         sequence=(timeline[-1].sequence + 1) if timeline else 1,
                         ordered_entity_ids=values,
-                        task_family=task.intent,
+                        task_family=getattr(task, "intent", route.intent),
                         episode_id=working.episode_id if working is not None else "",
                     ),
                 )
