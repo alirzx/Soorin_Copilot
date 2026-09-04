@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import logging
 import re
 from dataclasses import dataclass, replace
@@ -64,6 +65,15 @@ _WORKING_FACT_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ),
 )
 
+_EXPLICIT_MEMORY_PREFIX = re.compile(
+    r"^\s*(?:also\s+)?(?:remember|note|keep\s+in\s+mind|retain|store)"
+    r"(?:\s+for\s+(?:this|the)\s+(?:conversation|investigation))?"
+    r"\s*(?:that\b)?\s*[,;:]?\s*",
+    re.IGNORECASE,
+)
+_MEMORY_SEGMENT_SPLIT = re.compile(r"(?<=[.!?])\s+|\n+")
+MAX_EXACT_WORKING_FACT_CHARS = 600
+
 
 def extract_working_facts(message: str) -> tuple[WorkingFact, ...]:
     """Extract only explicit bounded session facts; never infer from model prose."""
@@ -74,7 +84,24 @@ def extract_working_facts(message: str) -> tuple[WorkingFact, ...]:
             continue
         value = " ".join(match.group(1).strip().rstrip(".").split())
         if value:
-            facts.append(WorkingFact(key=key, value=compact_preview(value, limit=300)))
+            facts.append(WorkingFact(key=key, value=value))
+    for segment in _MEMORY_SEGMENT_SPLIT.split(message or ""):
+        prefix = _EXPLICIT_MEMORY_PREFIX.match(segment)
+        if not prefix:
+            continue
+        if any(pattern.search(segment) for _key, pattern in _WORKING_FACT_PATTERNS):
+            continue
+        value = re.sub(r"\s+", " ", segment[prefix.end() :].strip()).rstrip(".?!").strip()
+        if not value or len(value) > MAX_EXACT_WORKING_FACT_CHARS:
+            continue
+        digest = hashlib.sha256(value.encode("utf-8")).hexdigest()[:16]
+        facts.append(
+            WorkingFact(
+                key=f"remembered_statement:{digest}",
+                value=value,
+                fact_type="user_provided",
+            )
+        )
     return tuple(facts)
 
 
@@ -712,6 +739,9 @@ class MemoryStore:
                 request_id=item.request_id,
                 context_key=item.context_key,
                 created_at=item.created_at,
+                user_digest=compact_preview(item.user_content, limit=360),
+                assistant_digest=compact_preview(item.assistant_content, limit=560),
+                workflow_status="completed",
             )
             for item in self._turns.get(session_id, ())[-max(0, turn_limit) :]
         )
@@ -787,12 +817,18 @@ class MemoryStore:
         restored: list[RelevantTurn] = []
         for reference in references:
             pair = grouped.get(reference.request_id, {})
-            if "user" not in pair or "assistant" not in pair:
+            if "user" in pair and "assistant" in pair:
+                user_content = str(pair["user"].content)
+                assistant_content = str(pair["assistant"].content)
+                retrieval_reason = "raw_recent_turn"
+                self.append(session_id, "user", user_content)
+                self.append(session_id, "assistant", assistant_content)
+            elif reference.user_digest and reference.assistant_digest:
+                user_content = reference.user_digest
+                assistant_content = reference.assistant_digest
+                retrieval_reason = "durable_turn_digest"
+            else:
                 continue
-            user_content = str(pair["user"].content)
-            assistant_content = str(pair["assistant"].content)
-            self.append(session_id, "user", user_content)
-            self.append(session_id, "assistant", assistant_content)
             restored.append(
                 RelevantTurn(
                     request_id=reference.request_id,
@@ -800,7 +836,7 @@ class MemoryStore:
                     user_content=user_content,
                     assistant_content=assistant_content,
                     created_at=reference.created_at,
-                    retrieval_reason="raw_recent_turn",
+                    retrieval_reason=retrieval_reason,
                     estimated_tokens=approx_tokens(user_content) + approx_tokens(assistant_content),
                 )
             )
@@ -1135,12 +1171,12 @@ class MemoryStore:
         graph_context: dict[str, Any] | None,
     ) -> dict[str, Any]:
         older_user_messages = [
-            compact_preview(item.get("content", ""), limit=140)
+            compact_preview(item.get("content", ""), limit=360)
             for item in older
             if item.get("role") == "user"
         ][-5:]
         sticky_user_facts = [
-            compact_preview(item.get("content", ""), limit=180)
+            compact_preview(item.get("content", ""), limit=360)
             for item in older
             if item.get("role") == "user"
             and re.search(r"\b(?:remember\s+my|my\s+name\s+is)\b", item.get("content", ""), re.IGNORECASE)

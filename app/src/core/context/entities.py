@@ -29,6 +29,11 @@ RECENT_REFERENCE_RE = re.compile(
     r"\b(?:it|this|that|previous|prior|last|recent|same|asset|host|node|ip|one)\b",
     re.IGNORECASE,
 )
+TIMELINE_REFERENCE_RE = re.compile(
+    r"\b(?P<ordinal>first|second|last|previous)\s+"
+    r"(?:investigated\s+)?(?:asset|entity|host|ip|investigation)\b",
+    re.IGNORECASE,
+)
 REFERENTIAL_ENTITY_PATTERNS: dict[str, re.Pattern[str]] = {
     "this_entity": re.compile(r"\b(?:this|that|the\s+selected|the\s+current)\s+(?:ip|asset|host|node)\b", re.IGNORECASE),
     "same_entity": re.compile(r"\b(?:the\s+)?(?:same|previous)\s+(?:ip|asset|host|node)\b", re.IGNORECASE),
@@ -178,6 +183,27 @@ def _extract_recent_entity_candidates(recent_messages: list[dict[str, str]] | No
     return tuple(candidates[:2])
 
 
+def _timeline_reference(
+    message: str,
+    routing_state: SessionRoutingState | None,
+) -> tuple[tuple[str, ...], str] | None:
+    """Resolve ordinal history from persisted visit order, never summary prose."""
+    match = TIMELINE_REFERENCE_RE.search(message or "")
+    timeline = tuple(routing_state.entity_timeline if routing_state else ())
+    if match is None or not timeline:
+        return None
+    ordinal = match.group("ordinal").casefold()
+    index = {
+        "first": 0,
+        "second": 1,
+        "last": len(timeline) - 1,
+        "previous": len(timeline) - 2,
+    }.get(ordinal)
+    if index is None or index < 0 or index >= len(timeline):
+        return None
+    return timeline[index].ordered_entity_ids, f"timeline_{ordinal}"
+
+
 class EntityResolver:
     """Resolve only IPv4 entities for the frozen baseline."""
 
@@ -266,6 +292,9 @@ class EntityResolver:
             reference_type = None
             pair_reference_detected = False
             pair_reference_type = None
+        timeline_reference = (
+            None if reference_suppressed or message_ips else _timeline_reference(message, routing_state)
+        )
 
         if (
             comparison_current is not None
@@ -360,6 +389,24 @@ class EntityResolver:
                 reference_type=reference_type,
                 reference_suppressed=reference_suppressed,
                 suppression_reason=suppression_reason,
+            )
+        elif timeline_reference is not None:
+            timeline_entities, timeline_reference_type = timeline_reference
+            entities = [
+                ResolvedEntity(type="ip", value=value, source="conversation")
+                for value in timeline_entities
+            ]
+            resolution = EntityResolution(
+                status="resolved",
+                entities=entities,
+                primary_entity=entities[0] if len(entities) == 1 else None,
+                entity_mode="single" if len(entities) == 1 else "multiple",
+                candidate_count=len(entities),
+                explicit_candidate_count=len(explicit_candidates),
+                valid_entity_count=len(entities),
+                reference_detected=True,
+                reference_type=timeline_reference_type,
+                reference_suppressed=False,
             )
         elif ui_selected_ip and not reference_suppressed:
             primary = ResolvedEntity(type="ip", value=ui_selected_ip, source="ui")

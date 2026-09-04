@@ -47,6 +47,7 @@ from src.core.memory.retrieval import (
 )
 from src.core.memory.routing_state import SessionRoutingState
 from src.core.memory.store import MemoryStore
+from src.core.memory.product import ProductMemoryContractError
 from src.core.product_client import ProductApiClient
 from src.core.rag.service import KnowledgeSearchService
 from src.core.rag.qdrant_store import QdrantVectorStore
@@ -264,15 +265,26 @@ class CopilotService:
                     purpose="active_inventory",
                 )
             except Exception as exc:
+                error_category = (
+                    "product_memory_contract"
+                    if isinstance(exc, ProductMemoryContractError)
+                    else "memory_inventory_transport_or_store"
+                )
                 logger.warning(
-                    "event=memory_inventory_unavailable request_id=%s error_type=%s",
+                    "event=memory_inventory_unavailable request_id=%s error_type=%s error_category=%s",
                     identity.request_id,
                     type(exc).__name__,
+                    error_category,
                 )
                 return replace(
                     selection,
                     selected_count=len(selection.memories),
-                    limitations=tuple(dict.fromkeys((*selection.limitations, "long_term_memory_inventory_unavailable"))),
+                    limitations=tuple(item for item in dict.fromkeys((
+                        *selection.limitations,
+                        "long_term_memory_inventory_unavailable",
+                        "long_term_memory_inventory_contract_invalid"
+                        if error_category == "product_memory_contract" else "",
+                    )) if item),
                 )
             structured_baselines: list[RetrievedLongTermMemory] = []
             for memory in active:

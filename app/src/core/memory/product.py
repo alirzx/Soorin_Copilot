@@ -27,34 +27,38 @@ PRODUCT_THREAD_STATE_SCHEMA_VERSION = 3
 logger = logging.getLogger(__name__)
 
 
+class ProductMemoryContractError(RuntimeError):
+    """A successful Product response violated the canonical memory contract."""
+
+
 def _object(value: Any, *keys: str) -> dict[str, Any]:
     if not isinstance(value, dict):
-        raise LocalPersistenceError("Product memory response was invalid.")
+        raise ProductMemoryContractError("Product memory response was invalid.")
     item: Any = value.get("data", value)
     if not isinstance(item, dict):
-        raise LocalPersistenceError("Product memory response was invalid.")
+        raise ProductMemoryContractError("Product memory response was invalid.")
     for key in keys:
         if key in item:
             item = item[key]
             if not isinstance(item, dict):
-                raise LocalPersistenceError("Product memory response was invalid.")
+                raise ProductMemoryContractError("Product memory response was invalid.")
             break
     return item
 
 
 def _refs_from_wire(refs: Any) -> tuple[str, ...]:
     if not isinstance(refs, list):
-        raise LocalPersistenceError("Product memory evidence references were invalid.")
+        raise ProductMemoryContractError("Product memory evidence references were invalid.")
     values: list[str] = []
     for ref in refs:
         if isinstance(ref, dict):
             if ref.get("type") != "canonical_ref" or not isinstance(ref.get("id"), str):
-                raise LocalPersistenceError("Product memory evidence reference is not lossless.")
+                raise ProductMemoryContractError("Product memory evidence reference is not lossless.")
             values.append(ref["id"])
         elif isinstance(ref, str):
             values.append(ref)
         else:
-            raise LocalPersistenceError("Product memory evidence reference was invalid.")
+            raise ProductMemoryContractError("Product memory evidence reference was invalid.")
     return tuple(values)
 
 
@@ -62,7 +66,7 @@ def _memory_from_wire(value: Any) -> LongTermMemoryRecord:
     item = _object(value, "memory", "record")
     required = ("memoryId", "memoryType", "userId", "statement", "epistemicStatus", "confidence", "sourceRequestId", "sourceConversationId", "evidenceRefs", "validFrom", "revision", "status", "indexStatus", "idempotencyFingerprint", "logicalMemoryKey")
     if any(key not in item for key in required):
-        raise LocalPersistenceError("Product memory canonical response was incomplete.")
+        raise ProductMemoryContractError("Product memory canonical response was incomplete.")
     try:
         return LongTermMemoryRecord(
             memory_id=item["memoryId"], memory_type=item["memoryType"], user_id=item["userId"],
@@ -75,7 +79,7 @@ def _memory_from_wire(value: Any) -> LongTermMemoryRecord:
             has_unresolved_conflict=bool(item.get("hasUnresolvedConflict", False)), policy_version=item.get("policyVersion", "ltm-promotion-v1"),
         )
     except (TypeError, ValueError) as exc:
-        raise LocalPersistenceError("Product memory canonical response was invalid.") from exc
+        raise ProductMemoryContractError("Product memory canonical response was invalid.") from exc
 
 
 class ProductThreadStateStore:
@@ -250,7 +254,7 @@ class ProductLongTermMemoryStore:
         )
         records = next((result[name] for name in ("records", "items", "memories") if name in result), None)
         if not isinstance(records, list):
-            raise LocalPersistenceError("Product memory search response was invalid.")
+            raise ProductMemoryContractError("Product memory search response was invalid.")
         logger.info(
             "event=product_ltm_read_completed request_id=%s operation=search purpose=%s status=ok record_count=%s",
             request_id,

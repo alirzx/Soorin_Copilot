@@ -12,6 +12,7 @@ from src.core.agent.contracts import (
     ExecutionPlan,
     PlanStep,
     RequestConstraints,
+    TaskEnvelope,
     TaskSpec,
     TurnPolicy,
 )
@@ -126,6 +127,87 @@ BROAD_CONVERSATION_RECALL_REQUEST = re.compile(
 )
 
 RecallClassification = Literal["none", "explicit_memory", "historical_summary"]
+
+
+def derive_task_envelope(
+    entities: EntityResolution,
+    constraints: RequestConstraints,
+    turn_policy: TurnPolicy,
+    routing_state: SessionRoutingState,
+) -> TaskEnvelope:
+    """Freeze deterministic task authority before any semantic router runs."""
+    resolved_entities = tuple(item.value for item in entities.entities)
+    # Let validation produce the established bounded clarification for an
+    # oversized request; do not turn it into an envelope-construction failure.
+    ordered_entities = resolved_entities if len(resolved_entities) <= 2 else ()
+    previous_pair_comparison = (
+        turn_policy.target == "active_pair"
+        and routing_state.previous_scope == "multi_entity_comparison"
+    )
+    comparison_required = (
+        len(ordered_entities) == 2
+        and (
+            turn_policy.operation == "compare_previous_current"
+            or entities.reference_type == "compare_with_reference"
+            or previous_pair_comparison
+        )
+    )
+    temporal_scope: TemporalMode = (
+        "historical"
+        if constraints.memory_only or not constraints.allow_live
+        else "compare_previous_current"
+        if turn_policy.operation == "compare_previous_current"
+        else "current"
+    )
+    task_family = (
+        "asset_comparison"
+        if comparison_required
+        else "memory_recall"
+        if turn_policy.operation == "memory_recall"
+        else "asset_investigation"
+        if resolved_entities
+        else "general"
+    )
+    return TaskEnvelope(
+        ordered_entities=ordered_entities,
+        reference_type=entities.reference_type or "none",
+        operation=turn_policy.operation,
+        temporal_scope=temporal_scope,
+        freshness_requirement=(
+            "current_required" if constraints.require_current else "historical_only"
+            if not constraints.allow_live else "current_when_available"
+        ),
+        allow_live=constraints.allow_live,
+        require_current=constraints.require_current,
+        comparison_required=comparison_required,
+        task_family=task_family,
+        reason_codes=tuple(dict.fromkeys((*constraints.reason_codes, *turn_policy.reason_codes))),
+    )
+
+
+def enforce_task_envelope(route: Any, envelope: TaskEnvelope | None) -> Any:
+    """Restore deterministic task authority after semantic/fallback routing."""
+    if envelope is None:
+        return route
+    updates: dict[str, Any] = {}
+    if envelope.ordered_entities:
+        updates.update(
+            materialized_entities=envelope.ordered_entities,
+            materialized_entity_count=len(envelope.ordered_entities),
+        )
+    if envelope.comparison_required:
+        updates.update(
+            use_graph=True,
+            intent="graph_relationships",
+            scope="multi_entity_comparison",
+            direction="both",
+            depth=1,
+            requires_multiple_entities=True,
+            relationship_mode="compare",
+            route_normalized=True,
+            route_normalization_reason="task_envelope_preserves_pair_comparison",
+        )
+    return replace(route, **updates) if updates else route
 
 
 def classify_historical_recall(request: str) -> RecallClassification:
@@ -340,6 +422,7 @@ def task_spec_from_route(
     request: str,
     constraints: RequestConstraints | None = None,
     turn_policy: TurnPolicy | None = None,
+    task_envelope: TaskEnvelope | None = None,
 ) -> TaskSpec:
     request_lower = request.lower()
     constraints = constraints or derive_request_constraints(request)
@@ -347,7 +430,10 @@ def task_spec_from_route(
     if turn_policy is not None and turn_policy.operation == "memory_recall" and evidence_mode == "normal":
         evidence_mode = "no_live_refresh"
     allow_capabilities = constraints.allow_live
-    entities = tuple(dict.fromkeys(getattr(route, "materialized_entities", ()) or ()))
+    route = enforce_task_envelope(route, task_envelope)
+    entities = task_envelope.ordered_entities if task_envelope and task_envelope.ordered_entities else tuple(
+        dict.fromkeys(getattr(route, "materialized_entities", ()) or ())
+    )
     if getattr(route, "scope", "none") == "multi_entity_comparison" and len(entities) != 2:
         raise ValueError("comparison_requires_two_distinct_entities")
     required_capabilities: list[str] = []
@@ -395,7 +481,26 @@ def task_spec_from_route(
         and set(capabilities) <= {"asset.get_profile", "asset.get_detection"}
         and not MULTI_STEP_WORDING.search(request)
     )
-    multi_step = not focused_identity_verification and (
+    known_routine = bool(entities) and set(capabilities) <= {
+        "asset.get_profile",
+        "asset.get_detection",
+        "graph.get_summary",
+        "graph.get_neighbors",
+        "graph.compare_assets",
+        "graph.find_path",
+        "graph.get_relationship",
+        "knowledge.search",
+    }
+    routine_direct = known_routine and (
+        bool(
+            task_envelope
+            and task_envelope.comparison_required
+            and getattr(route, "decision_source", "") == "deterministic_fallback"
+        )
+        or not bool(task_envelope and task_envelope.comparison_required)
+        and not bool(MULTI_STEP_WORDING.search(request))
+    )
+    multi_step = not routine_direct and not focused_identity_verification and (
         len(capabilities) >= 3
         or "security_or_anomaly" in signals
         or bool(MULTI_STEP_WORDING.search(request))

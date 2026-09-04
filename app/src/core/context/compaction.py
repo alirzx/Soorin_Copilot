@@ -163,6 +163,8 @@ def current_evidence_projections(
         capability = str(getattr(result, "source_capability", "") or "")
         status = str(getattr(result, "status", "") or "")
         entities = tuple(getattr(result, "entities", ()) or ())
+        receipt = getattr(result, "evidence_receipt", None)
+        receipt_payload = receipt.payload() if receipt is not None else None
         complete = (
             status == "ok"
             and getattr(result, "completeness", "") == "complete"
@@ -173,12 +175,22 @@ def current_evidence_projections(
             and not bool(getattr(result, "contradictions", ()))
             and bool(getattr(result, "context_included", True))
         )
+        if receipt is not None:
+            complete = (
+                receipt.status == "ok"
+                and receipt.completeness == "complete"
+                and not receipt.truncated
+                and not receipt.projection_truncated
+                and receipt.source_payload_complete
+                and receipt.projection_usable
+                and not bool(getattr(result, "contradictions", ()))
+            )
         if capability in {"asset.get_profile", "asset.get_detection"}:
             if status not in {"ok", "partial"} or len(entities) != 1:
                 continue
-            evidence = getattr(result, "view_payload", None)
+            evidence = receipt_payload if receipt is not None else getattr(result, "view_payload", None)
             views = evidence.get("views") if isinstance(evidence, dict) else None
-            schema_version = str(getattr(result, "projection_schema_version", "") or "")
+            schema_version = str(receipt.schema_version if receipt is not None else getattr(result, "projection_schema_version", "") or "")
             if not isinstance(views, dict) or not schema_version:
                 continue
             for view in tuple(getattr(result, "selected_views", ()) or ()):
@@ -192,19 +204,19 @@ def current_evidence_projections(
                         view=str(view),
                         schema_version=schema_version,
                         payload=payload,
-                        retrieved_at=str(getattr(result, "valid_at", None) or result.retrieved_at),
+                        retrieved_at=str(receipt.retrieved_at if receipt is not None else getattr(result, "valid_at", None) or result.retrieved_at),
                         complete=complete,
                     ))
             continue
         if not capability.startswith("graph.") or status not in {"ok", "partial"} or not entities:
             continue
         provider_result = _field(result, "provider_result")
-        context = _field(provider_result, "context")
+        context = receipt_payload if receipt is not None else _field(provider_result, "context")
         if not isinstance(context, Mapping):
             continue
-        scope = str(context.get("requested_scope") or context.get("scope") or "none")
-        direction = str(context.get("direction") or "none")
-        depth = int(context.get("depth") or 0)
+        scope = str(receipt.scope if receipt is not None else context.get("requested_scope") or context.get("scope") or "none")
+        direction = str(receipt.direction if receipt is not None else context.get("direction") or "none")
+        depth = int(receipt.depth if receipt is not None else context.get("depth") or 0)
         graph_complete = bool(
             complete
             and context.get("complete_for_user_request", context.get("requested_scope_complete", True))
@@ -218,7 +230,7 @@ def current_evidence_projections(
             view="graph",
             schema_version="graph-baseline-v1",
             payload=_graph_projection_payload(context),
-            retrieved_at=str(getattr(result, "valid_at", None) or result.retrieved_at),
+            retrieved_at=str(receipt.retrieved_at if receipt is not None else getattr(result, "valid_at", None) or result.retrieved_at),
             complete=graph_complete,
             scope=scope,
             direction=direction,

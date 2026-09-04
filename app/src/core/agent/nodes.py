@@ -25,8 +25,10 @@ from src.core.agent.task_mapping import (
     compile_direct_plan,
     compile_supplemental_plan,
     derive_request_constraints,
+    derive_task_envelope,
     derive_turn_policy,
     evidence_mode_from_request,
+    enforce_task_envelope,
     historical_evidence_classes_for_request,
     materialize_turn_policy_target,
     task_spec_from_route,
@@ -49,7 +51,7 @@ from src.core.copilot.fallback_answer import build_evidence_fallback_answer
 from src.core.llm.errors import LLMError
 from src.core.llm.providers.base import LLMProviderResult, LLMStreamEvent
 from src.core.llm.token_estimator import TokenEstimator
-from src.core.memory.episodes import MemoryContextKey
+from src.core.memory.episodes import EntityVisit, MemoryContextKey
 from src.core.memory.store import extract_working_facts
 from src.core.memory.long_term import LongTermMemoryRecord
 from src.core.memory.routing_state import SessionRoutingState
@@ -99,16 +101,23 @@ class CopilotWorkflowNodes:
             state["message"], constraints, resolution, routing_state
         )
         resolution = materialize_turn_policy_target(resolution, turn_policy)
+        task_envelope = derive_task_envelope(
+            resolution, constraints, turn_policy, routing_state
+        )
         pending_facts = extract_working_facts(state["message"]) if constraints.memory_write else ()
         resolved_values = tuple(item.value for item in resolution.entities)
         pending_facts = tuple(
             replace(
                 fact,
-                scope="conversation" if fact.key == "analyst_name" else "entity",
-                entity_ids=() if fact.key == "analyst_name" else resolved_values,
+                scope=(
+                    "conversation"
+                    if fact.key == "analyst_name" or not resolved_values
+                    else "entity"
+                ),
+                entity_ids=() if fact.key == "analyst_name" or not resolved_values else resolved_values,
+                source_request_id=state["request_id"],
             )
             for fact in pending_facts
-            if fact.key == "analyst_name" or resolved_values
         )
         logger.info(
             "event=request_constraints_resolved request_id=%s allow_live=%s require_current=%s memory_only=%s memory_write=%s reason_count=%s",
@@ -144,6 +153,7 @@ class CopilotWorkflowNodes:
             "long_term_memory_selection": long_term_selection,
             "request_constraints": constraints,
             "turn_policy": turn_policy,
+            "task_envelope": task_envelope,
             "pending_working_facts": pending_facts,
             "next_edge": "route",
         }
@@ -167,6 +177,9 @@ class CopilotWorkflowNodes:
         constraints = state.get("request_constraints") or derive_request_constraints(state["message"])
         turn_policy = state.get("turn_policy") or derive_turn_policy(
             state["message"], constraints, entities, routing_state
+        )
+        task_envelope = state.get("task_envelope") or derive_task_envelope(
+            entities, constraints, turn_policy, routing_state
         )
         if not turn_policy.requires_domain_router:
             values = tuple(item.value for item in entities.entities)
@@ -283,6 +296,7 @@ class CopilotWorkflowNodes:
             )
         if SECURITY_ANALYSIS_WORDS.search(state["message"]) and "security_or_anomaly" not in route.matched_signals:
             route = replace(route, matched_signals=[*route.matched_signals, "security_or_anomaly"])
+        route = enforce_task_envelope(route, task_envelope)
         return {
             "routing_result": route,
             "resolved_entities": route_entities,
@@ -319,6 +333,7 @@ class CopilotWorkflowNodes:
                 state["message"].strip(),
                 state.get("request_constraints"),
                 state.get("turn_policy"),
+                state.get("task_envelope"),
             )
         except Exception as exc:
             return {
@@ -1189,7 +1204,24 @@ class CopilotWorkflowNodes:
             return "operational_evidence_truncated"
         if any(not item.source_payload_complete or not item.projection_usable for item in operational):
             return "operational_projection_unusable"
-        if any(not item.context_included for item in operational):
+        receipt_results = tuple(
+            item for item in operational if getattr(item, "evidence_receipt", None) is not None
+        )
+        if any(
+            receipt.status != "ok"
+            or receipt.completeness != "complete"
+            or receipt.truncated
+            or receipt.projection_truncated
+            or not receipt.source_payload_complete
+            or not receipt.projection_usable
+            for item in receipt_results
+            for receipt in (item.evidence_receipt,)
+        ):
+            return "operational_receipt_incomplete"
+        if any(
+            item.evidence_receipt is None and not item.context_included
+            for item in operational
+        ):
             return "operational_evidence_context_excluded"
         return ""
 
@@ -1266,10 +1298,17 @@ class CopilotWorkflowNodes:
         active_entities = previous.active_entities
         active_ip = previous.active_ip
         last_resolved = previous.last_resolved_entities
-        transition = getattr(state.get("turn_policy"), "episode_transition", "switch")
-        if transition == "detach":
-            # The episode transition is authoritative: a general turn must not
-            # leave the prior asset available to the next resolver invocation.
+        timeline = previous.entity_timeline
+        turn_policy = state.get("turn_policy")
+        transition = getattr(turn_policy, "episode_transition", "switch")
+        detached_without_target = (
+            transition == "detach"
+            and getattr(turn_policy, "operation", "") != "topic_detach"
+            and not (resolved.status == "resolved" and bool(resolved.entities))
+        )
+        if detached_without_target:
+            # A detached general turn with no explicit replacement clears the
+            # cursor so later resolution cannot inherit stale asset context.
             active_entities = ()
             active_ip = None
             last_resolved = ()
@@ -1292,6 +1331,20 @@ class CopilotWorkflowNodes:
             last_resolved = values
             active_entities = values
             active_ip = values[0] if len(values) == 1 else None
+            operation = getattr(state.get("turn_policy"), "operation", "new_task")
+            if operation not in {"memory_recall", "memory_write"} and (
+                not timeline or timeline[-1].ordered_entity_ids != values
+            ):
+                working = self.service.memory_store.repository.get_working(state["session_id"])
+                timeline = (
+                    *timeline,
+                    EntityVisit(
+                        sequence=(timeline[-1].sequence + 1) if timeline else 1,
+                        ordered_entity_ids=values,
+                        task_family=task.intent,
+                        episode_id=working.episode_id if working is not None else "",
+                    ),
+                )
         provider_names = tuple(
             dict.fromkeys(
                 item.provider or item.source_capability.split(".", 1)[0]
@@ -1304,12 +1357,12 @@ class CopilotWorkflowNodes:
             active_entities=active_entities,
             last_resolved_entities=last_resolved,
             previous_entity_count=(
-                0 if transition == "detach"
+                0 if detached_without_target
                 else len(resolved.entities) if can_update
                 else previous.previous_entity_count
             ),
             previous_entity_mode=(
-                "none" if transition == "detach"
+                "none" if detached_without_target
                 else resolved.entity_mode if can_update
                 else previous.previous_entity_mode
             ),
@@ -1325,6 +1378,7 @@ class CopilotWorkflowNodes:
             last_review_outcome=state["review_decision"].outcome,
             last_evidence_ids=tuple(item.step_id for item in results if item.step_id),
             last_capability_statuses=tuple(f"{item.source_capability}:{item.status}" for item in results),
+            entity_timeline=timeline,
         )
         if self.settings.chat_store_history:
             self.service.memory_store.compact_if_needed(
