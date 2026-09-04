@@ -274,6 +274,9 @@ def test_rendered_contract_uses_internal_term_hiding_and_historical_modules() ->
     assert "temporal.historical" in modules
     assert "memory.historical_memory_only" in modules
     assert "ordinary user-facing responses" in contract
+    assert "never claim" in contract.casefold()
+    assert "exhaustive" in contract.casefold()
+    assert "absence" in contract.casefold()
 
 
 def test_no_live_refresh_preserves_underlying_task_identity() -> None:
