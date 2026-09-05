@@ -296,6 +296,13 @@ class Settings:
     graph_stats_path: str
     graph_graphml_path: str
     graph_gexf_path: str
+    neo4j_uri: str
+    neo4j_user: str
+    neo4j_password: str
+    neo4j_database: str
+    neo4j_query_timeout_seconds: int
+    neo4j_sync_batch_size: int
+    neo4j_max_connection_pool_size: int
     graph_max_ui_nodes: int
     graph_default_min_degree: int
     graph_api_max_neighbors: int
@@ -752,6 +759,13 @@ def get_settings() -> Settings:
         graph_stats_path=os.getenv("SOORIN_GRAPH_STATS_PATH", "data/processed/topology_stats.json").strip(),
         graph_graphml_path=os.getenv("SOORIN_GRAPH_GRAPHML_PATH", "data/processed/topology_graph.graphml").strip(),
         graph_gexf_path=os.getenv("SOORIN_GRAPH_GEXF_PATH", "data/processed/topology_graph.gexf").strip(),
+        neo4j_uri=os.getenv("SOORIN_NEO4J_URI", "bolt://127.0.0.1:7687").strip(),
+        neo4j_user=os.getenv("SOORIN_NEO4J_USER", "neo4j").strip(),
+        neo4j_password=os.getenv("SOORIN_NEO4J_PASSWORD", "").strip(),
+        neo4j_database=os.getenv("SOORIN_NEO4J_DATABASE", "neo4j").strip(),
+        neo4j_query_timeout_seconds=max(1, _int("SOORIN_NEO4J_QUERY_TIMEOUT_SECONDS", 8)),
+        neo4j_sync_batch_size=max(1, _int("SOORIN_NEO4J_SYNC_BATCH_SIZE", 1000)),
+        neo4j_max_connection_pool_size=max(1, _int("SOORIN_NEO4J_MAX_CONNECTION_POOL_SIZE", 50)),
         graph_max_ui_nodes=_int("SOORIN_GRAPH_MAX_UI_NODES", 1000),
         graph_default_min_degree=_int("SOORIN_GRAPH_DEFAULT_MIN_DEGREE", 1),
         graph_api_max_neighbors=_int("SOORIN_GRAPH_API_MAX_NEIGHBORS", 1000),

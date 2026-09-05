@@ -18,6 +18,26 @@ x-common-service: &common-service
     - copilot-network
 
 services:
+  neo4j:
+    image: neo4j:2026.07.1-enterprise
+    container_name: soorin-copilot-neo4j
+    restart: "${SOORIN_RESTART_POLICY:-unless-stopped}"
+    environment:
+      NEO4J_AUTH: "${SOORIN_NEO4J_USER:-neo4j}/${SOORIN_NEO4J_PASSWORD:?SOORIN_NEO4J_PASSWORD is required}"
+      NEO4J_ACCEPT_LICENSE_AGREEMENT: "${SOORIN_NEO4J_ACCEPT_LICENSE_AGREEMENT:-no}"
+      NEO4J_db_format: block
+    volumes:
+      - neo4j-data:/data
+      - neo4j-logs:/logs
+    networks:
+      - copilot-network
+    healthcheck:
+      test: ["CMD-SHELL", "cypher-shell -u \"$${NEO4J_AUTH%%/*}\" -p \"$${NEO4J_AUTH#*/}\" 'RETURN 1' >/dev/null 2>&1"]
+      interval: 30s
+      timeout: 10s
+      start_period: 60s
+      retries: 6
+
   api:
     <<: *common-service
     container_name: soorin-copilot-api
@@ -29,6 +49,10 @@ services:
 
     env_file:
       - ./.env
+
+    depends_on:
+      neo4j:
+        condition: service_healthy
 
     environment:
       PYTHONPATH: /workspace/app
@@ -269,6 +293,8 @@ networks:
     driver: bridge
 
 volumes:
+  neo4j-data:
+  neo4j-logs:
   prometheus-data:
   loki-data:
   grafana-data:
