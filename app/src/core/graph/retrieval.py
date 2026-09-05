@@ -10,7 +10,7 @@ import networkx as nx
 from src.config.settings import Settings
 from src.core.context.models import GraphDirection, GraphScope, IntentName, RelationshipMode, ResolvedEntity
 from src.core.graph.loader import get_graph
-from src.core.graph.service import get_subnet
+from src.core.graph.subnet import get_subnet
 
 
 GRAPH_CONTEXT_LIMITATIONS = [

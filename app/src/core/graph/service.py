@@ -2,18 +2,15 @@
 
 from __future__ import annotations
 
-import ipaddress
 import logging
-from collections import Counter
 from dataclasses import dataclass
 from typing import Any
 
-import networkx as nx
-
 from src.config.settings import Settings, get_settings
-from src.core.graph.loader import get_cached_graph, get_graph, get_graph_metadata
 from src.core.graph.refresh import get_refresh_status
-from src.core.graph.storage import resolve_path
+from src.core.graph.neo4j import Neo4jDriver, Neo4jGraphRepository, Neo4jUnavailable
+from src.core.graph.retrieval import GraphRetrievalSpec
+from src.core.graph.subnet import get_subnet
 
 logger = logging.getLogger(__name__)
 
@@ -47,16 +44,21 @@ class GraphService:
 
     def __init__(self, settings: Settings | None = None) -> None:
         self.settings = settings or get_settings()
+        self.driver = Neo4jDriver(self.settings)
+        self.repository = Neo4jGraphRepository(self.driver, self.settings)
 
     def status(self) -> GraphStatus:
-        cached = get_cached_graph()
-        artifact_available = resolve_path(self.settings.graph_pickle_path).exists()
-        metadata = get_graph_metadata()
         refresh = get_refresh_status()
+        try:
+            projection = self.repository.status()
+        except Neo4jUnavailable:
+            projection = None
         common = {
-            "active_graph_loaded_at": metadata.get("active_graph_loaded_at") or refresh.get("active_graph_loaded_at"),
-            "active_graph_source": metadata.get("active_graph_source") or refresh.get("active_graph_source"),
-            "active_graph_version": metadata.get("active_graph_version") or refresh.get("active_graph_version"),
+            # Only the published Neo4j metadata may identify the active graph.
+            # Refresh state describes attempts; it must never advertise staging.
+            "active_graph_loaded_at": projection.last_successful_sync if projection else None,
+            "active_graph_source": "neo4j_projection" if projection and projection.active_graph_version else None,
+            "active_graph_version": projection.active_graph_version if projection else None,
             "refresh_enabled": bool(refresh.get("enabled", False)),
             "refresh_running": bool(refresh.get("running", False)),
             "refresh_interval_seconds": int(refresh.get("interval_seconds", 0) or 0),
@@ -66,47 +68,60 @@ class GraphService:
             "refresh_last_error_type": refresh.get("last_error_type"),
             "refresh_last_error_message": refresh.get("last_error_message"),
             "refresh_consecutive_failures": int(refresh.get("consecutive_failures", 0) or 0),
-            "raw_snapshot_path": refresh.get("raw_snapshot_path") or metadata.get("raw_snapshot_path"),
-            "processed_snapshot_path": refresh.get("processed_snapshot_path") or metadata.get("processed_snapshot_path"),
+            "raw_snapshot_path": refresh.get("raw_snapshot_path"),
+            "processed_snapshot_path": refresh.get("processed_snapshot_path"),
         }
-        if cached is None:
+        if projection is None or projection.active_graph_version is None:
             logger.info(
                 "event=graph_query type=status loaded=false artifact_available=%s",
-                artifact_available,
+                False,
             )
             return GraphStatus(
                 loaded=False,
                 nodes=0,
                 edges=0,
                 directed=True,
-                artifact_available=artifact_available,
+                artifact_available=False,
                 last_known_good=False,
                 **common,
             )
 
         logger.info(
             "event=graph_query type=status loaded=true nodes=%s edges=%s artifact_available=%s",
-            cached.number_of_nodes(),
-            cached.number_of_edges(),
-            artifact_available,
+            projection.nodes,
+            projection.edges,
+            False,
         )
         return GraphStatus(
             loaded=True,
-            nodes=cached.number_of_nodes(),
-            edges=cached.number_of_edges(),
-            directed=cached.is_directed(),
-            artifact_available=artifact_available,
+            nodes=projection.nodes,
+            edges=projection.edges,
+            directed=True,
+            artifact_available=False,
             last_known_good=True,
             **common,
         )
 
     def stats(self) -> dict[str, Any]:
-        return get_stats()
+        stats = self.repository.stats()
+        logger.info("event=graph_query type=stats nodes=%s edges=%s", stats["total_nodes"], stats["total_edges"])
+        return stats
+
+    def context(self, spec: GraphRetrievalSpec) -> dict[str, object]:
+        """Return normalized context with published-projection provenance."""
+        context = self.repository.get_context(spec)
+        projection = self.repository.status()
+        return {
+            **context,
+            "graph_provider": "neo4j_projection",
+            "active_graph_version": projection.active_graph_version,
+            "graph_last_successful_sync": projection.last_successful_sync,
+        }
 
     def node(self, ip: str) -> dict[str, Any]:
-        graph = get_graph()
         target_ip = ip.strip()
-        found = target_ip in graph
+        summary = self.repository.get_summary(target_ip)
+        found = bool(summary["found"])
         logger.info("event=graph_api_node target_ip=%s found=%s", target_ip, found)
         if not found:
             return {"ip": target_ip, "found": False, "degree": {"in": 0, "out": 0, "total": 0}}
@@ -114,69 +129,28 @@ class GraphService:
             "ip": target_ip,
             "found": True,
             "degree": {
-                "in": graph.in_degree(target_ip),
-                "out": graph.out_degree(target_ip),
-                "total": graph.degree(target_ip),
+                "in": summary["in_degree"],
+                "out": summary["out_degree"],
+                "total": summary["degree"],
             },
         }
 
     def neighbors(self, ip: str, *, direction: str = "both", limit: int = 20) -> dict[str, Any]:
-        graph = get_graph()
         target_ip = ip.strip()
         direction = direction.strip().lower()
-        limit = min(self.settings.graph_api_max_neighbors, max(1, int(limit)))
-
-        if target_ip not in graph:
-            logger.info("event=graph_api_neighbors target_ip=%s direction=%s found=false", target_ip, direction)
-            return {
-                "target_ip": target_ip,
-                "found": False,
-                "direction": direction,
-                "total": 0,
-                "returned": 0,
-                "neighbors": [],
-            }
-
-        records: list[dict[str, Any]] = []
-        if direction in {"out", "both"}:
-            records.extend(
-                {
-                    "ip": peer,
-                    "direction": "out",
-                    "edge_weight": int(graph[target_ip][peer].get("weight", 1)),
-                }
-                for peer in graph.successors(target_ip)
-            )
-        if direction in {"in", "both"}:
-            records.extend(
-                {
-                    "ip": peer,
-                    "direction": "in",
-                    "edge_weight": int(graph[peer][target_ip].get("weight", 1)),
-                }
-                for peer in graph.predecessors(target_ip)
-            )
-
-        records = sorted(records, key=lambda item: (-item["edge_weight"], item["ip"], item["direction"]))
-        returned = min(len(records), limit)
+        result = self.repository.get_neighbors(target_ip, direction, limit)
         logger.info(
             "event=graph_api_neighbors target_ip=%s direction=%s found=true result_count=%s returned=%s",
             target_ip,
             direction,
-            len(records),
-            returned,
+            result["total"],
+            result["returned"],
         )
         return {
-            "target_ip": target_ip,
-            "found": True,
-            "direction": direction,
-            "total": len(records),
-            "returned": returned,
-            "neighbors": records[:limit],
+            **result,
         }
 
     def path(self, source: str, target: str) -> dict[str, Any]:
-        graph = get_graph()
         source_ip = source.strip()
         target_ip = target.strip()
         logger.info("event=graph_api_path source_ip=%s target_ip=%s", source_ip, target_ip)
@@ -184,21 +158,43 @@ class GraphService:
 
         if source_ip == target_ip:
             return {"source": source_ip, "target": target_ip, "found": True, "path": [source_ip], "edge_count": 0, "semantics": semantics}
-        if source_ip not in graph:
-            return {"source": source_ip, "target": target_ip, "found": False, "path": [], "edge_count": 0, "reason": "source_not_found", "semantics": semantics}
-        if target_ip not in graph:
-            return {"source": source_ip, "target": target_ip, "found": False, "path": [], "edge_count": 0, "reason": "target_not_found", "semantics": semantics}
+        result = self.repository.find_path(source_ip, target_ip)
+        if not result["source_present"]:
+            result["reason"] = "source_not_found"
+        elif not result["target_present"]:
+            result["reason"] = "target_not_found"
+        elif not result["found"]:
+            result["reason"] = "no_observed_communication_graph_path"
+        return {**result, "semantics": semantics}
 
-        try:
-            path = nx.shortest_path(graph, source=source_ip, target=target_ip)
-        except nx.NetworkXNoPath:
-            return {"source": source_ip, "target": target_ip, "found": False, "path": [], "edge_count": 0, "reason": "no_observed_communication_graph_path", "semantics": semantics}
+    def relationship(self, source: str, target: str) -> dict[str, Any]:
+        return self.repository.get_relationship(source.strip(), target.strip())
 
-        return {"source": source_ip, "target": target_ip, "found": True, "path": path, "edge_count": len(path) - 1, "semantics": semantics}
+    def comparison(self, entity_a: str, entity_b: str) -> dict[str, Any]:
+        return self.repository.compare_assets(entity_a.strip(), entity_b.strip())
+
+    def topology(
+        self,
+        *,
+        max_nodes: int | None = None,
+        min_degree: int | None = None,
+        subnet: str = "",
+    ) -> dict[str, Any]:
+        requested_nodes = self.settings.graph_max_ui_nodes if max_nodes is None else max_nodes
+        requested_degree = self.settings.graph_default_min_degree if min_degree is None else min_degree
+        return self.repository.topology(
+            max_nodes=requested_nodes,
+            min_degree=requested_degree,
+            subnet=subnet.strip(),
+        )
 
 
 def get_stats() -> dict[str, Any]:
     """Get basic graph statistics."""
+    # Legacy Streamlit helper.  Task 2 moves these UI-only callers; the online
+    # GraphService above is Neo4j-only.
+    from collections import Counter
+    from src.core.graph.loader import get_graph
     G = get_graph()
     logger.info("event=graph_query type=stats nodes=%s edges=%s", G.number_of_nodes(), G.number_of_edges())
 
@@ -235,6 +231,7 @@ def get_stats() -> dict[str, Any]:
 
 def get_neighbors(ip: str, depth: int = 1) -> dict[str, Any]:
     """Get neighbors of an IP up to a certain depth."""
+    from src.core.graph.loader import get_graph
     G = get_graph()
     target_ip = ip.strip()
     logger.info("event=graph_query type=neighbors target_ip=%s", target_ip)
@@ -267,6 +264,9 @@ def get_path(src_ip: str, dst_ip: str, max_length: int = 5) -> dict[str, Any]:
 
     This does not prove actual packet routing or network-layer reachability.
     """
+    import networkx as nx
+    from src.core.graph.loader import get_graph
+
     G = get_graph()
     source = src_ip.strip()
     destination = dst_ip.strip()
@@ -309,6 +309,7 @@ def get_path(src_ip: str, dst_ip: str, max_length: int = 5) -> dict[str, Any]:
 
 def get_subnet_nodes(subnet_prefix: str) -> list[str]:
     """Get all nodes in a subnet."""
+    from src.core.graph.loader import get_graph
     G = get_graph()
     prefix = subnet_prefix.strip()
     return sorted(node for node in G.nodes() if node.startswith(prefix))
@@ -316,6 +317,7 @@ def get_subnet_nodes(subnet_prefix: str) -> list[str]:
 
 def get_node_list(page: int = 1, page_size: int = 50) -> dict[str, Any]:
     """Get paginated list of all nodes."""
+    from src.core.graph.loader import get_graph
     G = get_graph()
     all_nodes = sorted(G.nodes())
 
@@ -346,20 +348,10 @@ def get_node_list(page: int = 1, page_size: int = 50) -> dict[str, Any]:
         "nodes": node_data,
     }
 
-def get_subnet(ip: str) -> str:
-    """Return the IPv4 /24 subnet in canonical CIDR notation."""
-    try:
-        address = ipaddress.ip_address(ip)
-    except ValueError:
-        return "other"
-    if address.version == 4:
-        network = ipaddress.ip_network(f"{address}/24", strict=False)
-        return str(network)
-    return "other"
-
-
 def get_subnet_list() -> list[dict[str, Any]]:
     """Get list of subnets with node counts."""
+    from collections import Counter
+    from src.core.graph.loader import get_graph
     G = get_graph()
     subnet_counts = Counter(get_subnet(n) for n in G.nodes())
     logger.info("event=graph_query type=subnet_list subnets=%s", len(subnet_counts))

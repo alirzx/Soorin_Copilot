@@ -816,7 +816,7 @@ def get_settings() -> Settings:
         intent_router_min_confidence=_float("SOORIN_INTENT_ROUTER_MIN_CONFIDENCE", 0.65),
         intent_router_retry_enabled=_bool("SOORIN_INTENT_ROUTER_RETRY_ENABLED", True),
         graph_auto_refresh_enabled=_bool("SOORIN_GRAPH_AUTO_REFRESH_ENABLED", True),
-        graph_refresh_interval_seconds=max(600, _int("SOORIN_GRAPH_REFRESH_INTERVAL_SECONDS", 900)),
+        graph_refresh_interval_seconds=max(600, _int("SOORIN_GRAPH_REFRESH_INTERVAL_SECONDS", 3600)),
         graph_refresh_on_startup=_bool("SOORIN_GRAPH_REFRESH_ON_STARTUP", True),
         graph_refresh_startup_delay_seconds=_int("SOORIN_GRAPH_REFRESH_STARTUP_DELAY_SECONDS", 5),
         graph_refresh_jitter_seconds=_int("SOORIN_GRAPH_REFRESH_JITTER_SECONDS", 30),

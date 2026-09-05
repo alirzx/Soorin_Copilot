@@ -18,9 +18,11 @@ from src.core.graph.retrieval import (
     _apply_completeness_contract,
     _comparison_context,
     _empty_result,
+    _neighbor_context,
     _relationship_context,
     _two_hop_context,
 )
+from src.core.graph.subnet import get_subnet
 from src.core.product_client.schemas import TopologyConnectionRecord
 
 logger = logging.getLogger(__name__)
@@ -93,12 +95,15 @@ class _ProjectionAdjacency:
 
     def __init__(self, nodes: list[str], edges: list[dict[str, object]]) -> None:
         self._nodes = set(nodes)
+        self.nodes: dict[str, dict[str, object]] = {node: {} for node in self._nodes}
         self._outbound: dict[str, dict[str, int]] = {node: {} for node in self._nodes}
         self._inbound: dict[str, dict[str, int]] = {node: {} for node in self._nodes}
         for edge in edges:
             source, target = str(edge["source"]), str(edge["target"])
             weight = int(edge.get("weight") or 1)
             self._nodes.update((source, target))
+            self.nodes.setdefault(source, {})
+            self.nodes.setdefault(target, {})
             self._outbound.setdefault(source, {})[target] = weight
             self._inbound.setdefault(target, {})[source] = weight
             self._outbound.setdefault(target, {})
@@ -219,6 +224,57 @@ class Neo4jGraphRepository:
             return GraphProjectionStatus(None, 0, 0, None)
         return GraphProjectionStatus(record["version"], int(record["nodes"] or 0), int(record["edges"] or 0), record["last_successful_sync"])
 
+    def stats(self) -> dict[str, object]:
+        """Return active-projection aggregates without hydrating a graph object."""
+        query = """
+        MATCH (m:GraphMetadata {id: 'active'})
+        CALL (m) {
+          WITH m
+          MATCH (a:Asset {graph_version: m.active_graph_version})
+          RETURN count(a) AS total_nodes, collect(a.ip) AS ips
+        }
+        CALL (m) {
+          WITH m
+          MATCH ()-[r:COMMUNICATES_WITH {graph_version: m.active_graph_version}]->()
+          RETURN count(r) AS total_edges
+        }
+        CALL (m) {
+          WITH m
+          MATCH ()-[r:COMMUNICATES_WITH {graph_version: m.active_graph_version}]->(target:Asset {graph_version: m.active_graph_version})
+          WITH target.ip AS ip, count(r) AS incoming
+          ORDER BY incoming DESC, ip ASC LIMIT 10
+          RETURN collect({ip: ip, incoming: incoming}) AS top_destinations
+        }
+        CALL (m) {
+          WITH m
+          MATCH (source:Asset {graph_version: m.active_graph_version})-[r:COMMUNICATES_WITH {graph_version: m.active_graph_version}]->()
+          WITH source.ip AS ip, count(r) AS outgoing
+          ORDER BY outgoing DESC, ip ASC LIMIT 10
+          RETURN collect({ip: ip, outgoing: outgoing}) AS top_sources
+        }
+        RETURN total_nodes, total_edges, ips, top_destinations, top_sources
+        """
+        row = self._single(query)
+        if row is None:
+            return {
+                "total_nodes": 0, "total_edges": 0, "avg_degree": 0,
+                "top_destinations": [], "top_sources": [], "ip_range_distribution": {},
+            }
+        total_nodes = int(row["total_nodes"] or 0)
+        total_edges = int(row["total_edges"] or 0)
+        ranges: dict[str, int] = {}
+        for ip in row["ips"] or []:
+            label = self._ip_range(str(ip))
+            ranges[label] = ranges.get(label, 0) + 1
+        return {
+            "total_nodes": total_nodes,
+            "total_edges": total_edges,
+            "avg_degree": round((2 * total_edges) / total_nodes, 1) if total_nodes else 0,
+            "top_destinations": list(row["top_destinations"] or []),
+            "top_sources": list(row["top_sources"] or []),
+            "ip_range_distribution": ranges,
+        }
+
     def get_summary(self, ip: str) -> dict[str, object]:
         """Aggregate a single asset without enumerating peer identities."""
         query = """
@@ -301,8 +357,37 @@ class Neo4jGraphRepository:
             if spec.scope == "multi_entity_comparison" or spec.relationship_mode == "compare":
                 return _apply_completeness_contract(_comparison_context(graph, spec, self.settings), spec)
             return _apply_completeness_contract(_relationship_context(graph, spec), spec)
+        if spec.scope == "path":
+            source = spec.entities[0].value if spec.entities else ""
+            destination = spec.entities[1].value if len(spec.entities) > 1 else ""
+            path = self.find_path(source, destination, self.policy.max_hops)
+            base = _empty_result(spec, source, node_found=bool(path["source_present"] and path["target_present"]))
+            nodes = list(path["path"])
+            edges = [
+                {"source": nodes[index], "target": nodes[index + 1], "weight": 1}
+                for index in range(max(0, len(nodes) - 1))
+            ]
+            base.update({
+                "source_ip": source, "destination_ip": destination, "target_ips": [source, destination],
+                "source_present": path["source_present"], "target_present": path["target_present"],
+                "path_exists": path["found"], "path_found": path["found"], "path_nodes": nodes,
+                "path_edges": edges, "hop_count": path["edge_count"] if path["found"] else None,
+                "nodes": [{"id": node, "hop": index, "subnet": get_subnet(node), "inbound": False, "outbound": False, "bidirectional": False} for index, node in enumerate(nodes)],
+                "edges": edges, "candidate_node_count": len(nodes), "retrieved_node_count": len(nodes),
+                "returned_node_count": len(nodes), "candidate_edge_count": len(edges), "retrieved_edge_count": len(edges),
+                "returned_edge_count": len(edges), "node_found": bool(path["source_present"] and path["target_present"]),
+            })
+            return _apply_completeness_contract(base, spec)
         if spec.scope != "two_hop":
-            raise ValueError("Neo4j context parity currently supports two_hop and relationship scopes only.")
+            if spec.scope in {"node_summary", "one_hop", "full_neighbors"}:
+                found, nodes, edges = self._active_neighborhood(target, 1)
+                if not found:
+                    return _apply_completeness_contract(_empty_result(spec, target, node_found=False), spec)
+                return _apply_completeness_contract(
+                    _neighbor_context(_ProjectionAdjacency(nodes, edges), spec, self.settings),
+                    spec,
+                )
+            raise ValueError("Neo4j context parity currently supports graph neighbor and relationship scopes only.")
         found, nodes, edges = self._active_neighborhood(target, 2)
         if not found:
             return _apply_completeness_contract(_empty_result(spec, target, node_found=False), spec)
@@ -474,13 +559,31 @@ class Neo4jGraphRepository:
         WITH m, a, count(r) AS degree
         WHERE degree >= $min_degree AND ($subnet = '' OR a.ip STARTS WITH $subnet)
         ORDER BY degree DESC, a.ip ASC LIMIT $limit
-        WITH m, collect(a.ip) AS ips
+        WITH m, collect({ip: a.ip, degree: degree}) AS nodes, collect(a.ip) AS ips
         MATCH (source:Asset {graph_version: m.active_graph_version})-[r:COMMUNICATES_WITH {graph_version: m.active_graph_version}]->(target:Asset {graph_version: m.active_graph_version})
         WHERE source.ip IN ips AND target.ip IN ips
-        RETURN ips, collect({source: source.ip, target: target.ip, weight: r.weight})[0..$edge_limit] AS edges
+        RETURN nodes, collect({source: source.ip, target: target.ip, weight: r.weight})[0..$edge_limit] AS edges
         """
         row = self._single(query, limit=cap, edge_limit=self.policy.max_edges, min_degree=max(0, int(min_degree)), subnet=subnet)
-        return {"nodes": list(row["ips"] or []) if row else [], "edges": list(row["edges"] or []) if row else []}
+        return {
+            "nodes": list(row["nodes"] or []) if row else [],
+            "edges": list(row["edges"] or []) if row else [],
+            "max_nodes": cap,
+            "min_degree": max(0, int(min_degree)),
+            "subnet": subnet,
+        }
+
+    @staticmethod
+    def _ip_range(ip: str) -> str:
+        if ip.startswith("192.168."):
+            return "192.168.x.x"
+        if ip.startswith("10."):
+            return "10.x.x.x"
+        if any(ip.startswith(f"172.{number}.") for number in range(16, 32)):
+            return "172.16-31.x.x"
+        if ip.startswith("169.254."):
+            return "169.254.x.x"
+        return "Other"
 
     def _single(self, query: str, **params: object) -> Any:
         try:

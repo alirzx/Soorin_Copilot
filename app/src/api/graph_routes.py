@@ -17,9 +17,11 @@ from src.api.schemas.graph import (
     GraphPathResponse,
     GraphStatsResponse,
     GraphStatusResponse,
+    GraphTopologyResponse,
 )
 from src.config.settings import get_settings
-from src.core.graph.context import build_graph_context
+from src.core.context.models import ResolvedEntity
+from src.core.graph.retrieval import GraphRetrievalSpec
 from src.core.graph.service import GraphService
 
 
@@ -107,16 +109,33 @@ def graph_neighbors(
 @router.get("/nodes/{ip}/context", response_model=GraphContextResponse)
 def graph_context(
     ip: str,
+    service: GraphService = Depends(get_graph_service),
     _auth: None = Depends(verify_api_key),
 ) -> GraphContextResponse:
     target_ip = _validate_ip(ip)
-    result = build_graph_context(target_ip)
+    context = service.context(
+        GraphRetrievalSpec(
+            scope="node_summary",
+            direction="both",
+            depth=0,
+            entities=[ResolvedEntity(type="ip", value=target_ip, source="api")],
+        )
+    )
     logger.info(
         "event=graph_api_context target_ip=%s found=%s",
         target_ip,
-        result["node_found"],
+        context["node_found"],
     )
-    return GraphContextResponse(**result)
+    return GraphContextResponse(
+        target_ip=target_ip,
+        node_found=bool(context["node_found"]),
+        degree={"in": context["in_degree"], "out": context["out_degree"], "total": context["degree"]},
+        top_inbound_peers=list(context.get("top_inbound_peers") or []),
+        top_outbound_peers=list(context.get("top_outbound_peers") or []),
+        bidirectional_peers=list(context.get("bidirectional_peers") or []),
+        subnets_reached=list(context.get("subnets_reached") or []),
+        limitations=list(context.get("limitations") or []),
+    )
 
 
 @router.get("/path", response_model=GraphPathResponse)
@@ -137,3 +156,20 @@ def graph_path(
         result["edge_count"],
     )
     return GraphPathResponse(**result)
+
+
+@router.get("/topology", response_model=GraphTopologyResponse)
+def graph_topology(
+    max_nodes: int | None = Query(default=None, gt=0),
+    min_degree: int | None = Query(default=None, ge=0),
+    subnet: str = Query(default="", max_length=64),
+    service: GraphService = Depends(get_graph_service),
+    _auth: None = Depends(verify_api_key),
+) -> GraphTopologyResponse:
+    """Return a bounded active-projection topology for the future UI consumer."""
+    result = service.topology(max_nodes=max_nodes, min_degree=min_degree, subnet=subnet)
+    logger.info(
+        "event=graph_api_topology nodes=%s edges=%s max_nodes=%s min_degree=%s subnet=%s",
+        len(result["nodes"]), len(result["edges"]), result["max_nodes"], result["min_degree"], result["subnet"],
+    )
+    return GraphTopologyResponse(**result)

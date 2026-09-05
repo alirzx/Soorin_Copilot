@@ -594,7 +594,7 @@ Secrets such as API keys, passwords, Product tokens, captcha bypass values, and 
 
 ### `SOORIN_GRAPH_REFRESH_INTERVAL_SECONDS`
 
-`SOORIN_GRAPH_REFRESH_INTERVAL_SECONDS` sets the nominal interval between scheduled Graph refresh checks. Increasing it refreshes less frequently, reducing Product/load activity but allowing the topology snapshot to age longer; decreasing it improves snapshot freshness while increasing Product traffic, artifact writes, and refresh work.
+`SOORIN_GRAPH_REFRESH_INTERVAL_SECONDS` sets the nominal interval between scheduled Graph refresh checks. The default is 3600 seconds (one hour). Increasing it refreshes less frequently, reducing Product/load activity but allowing the topology projection to age longer; decreasing it improves snapshot freshness while increasing Product traffic and Neo4j sync work.
 
 ### `SOORIN_GRAPH_REFRESH_ON_STARTUP`
 

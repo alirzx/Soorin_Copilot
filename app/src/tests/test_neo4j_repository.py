@@ -72,3 +72,52 @@ def test_neighbors_are_sorted_and_bounded_by_query_policy() -> None:
     assert result["returned"] == 2 and result["truncated"] is True
     assert "ORDER BY item.edge_weight DESC, item.ip ASC, item.direction ASC" in query
     assert params["limit"] == 2 and params["direction"] == "both"
+
+
+def test_stats_are_active_projection_only_and_preserve_legacy_shape() -> None:
+    repository, driver = _repository({
+        "total_nodes": 4,
+        "total_edges": 3,
+        "ips": ["10.0.0.1", "192.168.1.4", "172.20.0.8", "198.51.100.1"],
+        "top_destinations": [{"ip": "10.0.0.1", "incoming": 2}],
+        "top_sources": [{"ip": "192.168.1.4", "outgoing": 2}],
+    })
+
+    result = repository.stats()
+    query, params = driver.session_value.calls[0]
+
+    assert params == {}
+    assert "GraphMetadata {id: 'active'}" in query
+    assert "graph_version: m.active_graph_version" in query
+    assert result == {
+        "total_nodes": 4,
+        "total_edges": 3,
+        "avg_degree": 1.5,
+        "top_destinations": [{"ip": "10.0.0.1", "incoming": 2}],
+        "top_sources": [{"ip": "192.168.1.4", "outgoing": 2}],
+        "ip_range_distribution": {
+            "10.x.x.x": 1,
+            "192.168.x.x": 1,
+            "172.16-31.x.x": 1,
+            "Other": 1,
+        },
+    }
+
+
+def test_topology_is_bounded_by_settings_and_query_policy() -> None:
+    repository, driver = _repository({
+        "nodes": [{"ip": "10.0.0.1", "degree": 2}],
+        "edges": [{"source": "10.0.0.1", "target": "10.0.0.2", "weight": 3}],
+    })
+
+    result = repository.topology(max_nodes=999_999, min_degree=-2, subnet="10.")
+    query, params = driver.session_value.calls[0]
+
+    assert "LIMIT $limit" in query
+    assert "[0..$edge_limit]" in query
+    assert params["limit"] == repository.settings.graph_max_ui_nodes
+    assert params["edge_limit"] == repository.policy.max_edges
+    assert params["min_degree"] == 0
+    assert params["subnet"] == "10."
+    assert result["nodes"] == [{"ip": "10.0.0.1", "degree": 2}]
+    assert result["max_nodes"] == repository.settings.graph_max_ui_nodes
