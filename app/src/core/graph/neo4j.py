@@ -13,6 +13,14 @@ from datetime import datetime, timezone
 from typing import Any, Iterator
 
 from src.config.settings import Settings
+from src.core.graph.retrieval import (
+    GraphRetrievalSpec,
+    _apply_completeness_contract,
+    _comparison_context,
+    _empty_result,
+    _relationship_context,
+    _two_hop_context,
+)
 from src.core.product_client.schemas import TopologyConnectionRecord
 
 logger = logging.getLogger(__name__)
@@ -73,6 +81,55 @@ class GraphQueryPolicy:
             comparison_shared_peer_limit=settings.graph_comparison_max_shared_peers,
             timeout_seconds=settings.neo4j_query_timeout_seconds,
         )
+
+
+class _ProjectionAdjacency:
+    """Minimal directed adjacency view hydrated from the active Neo4j projection.
+
+    It deliberately implements only the topology operations used by the legacy
+    bounded-context contract.  It is not a second graph store and keeps the
+    Community repository's shadow parity path independent of NetworkX.
+    """
+
+    def __init__(self, nodes: list[str], edges: list[dict[str, object]]) -> None:
+        self._nodes = set(nodes)
+        self._outbound: dict[str, dict[str, int]] = {node: {} for node in self._nodes}
+        self._inbound: dict[str, dict[str, int]] = {node: {} for node in self._nodes}
+        for edge in edges:
+            source, target = str(edge["source"]), str(edge["target"])
+            weight = int(edge.get("weight") or 1)
+            self._nodes.update((source, target))
+            self._outbound.setdefault(source, {})[target] = weight
+            self._inbound.setdefault(target, {})[source] = weight
+            self._outbound.setdefault(target, {})
+            self._inbound.setdefault(source, {})
+
+    def __contains__(self, node: object) -> bool:
+        return node in self._nodes
+
+    def predecessors(self, node: str):
+        return self._inbound.get(node, {}).keys()
+
+    def successors(self, node: str):
+        return self._outbound.get(node, {}).keys()
+
+    def degree(self, node: str) -> int:
+        return self.in_degree(node) + self.out_degree(node)
+
+    def in_degree(self, node: str) -> int:
+        return len(self._inbound.get(node, {}))
+
+    def out_degree(self, node: str) -> int:
+        return len(self._outbound.get(node, {}))
+
+    def has_edge(self, source: str, target: str) -> bool:
+        return target in self._outbound.get(source, {})
+
+    def edge_weight(self, source: str, target: str) -> int:
+        return self._outbound[source][target]
+
+    def __getitem__(self, source: str) -> dict[str, dict[str, int]]:
+        return {target: {"weight": weight} for target, weight in self._outbound[source].items()}
 
 
 class Neo4jDriver:
@@ -224,6 +281,59 @@ class Neo4jGraphRepository:
         return {"target_ip": ip, "found": found, "direction": normalized_direction,
                 "total": int(row["total"] or 0) if row else 0, "returned": len(rows), "neighbors": rows,
                 "truncated": bool(row and int(row["total"] or 0) > len(rows))}
+
+    def get_context(self, spec: GraphRetrievalSpec) -> dict[str, object]:
+        """Shadow-only exact context contract over the active Community projection.
+
+        Runtime callers remain on NetworkX until the dedicated cutover task.  A
+        two-hop projection is the narrowest data needed to reproduce the
+        established BFS, ordering, de-duplication, and limit semantics.
+        """
+        target = spec.entities[0].value if spec.entities else ""
+        if spec.intent == "graph_relationships" and len(spec.entities) == 2:
+            left, right = spec.entities[0].value, spec.entities[1].value
+            _, left_nodes, left_edges = self._active_neighborhood(left, 1)
+            _, right_nodes, right_edges = self._active_neighborhood(right, 1)
+            graph = _ProjectionAdjacency(
+                sorted(set(left_nodes).union(right_nodes)),
+                list({(edge["source"], edge["target"]): edge for edge in [*left_edges, *right_edges]}.values()),
+            )
+            if spec.scope == "multi_entity_comparison" or spec.relationship_mode == "compare":
+                return _apply_completeness_contract(_comparison_context(graph, spec, self.settings), spec)
+            return _apply_completeness_contract(_relationship_context(graph, spec), spec)
+        if spec.scope != "two_hop":
+            raise ValueError("Neo4j context parity currently supports two_hop and relationship scopes only.")
+        found, nodes, edges = self._active_neighborhood(target, 2)
+        if not found:
+            return _apply_completeness_contract(_empty_result(spec, target, node_found=False), spec)
+        graph = _ProjectionAdjacency(nodes, edges)
+        # The existing helper is duck-typed: it requires directed adjacency, not
+        # NetworkX. Reusing it protects every ordering and completeness detail
+        # until the dedicated runtime-cutover task makes Neo4j primary.
+        return _apply_completeness_contract(_two_hop_context(graph, spec, self.settings), spec)
+
+    def _active_neighborhood(self, target: str, hops: int) -> tuple[bool, list[str], list[dict[str, object]]]:
+        """Hydrate only the active undirected neighborhood needed for parity."""
+        query = """
+            MATCH (m:GraphMetadata {id: 'active'})
+            OPTIONAL MATCH (root:Asset {graph_version: m.active_graph_version, graph_key: $target})
+            CALL (root, m) {
+              WITH root, m WHERE root IS NOT NULL
+              MATCH path = (root)-[:COMMUNICATES_WITH*0..__MAX_HOPS__]-(candidate:Asset {graph_version: m.active_graph_version})
+              WITH collect(DISTINCT candidate) AS candidates
+              UNWIND candidates AS source
+              OPTIONAL MATCH (source)-[r:COMMUNICATES_WITH {graph_version: m.active_graph_version}]->(destination:Asset {graph_version: m.active_graph_version})
+              WHERE destination IN candidates
+              RETURN collect(DISTINCT source.ip) AS nodes,
+                     collect(DISTINCT {source: source.ip, target: destination.ip, weight: r.weight}) AS edges
+            }
+            RETURN root IS NOT NULL AS found, nodes, edges
+            """.replace("__MAX_HOPS__", str(hops))
+        row = self._single(query, target=target)
+        if not row or not row["found"]:
+            return False, [], []
+        edges = [edge for edge in list(row["edges"] or []) if edge.get("source") and edge.get("target")]
+        return True, list(row["nodes"] or []), edges
 
     def find_path(self, source: str, target: str, max_hops: int | None = None) -> dict[str, object]:
         hops = min(self.policy.max_hops, max(1, int(max_hops or self.policy.max_hops)))
