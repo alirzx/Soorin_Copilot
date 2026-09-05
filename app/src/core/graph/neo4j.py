@@ -18,10 +18,11 @@ from src.core.product_client.schemas import TopologyConnectionRecord
 logger = logging.getLogger(__name__)
 
 try:  # Keep configuration/import checks usable before the production image is rebuilt.
-    from neo4j import GraphDatabase
+    from neo4j import GraphDatabase, Query
     from neo4j.exceptions import Neo4jError, ServiceUnavailable
 except ImportError:  # pragma: no cover - exercised only in dependency-missing environments
     GraphDatabase = None  # type: ignore[assignment]
+    Query = None  # type: ignore[assignment]
     Neo4jError = Exception
     ServiceUnavailable = Exception
 
@@ -51,6 +52,8 @@ class GraphQueryPolicy:
     """The only place graph expansion limits are derived from Settings."""
     max_hops: int
     max_neighbors: int
+    one_hop_max_nodes: int
+    full_neighbors_hard_max: int
     max_nodes: int
     max_edges: int
     comparison_peer_limit: int
@@ -62,6 +65,8 @@ class GraphQueryPolicy:
         return cls(
             max_hops=settings.graph_max_path_length,
             max_neighbors=settings.graph_api_max_neighbors,
+            one_hop_max_nodes=settings.graph_one_hop_max_nodes,
+            full_neighbors_hard_max=settings.graph_full_neighbors_hard_max,
             max_nodes=settings.graph_two_hop_max_nodes,
             max_edges=settings.graph_max_edges,
             comparison_peer_limit=settings.graph_comparison_max_peers_per_entity,
@@ -152,7 +157,7 @@ class Neo4jGraphRepository:
                count(DISTINCT a) AS nodes, count(DISTINCT r) AS edges
         """
         with self.driver.session() as session:
-            record = session.run(query, timeout=self.settings.neo4j_query_timeout_seconds).single()
+            record = session.run(self._query(query),).single()
         if record is None:
             return GraphProjectionStatus(None, 0, 0, None)
         return GraphProjectionStatus(record["version"], int(record["nodes"] or 0), int(record["edges"] or 0), record["last_successful_sync"])
@@ -162,17 +167,17 @@ class Neo4jGraphRepository:
         query = """
         MATCH (m:GraphMetadata {id: 'active'})
         OPTIONAL MATCH (a:Asset {graph_version: m.active_graph_version, graph_key: $ip})
-        CALL {
+        CALL (a, m) {
           WITH a, m
           OPTIONAL MATCH (a)<-[incoming:COMMUNICATES_WITH {graph_version: m.active_graph_version}]-()
           RETURN count(incoming) AS inbound
         }
-        CALL {
+        CALL (a, m) {
           WITH a, m
           OPTIONAL MATCH (a)-[outgoing:COMMUNICATES_WITH {graph_version: m.active_graph_version}]->()
           RETURN count(outgoing) AS outbound
         }
-        CALL {
+        CALL (a, m) {
           WITH a, m
           OPTIONAL MATCH (a)-[:COMMUNICATES_WITH {graph_version: m.active_graph_version}]->(peer)
           WHERE EXISTS { MATCH (peer)-[:COMMUNICATES_WITH {graph_version: m.active_graph_version}]->(a) }
@@ -195,16 +200,16 @@ class Neo4jGraphRepository:
         query = """
         MATCH (m:GraphMetadata {id: 'active'})
         OPTIONAL MATCH (a:Asset {graph_version: m.active_graph_version, graph_key: $ip})
-        CALL {
-          WITH a, m, $direction AS direction
-          WITH a, m, direction WHERE a IS NOT NULL
+        CALL (a, m) {
+          WITH a, m
+          WITH a, m WHERE a IS NOT NULL
           MATCH (a)-[r:COMMUNICATES_WITH {graph_version: m.active_graph_version}]->(peer:Asset {graph_version: m.active_graph_version})
-          WHERE direction IN ['out', 'both']
+          WHERE $direction IN ['out', 'both']
           RETURN peer.ip AS ip, 'out' AS direction, r.weight AS edge_weight
           UNION ALL
-          WITH a, m, direction WHERE a IS NOT NULL
+          WITH a, m WHERE a IS NOT NULL
           MATCH (peer:Asset {graph_version: m.active_graph_version})-[r:COMMUNICATES_WITH {graph_version: m.active_graph_version}]->(a)
-          WHERE direction IN ['in', 'both']
+          WHERE $direction IN ['in', 'both']
           RETURN peer.ip AS ip, 'in' AS direction, r.weight AS edge_weight
         }
         WITH a, collect({ip: ip, direction: direction, edge_weight: edge_weight}) AS all_rows
@@ -222,24 +227,132 @@ class Neo4jGraphRepository:
 
     def find_path(self, source: str, target: str, max_hops: int | None = None) -> dict[str, object]:
         hops = min(self.policy.max_hops, max(1, int(max_hops or self.policy.max_hops)))
+        # Cypher does not parameterize variable-length pattern bounds. `hops` is
+        # a validated application policy value, never a user value.
         query = """
         MATCH (m:GraphMetadata {id: 'active'})
         OPTIONAL MATCH (source:Asset {graph_version: m.active_graph_version, graph_key: $source})
         OPTIONAL MATCH (target:Asset {graph_version: m.active_graph_version, graph_key: $target})
-        CALL {
+        CALL (source, target, m) {
           WITH source, target, m
           WITH source, target, m WHERE source IS NOT NULL AND target IS NOT NULL
-          MATCH path = shortestPath((source)-[:COMMUNICATES_WITH*..$max_hops]->(target))
+          MATCH path = shortestPath((source)-[:COMMUNICATES_WITH*1..__MAX_HOPS__]->(target))
           RETURN [node IN nodes(path) | node.ip] AS nodes
           ORDER BY size(nodes) ASC, nodes ASC LIMIT 1
         }
         RETURN source IS NOT NULL AS source_present, target IS NOT NULL AS target_present, nodes
-        """
-        row = self._single(query, source=source, target=target, max_hops=hops)
+        """.replace("__MAX_HOPS__", str(hops))
+        row = self._single(query, source=source, target=target)
         nodes = list(row["nodes"] or []) if row else []
         return {"source": source, "target": target, "source_present": bool(row and row["source_present"]),
                 "target_present": bool(row and row["target_present"]), "found": bool(nodes), "path": nodes,
                 "edge_count": max(0, len(nodes) - 1), "max_hops": hops}
+
+    def get_relationship(self, source: str, target: str) -> dict[str, object]:
+        """Exact directed direct-relationship result; staging versions are excluded."""
+        query = """
+        MATCH (m:GraphMetadata {id: 'active'})
+        OPTIONAL MATCH (source:Asset {graph_version: m.active_graph_version, graph_key: $source})
+        OPTIONAL MATCH (target:Asset {graph_version: m.active_graph_version, graph_key: $target})
+        RETURN source IS NOT NULL AS source_present, target IS NOT NULL AS target_present,
+          CASE WHEN source IS NULL OR target IS NULL THEN false
+               ELSE EXISTS { MATCH (source)-[:COMMUNICATES_WITH {graph_version: m.active_graph_version}]->(target) } END AS forward_edge,
+          CASE WHEN source IS NULL OR target IS NULL THEN false
+               ELSE EXISTS { MATCH (target)-[:COMMUNICATES_WITH {graph_version: m.active_graph_version}]->(source) } END AS reverse_edge
+        """
+        row = self._single(query, source=source, target=target)
+        source_present = bool(row and row["source_present"])
+        target_present = bool(row and row["target_present"])
+        forward, reverse = bool(row and row["forward_edge"]), bool(row and row["reverse_edge"])
+        if forward and reverse:
+            relationship = "bidirectional_direct_relationship"
+        elif forward:
+            relationship = "forward_direct_relationship"
+        elif reverse:
+            relationship = "reverse_direct_relationship"
+        elif source_present and target_present:
+            relationship = "no_direct_relationship"
+        else:
+            relationship = "entity_missing_from_active_graph"
+        return {"source": source, "target": target, "source_present": source_present,
+                "target_present": target_present, "forward_edge": forward, "reverse_edge": reverse,
+                "bidirectional": forward and reverse, "relationship": relationship,
+                "relationship_status": relationship}
+
+    def compare_assets(self, entity_a: str, entity_b: str) -> dict[str, object]:
+        """Bounded, deterministic parity record for the existing pair comparison."""
+        peer_cap, shared_cap = self.policy.comparison_peer_limit, self.policy.comparison_shared_peer_limit
+        query = """
+        MATCH (m:GraphMetadata {id: 'active'})
+        OPTIONAL MATCH (a:Asset {graph_version: m.active_graph_version, graph_key: $entity_a})
+        OPTIONAL MATCH (b:Asset {graph_version: m.active_graph_version, graph_key: $entity_b})
+        CALL {
+          WITH a, m
+          OPTIONAL MATCH (a)-[:COMMUNICATES_WITH {graph_version: m.active_graph_version}]-(peer:Asset {graph_version: m.active_graph_version})
+          RETURN count(DISTINCT peer) AS a_total
+        }
+        CALL {
+          WITH a, m
+          OPTIONAL MATCH (a)-[:COMMUNICATES_WITH {graph_version: m.active_graph_version}]-(peer:Asset {graph_version: m.active_graph_version})
+          WITH DISTINCT peer ORDER BY peer.ip ASC LIMIT $peer_cap
+          RETURN collect(peer.ip) AS a_peers
+        }
+        CALL {
+          WITH b, m
+          OPTIONAL MATCH (b)-[:COMMUNICATES_WITH {graph_version: m.active_graph_version}]-(peer:Asset {graph_version: m.active_graph_version})
+          RETURN count(DISTINCT peer) AS b_total
+        }
+        CALL {
+          WITH b, m
+          OPTIONAL MATCH (b)-[:COMMUNICATES_WITH {graph_version: m.active_graph_version}]-(peer:Asset {graph_version: m.active_graph_version})
+          WITH DISTINCT peer ORDER BY peer.ip ASC LIMIT $peer_cap
+          RETURN collect(peer.ip) AS b_peers
+        }
+        RETURN a IS NOT NULL AS a_present, b IS NOT NULL AS b_present, a_total, b_total, a_peers, b_peers
+        """
+        row = self._single(query, entity_a=entity_a, entity_b=entity_b, peer_cap=peer_cap)
+        a_peers = sorted(str(peer) for peer in (row["a_peers"] or []) if peer) if row else []
+        b_peers = sorted(str(peer) for peer in (row["b_peers"] or []) if peer) if row else []
+        shared = sorted(set(a_peers).intersection(b_peers))
+        relationship = self.get_relationship(entity_a, entity_b)
+        a_total = int(row["a_total"] or 0) if row else 0
+        b_total = int(row["b_total"] or 0) if row else 0
+        # Shared identities need one bounded query too; the first-cap peer lists
+        # are deliberately not treated as a complete overlap calculation.
+        shared_limited = self._shared_peers(entity_a, entity_b, shared_cap)
+        truncated = len(a_peers) < a_total or len(b_peers) < b_total
+        return {
+            "entities": [entity_a, entity_b], "node_found": bool(row and (row["a_present"] or row["b_present"])),
+            "entity_a": self._comparison_entity(entity_a, bool(row and row["a_present"]), a_total, a_peers),
+            "entity_b": self._comparison_entity(entity_b, bool(row and row["b_present"]), b_total, b_peers),
+            "direct_relationship": {"a_to_b": relationship["forward_edge"], "b_to_a": relationship["reverse_edge"],
+                                    "relationship": relationship["relationship"], "relationship_status": relationship["relationship_status"],
+                                    "bidirectional": relationship["bidirectional"]},
+            "shared_peer_total": len(shared), "shared_peers_retrieved": shared_limited,
+            "shared_peers_retrieved_count": len(shared_limited),
+            "entity_a_unique_peer_total": len(set(a_peers).difference(b_peers)),
+            "entity_b_unique_peer_total": len(set(b_peers).difference(a_peers)),
+            "retrieval_truncated": truncated,
+        }
+
+    @staticmethod
+    def _comparison_entity(ip: str, present: bool, total: int, peers: list[str]) -> dict[str, object]:
+        return {"ip": ip, "present": present, "total_peer_count": total,
+                "peers_retrieved": peers, "peer_retrieved_count": len(peers),
+                "retrieval_truncated": len(peers) < total}
+
+    def _shared_peers(self, entity_a: str, entity_b: str, limit: int) -> list[str]:
+        query = """
+        MATCH (m:GraphMetadata {id: 'active'})
+        MATCH (a:Asset {graph_version: m.active_graph_version, graph_key: $entity_a})-[:COMMUNICATES_WITH {graph_version: m.active_graph_version}]-(peer:Asset {graph_version: m.active_graph_version})
+        MATCH (b:Asset {graph_version: m.active_graph_version, graph_key: $entity_b})-[:COMMUNICATES_WITH {graph_version: m.active_graph_version}]-(peer)
+        RETURN DISTINCT peer.ip AS ip ORDER BY ip ASC LIMIT $limit
+        """
+        try:
+            with self.driver.session() as session:
+                return [str(record["ip"]) for record in session.run(self._query(query), entity_a=entity_a, entity_b=entity_b, limit=limit)]
+        except Exception as exc:
+            raise Neo4jUnavailable("Neo4j comparison overlap query failed.") from exc
 
     def topology(self, max_nodes: int, min_degree: int = 0, subnet: str = "") -> dict[str, object]:
         """Bounded UI projection; Streamlit never reads the database directly."""
@@ -262,7 +375,7 @@ class Neo4jGraphRepository:
     def _single(self, query: str, **params: object) -> Any:
         try:
             with self.driver.session() as session:
-                return session.run(query, **params, timeout=self.policy.timeout_seconds).single()
+                return session.run(self._query(query), **params).single()
         except Exception as exc:
             raise Neo4jUnavailable("Neo4j graph query failed.") from exc
 
@@ -302,7 +415,7 @@ class Neo4jGraphRepository:
         RETURN count(DISTINCT a) AS nodes, count(DISTINCT r) AS edges
         """
         with self.driver.session() as session:
-            record = session.run(query, version=version, timeout=self.settings.neo4j_query_timeout_seconds).single()
+            record = session.run(self._query(query), version=version).single()
         if record is None or int(record["nodes"] or 0) != expected_nodes or int(record["edges"] or 0) != expected_edges:
             raise GraphSyncValidationError("Neo4j staging projection failed count validation.")
 
@@ -330,6 +443,11 @@ class Neo4jGraphRepository:
                 continue
             weights[(source, target)] = weights.get((source, target), 0) + int(record.weight or 1)
         return [{"source": source, "target": target, "weight": weight} for (source, target), weight in sorted(weights.items())]
+
+    def _query(self, cypher: str) -> Any:
+        if Query is None:
+            return cypher
+        return Query(cypher, timeout=self.policy.timeout_seconds)
 
 
 def _utc_now() -> str:

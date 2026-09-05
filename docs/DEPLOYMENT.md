@@ -30,6 +30,19 @@ The original SOC corpus is external to normal runtime retrieval. It is used by
 the separate indexing maintenance flow and is not scanned during application
 import or startup.
 
+## Neo4j Projection Baseline
+
+The graph projection uses Neo4j Community Edition 2026.07.1 as a single
+instance with the persistent `neo4j-data` Docker volume. Community creates the
+supported record-aligned store format. Product remains the topology authority,
+so the projection can be rebuilt from a validated Product snapshot. Retain the
+volume as operational state and use host-level/offline volume snapshots for
+backup; this does not replace broader disaster-recovery planning.
+
+Enterprise licensing, clustering, online backup, and the `block` store format
+are not runtime requirements. They are optional future upgrade concerns, not
+deployment prerequisites for Copilot.
+
 ## Local Compose Workflow
 
 Keep host bindings on `127.0.0.1` unless LAN exposure is intentional. Validate
