@@ -5,6 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 import ipaddress
 
+from src.core.memory.episodes import EntityVisit
+
 
 def _valid_ipv4(value: str | None) -> str | None:
     if not value:
@@ -37,6 +39,7 @@ class SessionRoutingState:
     last_review_outcome: str | None = None
     last_evidence_ids: tuple[str, ...] = ()
     last_capability_statuses: tuple[str, ...] = ()
+    entity_timeline: tuple[EntityVisit, ...] = ()
 
     def __post_init__(self) -> None:
         active_entities = tuple(
@@ -53,6 +56,11 @@ class SessionRoutingState:
             active_ip = active_entities[0]
         object.__setattr__(self, "active_ip", active_ip)
         object.__setattr__(self, "active_entities", active_entities)
+        timeline = tuple(
+            item for item in self.entity_timeline
+            if isinstance(item, EntityVisit) and item.ordered_entity_ids
+        )[-24:]
+        object.__setattr__(self, "entity_timeline", timeline)
 
     @property
     def active_entity_count(self) -> int:

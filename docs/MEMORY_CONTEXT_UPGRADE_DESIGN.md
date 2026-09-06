@@ -44,7 +44,7 @@ POST /chat or /chat/stream
 ```
 
 Direct tasks skip the Planner. The Planner is a bounded proposal mechanism,
-not a tool loop. The registry currently wraps Profile, Detection, NetworkX
+not a tool loop. The registry currently wraps Profile, Detection, Neo4j-backed
 Graph, and `knowledge.search`.
 
 ### 2.2 Current contracts and authority
@@ -67,7 +67,7 @@ logic validates, normalizes, and safely falls back only when needed.
 | --- | --- | --- |
 | Asset Profile | Product API via shared client | point-in-time operational evidence |
 | Asset Detection | Product API via shared client | point-in-time operational evidence |
-| Graph | validated NetworkX last-known-good graph | observed topology snapshot |
+| Graph | validated last-known-good Neo4j Community projection | current observed topology evidence |
 | Knowledge | optional local/server Qdrant RAG | documentation only |
 
 `ToolResult` preserves status, entity binding, retrieval time, freshness,
@@ -641,6 +641,22 @@ Qdrant, and storage backend unless the user asks for architecture/debugging. It
 uses provenance-aware natural language instead. Router and Planner retain their
 separate prompts. The old `app/prompts/system_prompt.md` is intentionally retained
 as a tested rollback fallback; it is not the default Synth core.
+
+### 2026-09-02 continuity implementation note
+
+The implementation now treats a broad same-conversation recall as a bounded
+thread-recall selection, not as an ordinary active-entity request. It selects only
+within the existing relevant-turn, episode, and context-token budgets; this is not
+an unconditional transcript or episode dump. A normal current-asset request and a
+general DETACH request retain their existing scoped selection rules.
+
+The existing comparison authority also applies to a UI-selected current asset:
+when the request clearly refers to the previous/last asset, deterministic state
+materializes the current/previous pair before the semantic Router. Router success
+and fallback both preserve that pair. Explicit Working Fact name writes such as
+`remember, I'm …` remain typed conversation assertions, never Product evidence or
+automatic LTM promotion. These changes are covered by focused offline memory,
+routing, and LTM suites; no live Product or model validation is implied.
 
 ## Appendix A. Disposition of the removed OpenCode guide
 

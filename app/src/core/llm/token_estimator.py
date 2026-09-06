@@ -42,22 +42,22 @@ class TokenEstimator:
         return TokenEstimate(raw, int(math.ceil(raw * self.multiplier)), self.multiplier)
 
     @staticmethod
-    def output_reservation(detail: str, deployment_max_tokens: int) -> int:
-        requested = {"brief": 1536, "standard": 4096, "detailed": 6144, "deep": 6144, "report": 6144}.get(
-            detail,
-            4096,
-        )
+    def output_reservation(
+        detail: str,
+        deployment_max_tokens: int,
+        *,
+        brief_output_tokens: int,
+        standard_output_tokens: int,
+        deep_output_tokens: int,
+    ) -> int:
+        requested = {
+            "brief": brief_output_tokens,
+            "standard": standard_output_tokens,
+            "detailed": deep_output_tokens,
+            "deep": deep_output_tokens,
+            "report": deep_output_tokens,
+        }.get(detail, standard_output_tokens)
         return max(1, min(int(deployment_max_tokens), requested))
-
-    @staticmethod
-    def minimum_output_reservation(detail: str) -> int:
-        return {
-            "brief": 512,
-            "standard": 1024,
-            "detailed": 1536,
-            "deep": 1536,
-            "report": 1536,
-        }.get(detail, 1024)
 
     @staticmethod
     def window_budget(

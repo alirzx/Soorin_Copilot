@@ -26,12 +26,30 @@ class WorkingFact:
     scope: Literal["conversation", "entity"] = "conversation"
     entity_ids: tuple[str, ...] = ()
     created_at: str = field(default_factory=_now)
+    source_request_id: str = ""
 
     def __post_init__(self) -> None:
         if self.scope not in {"conversation", "entity"}:
             raise ValueError("Unsupported working fact scope")
         if self.scope == "entity" and not self.entity_ids:
             raise ValueError("Entity-scoped working facts require an entity binding")
+
+
+@dataclass(frozen=True)
+class EntityVisit:
+    """One bounded chronological investigation visit; never an active cursor."""
+
+    sequence: int
+    ordered_entity_ids: tuple[str, ...]
+    task_family: str
+    episode_id: str = ""
+    created_at: str = field(default_factory=_now)
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.sequence, int) or self.sequence < 1:
+            raise ValueError("Entity visit sequence must be positive")
+        if not 1 <= len(self.ordered_entity_ids) <= 2:
+            raise ValueError("Entity visits require one or two ordered entities")
 
 
 @dataclass(frozen=True)
@@ -128,11 +146,14 @@ class WorkingMemory:
 
 @dataclass(frozen=True)
 class TurnReference:
-    """Bounded metadata for one completed turn; transcript text stays in ChatRepository."""
+    """Bounded durable digest; the transcript remains authoritative when available."""
 
     request_id: str
     context_key: MemoryContextKey
     created_at: str = field(default_factory=_now)
+    user_digest: str = ""
+    assistant_digest: str = ""
+    workflow_status: str = "completed"
 
 
 @dataclass(frozen=True)
@@ -146,6 +167,7 @@ class RelevantTurn:
     created_at: str
     retrieval_reason: str
     estimated_tokens: int
+    source_representation: str = "raw"
 
 
 @dataclass(frozen=True)
@@ -157,9 +179,13 @@ class MemoryContextPackage:
     episode_summaries: tuple[EpisodeRecord, ...] = ()
     long_term_memories: tuple[RetrievedLongTermMemory, ...] = ()
     working_facts: tuple[WorkingFact, ...] = ()
+    entity_timeline: tuple[EntityVisit, ...] = ()
     active_entities: tuple[str, ...] = ()
     estimated_tokens: int = 0
     omitted: tuple[str, ...] = ()
+    thread_recall_requested: bool = False
+    thread_recall_complete: bool = False
+    sources_considered: tuple[str, ...] = ()
 
     def model_messages(self) -> list[dict[str, str]]:
         messages: list[dict[str, str]] = []
@@ -172,8 +198,8 @@ class MemoryContextPackage:
                 {
                     "role": "system",
                     "content": (
-                        "[SOORIN ANALYST/USER-PROVIDED WORKING FACTS]\n"
-                        "These are conversation assertions, not independently verified operational evidence.\n"
+                        "[SOORIN USER-PROVIDED WORKING FACTS — CONVERSATION-SCOPED]\n"
+                        "Authority: explicit user assertions only; not independently verified operational evidence.\n"
                     ) + "\n".join(
                         f"- scope={item.scope}; entities={','.join(item.entity_ids) or 'conversation'}; "
                         f"{item.key}: {item.value}"
@@ -185,18 +211,26 @@ class MemoryContextPackage:
             messages.append(
                 {
                     "role": "system",
-                    "content": f"[SOORIN CONVERSATION SUMMARY]\n{self.working_summary}",
+                    "content": (
+                        "[SOORIN CONVERSATION SUMMARY]\n"
+                        "Source: compact working summary — conversation-derived.\n"
+                        "Authority: bounded continuity summary; do not treat it as current verification.\n"
+                        f"Entity scope: {','.join(self.active_entities) or 'conversation/mixed'}.\n"
+                        f"{self.working_summary}"
+                    ),
                 }
             )
         if self.episode_summaries:
             summaries = "\n".join(
-                episode.compact_summary or "\n".join(
+                f"- entities={','.join(episode.context_key.entities) or 'conversation'}; "
+                f"source=episode_summary; temporal=historical; "
+                + (episode.compact_summary or " | ".join(
                     (
                         *(f"contradiction: {item}" for item in episode.contradictions),
                         *(f"finding: {item}" for item in episode.key_findings),
                         *(f"next_check: {item}" for item in episode.next_checks),
                     )
-                )
+                ))
                 for episode in self.episode_summaries
                 if (episode.compact_summary or episode.contradictions or episode.key_findings)
                 and (episode.compact_summary or "").strip().casefold() not in normalized_long_term
@@ -206,24 +240,61 @@ class MemoryContextPackage:
                     {
                         "role": "system",
                         "content": (
-                            "[SOORIN HISTORICAL EPISODIC SUMMARIES]\n"
-                            "These summaries are historical continuity, not fresh operational verification.\n"
+                            "[SOORIN EPISODIC INVESTIGATION HISTORY — CONVERSATION-DERIVED]\n"
+                            "Authority: historical continuity only, not fresh operational verification.\n"
                             f"{summaries}"
                         ),
                     }
                 )
+        if self.entity_timeline:
+            messages.append(
+                {
+                    "role": "system",
+                    "content": (
+                        "[SOORIN THREAD CHRONOLOGY — STRUCTURAL HISTORY]\n"
+                        "Source: ordered investigation visits; historical continuity only.\n"
+                        + "\n".join(
+                            f"- visit {item.sequence}: {', '.join(item.ordered_entity_ids)} "
+                            f"({item.task_family})"
+                            for item in self.entity_timeline
+                        )
+                    ),
+                }
+            )
         if self.long_term_memories:
             messages.append(
                 {
                     "role": "system",
                     "content": (
                         "[SOORIN VALIDATED LONG-TERM MEMORY]\n"
-                        "Current operational evidence overrides memory. Treat historical entries as context only.\n"
+                        "Source: Product-canonical durable memory. Authority: validated historical findings; "
+                        "current operational evidence overrides memory.\n"
                         + "\n".join(item.model_text() for item in self.long_term_memories)
                     ),
                 }
             )
+        if self.relevant_turns:
+            messages.append(
+                {
+                    "role": "system",
+                    "content": (
+                        "[SOORIN SHORT-TERM RECENT TURN CONTEXT]\n"
+                        "Authority: bounded conversation history. It may contain user assertions or prior assistant text, "
+                        "not independent current operational evidence. Entity bindings below are authoritative for attribution; "
+                        "do not transfer facts between entities or infer protocol, service, or relationship direction."
+                    ),
+                }
+            )
         for turn in self.relevant_turns:
+            messages.append({
+                "role": "system",
+                "content": (
+                    "[SOORIN RELEVANT TURN PROVENANCE]\n"
+                    f"request_id={turn.request_id}; entities={','.join(turn.context_key.entities) or 'conversation'}; "
+                    f"topic={turn.context_key.topic_family}; source={turn.source_representation}; temporal=historical; "
+                    "user text is analyst-supplied and assistant text is a prior conclusion, not fresh evidence."
+                ),
+            })
             messages.extend(
                 (
                     {"role": "user", "content": turn.user_content},

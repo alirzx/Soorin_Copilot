@@ -174,6 +174,9 @@ Do not require Graph merely because an asset is being investigated.
 
 ### Knowledge
 
+Knowledge is supplemental by default and never substitutes for operational evidence.
+Its availability does not decide whether synthesis may continue.
+
 Require Knowledge when the task materially requests approved reference information such as:
 
 - cybersecurity concepts;

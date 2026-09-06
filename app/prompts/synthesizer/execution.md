@@ -1,6 +1,6 @@
 # current_retrieval_completed
 
-Live retrieval actually occurred and usable current evidence was returned. Never state or imply that no live lookup occurred. Base current claims only on the current evidence actually supplied, and mention execution gaps only when material.
+Live retrieval actually occurred and usable current evidence was returned. Never claim that live retrieval was prohibited, or state or imply that no live lookup occurred. Base current claims only on the current evidence actually supplied, and mention execution gaps only when material.
 
 # current_retrieval_partial
 
@@ -20,4 +20,4 @@ No compatible deterministic baseline is available. Do not claim change, stabilit
 
 # working_memory_write
 
-Analyst-provided information was accepted into the current investigation context. Use it naturally when relevant and preserve it as analyst-provided unless independently verified. Do not expose persistence or memory-layer mechanics.
+Analyst-provided information was accepted into the current investigation context. Use it naturally when relevant and preserve it as analyst-provided unless independently verified. do not discuss long-term-memory availability, persistence, or memory-layer mechanics.

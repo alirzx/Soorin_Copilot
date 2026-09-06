@@ -18,6 +18,7 @@ from src.core.memory.baselines import (
     InvestigationBaseline,
 )
 from src.core.memory.episodes import (
+    EntityVisit,
     EpisodeRecord,
     MemoryContextKey,
     TurnReference,
@@ -34,6 +35,7 @@ MAX_THREAD_STATE_BYTES = 16_384
 MAX_CHAT_CONTENT_CHARS = 100_000
 MAX_CONVERSATION_TITLE_CHARS = 256
 MAX_CHAT_READ_LIMIT = 200
+MAX_ENTITY_TIMELINE_VISITS = 24
 
 
 def utc_now() -> str:
@@ -218,12 +220,12 @@ def _working_facts_from_payload(value: Any) -> tuple[WorkingFact, ...]:
         raise LocalPersistenceSchemaError("Invalid persisted working facts.")
     facts: list[WorkingFact] = []
     for item in value:
-        if not isinstance(item, dict) or set(item) - {"key", "value", "fact_type", "scope", "entity_ids", "created_at"}:
+        if not isinstance(item, dict) or set(item) - {"key", "value", "fact_type", "scope", "entity_ids", "created_at", "source_request_id"}:
             raise LocalPersistenceSchemaError("Invalid persisted working fact.")
         facts.append(
             WorkingFact(
                 key=_bounded_optional(item.get("key"), field_name="working fact key", maximum=64) or "",
-                value=_bounded_text(item.get("value"), maximum=300),
+                value=_bounded_text(item.get("value"), maximum=600),
                 fact_type=_bounded_optional(item.get("fact_type"), field_name="working fact type", maximum=64) or "user_provided",
                 scope=_bounded_optional(item.get("scope"), field_name="working fact scope", maximum=32) or "conversation",
                 entity_ids=_bounded_strings(
@@ -233,6 +235,11 @@ def _working_facts_from_payload(value: Any) -> tuple[WorkingFact, ...]:
                     maximum_chars=64,
                 ),
                 created_at=_bounded_text(item.get("created_at"), maximum=64),
+                source_request_id=_bounded_optional(
+                    item.get("source_request_id") or None,
+                    field_name="working fact source request id",
+                    maximum=128,
+                ) or "",
             )
         )
     return tuple(facts)
@@ -247,9 +254,60 @@ def _working_facts_payload(value: tuple[WorkingFact, ...]) -> list[dict[str, Any
             "scope": item.scope,
             "entity_ids": list(item.entity_ids),
             "created_at": item.created_at,
+            "source_request_id": item.source_request_id,
         }
         for item in value
     ]
+
+
+def _entity_visits_payload(value: tuple[EntityVisit, ...]) -> list[dict[str, Any]]:
+    return [
+        {
+            "sequence": item.sequence,
+            "ordered_entity_ids": list(item.ordered_entity_ids),
+            "task_family": item.task_family,
+            "episode_id": item.episode_id,
+            "created_at": item.created_at,
+        }
+        for item in value[-MAX_ENTITY_TIMELINE_VISITS:]
+    ]
+
+
+def _entity_visits_from_payload(value: Any) -> tuple[EntityVisit, ...]:
+    if not isinstance(value, list) or len(value) > MAX_ENTITY_TIMELINE_VISITS:
+        raise LocalPersistenceSchemaError("Invalid persisted entity timeline.")
+    visits: list[EntityVisit] = []
+    previous_sequence = 0
+    for item in value:
+        if not isinstance(item, dict) or set(item) - {
+            "sequence", "ordered_entity_ids", "task_family", "episode_id", "created_at"
+        }:
+            raise LocalPersistenceSchemaError("Invalid persisted entity visit.")
+        sequence = item.get("sequence")
+        if not isinstance(sequence, int) or sequence <= previous_sequence:
+            raise LocalPersistenceSchemaError("Invalid persisted entity visit sequence.")
+        entities = _ipv4_values(
+            item.get("ordered_entity_ids", []), field_name="entity visit entities"
+        )
+        if not entities:
+            raise LocalPersistenceSchemaError("Persisted entity visit requires an entity.")
+        visits.append(
+            EntityVisit(
+                sequence=sequence,
+                ordered_entity_ids=entities,
+                task_family=_bounded_optional(
+                    item.get("task_family"), field_name="entity visit task family", maximum=96
+                ) or "unknown",
+                episode_id=_bounded_optional(
+                    item.get("episode_id") or None,
+                    field_name="entity visit episode",
+                    maximum=64,
+                ) or "",
+                created_at=_bounded_text(item.get("created_at"), maximum=64),
+            )
+        )
+        previous_sequence = sequence
+    return tuple(visits)
 
 
 def _baseline_payload(value: InvestigationBaseline) -> dict[str, Any] | None:
@@ -378,13 +436,22 @@ def _turn_references_from_payload(value: Any) -> tuple[TurnReference, ...]:
         raise LocalPersistenceSchemaError("Invalid persisted recent turn references.")
     records: list[TurnReference] = []
     for item in value:
-        if not isinstance(item, dict):
+        if not isinstance(item, dict) or set(item) - {
+            "request_id", "context_key", "created_at", "user_digest", "assistant_digest", "workflow_status"
+        }:
             raise LocalPersistenceSchemaError("Invalid persisted recent turn reference.")
         records.append(
             TurnReference(
                 request_id=_bounded_optional(item.get("request_id"), field_name="request_id") or "",
                 context_key=_context_key_from_payload(item.get("context_key")),
                 created_at=_bounded_text(item.get("created_at"), maximum=64),
+                user_digest=_bounded_text(item.get("user_digest"), maximum=360),
+                assistant_digest=_bounded_text(item.get("assistant_digest"), maximum=560),
+                workflow_status=_bounded_optional(
+                    item.get("workflow_status") or None,
+                    field_name="turn workflow status",
+                    maximum=64,
+                ) or "completed",
             )
         )
     return tuple(records)
@@ -482,6 +549,7 @@ class ThreadMemoryState:
     working_memory: WorkingMemory | None = None
     recent_turn_references: tuple[TurnReference, ...] = ()
     recent_episodes: tuple[EpisodeRecord, ...] = ()
+    entity_timeline: tuple[EntityVisit, ...] = ()
     summary_updated_at: str = ""
     summary_source_request_id: str = ""
     summary_size_tokens: int = 0
@@ -499,6 +567,7 @@ class ThreadMemoryState:
         working_memory: WorkingMemory | None = None,
         recent_turn_references: tuple[TurnReference, ...] = (),
         recent_episodes: tuple[EpisodeRecord, ...] = (),
+        entity_timeline: tuple[EntityVisit, ...] | None = None,
         summary_updated_at: str = "",
         summary_source_request_id: str = "",
         summary_size_tokens: int = 0,
@@ -523,6 +592,9 @@ class ThreadMemoryState:
             working_memory=working_memory,
             recent_turn_references=recent_turn_references,
             recent_episodes=recent_episodes,
+            entity_timeline=(
+                state.entity_timeline if entity_timeline is None else entity_timeline
+            ),
             summary_updated_at=summary_updated_at,
             summary_source_request_id=summary_source_request_id,
             summary_size_tokens=summary_size_tokens,
@@ -544,6 +616,7 @@ class ThreadMemoryState:
             previous_depth=self.previous_depth,
             previous_requires_detection=self.previous_requires_detection,
             previous_requires_asset_profile=self.previous_requires_asset_profile,
+            entity_timeline=self.entity_timeline,
         )
 
     def to_payload(self) -> dict[str, Any]:
@@ -565,10 +638,14 @@ class ThreadMemoryState:
                     "request_id": item.request_id,
                     "context_key": _context_key_payload(item.context_key),
                     "created_at": item.created_at,
+                    "user_digest": item.user_digest,
+                    "assistant_digest": item.assistant_digest,
+                    "workflow_status": item.workflow_status,
                 }
                 for item in self.recent_turn_references
             ],
             "recent_episodes": [_episode_payload(item) for item in self.recent_episodes],
+            "entity_timeline": _entity_visits_payload(self.entity_timeline),
             "summary_updated_at": self.summary_updated_at,
             "summary_source_request_id": self.summary_source_request_id,
             "summary_size_tokens": self.summary_size_tokens,
@@ -639,6 +716,7 @@ class ThreadMemoryState:
             "working_memory",
             "recent_turn_references",
             "recent_episodes",
+            "entity_timeline",
             "summary_updated_at",
             "summary_source_request_id",
             "summary_size_tokens",
@@ -674,6 +752,7 @@ class ThreadMemoryState:
         episodes = _episodes_from_payload(
             payload.get("recent_episodes", []), session_id, normalized_owner
         )
+        timeline = _entity_visits_from_payload(payload.get("entity_timeline", []))
         summary_size = payload.get("summary_size_tokens", 0)
         if not isinstance(summary_size, int) or not 0 <= summary_size <= 16_384:
             raise LocalPersistenceSchemaError("Invalid persisted summary_size_tokens.")
@@ -729,6 +808,7 @@ class ThreadMemoryState:
             working_memory=working_memory,
             recent_turn_references=turn_references,
             recent_episodes=episodes,
+            entity_timeline=timeline,
             summary_updated_at=str(payload.get("summary_updated_at") or "")[:64],
             summary_source_request_id=str(payload.get("summary_source_request_id") or "")[:128],
             summary_size_tokens=summary_size,

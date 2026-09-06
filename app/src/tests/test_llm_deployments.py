@@ -48,6 +48,9 @@ BASE_ENV = {
     "SOORIN_SYNTHESIZER_API_KEY": "synth-secret",
     "SOORIN_SYNTHESIZER_TIMEOUT_SECONDS": "360",
     "SOORIN_SYNTHESIZER_MAX_TOKENS": "4096",
+    "SOORIN_SYNTHESIZER_BRIEF_OUTPUT_TOKENS": "1536",
+    "SOORIN_SYNTHESIZER_STANDARD_OUTPUT_TOKENS": "4096",
+    "SOORIN_SYNTHESIZER_DEEP_OUTPUT_TOKENS": "6144",
     "SOORIN_SYNTHESIZER_RETRY_MAX_TOKENS": "4096",
     "SOORIN_SYNTHESIZER_TEMPERATURE": "0.3",
     "SOORIN_SYNTHESIZER_TOP_P": "0.9",
@@ -112,6 +115,17 @@ class RoleConfigurationTests(unittest.TestCase):
         self.assertEqual(settings.role("router").endpoint, "https://r.example.invalid/v1/chat/completions")
         self.assertEqual(settings.role("planner").model, "planner-model")
         self.assertEqual(settings.role("synthesizer").api_key, "synth-key")
+
+    def test_synth_output_reservations_read_from_environment(self) -> None:
+        settings = isolated_settings(
+            SOORIN_SYNTHESIZER_BRIEF_OUTPUT_TOKENS="701",
+            SOORIN_SYNTHESIZER_STANDARD_OUTPUT_TOKENS="1701",
+            SOORIN_SYNTHESIZER_DEEP_OUTPUT_TOKENS="2701",
+        )
+
+        self.assertEqual(settings.synthesizer_brief_output_tokens, 701)
+        self.assertEqual(settings.synthesizer_standard_output_tokens, 1701)
+        self.assertEqual(settings.synthesizer_deep_output_tokens, 2701)
 
     def test_endpoint_normalization_is_shared(self) -> None:
         self.assertEqual(

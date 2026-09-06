@@ -58,8 +58,8 @@ RAG_MODEL_CACHE_KEY := models--$(subst /,--,$(RAG_MODEL))
 RAG_CONFIG_PATH := $(HF_CACHE_DIR)/hub/$(RAG_MODEL_CACHE_KEY)/snapshots/$(RAG_REVISION)/config.json
 
 .PHONY: \
-	help show-config preflight check-ports config test-local \
-	build build-no-cache up down restart logs ps health \
+	help show-config preflight preflight-image check-ports config test-local \
+	build build-no-cache deploy up down restart logs ps health \
 	inspect-image inspect-size export clean-export
 
 # ---------------------------------------------------------------------
@@ -68,7 +68,8 @@ RAG_CONFIG_PATH := $(HF_CACHE_DIR)/hub/$(RAG_MODEL_CACHE_KEY)/snapshots/$(RAG_RE
 
 help:
 	@echo "Available targets:"
-	@echo "  make preflight        Validate files, image, mounts, RAG data and permissions"
+	@echo "  make preflight        Validate deployment inputs, mounts and Compose configuration"
+	@echo "  make deploy           Preflight, build current source, then recreate API and UI only"
 	@echo "  make check-ports      Verify configured API and UI host ports are available"
 	@echo "  make config           Validate docker-compose.yaml with the unified .env"
 	@echo "  make show-config      Print non-secret resolved deployment values"
@@ -115,9 +116,6 @@ preflight:
 		(echo "Preflight failed: Docker Compose v2 is unavailable."; exit 1)
 	@test -x "$(PYTHON)" || command -v "$(PYTHON)" >/dev/null 2>&1 || \
 		(echo "Preflight failed: Python interpreter is unavailable: $(PYTHON)"; exit 1)
-	@docker image inspect "$(IMAGE)" >/dev/null 2>&1 || \
-		(echo "Preflight failed: image is not loaded: $(IMAGE)"; exit 1)
-
 	@test -d "$(DATA_DIR)" || \
 		(echo "Preflight failed: data directory does not exist: $(DATA_DIR)"; exit 1)
 	@test -d "$(HF_CACHE_DIR)" || \
@@ -134,9 +132,6 @@ preflight:
 required=sys.argv[1:]; missing=[p for p in required if not Path(p).is_file()]; \
 sys.exit("Preflight failed: missing runtime files: " + ", ".join(missing) if missing else 0)' \
 		"$(DATA_DIR)/qdrant-local/meta.json" \
-		"$(DATA_DIR)/processed/topology_graph.pkl" \
-		"$(DATA_DIR)/raw/topology_raw.json" \
-		"$(DATA_DIR)/processed/topology_stats.json" \
 		"$(RAG_CONFIG_PATH)"
 
 	@$(PYTHON) -c 'import json, sys; \
@@ -151,7 +146,12 @@ actual=int(config.get("hidden_size", 0)); \
 sys.exit(0 if actual == expected \
 else f"Preflight failed: cached embedding dimension is {actual}, expected {expected}.")' \
 		"$(RAG_CONFIG_PATH)" "$(RAG_DIMENSION)"
+	@$(COMPOSE) config --quiet
+	@echo "Preflight passed."
 
+preflight-image: preflight
+	@docker image inspect "$(IMAGE)" >/dev/null 2>&1 || \
+		(echo "Preflight failed: image is not loaded: $(IMAGE)"; exit 1)
 	@docker run --rm --entrypoint sh \
 		-v "$(DATA_DIR):/workspace/data" \
 		-v "$(HF_CACHE_DIR):/home/soorin/.cache/huggingface:ro" \
@@ -160,8 +160,7 @@ else f"Preflight failed: cached embedding dimension is {actual}, expected {expec
 		test -r "/home/soorin/.cache/huggingface/hub/$(RAG_MODEL_CACHE_KEY)/snapshots/$(RAG_REVISION)/config.json"' || \
 		(echo "Preflight failed: the image user cannot write data or read the model cache."; exit 1)
 
-	@$(COMPOSE) config --quiet
-	@echo "Preflight passed."
+	@echo "Image preflight passed."
 
 # Run before starting a stopped stack. Occupied ports are expected while it runs.
 check-ports:
@@ -219,7 +218,10 @@ build-no-cache:
 # Lifecycle
 # ---------------------------------------------------------------------
 
-up: preflight check-ports
+deploy: preflight build preflight-image
+	$(COMPOSE) up -d --no-build api ui
+
+up: preflight-image check-ports
 	$(COMPOSE) up -d --no-build --remove-orphans
 
 down:

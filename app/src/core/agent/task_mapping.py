@@ -12,6 +12,7 @@ from src.core.agent.contracts import (
     ExecutionPlan,
     PlanStep,
     RequestConstraints,
+    TaskEnvelope,
     TaskSpec,
     TurnPolicy,
 )
@@ -38,6 +39,7 @@ EXPLICIT_MEMORY_RECALL_REQUEST = re.compile(
     r"summari[sz]e\s+what\s+you\s+remember|continue\s+with\s+the\s+same\s+asset.*before\s+the\s+restart|"
     r"conversation\s+memory|episodic\s+memory|long[\s-]*term\s+memory|prior\s+investigations?|what(?:'s|\s+is)\s+my\s+name|"
     r"what\s+(?:do|did)\s+you\s+remember|what\s+you\s+(?:already\s+)?remember|do\s+you\s+remember|"
+    r"what\s+(?:did\s+)?i\s+ask(?:ed)?\s+you\s+to\s+remember|"
     r"what\s+did\s+(?:i|we)\s+(?:tell|say)|what\s+was\s+the\s+previous\s+contradiction|"
     r"from\s+(?:stored\s+(?:context|conversation\s+context)|our\s+previous\s+investigation)|"
     r"what\s+(?:investigation\s+)?state\s+(?:(?:did\s+)?you\s+)?retain(?:ed)?|"
@@ -66,7 +68,7 @@ NO_LIVE_EVIDENCE_REQUEST = re.compile(
     r"without\s+(?:performing\s+)?(?:any\s+)?live\s+(?:lookup|check|retrieval)|"
     r"without\s+checking\s+(?:any\s+)?current\s+(?:information|status|state|systems?)|"
     r"do\s+not\s+(?:retrieve|look\s+anything\s+up)\b|"
-    r"do\s+not\s+(?:use|call|retrieve|check|look\s+up)\s+(?:anything|any\s+)?(?:current\s+|live\s+)?(?:product|detection|graph|knowledge|evidence|providers?|refresh|systems?|status|state|data|lookup)?|"
+    r"do\s+not\s+(?:use|call|retrieve|check|look\s+up)\s+(?:anything|any\s+)?(?:current\s+|live\s+)?(?:product|detection|graph|knowledge|evidence|providers?|refresh|systems?|status|state|data|lookup|tools?)?|"
     r"don't\s+use\s+live|do\s+not\s+refresh|don't\s+refresh|no\s+live\s+(?:provider|evidence|refresh)|"
     r"without\s+(?:using\s+)?live\s+(?:sources?|data)|do\s+not\s+use\s+live\s+(?:sources?|data)|"
     r"use\s+only\s+memory|use\s+only\s+what\s+(?:you|we)\s+(?:already\s+)?(?:remember|discussed|concluded|knew)|using\s+only\s+stored\s+(?:conversation\s+)?context|memory\s+only|"
@@ -75,15 +77,16 @@ NO_LIVE_EVIDENCE_REQUEST = re.compile(
 )
 
 MEMORY_WRITE_REQUEST = re.compile(
-    r"\b(?:remember\s+that|note\s+that|keep\s+in\s+mind|for\s+this\s+investigation\s+remember)\b|"
+    r"\b(?:remember\s*(?:that\b|[,;:]\s*(?:i(?:'m|m|\s+am)|my\s+(?:analyst\s+)?name\s+is|call\s+me))|"
+    r"note\s+that|keep\s+in\s+mind|for\s+this\s+investigation\s+remember)\b|"
     r"\b(?:remember|keep|retain|store)\b.{0,160}\b(?:for\s+(?:this|the)\s+(?:conversation|investigation)|"
     r"in\s+(?:this|the)\s+(?:conversation|investigation)|my\s+name|tag|owner\s+validation|analyst\s+note|contradiction)\b",
     re.IGNORECASE,
 )
 
 CURRENT_EVIDENCE_REQUEST = re.compile(
-    r"\b(?:fresh|current|currently|now|right\s+now|still|verify\s+(?:now|again)|recheck|refresh|latest|"
-    r"live\s+(?:evidence|data|state))\b",
+    r"\b(?:fresh|current|currently|right\s+now|still|verify\s+(?:now|again)|recheck|refresh|latest|"
+    r"live\s+(?:evidence|data|state))\b|\bverify\b.{0,40}\b(?:now|again)\b",
     re.IGNORECASE,
 )
 
@@ -117,11 +120,112 @@ PREVIOUS_CURRENT_COMPARISON_REQUEST = re.compile(
 BROAD_CONVERSATION_RECALL_REQUEST = re.compile(
     r"\b(?:what\s+(?:do\s+you\s+)?(?:know|remember)|summari[sz]e|recall|tell\s+me)\b"
     r".{0,100}\b(?:our\s+chats?|our\s+conversations?|chat\s+history|conversation\s+history|"
-    r"everything\s+we(?:'ve|\s+have)?\s+discussed)\b",
+    r"(?:this|our)\s+conversation|(?:all\s+)?previous\s+investigations?|"
+    r"everything\s+we(?:'ve|\s+have)?\s+discussed)\b|"
+    r"\b(?:everything|all)\s+(?:you\s+)?(?:remember|established|from)\b.{0,100}"
+    r"\b(?:this|our)\s+conversation\b|"
+    r"\bwhat\s+(?:investigations?|analyses)\s+have\s+we\s+(?:done|performed)\b|"
+    r"\bwhat\s+did\s+we\s+talk\s+about(?:\s+earlier)?\b|"
+    r"\bsummari[sz]e\s+what\s+we\s+have\s+done\s+so\s+far\b",
+    re.IGNORECASE,
+)
+
+EXPLICIT_RECALL_ENTITY_SCOPE = re.compile(
+    r"\b(?:about|regarding|for)\s+(?:(?:this|that|the\s+selected)\s+"
+    r"(?:asset|host|node)|(?:\d{1,3}\.){3}\d{1,3})\b",
     re.IGNORECASE,
 )
 
 RecallClassification = Literal["none", "explicit_memory", "historical_summary"]
+
+
+def is_broad_conversation_recall(request: str) -> bool:
+    """Return true only for an explicit request to recall the whole thread."""
+    return bool(
+        BROAD_CONVERSATION_RECALL_REQUEST.search(request)
+        and not EXPLICIT_RECALL_ENTITY_SCOPE.search(request)
+    )
+
+
+def derive_task_envelope(
+    entities: EntityResolution,
+    constraints: RequestConstraints,
+    turn_policy: TurnPolicy,
+    routing_state: SessionRoutingState,
+) -> TaskEnvelope:
+    """Freeze deterministic task authority before any semantic router runs."""
+    resolved_entities = tuple(item.value for item in entities.entities)
+    # Let validation produce the established bounded clarification for an
+    # oversized request; do not turn it into an envelope-construction failure.
+    ordered_entities = resolved_entities if len(resolved_entities) <= 2 else ()
+    previous_pair_comparison = (
+        turn_policy.target == "active_pair"
+        and routing_state.previous_scope == "multi_entity_comparison"
+    )
+    comparison_required = (
+        len(ordered_entities) == 2
+        and (
+            turn_policy.operation == "compare_previous_current"
+            or entities.reference_type == "compare_with_reference"
+            or previous_pair_comparison
+        )
+    )
+    temporal_scope: TemporalMode = (
+        "historical"
+        if constraints.memory_only or not constraints.allow_live
+        else "compare_previous_current"
+        if turn_policy.operation == "compare_previous_current"
+        else "current"
+    )
+    task_family = (
+        "asset_comparison"
+        if comparison_required
+        else "memory_recall"
+        if turn_policy.operation == "memory_recall"
+        else "asset_investigation"
+        if resolved_entities
+        else "general"
+    )
+    return TaskEnvelope(
+        ordered_entities=ordered_entities,
+        reference_type=entities.reference_type or "none",
+        operation=turn_policy.operation,
+        temporal_scope=temporal_scope,
+        freshness_requirement=(
+            "current_required" if constraints.require_current else "historical_only"
+            if not constraints.allow_live else "current_when_available"
+        ),
+        allow_live=constraints.allow_live,
+        require_current=constraints.require_current,
+        comparison_required=comparison_required,
+        task_family=task_family,
+        reason_codes=tuple(dict.fromkeys((*constraints.reason_codes, *turn_policy.reason_codes))),
+    )
+
+
+def enforce_task_envelope(route: Any, envelope: TaskEnvelope | None) -> Any:
+    """Restore deterministic task authority after semantic/fallback routing."""
+    if envelope is None:
+        return route
+    updates: dict[str, Any] = {}
+    if envelope.ordered_entities:
+        updates.update(
+            materialized_entities=envelope.ordered_entities,
+            materialized_entity_count=len(envelope.ordered_entities),
+        )
+    if envelope.comparison_required:
+        updates.update(
+            use_graph=True,
+            intent="graph_relationships",
+            scope="multi_entity_comparison",
+            direction="both",
+            depth=1,
+            requires_multiple_entities=True,
+            relationship_mode="compare",
+            route_normalized=True,
+            route_normalization_reason="task_envelope_preserves_pair_comparison",
+        )
+    return replace(route, **updates) if updates else route
 
 
 def classify_historical_recall(request: str) -> RecallClassification:
@@ -150,7 +254,8 @@ def derive_request_constraints(request: str) -> RequestConstraints:
     """Resolve live-evidence and memory authority without an LLM."""
     no_live = bool(NO_LIVE_EVIDENCE_REQUEST.search(request))
     recall_classification = classify_historical_recall(request)
-    recall = recall_classification != "none"
+    broad_recall = is_broad_conversation_recall(request)
+    recall = recall_classification != "none" or broad_recall
     memory_write = bool(MEMORY_WRITE_REQUEST.search(request))
     require_current = bool(CURRENT_EVIDENCE_REQUEST.search(request)) and not no_live
     pure_memory_write = memory_write and not require_current and not re.search(
@@ -169,7 +274,11 @@ def derive_request_constraints(request: str) -> RequestConstraints:
     if no_live:
         reasons.append("explicit_no_live")
     if recall:
-        reasons.append(f"deterministic_memory_recall:{recall_classification}")
+        reasons.append(
+            "deterministic_memory_recall:thread"
+            if broad_recall
+            else f"deterministic_memory_recall:{recall_classification}"
+        )
     if memory_write:
         reasons.append("session_memory_write")
     if require_current:
@@ -194,6 +303,8 @@ def derive_turn_policy(
     active = tuple(routing_state.active_entities)
 
     def target_for(values: tuple[str, ...], entity_source: str) -> str:
+        if len(values) == 2:
+            return "active_pair"
         if entity_source == "message":
             return "explicit_entity"
         if entity_source == "ui":
@@ -213,20 +324,27 @@ def derive_turn_policy(
             reason_codes=("explicit_topic_detachment",),
         )
 
-    broad_recall = bool(BROAD_CONVERSATION_RECALL_REQUEST.search(request))
-    if constraints.memory_only or broad_recall:
-        values = resolved or active
-        explicit_switch = bool(
-            resolved
-            and source in {"message", "ui"}
-            and tuple(resolved) != tuple(active)
+    broad_recall = is_broad_conversation_recall(request)
+    if broad_recall:
+        return TurnPolicy(
+            operation="memory_write" if constraints.memory_write else "memory_recall",
+            target="conversation",
+            target_entities=(),
+            requires_domain_router=False,
+            episode_transition="keep",
+            operational_state_mutation_allowed=False,
+            reason_codes=("deterministic_conversation_memory_recall",),
         )
+
+    if constraints.memory_only or not constraints.allow_live:
+        values = resolved or active
         return TurnPolicy(
             operation="memory_write" if constraints.memory_write else "memory_recall",
             target=(target_for(values, source) if resolved else "conversation"),  # type: ignore[arg-type]
             target_entities=values,
             requires_domain_router=False,
-            episode_transition="switch" if explicit_switch else "keep",
+            episode_transition="keep",
+            operational_state_mutation_allowed=False,
             reason_codes=("deterministic_conversation_memory_recall",) if broad_recall else constraints.reason_codes,
         )
 
@@ -319,6 +437,7 @@ def task_spec_from_route(
     request: str,
     constraints: RequestConstraints | None = None,
     turn_policy: TurnPolicy | None = None,
+    task_envelope: TaskEnvelope | None = None,
 ) -> TaskSpec:
     request_lower = request.lower()
     constraints = constraints or derive_request_constraints(request)
@@ -326,7 +445,10 @@ def task_spec_from_route(
     if turn_policy is not None and turn_policy.operation == "memory_recall" and evidence_mode == "normal":
         evidence_mode = "no_live_refresh"
     allow_capabilities = constraints.allow_live
-    entities = tuple(dict.fromkeys(getattr(route, "materialized_entities", ()) or ()))
+    route = enforce_task_envelope(route, task_envelope)
+    entities = task_envelope.ordered_entities if task_envelope and task_envelope.ordered_entities else tuple(
+        dict.fromkeys(getattr(route, "materialized_entities", ()) or ())
+    )
     if getattr(route, "scope", "none") == "multi_entity_comparison" and len(entities) != 2:
         raise ValueError("comparison_requires_two_distinct_entities")
     required_capabilities: list[str] = []
@@ -374,7 +496,26 @@ def task_spec_from_route(
         and set(capabilities) <= {"asset.get_profile", "asset.get_detection"}
         and not MULTI_STEP_WORDING.search(request)
     )
-    multi_step = not focused_identity_verification and (
+    known_routine = bool(entities) and set(capabilities) <= {
+        "asset.get_profile",
+        "asset.get_detection",
+        "graph.get_summary",
+        "graph.get_neighbors",
+        "graph.compare_assets",
+        "graph.find_path",
+        "graph.get_relationship",
+        "knowledge.search",
+    }
+    routine_direct = known_routine and (
+        bool(
+            task_envelope
+            and task_envelope.comparison_required
+            and getattr(route, "decision_source", "") == "deterministic_fallback"
+        )
+        or not bool(task_envelope and task_envelope.comparison_required)
+        and not bool(MULTI_STEP_WORDING.search(request))
+    )
+    multi_step = not routine_direct and not focused_identity_verification and (
         len(capabilities) >= 3
         or "security_or_anomaly" in signals
         or bool(MULTI_STEP_WORDING.search(request))

@@ -8,7 +8,6 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-import networkx as nx
 import pytest
 
 from src.config.settings import get_settings
@@ -41,6 +40,7 @@ from src.core.context.models import (
 )
 from src.core.context.product_views import build_product_view
 from src.core.copilot.service import CopilotService
+from src.core.graph.neo4j import _ProjectionAdjacency
 from src.core.graph.retrieval import GraphRetrievalPolicy, GraphRetrievalSpec, retrieve_graph_context
 from src.core.llm.providers.base import LLMProviderResult
 from src.core.llm.token_estimator import TokenEstimator
@@ -112,17 +112,18 @@ def _graph_tool(capability: str, entities: tuple[str, ...], scope: str) -> ToolR
 
 
 def test_node_summary_is_aggregate_only_without_magic_peer_sample():
-    graph = nx.DiGraph()
-    graph.add_edges_from([(f"192.0.2.{index}", IP_A) for index in range(30, 60)])
-    graph.add_edges_from([(IP_A, f"198.51.100.{index}") for index in range(30, 60)])
+    graph = _ProjectionAdjacency(
+        [IP_A, *[f"192.0.2.{index}" for index in range(30, 60)], *[f"198.51.100.{index}" for index in range(30, 60)]],
+        [{"source": f"192.0.2.{index}", "target": IP_A} for index in range(30, 60)]
+        + [{"source": IP_A, "target": f"198.51.100.{index}"} for index in range(30, 60)],
+    )
     spec = GraphRetrievalSpec(
         scope="node_summary",
         direction="both",
         depth=0,
         entities=[ResolvedEntity("ip", IP_A, "message")],
     )
-    with patch("src.core.graph.retrieval.get_graph", return_value=graph):
-        result = retrieve_graph_context(spec, _settings())
+    result = retrieve_graph_context(graph, spec, _settings())
 
     assert result["inbound_total"] == 30
     assert result["outbound_total"] == 30

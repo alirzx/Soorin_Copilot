@@ -7,7 +7,8 @@ import time
 
 from src.config.settings import Settings
 from src.core.context.models import GraphProviderResult, ProviderProvenance, ResolvedEntity, RouteDecision, approx_tokens
-from src.core.graph.retrieval import GraphRetrievalSpec, retrieve_graph_context
+from src.core.graph.retrieval import GraphRetrievalSpec
+from src.core.graph.service import GraphService
 
 
 logger = logging.getLogger(__name__)
@@ -18,6 +19,7 @@ class GraphContextProvider:
 
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
+        self.graph_service = GraphService(settings)
 
     def provide(
         self,
@@ -45,7 +47,7 @@ class GraphContextProvider:
         provenance = ProviderProvenance(source="observed_communication_graph", status="unavailable")
 
         try:
-            context = retrieve_graph_context(
+            context = self.graph_service.context(
                 GraphRetrievalSpec(
                     scope=scope,
                     direction=direction,
@@ -55,7 +57,6 @@ class GraphContextProvider:
                     relationship_mode=route.relationship_mode if route else "none",
                     exhaustive_connections_requested=route.exhaustive_connections_requested if route else False,
                 ),
-                self.settings,
             )
         except FileNotFoundError:
             latency_ms = int((time.perf_counter() - started) * 1000)

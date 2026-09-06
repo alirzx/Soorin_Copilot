@@ -370,11 +370,23 @@ Secrets such as API keys, passwords, Product tokens, captcha bypass values, and 
 
 ### `SOORIN_SYNTHESIZER_MAX_TOKENS`
 
-`SOORIN_SYNTHESIZER_MAX_TOKENS` is the upper completion budget exposed to normal final synthesis. The context-budgeting layer may select a smaller output reservation for brief or standard responses, so this is an upper role limit rather than a guarantee that every request can emit that many tokens. Larger values support longer reports at greater latency/cost and less potential context headroom.
+`SOORIN_SYNTHESIZER_MAX_TOKENS` is the absolute completion ceiling for normal final synthesis. The normal request budget is selected from the detail-level output reservation below and cannot exceed this role ceiling. Larger values support longer reports at greater latency/cost and less potential context headroom.
+
+### `SOORIN_SYNTHESIZER_BRIEF_OUTPUT_TOKENS`
+
+`SOORIN_SYNTHESIZER_BRIEF_OUTPUT_TOKENS` is the normal requested output reservation for brief Synthesizer responses. It defaults to `1536`, remains capped by `SOORIN_SYNTHESIZER_MAX_TOKENS`, and is checked by the configured model-context guard.
+
+### `SOORIN_SYNTHESIZER_STANDARD_OUTPUT_TOKENS`
+
+`SOORIN_SYNTHESIZER_STANDARD_OUTPUT_TOKENS` is the normal requested output reservation for standard Synthesizer responses. It defaults to `4096`, remains capped by `SOORIN_SYNTHESIZER_MAX_TOKENS`, and is checked by the configured model-context guard.
+
+### `SOORIN_SYNTHESIZER_DEEP_OUTPUT_TOKENS`
+
+`SOORIN_SYNTHESIZER_DEEP_OUTPUT_TOKENS` is the normal requested output reservation for deep and report Synthesizer responses. It defaults to `6144`, remains capped by `SOORIN_SYNTHESIZER_MAX_TOKENS`, and is checked by the configured model-context guard.
 
 ### `SOORIN_SYNTHESIZER_RETRY_MAX_TOKENS`
 
-`SOORIN_SYNTHESIZER_RETRY_MAX_TOKENS` defines the completion budget used for an eligible retried final synthesis request. It should normally be at least large enough for the intended answer detail, but increasing it does not expand the model context window and can increase worst-case retry cost.
+`SOORIN_SYNTHESIZER_RETRY_MAX_TOKENS` is the completion ceiling for the one eligible final-synthesis recovery attempt. Recovery uses this setting instead of the normal detail-level reservation, while still being reduced when the recovery prompt would otherwise exceed the configured model context window. Increasing it does not expand the model context window and can increase worst-case recovery cost.
 
 ### `SOORIN_SYNTHESIZER_TEMPERATURE`
 
@@ -402,7 +414,7 @@ Secrets such as API keys, passwords, Product tokens, captcha bypass values, and 
 
 ### `SOORIN_PRODUCT_TOPOLOGY_PATH`
 
-`SOORIN_PRODUCT_TOPOLOGY_PATH` is the HTTP endpoint path appended to the Product base URL to retrieve unique network-connection IP pairs used for Graph refresh. It is an API route, not a filesystem path. Changing it changes the source contract for the NetworkX topology and must match the Product backend endpoint schema.
+`SOORIN_PRODUCT_TOPOLOGY_PATH` is the HTTP endpoint path appended to the Product base URL to retrieve unique network-connection IP pairs used for Graph refresh. It is an API route, not a filesystem path. Changing it changes the source contract for the versioned Neo4j projection and must match the Product backend endpoint schema.
 
 ### `SOORIN_PRODUCT_ASSET_DETECTION_PATH`
 
@@ -498,23 +510,7 @@ Secrets such as API keys, passwords, Product tokens, captcha bypass values, and 
 
 ### `SOORIN_GRAPH_RAW_PATH`
 
-`SOORIN_GRAPH_RAW_PATH` is the filesystem path where the latest raw topology payload is stored during Graph refresh. It normally lives under the persistent data tree; changing it changes artifact location, not graph semantics. The API process requires write access when refresh is enabled.
-
-### `SOORIN_GRAPH_PICKLE_PATH`
-
-`SOORIN_GRAPH_PICKLE_PATH` identifies the serialized NetworkX pickle used as the last-known-good Graph artifact and loaded at API startup. Changing the path changes which persisted graph is loaded and where refreshed graph state is written. A missing artifact does not create topology truth; startup/refresh availability rules determine the safe resulting state.
-
-### `SOORIN_GRAPH_STATS_PATH`
-
-`SOORIN_GRAPH_STATS_PATH` is the filesystem location for generated Graph statistics metadata associated with the processed topology artifact. It is operational data rather than model context itself and should live in the persistent data area.
-
-### `SOORIN_GRAPH_GRAPHML_PATH`
-
-`SOORIN_GRAPH_GRAPHML_PATH` sets the optional GraphML export destination. The file is generated only when optional graph exports are enabled; changing the path affects export storage only and does not change the active in-memory Graph.
-
-### `SOORIN_GRAPH_GEXF_PATH`
-
-`SOORIN_GRAPH_GEXF_PATH` sets the optional GEXF export destination used when optional graph exports are enabled. It exists for external visualization/analysis compatibility and does not affect retrieval or model context when exports are disabled.
+`SOORIN_GRAPH_RAW_PATH` is the filesystem path for retained raw Product topology payloads. These JSON snapshots support audit and debugging only; the active graph and all graph evidence are published from Neo4j.
 
 ### `SOORIN_GRAPH_MAX_UI_NODES`
 
@@ -582,7 +578,7 @@ Secrets such as API keys, passwords, Product tokens, captcha bypass values, and 
 
 ### `SOORIN_GRAPH_REFRESH_INTERVAL_SECONDS`
 
-`SOORIN_GRAPH_REFRESH_INTERVAL_SECONDS` sets the nominal interval between scheduled Graph refresh checks. Increasing it refreshes less frequently, reducing Product/load activity but allowing the topology snapshot to age longer; decreasing it improves snapshot freshness while increasing Product traffic, artifact writes, and refresh work.
+`SOORIN_GRAPH_REFRESH_INTERVAL_SECONDS` sets the nominal interval between scheduled Graph refresh checks. The default is 3600 seconds (one hour). Increasing it refreshes less frequently, reducing Product/load activity but allowing the topology projection to age longer; decreasing it improves snapshot freshness while increasing Product traffic and Neo4j sync work.
 
 ### `SOORIN_GRAPH_REFRESH_ON_STARTUP`
 
@@ -602,19 +598,12 @@ Secrets such as API keys, passwords, Product tokens, captcha bypass values, and 
 
 ### `SOORIN_GRAPH_REFRESH_KEEP_RAW_SNAPSHOTS`
 
-`SOORIN_GRAPH_REFRESH_KEEP_RAW_SNAPSHOTS` sets how many historical raw topology snapshots are retained by count during refresh cleanup. Increasing it provides more rollback/audit history at higher disk cost; decreasing it keeps storage smaller and removes older raw snapshots sooner.
-
-### `SOORIN_GRAPH_REFRESH_KEEP_PROCESSED_SNAPSHOTS`
-
-`SOORIN_GRAPH_REFRESH_KEEP_PROCESSED_SNAPSHOTS` sets how many processed Graph snapshots are retained by count. Larger values preserve more previous graph artifacts for investigation/recovery while consuming additional storage; smaller values prune historical processed artifacts more aggressively.
+`SOORIN_GRAPH_REFRESH_KEEP_RAW_SNAPSHOTS` sets how many historical raw Product snapshots are retained by count during refresh cleanup. This retains source evidence for audit and debugging, never an active graph fallback.
 
 ### `SOORIN_GRAPH_SNAPSHOT_TTL_HOURS`
 
 `SOORIN_GRAPH_SNAPSHOT_TTL_HOURS` controls age-based Graph snapshot cleanup. A positive value removes retained snapshots older than the configured number of hours in addition to count-based retention; `0` disables TTL-based cleanup according to the current configuration contract. Larger values retain history longer and use more disk.
 
-### `SOORIN_GRAPH_OPTIONAL_EXPORTS_ENABLED`
-
-`SOORIN_GRAPH_OPTIONAL_EXPORTS_ENABLED` controls GraphML/GEXF generation during topology processing. `true` writes the configured optional export formats, increasing I/O and disk use; `false` keeps production refresh focused on the required pickle/stats artifacts and avoids unnecessary export overhead.
 
 ### `SOORIN_GRAPH_REFRESH_LOCK_TIMEOUT_SECONDS`
 

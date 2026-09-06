@@ -35,6 +35,12 @@ class SynthesizerMemoryState:
     ltm_active_count: int = 0
     ltm_selected_count: int = 0
     historical_only: bool = False
+    thread_recall_requested: bool = False
+    thread_recall_complete: bool = False
+    sources_considered: tuple[str, ...] = ()
+    sources_omitted: tuple[str, ...] = ()
+    memory_context_truncated: bool = False
+    inventory_available: bool | None = None
     compatible_previous_baseline_available: bool = False
     baseline_status: str = "absent"
     baseline_present: bool = False
@@ -218,6 +224,12 @@ class SynthesizerPromptBuilder:
             ltm_active_count=int(getattr(long_term_selection, "active_record_count", 0) or 0),
             ltm_selected_count=selected_count,
             historical_only=task.evidence_mode == "memory_only",
+            thread_recall_requested=bool(getattr(memory_package, "thread_recall_requested", False)),
+            thread_recall_complete=bool(getattr(memory_package, "thread_recall_complete", False)),
+            sources_considered=tuple(getattr(memory_package, "sources_considered", ()) or ()),
+            sources_omitted=tuple(getattr(memory_package, "omitted", ()) or ()),
+            memory_context_truncated=bool(getattr(memory_package, "omitted", ()) or ()),
+            inventory_available=getattr(long_term_selection, "inventory_available", None),
             compatible_previous_baseline_available=baseline_compatible,
             baseline_status=baseline_status,
             baseline_present=baseline_present,
@@ -280,7 +292,7 @@ class SynthesizerPromptBuilder:
             current_vs_historical_relationship=(
                 "compatible_deterministic_delta_supplied"
                 if delta_contexts
-                else f"baseline_{baseline_status}_delta_unavailable"
+                else "compatible_baseline_unavailable"
             ),
             deterministic_delta_available=bool(delta_contexts),
             selected_analytical_lenses=self._analytical_lenses(task),

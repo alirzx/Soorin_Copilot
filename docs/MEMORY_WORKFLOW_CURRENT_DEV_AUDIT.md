@@ -12,6 +12,42 @@
 
 **Runtime evidence:** no services, models, Product endpoints, Qdrant operations, graph refresh, or UI were run
 
+> **2026-09-04 continuity/routing/evidence simplification update:** The prior
+> observations below remain historical audit evidence. The current `dev`
+> working tree has a source- and fixture-tested resolution for the identified
+> T2/T3/T4/T5/T1 concerns, without invoking an additional memory, extraction,
+> summary, or agent model call. This update was offline only.
+>
+> - `ThreadMemoryState` now persists a bounded chronological entity-visit
+>   timeline (including revisits) and bounded per-turn digests; resolver ordinal
+>   references use that structural timeline, never summary prose.
+> - Explicit memory commands preserve exact bounded generic statements alongside
+>   recognized typed facts, with request provenance and conversation/entity
+>   scope. They remain user-provided assertions, not operational evidence.
+> - The immutable deterministic `TaskEnvelope` carries ordered entities,
+>   comparison requirement, temporal/freshness authority, and live constraints
+>   across semantic routing, deterministic fallback, TaskSpec construction, and
+>   direct planning. Pair comparison fallback now remains
+>   `multi_entity_comparison` and compiles `graph.compare_assets`.
+> - Product and Graph capability results carry immutable acquisition receipts.
+>   Baseline capture reads the receipt/projection boundary; composer mutation or
+>   model-context exclusion cannot corrupt acquisition facts. Full Product views
+>   are normalized under a stable receipt view wrapper while their established
+>   presentation contract remains unchanged.
+> - Product LTM malformed successful responses now raise
+>   `ProductMemoryContractError`, separate from local persistence failures. The
+>   caller logs a safe category and continues with the existing degraded
+>   long-term-memory selection.
+> - Memory sections are explicitly labeled as user-provided working facts,
+>   conversation-derived summaries/history, or Product-canonical durable memory.
+>
+> Focused offline coverage is in
+> `app/src/tests/test_memory_continuity_simplification.py` together with the
+> existing memory, routing, Product-memory, Gate 8, phase 21, and Synthesizer
+> suites. Product remains canonical for LTM, Qdrant remains derivative, active
+> entity state remains bounded to two, and no public API/SSE/Product LTM schema
+> changed.
+
 > **2026-08-16 stabilization update:** The implementation findings below describe
 > the audited starting commit. The E1-E7 changes completed in the current working
 > tree supersede the former delta-path P0 and the related “partially implemented”
@@ -344,11 +380,11 @@ memory updates add no LLM calls.
 | --- | ---: | --- | --- | --- | --- |
 | `asset.get_profile` | 1 | Product API | current asset identity/security/network/activity | yes | one entity per step; Product serialization lock |
 | `asset.get_detection` | 1 | Product API | current classifier/rule/similarity/cluster evidence | yes | one entity per step; Product serialization lock |
-| `graph.get_summary` | 1 | NetworkX snapshot | node topology summary | yes | depth 0 |
-| `graph.get_neighbors` | 1 | NetworkX snapshot | one/two-hop or exhaustive direct peers | yes | depth <= 2 and configured node/edge limits |
-| `graph.get_relationship` | 2 | NetworkX snapshot | direct relation | yes | exactly two entities |
-| `graph.compare_assets` | 2 | NetworkX snapshot | bounded topology comparison | yes | exactly two entities; per-entity/shared-peer limits |
-| `graph.find_path` | 2 | NetworkX snapshot | observed graph shortest path | yes | exactly two entities; bounded path length |
+| `graph.get_summary` | 1 | published Neo4j projection | node topology summary | yes | depth 0 |
+| `graph.get_neighbors` | 1 | published Neo4j projection | one/two-hop or exhaustive direct peers | yes | depth <= 2 and configured node/edge limits |
+| `graph.get_relationship` | 2 | published Neo4j projection | direct relation | yes | exactly two entities |
+| `graph.compare_assets` | 2 | published Neo4j projection | bounded topology comparison | yes | exactly two entities; per-entity/shared-peer limits |
+| `graph.find_path` | 2 | published Neo4j projection | observed graph directed path | yes | exactly two entities; bounded path length |
 | `knowledge.search` | 0 | Qdrant SOC corpus | documentation/runbook knowledge | yes | Top-K, score, token, and citation limits |
 
 All registered capabilities are read-only. The executor runs dependency-ready
@@ -370,13 +406,13 @@ projection omissions/counts explicit. Explicit deep/full requests may still be
 large. A request-scoped fetch cache avoids duplicate Product retrieval inside one
 request, but there is no durable operational-evidence cache across requests.
 
-### NetworkX graph evidence
+### Neo4j graph evidence
 
-- Startup loads the last-known-good pickle into an active in-memory graph.
+- Startup verifies the last successfully published Neo4j graph projection.
 - The current local configuration enables background refresh, startup refresh,
-  and a 900-second interval. Refresh calls Product, validates node/edge/drop
-  thresholds, writes required artifacts and bounded snapshots atomically, then
-  replaces the active graph only after validation.
+  and a 3600-second interval. Refresh calls Product, validates node/edge/drop
+  thresholds, stages a versioned Neo4j projection, then publishes it only after
+  validation. Raw Product JSON remains audit/debug material, not a fallback.
 - Retrieval and serialization have separate completeness contracts. Returned
   totals are not silently rewritten when context serialization omits nodes/edges.
 - Current effective limits include one-hop 350 nodes, two-hop 800 nodes, 4,000
@@ -689,7 +725,7 @@ Result: the system safely refreshes, but deterministic change analysis is
 | LTM canonical records | LongTermMemoryStore | local SQLite | yes | local-development implementation only |
 | LTM semantic projection | SemanticMemoryIndex | separate Qdrant collection | yes if storage available | accelerator only, never canonical |
 | SOC Knowledge | KnowledgeSearchService | separate Qdrant collection | yes | externally maintained index |
-| Graph | GraphRefreshService/loader | files + in-memory NetworkX | last-known-good file survives | operational artifact, not conversation memory |
+| Graph | GraphRefreshService/GraphService | Neo4j Community versioned projection | last-known-good projection survives | current graph evidence, not conversation memory |
 | LangGraph execution | InvestigationState | memory only | no | checkpointing deferred |
 | LLM usage report | request-local collector | outbound Product POST when enabled | Product-owned after delivery | non-fatal and idempotent per request |
 | Metrics/logs | observability subsystem | Prometheus/log files/stdout | deployment dependent | operational telemetry, not evidence |
@@ -826,7 +862,7 @@ classifies failure classes from source and tests, not from live execution.
 | Direct vs bounded Planner workflow | working | high |
 | Capability allowlist, validation, cardinality, DAG, and budgets | working | high |
 | Product projection and request-scoped reuse | working | high |
-| NetworkX scoped retrieval and separate serialization completeness | working | high |
+| Neo4j scoped retrieval and separate serialization completeness | working | high |
 | Knowledge RAG as optional documentation evidence | working when configured/index available | medium: offline tests, no live audit |
 | No-refresh/memory-only hard authority | working for covered deterministic forms | high |
 | Latest completed raw turn retention and topic detachment | working | high |
@@ -995,3 +1031,317 @@ current Profile, Detection, or Graph capability. Historical exact retrieval may
 select complementary authoritative Profile and Detection records. The runtime
 contract states actual retrieval/partial/baseline/write execution truth, and
 ordinary answers suppress internal memory, tool, and storage terminology.
+
+## 22. 2026-09-02 targeted continuity stabilization
+
+**Fixed and verified by focused offline tests.** The deterministic entity resolver
+now materializes a two-entity pair when a distinct UI-selected asset is explicitly
+compared with the previous/last investigation target. The pair is retained through
+semantic-router binding validation and deterministic fallback; no route may reduce
+that already-resolved comparison to one asset.
+
+**Fixed and verified by focused offline tests.** Broad same-thread recall is now a
+distinct deterministic `TurnPolicy` target (`conversation`), so it bypasses the
+domain Router and retrieves bounded recent turns plus matching archived episode
+summaries across the thread. Normal active-asset and detached-general requests
+remain entity/general scoped. Relevant turns and episode records retain their
+typed `MemoryContextKey` entity binding; analyst/user Working Facts retain their
+`user_provided` fact type and are not LTM candidates.
+
+**Fixed and verified by focused offline tests.** The bounded Working Fact grammar
+accepts explicit analyst-name forms such as `remember, I'm <name>` (including the
+common apostrophe-free spelling). This follows the existing pure-memory-write path:
+no operational capability is planned, the fact remains conversation scoped, and
+it survives `ThreadMemoryState` restore without automatic LTM promotion.
+
+**Fixed and verified by focused offline tests.** Explicit `do not use tools` joins
+the existing no-live grammar. A no-live turn bypasses semantic routing while
+retaining the distinct `no_live_refresh` evidence mode where the request is not a
+historical-memory recall.
+
+Focused verification: `test_memory_no_refresh_regressions.py` (62 tests),
+`test_memory_gate5.py`, and `test_gate8_memory_context.py` (132 combined),
+comparison/detachment routing selection (15 tests), and
+`test_long_term_memory_gate67.py` (43 tests). No Product endpoint, ThreadState,
+frontend/SSE, canonical LTM, Qdrant, or baseline/delta contract was changed. Live
+Product/model/Qdrant validation remains intentionally unperformed.
+
+## 23. 2026-09-02 room 116 architecture audit
+
+### Scope and evidence
+
+This section is the current-state architecture audit for `dev` at `0ffc62f`. It
+uses the source tree, the relevant focused tests, Graphify dependency queries,
+and the complete recent room `116` log sequence in
+`data/runtime/logs/soorin-copilot.log`. It does **not** represent a live test
+run, change any runtime behavior, or establish the health of Product, Arvan, or
+Qdrant beyond what the recorded trace proves.
+
+The Graphify subgraph places `CopilotService` at the ThreadState/MemoryStore
+boundary, connects `EntityResolver`, `SemanticIntentRouter`, and
+`DeterministicFallbackRouter` through the workflow, and connects the Product
+LTM adapter and Qdrant index through the memory factory/retriever. The direct
+source trace is necessary for procedural details: Graphify shows the structural
+relationships, while `CopilotWorkflowNodes.route`, `task_spec_from_route`, and
+`compile_direct_plan` establish the runtime order.
+
+### CURRENT IMPLEMENTATION: request and authority flow
+
+```text
+Product conversation / UI request
+  -> CopilotService loads Product ThreadState (or starts fresh on 404)
+  -> EntityResolver combines explicit IPs, UI selection, active state, and recent text
+  -> deterministic RequestConstraints + TurnPolicy decide memory-only/live/detach/recall
+  -> memory-only paths bypass the semantic Router and live tools
+  -> otherwise SemanticIntentRouter produces a normalized RouteDecision
+  -> deterministic route correction, TaskSpec mapping, memory sufficiency, and policy
+  -> direct plan or bounded LLM Planner; PlanValidator is the final capability guard
+  -> Product Profile/Detection, Graph, and optional Knowledge capabilities execute
+  -> EvidenceReviewer, ContextComposer, and Synthesizer create the answer
+  -> MemoryStore records turns/facts/episodes/baselines; Product ThreadState persists
+  -> LTM coordinator persists canonical Product records and may index them in Qdrant
+```
+
+`src/core/copilot/service.py` owns request assembly and durable-store selection.
+`src/core/agent/nodes.py` owns the workflow transitions. Product ThreadState and
+Product LTM are the intended durable authorities in Product mode; the Qdrant
+semantic index is only candidate discovery and all selected IDs are hydrated
+again from canonical memory before use. Router, Planner, and Synthesizer are LLM
+calls; entity extraction, constraints, state restoration, validation, capability
+cardinality, memory write mechanics, and fallback safety are deterministic.
+
+### CURRENT IMPLEMENTATION: memory responsibility matrix
+
+| Component | Responsibility and authority | Lifetime, scope, and bound | Retrieval/persistence and overlap |
+| --- | --- | --- | --- |
+| `ThreadMemoryState` / Product ThreadState | Durable operational conversation cursor: active/last entities, previous route fields, working memory, recent refs, episode metadata, summary metadata, revision. It is not a historical fact authority. | One thread; active execution state is effectively one/two entities. No ordered visit timeline or ordinal fields exist. | `ProductThreadStateStore` serializes it. It overlaps with `SessionRoutingState`, which reconstructs the per-request cursor and truncates active entities to two. |
+| `SessionRoutingState` | In-request routing representation of active/previous entity and route facts. | One request; active entities are `[:2]`. | Rebuilt from ThreadState; it should not be a history model, but resolver fallback candidates draw from it. |
+| Recent turns and rolling summary | Immediate conversational continuity and bounded model history. Neither is authoritative operational evidence. | Bounded raw turns plus a compact summary. | Kept by `MemoryStore`; summary is lossy and overlaps episode summaries for historical narration. |
+| Working Facts | Typed user/analyst assertions such as the currently supported analyst-name grammar. Facts are unverified unless evidence says otherwise. | Conversation or entity scope; store cap is 20. Multiple candidates are supported by storage, although extraction is narrow. | `extract_working_facts` -> pending facts -> `upsert_working_facts`; dedupe is `(key, scope, entity_ids)`. It overlaps raw turns only as a deliberate compact representation. |
+| Current/archived investigation episodes | Bounded semantic investigation unit with entity/context key, turn references, compact summary, providers, limitations, and optional baseline. | One active episode plus bounded archived episodes; comparison keys contain a sorted two-entity pair. | `MemoryStore.prepare_for_model`, `_archive_current_episode`, and episode lookup. Episodes provide history but no explicit entity visit sequence. |
+| Investigation Baseline / Delta | Normalized snapshot comparison mechanism for verified operational evidence, not human or analyst memory. | Per compatible episode/context; projections and byte count are bounded. | Created from `ToolResult`s, stored on episodes, read by `ContextComposer`. Its eligibility overlaps evidence review and context completeness checks. |
+| Product LTM | Candidate/active durable typed memory with lifecycle, owner/entity checks, and canonical hydration. This is the durable memory authority. | Owner-scoped, lifecycle-bounded records. | Product API adapter is canonical in Product mode. It must not be replaced by raw transcript or Qdrant text. |
+| Qdrant `MemorySemanticIndex` | Semantic candidate discovery for LTM only. | Disposable/index lifecycle; no authority. | Search returns IDs, then retriever fetches canonical Product records and rechecks lifecycle/owner/entity scope. |
+
+The useful conceptual layers are therefore Thread State, Typed Working Facts,
+Investigation Episodes, and Product LTM. Recent turns and summaries are bounded
+representations used by those layers. Baseline/Delta is an evidence mechanism,
+and Qdrant is an index, not additional human-memory layers.
+
+### CURRENT IMPLEMENTATION: entity cardinality and chronology
+
+The active two-entity bound is appropriate for the current capability contracts:
+product views accept exactly one entity and graph comparison/path accept exactly
+two. It is **not**, however, cleanly isolated to execution. The resolver reads
+`active_entities[:2]` and recent candidate extraction also returns at most two;
+the durable ThreadState contains last/active state but no ordered investigation
+timeline. Episodes are ordered by timestamps, but comparison identity sorts its
+pair and episode selection is relevance-oriented, not an ordinal-history query.
+
+Consequently, a thread can retain multiple archived episodes, but it cannot
+reliably answer the structural sequence `A -> B -> C -> D -> A`, nor resolve
+`first`, `second`, or an earlier visit without recovering that order from lossy
+turn/summary text. Active execution state and historical navigation are thus
+partly mixed. The max-two limit does not delete all older episodes, but it
+incorrectly constrains the most readily available reference candidates and leaves
+no separate history model.
+
+### CURRENT IMPLEMENTATION: deterministic versus semantic decisions
+
+| Decision | Current implementation | Recommended authority | Why |
+| --- | --- | --- | --- |
+| Explicit IP/CIDR, UI selection, active/previous candidates | Deterministic `EntityResolver`; recent/active candidates are bounded to two. | Deterministic structural state. | Known identifiers must not be rediscovered by an LLM. |
+| `this`, `same`, `last`, `previous`, pair references | Deterministic phrase/reference logic plus active state. | Deterministic against an explicit timeline; semantic only if unresolved. | Current rules have no ordinal model. |
+| `first`, `second`, earlier visit | No structural implementation; broad memory reference is used instead. | Deterministic ordinal lookup on an entity/episode timeline. | Adding ordinal regexes would not supply the missing sequence. |
+| Explicit comparison and known pair | Deterministic pair materialization and pair preservation, with semantic route validation. | Deterministic entities/cardinality; semantic only for ambiguous compare intent. | The room-116 T3 path demonstrates this can work. |
+| Memory-only, no-live, remember/write, broad recall, detach | Deterministic request constraints and TurnPolicy, based on phrase grammars. | Hard no-live/security instructions remain deterministic; semantic classifier may assist only for unmatched explicit commands. | Safety constraints must survive model failure. |
+| Working-fact extraction | Deterministic fixed `_WORKING_FACT_PATTERNS`. | Bounded hybrid candidate extraction and deterministic schema validation. | One turn may contain many facts that cannot be covered by endless grammar growth. |
+| Intent, graph need, profile/detection/knowledge need, scope/direction/depth, follow-up | Semantic Router output, followed by route normalization and corrections. | Minimum semantic intent/continuation/evidence-goal contract. | Several output fields restate known entities, constraints, or safe cardinality. |
+| Route entity binding, hard scope/cardinality constraints, freshness constraints | Hybrid: semantic proposal followed by deterministic correction/validation. | Deterministic once entities and constraints are known. | Validation should preserve known facts rather than reconstruct them. |
+| Task capabilities and evidence mode | Deterministic `task_spec_from_route`, evidence policy, and memory sufficiency logic. | Deterministic task envelope for known task families. | Current Planner is frequently asked to reproduce this result. |
+| Multi-step evidence strategy and unusual supplemental evidence | Bounded LLM Planner, then `PlanValidator`. | Planner only for genuinely open evidence strategy. | This is the part that benefits from semantic trade-offs. |
+| Fallback after Router/Planner failure | Deterministic fallback router/plan, but it derives some semantics again. | Reuse the validated deterministic envelope and fill only semantic unknowns conservatively. | Failure must not erase an already known pair, scope, or safety rule. |
+| Evidence completeness, baseline eligibility, LTM lifecycle | Deterministic, but represented in several layers. | One canonical coverage receipt/eligibility decision. | Duplicated booleans caused the pair-baseline disagreement. |
+
+The current Router schema (`RouteDecision`/semantic intent output) covers intent,
+scope, direction, depth, graph/profile/detection/knowledge requirements,
+entity binding, multi-entity/follow-up signals, relationship mode, confidence,
+and explanation. Entity IDs, active pair, hard live prohibition, known chronology,
+and capability cardinality are redundant semantic responsibilities when already
+known. The Planner receives a `TaskSpec` and registered capabilities, can return
+up to six steps, and its output is then restricted by `PlanValidator`; for
+routine fixed evidence requirements it often adds latency without adding
+authority.
+
+### Room 116 trace: observed behavior
+
+| Turn | Request ID | Observed workflow and state transition | Finding |
+| --- | --- | --- | --- |
+| T1 fresh deep investigation of `192.168.20.103` | `1aa7518700fd452ebaaaae10257ebfe3` | Fresh Product ThreadState 404; semantic Router and Planner; Profile, Detection, and Graph all `ok`; Synth used 6144 output tokens; revision 1 saved. | Detection succeeded but a `full` raw-shaped product view produced no baseline projection, so capture rejected it. |
+| T2 explicit memory write | `ff3ba4d64f954c4c976e4e07947114c4` | `allow_live=False`, memory-only/write, Router/Planner/tools all bypassed; revision 2 persisted one fact. | The storage path accepted all candidates, but the extractor emitted only the analyst-name pattern. |
+| T3 comparison of `.120` with `.103` | `0d89994a670c46ffb11ba305da44e4e5` | Resolver created `compare_with_reference`; deterministic pair was retained; five tools succeeded; pair episode persisted at revision 3. | Pair formation is a useful general deterministic behavior. The later baseline failure is a separate context-completeness mutation. |
+| T4 memory-only recall | `68dd93f677a84dadae28358a89b14b1a` | Router/Planner/tools zero; thread recall with one working fact and one episode; 1536 Synth budget. | The label was replayed from a lossy archived episode preview, not from a Working Fact. |
+| T5 pair follow-up after two Router read timeouts | `379fcd2b3934459fae8e28c011f0deb1`, `3bb7d5e7681f40bea2f08b6e984d2d6d` | Pair entities and previous route survived. Fallback reported graph relationships but `scope=none`; Planner validation and deterministic-plan validation both failed; no tools or Synth. | A fresh-current fallback branch overwrites the preserved comparison scope with `none`, then emits an invalid two-entity graph-summary task. |
+| T6 memory-only historical ordinal recall | `8fc15350ceb647f0aac59146d5699755` | ThreadState revision 4 loaded; no entity resolved; Router/tools bypassed; Product candidate/active inventory requests returned 201, then inventory parsing raised `LocalPersistenceError`; answer chose `.120` as first. | No explicit entity chronology/ordinal resolver exists. The inventory warning is a Product DTO-validation failure named as local persistence, not proof that SQLite was used. |
+
+### Confirmed bugs
+
+| Bug and symptom | Exact root cause and affected state | Why tests missed/tolerated it | Recommended fix direction (not implemented) |
+| --- | --- | --- | --- |
+| 1. Multi-fact Working Fact extraction: T2 writes one fact for a name plus analyst label. | `src/core/memory/store.py:extract_working_facts` iterates only `_WORKING_FACT_PATTERNS` for a small set of keys. It matches `analyst_name`; no analyst-label grammar exists. It does not stop after one match, and `upsert_working_facts` supports multiple candidates, so this is extractor coverage, not one-fact-per-turn, dedupe, or storage cap. | Existing tests cover the explicit name form and positive typed facts, not an independent label in the same command. | Move to bounded typed candidate extraction: deterministic command envelope/entity binding, zero-to-N candidates, strict schema/value/provenance validation, optional small semantic extractor only for unsupported content. |
+| 2. Exact analyst-label value becomes `vxidalira legacy integrati`. | The label never reached Working Facts. On T3, `_archive_current_episode` builds `older_user_requests` using `compact_preview(user, limit=140)` (`store.py` and `context/models.py`), a direct prefix slice. The value occurs after that cut and T4 replays the episode summary. | Name-preservation tests cover a recognized fact; they do not assert fidelity of an unsupported fact embedded late in archived raw text. | Preserve recognized typed fact values exactly within an explicit bounded policy; label omitted/unrecognized content must be marked unavailable rather than silently treated as durable exact recall. |
+| 3. `first asset` resolves to `.120` rather than `.103`. | `EntityResolver` has current/previous/reference phrases but no chronological entity visits or ordinals. Broad thread recall selects relevant bounded turns/episodes; pair identity is sorted and selected context carries no ordinal authority. Synthesizer infers order from prose. | Tests cover broad recall and explicit previous/comparison forms, not structural ordinal chronology across switches. | Add a bounded chronological entity/episode event timeline separate from active execution state; resolve ordinal references deterministically before retrieval. |
+| 4. Router-timeout pair follow-up loses comparison scope. | In `src/core/context/router.py:DeterministicFallbackRouter.route`, the previous-route pair branch can preserve `multi_entity_comparison`, but the later `require_current` continuation branch replaces any scope outside its single-entity allow-list with `none`. Pair entities remain intact. | Tests assert direct comparison and several fallback paths but do not combine Router timeout, current verification, and an already materialized pair. | Carry an immutable resolved-pair/task envelope through fallback. Fallback should fill semantic unknowns, never rewrite validated cardinality/scope. |
+| 5. Planner and deterministic fallback plan both safe-fail after that loss. | `task_spec_from_route` maps `graph_relationships + scope=none` to `graph.get_summary`; `compile_direct_plan` forwards both task entities. `PlanValidator` correctly rejects `graph.get_summary` because it requires exactly one entity. The fallback plan reuses the malformed `TaskSpec`, so it cannot recover. | Planner tests validate cardinality and direct plans independently; no regression asserts a known pair plus lost scope produces a recoverable valid direct plan. | Validate a deterministic task envelope before planning; skip Planner for known comparison profile; only execute a fallback direct plan after capability/cardinality validation. |
+| 6. T1 single-asset baseline rejects successful detection. | `build_product_view` returns the raw payload when selected views equal `("full",)`. `current_evidence_projections` requires a wrapper with `view_payload["views"]` and then searches each selected view. Thus detection has no normalized projection, despite status `ok`, complete evidence, and context inclusion. | Tests cover product projections but do not require a `full` detection view to remain baseline-projectable in the end-to-end capture path. | Use one normalized evidence receipt/schema for every view, including `full`, or make baseline capture consume a canonical projection generated before presentation shaping. |
+| 7. T3 pair baseline rejects complete graph comparison. | Retrieval initially reports complete. `context_package_from_evidence` passes the mutable `GraphProviderResult.context` to `ContextComposer`; comparison compaction sets `serialized_context_truncated=True` and `complete_for_user_request=False`. Later `investigation_baseline_from_results` re-reads that mutated context through `current_evidence_projections`, so `graph.compare_assets` is incomplete. The pre-capture guard only inspected the original `ToolResult` completeness and therefore passed. | Tests prove graph inclusion and compaction separately, but do not assert that a complete retrieval keeps a baseline-eligible immutable receipt after comparison presentation compaction. | Separate immutable retrieval/coverage receipt from mutable model-presentation context; have one baseline eligibility authority with an explicit policy for bounded pair snapshots. |
+| 8. `memory_inventory_unavailable` reports `LocalPersistenceError` after Product 201 inventory calls. | `ProductLongTermMemoryStore.list` logs record count from Product then converts every item with `_domain_record`/`_memory_from_wire`. A malformed/missing required field, bad reference, or owner mismatch raises the generic `LocalPersistenceError` class after HTTP success. `CopilotService.retrieve_long_term_memory` catches inventory failure, retains its initial retrieved selection, and adds a limitation. | Adapter/unit coverage does not replay the actual malformed Product inventory record or assert that error type/phase distinguishes Product wire validation from local persistence. | Keep initial canonical retrieval independent; make optional inventory parsing report a Product contract-validation code, phase, and safe record count. Do not make Qdrant or local storage an authority for this metadata path. |
+
+### Architectural weaknesses confirmed by the trace
+
+1. **Overlapping state and policies.** Entity/reference state is split among
+   ThreadState, `SessionRoutingState`, resolver heuristics, episodes, and recent
+   text. Router, normalizer, fallback router, task mapping, evidence policy, and
+   plan validator each carry parts of task semantics. This makes a safe fallback
+   capable of preserving entities while losing their meaning.
+2. **Lossy raw history is a fallback for typed memory.** Unsupported facts can
+   survive only in compact episode prose, which is unsuitable for exact recall.
+3. **Baseline is coupled to model presentation.** A complete retrieval becomes
+   ineligible when the model-facing graph representation is compacted; product
+   `full` presentation also has a different shape from normalized views.
+4. **Retrieval scope, reference resolution, and freshness are coupled.** Broad
+   recall can trigger a memory-only path without producing a structural target;
+   the model then decides chronology from narration.
+5. **Planner work is too broad for routine tasks.** A semantically known pair and
+   evidence family still goes through LLM plan generation/repair even though
+   deterministic task mapping and validation already define the safe plan.
+6. **Product adapter error naming is misleading.** Product wire conversion shares
+   an exception name associated with local persistence, obscuring both authority
+   and remediation.
+
+The architecture is therefore overengineered in the *overlapping decision and
+representation layers*, not because bounded ThreadState, facts, episodes, LTM,
+or validation are intrinsically unnecessary. Those responsibilities should stay
+but have cleaner boundaries.
+
+### PROPOSED / RECOMMENDED DESIGN: simpler bounded model
+
+This is a target design, not current behavior.
+
+```text
+Thread State (active execution cursor, revision, bounded route facts)
+  + chronological entity/episode timeline (history navigation only)
+  + Typed Working Facts (0..N, provenance-preserving)
+  + Investigation Episodes (semantic unit and compact evidence links)
+  + Product LTM (canonical durable lifecycle)
+      -> Qdrant (derivative semantic discovery)
+
+Reference resolution -> retrieval scope -> freshness requirement -> capability plan
+```
+
+Keep the active execution cursor at one/two entities because providers require
+it. Add a separately bounded timeline of entity visits/episode transitions with
+stable sequence numbers, event timestamps, explicitly ordered entities, and
+episode links. This lets `current`, `last`, `previous`, `first`, and `second`
+resolve structurally without making old investigations active.
+
+Working Facts need only a minimal versioned representation: stable ID, key/type,
+scope, optional entity IDs, exact bounded value, provenance/source turn,
+verification status, created/updated time, and deterministic logical dedupe key.
+An explicit user-memory command is first parsed as a safe envelope. A
+deterministic parser handles known forms; if the content includes unsupported or
+multiple statements, a small dedicated extractor may produce a bounded list of
+typed candidates. The application validates every candidate's schema, scope,
+entity binding, value length, and provenance. This is safer, cheaper, and more
+auditable than using the Planner or Synthesizer, while avoiding a growing
+collection of sentence-specific regular expressions.
+
+Model baseline/delta should operate on an immutable evidence coverage receipt
+created from validated tool results before model-context serialization. The
+composer may independently create truncated or bounded presentation material.
+Pair baseline policy should be explicit: either retain a bounded normalized
+comparison receipt with declared scope or decline pair delta by policy; it must
+not silently change because a display serializer omitted peers.
+
+### PROPOSED / RECOMMENDED DESIGN: Router and Planner split
+
+The Router should have a small semantic contract: task family/intent, whether
+the language continues or changes topic when structural state is inconclusive,
+ambiguous temporal interpretation, ambiguous comparison intent, and a bounded
+evidence goal. It may return uncertainty/clarification rather than inventing an
+entity. It should not own resolved IDs, pair cardinality, hard live/no-live
+rules, known chronology, or capability cardinality.
+
+The Planner should receive a validated `TaskEnvelope` containing resolved
+entities, reference result, temporal scope (`CURRENT`, `HISTORICAL`, `THREAD`),
+freshness (`required`, `prohibited`, `optional`), and immutable safety
+constraints. It should be skipped when a deterministic task profile already
+selects a valid minimal plan, such as straightforward current asset assessment
+or a known two-asset comparison. It adds value for unusual multi-step evidence
+strategy, optional/supplemental acquisition, and genuinely multi-intent work.
+
+Router or Planner failure should select a conservative deterministic task profile
+using that same envelope. A fallback must never rebuild or erase a known scope,
+pair, ownership boundary, or no-live instruction. `PlanValidator` remains the
+final guard, but it should reject only an invalid strategy, not be the first
+component able to discover an upstream semantic contradiction.
+
+### Migration strategy (future work only)
+
+| Phase | Small, independently testable outcome | Narrow fixes versus refactor |
+| --- | --- | --- |
+| 0. Invariants and replay tests | Add room-116-derived fixtures: multi-fact fidelity, timeline ordering, ordinal references, Router-timeout pair preservation, valid direct pair plan, immutable baseline receipt, and malformed Product inventory grading. | No production behavior change. |
+| 1. Structural state correction | Introduce a bounded entity/episode visit timeline separate from the max-two active cursor; migrate/derive it safely from new events. | Ordinal-reference defect waits for this structural work. |
+| 2. Working Fact generalization | Add versioned zero-to-N candidate representation, provenance, independent dedupe, and bounded hybrid extraction behind strict validation. | Fixes multi-fact and exact-value fidelity without expanding regex lists. |
+| 3. Router/Planner cleanup | Introduce immutable `TaskEnvelope`; make fallback preserve known state; skip Planner for validated deterministic task profiles. | The T5 scope and validation cascade can be narrowly addressed here. |
+| 4. Retrieval and evidence simplification | Separate reference target, temporal retrieval scope, freshness, and plan; generate immutable coverage receipts; define pair-baseline policy. | Product full-view and pair-baseline bugs should be corrected within this boundary. |
+| 5. Controlled live E2E validation | In an approved environment, replay Product ThreadState/LTM, malformed inventory, provider timeouts, and comparison/ordinal scenarios; verify Qdrant remains derivative. | Required before claiming live production closure. |
+
+The Product inventory error classification is a narrower adapter/observability
+candidate, but it should still preserve the rule established by the current safe
+degradation: an optional inventory failure cannot invalidate an already selected
+canonical memory result. The other defects are best addressed with the stated
+structural boundaries rather than isolated special cases.
+
+### Audit conclusion
+
+Current Soorin Copilot is a bounded, safety-oriented evidence workflow with
+sound high-level authority boundaries: current Product/Graph evidence outranks
+memory for current claims, Product LTM is canonical, Qdrant is derivative, and
+capability validation fails closed. Its principal reliability gap is not lack of
+another heuristic; it is that known state, semantic interpretation, presentation
+metadata, and fallback policy are represented more than once. The recommended
+path is to make known state structural and immutable, confine LLMs to genuinely
+ambiguous language and open evidence strategy, and use one validated task and
+evidence contract throughout fallback and persistence.
+
+## 19. September 2026 focused reliability addendum
+
+The follow-up stabilization keeps the architecture above and closes the later
+room-118 integration failures without adding a model stage or changing an
+external contract:
+
+- conversational `now` is no longer sufficient by itself to require current
+  evidence; explicit current/status language and bounded `verify ... now/again`
+  forms remain strong current-evidence signals;
+- whole-thread recall is resolved before incidental UI entity context, remains
+  read-only for the active investigation cursor, and receives bounded structural
+  chronology plus thread-wide explicit facts;
+- pair references outrank a single UI selection when a unique active pair exists,
+  and semantic comparison output independently recovers that pair when no
+  different entities were explicitly supplied;
+- recent conversational context contains at most one newest exact turn plus
+  deterministic older digests, deduplicated by request identity; summaries,
+  Working Facts, episode summaries, and Product LTM retain distinct authority;
+- successful Product payloads that violate the LTM DTO/canonical contract now
+  use `ProductMemoryContractError` through hydration, audit, and lifecycle
+  readback paths rather than being mislabeled as local persistence failures;
+- Synth instructions prohibit internal orchestration vocabulary, unsupported
+  exhaustive-recall claims, and negative-history claims inferred from omitted
+  context.
+
+`SOORIN_CONVERSATION_SUMMARY_TEMPERATURE` and
+`SOORIN_CONVERSATION_SUMMARY_TIMEOUT_SECONDS` are still parsed for configuration
+compatibility, but no runtime code consumes them. Conversation compaction is
+deterministic and performs no summary-model call. They remain intentionally
+dormant in this compatibility-preserving change.

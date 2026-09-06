@@ -372,7 +372,9 @@ def test_product_login_is_login_only_and_app_has_one_early_product_dispatch():
     assert 'clear_on_submit=True' in product_ui
     assert "Sign Up" not in product_ui and "Create account" not in product_ui
     assert app_source.count('settings.streamlit_auth_backend == "product"') == 1
-    assert app_source.index('settings.streamlit_auth_backend == "product"') < app_source.index("def init_graph")
+    assert "def init_graph" not in app_source
+    assert "src.core.graph.loader" not in app_source
+    assert app_source.index('settings.streamlit_auth_backend == "product"') < app_source.index("def get_graph_status_label")
     assert "run_local_simulation_workspace(settings)" not in product_ui
 
 

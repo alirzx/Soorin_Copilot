@@ -247,7 +247,7 @@ Direct and Planner paths both go through `PlanValidator`, `CapabilityExecutor`, 
 
 ```mermaid
 flowchart LR
-    A[NetworkX graph] --> B[retrieve_graph_context]
+    A[Published Neo4j projection] --> B[GraphService / GraphQueryPolicy]
     B --> C[scope-specific context dict]
     C --> D[GraphProviderResult]
     D --> E[ToolResult graph.*]
@@ -259,7 +259,7 @@ flowchart LR
     J --> M[final model messages]
 ```
 
-Raw graph source is the active NetworkX graph returned by `get_graph()` in `app/src/core/graph/loader.py`; retrieval behavior is in `app/src/core/graph/retrieval.py`.
+Raw graph source is the active Neo4j projection queried through `GraphService`; backend-neutral retrieval normalization remains in `app/src/core/graph/retrieval.py`.
 
 Graph mode selection:
 
@@ -411,7 +411,7 @@ Activation:
 
 Retrieval:
 
-`_path_context()` computes shortest path with NetworkX, checks source/target presence, records ordered path nodes, path edges, hop count, and truncates by `graph_max_path_length`.
+`GraphService.path()` executes the bounded directed path query through `GraphQueryPolicy` and `Neo4jGraphRepository`, checks source/target presence, and returns ordered nodes, path edges, hop count, active graph version, and truncation metadata.
 
 Final context:
 
@@ -501,11 +501,11 @@ Divergence risks:
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | `asset.get_profile` | Profile/identity/asset request | Product profile endpoint | `AssetProfileProviderResult` | `ProductEvidenceView`, full payload | raw payload + provider result + view metadata | `AssetInvestigationResult` counts | yes | `ASSET_PROFILE_FULL_MINIFIED_JSON` | yes if Product fits | full Product excluded if over window | verified conditionally |
 | `asset.get_detection` | Detection/risk/classification request | Product detection endpoint | `DetectionProviderResult` | `ProductEvidenceView`, full payload | raw payload + provider result + view metadata | `AssetInvestigationResult` counts | yes | `ASSET_DETECTION_FULL_MINIFIED_JSON` | yes if Product fits | full Product excluded if over window | verified conditionally |
-| `graph.get_summary` | single node summary | NetworkX graph | `GraphProviderResult.context` | aggregate-only | graph context as raw payload | `GraphAnalysisResult` counts | yes | `SOORIN_GRAPH_CONTEXT_JSON` node_summary | yes if graph budget fits | subnet top-k only | verified |
-| `graph.get_neighbors` | one-hop/full/two-hop | NetworkX graph | retrieved nodes/edges/totals | ranked peers | graph context as raw payload | `GraphAnalysisResult` counts | yes | neighborhood summary | yes if graph budget fits | peer/edge serialization top-k | verified |
-| `graph.get_relationship` | pair/direct relation | NetworkX edge checks | booleans + edge metadata | direct relationship | graph context as raw payload | direct relationship bool | yes | direct_relationship JSON | yes if graph budget fits | low | verified |
-| `graph.compare_assets` | pair comparison | NetworkX summaries + direct check | comparison dict | top-k comparison summary | graph context as raw payload | protected direct relationship fact | yes | comparison_summary JSON | yes; optional neighborhood edge records omitted | optional detail truncation only | verified conditionally |
-| `graph.find_path` | pair/path | NetworkX shortest path | path nodes/edges | selected path | graph context as raw payload | graph counts | yes | selected_path JSON | yes if graph budget fits | path length cap | verified |
+| `graph.get_summary` | single node summary | Neo4j active projection | `GraphProviderResult.context` | aggregate-only | graph context as raw payload | `GraphAnalysisResult` counts | yes | `SOORIN_GRAPH_CONTEXT_JSON` node_summary | yes if graph budget fits | subnet top-k only | verified |
+| `graph.get_neighbors` | one-hop/full/two-hop | Neo4j active projection | retrieved nodes/edges/totals | ranked peers | graph context as raw payload | `GraphAnalysisResult` counts | yes | neighborhood summary | yes if graph budget fits | peer/edge serialization top-k | verified |
+| `graph.get_relationship` | pair/direct relation | Neo4j directed edge query | booleans + edge metadata | direct relationship | graph context as raw payload | direct relationship bool | yes | direct_relationship JSON | yes if graph budget fits | low | verified |
+| `graph.compare_assets` | pair comparison | Neo4j bounded summaries + direct check | comparison dict | top-k comparison summary | graph context as raw payload | protected direct relationship fact | yes | comparison_summary JSON | yes; optional neighborhood edge records omitted | optional detail truncation only | verified conditionally |
+| `graph.find_path` | pair/path | Neo4j bounded directed path | path nodes/edges | selected path | graph context as raw payload | graph counts | yes | selected_path JSON | yes if graph budget fits | path length cap | verified |
 | `knowledge.search` | Knowledge-required route | Qdrant search hits | `KnowledgeSearchResult` | score + safety filter | chunks/citations | none, generic result | yes | `SOORIN_KNOWLEDGE_CONTEXT_JSON` | yes if remaining budget fits | Top-K + token budget | verified conditionally |
 
 ## 12. Context Budget and Compaction Rules

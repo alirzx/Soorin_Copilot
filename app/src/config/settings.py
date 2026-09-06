@@ -206,6 +206,9 @@ class Settings:
     synthesizer_api_key: str
     synthesizer_timeout_seconds: int
     synthesizer_max_tokens: int
+    synthesizer_brief_output_tokens: int
+    synthesizer_standard_output_tokens: int
+    synthesizer_deep_output_tokens: int
     synthesizer_retry_max_tokens: int
     synthesizer_temperature: float | None
     synthesizer_top_p: float | None
@@ -289,10 +292,13 @@ class Settings:
     detection_cache_ttl_seconds: int
     detection_stale_on_error: bool
     graph_raw_path: str
-    graph_pickle_path: str
-    graph_stats_path: str
-    graph_graphml_path: str
-    graph_gexf_path: str
+    neo4j_uri: str
+    neo4j_user: str
+    neo4j_password: str
+    neo4j_database: str
+    neo4j_query_timeout_seconds: int
+    neo4j_sync_batch_size: int
+    neo4j_max_connection_pool_size: int
     graph_max_ui_nodes: int
     graph_default_min_degree: int
     graph_api_max_neighbors: int
@@ -340,9 +346,7 @@ class Settings:
     graph_refresh_jitter_seconds: int
     graph_refresh_max_consecutive_failures: int
     graph_refresh_keep_raw_snapshots: int
-    graph_refresh_keep_processed_snapshots: int
     graph_snapshot_ttl_hours: int
-    graph_optional_exports_enabled: bool
     graph_refresh_lock_timeout_seconds: int
     graph_refresh_min_nodes: int
     graph_refresh_min_edges: int
@@ -586,6 +590,9 @@ def get_settings() -> Settings:
         synthesizer_api_key=os.getenv("SOORIN_SYNTHESIZER_API_KEY", "").strip(),
         synthesizer_timeout_seconds=_int("SOORIN_SYNTHESIZER_TIMEOUT_SECONDS", 360),
         synthesizer_max_tokens=_int("SOORIN_SYNTHESIZER_MAX_TOKENS", 12288),
+        synthesizer_brief_output_tokens=_int("SOORIN_SYNTHESIZER_BRIEF_OUTPUT_TOKENS", 1536),
+        synthesizer_standard_output_tokens=_int("SOORIN_SYNTHESIZER_STANDARD_OUTPUT_TOKENS", 4096),
+        synthesizer_deep_output_tokens=_int("SOORIN_SYNTHESIZER_DEEP_OUTPUT_TOKENS", 6144),
         synthesizer_retry_max_tokens=_int("SOORIN_SYNTHESIZER_RETRY_MAX_TOKENS", 12288),
         synthesizer_temperature=_optional_float("SOORIN_SYNTHESIZER_TEMPERATURE"),
         synthesizer_top_p=_optional_float("SOORIN_SYNTHESIZER_TOP_P"),
@@ -742,10 +749,13 @@ def get_settings() -> Settings:
         detection_cache_ttl_seconds=max(600, _int("SOORIN_DETECTION_CACHE_TTL_SECONDS", 600)),
         detection_stale_on_error=_bool("SOORIN_DETECTION_STALE_ON_ERROR", True),
         graph_raw_path=os.getenv("SOORIN_GRAPH_RAW_PATH", "data/raw/topology_raw.json").strip(),
-        graph_pickle_path=os.getenv("SOORIN_GRAPH_PICKLE_PATH", "data/processed/topology_graph.pkl").strip(),
-        graph_stats_path=os.getenv("SOORIN_GRAPH_STATS_PATH", "data/processed/topology_stats.json").strip(),
-        graph_graphml_path=os.getenv("SOORIN_GRAPH_GRAPHML_PATH", "data/processed/topology_graph.graphml").strip(),
-        graph_gexf_path=os.getenv("SOORIN_GRAPH_GEXF_PATH", "data/processed/topology_graph.gexf").strip(),
+        neo4j_uri=os.getenv("SOORIN_NEO4J_URI", "bolt://127.0.0.1:7687").strip(),
+        neo4j_user=os.getenv("SOORIN_NEO4J_USER", "neo4j").strip(),
+        neo4j_password=os.getenv("SOORIN_NEO4J_PASSWORD", "").strip(),
+        neo4j_database=os.getenv("SOORIN_NEO4J_DATABASE", "neo4j").strip(),
+        neo4j_query_timeout_seconds=max(1, _int("SOORIN_NEO4J_QUERY_TIMEOUT_SECONDS", 8)),
+        neo4j_sync_batch_size=max(1, _int("SOORIN_NEO4J_SYNC_BATCH_SIZE", 1000)),
+        neo4j_max_connection_pool_size=max(1, _int("SOORIN_NEO4J_MAX_CONNECTION_POOL_SIZE", 50)),
         graph_max_ui_nodes=_int("SOORIN_GRAPH_MAX_UI_NODES", 1000),
         graph_default_min_degree=_int("SOORIN_GRAPH_DEFAULT_MIN_DEGREE", 1),
         graph_api_max_neighbors=_int("SOORIN_GRAPH_API_MAX_NEIGHBORS", 1000),
@@ -796,15 +806,13 @@ def get_settings() -> Settings:
         intent_router_min_confidence=_float("SOORIN_INTENT_ROUTER_MIN_CONFIDENCE", 0.65),
         intent_router_retry_enabled=_bool("SOORIN_INTENT_ROUTER_RETRY_ENABLED", True),
         graph_auto_refresh_enabled=_bool("SOORIN_GRAPH_AUTO_REFRESH_ENABLED", True),
-        graph_refresh_interval_seconds=max(600, _int("SOORIN_GRAPH_REFRESH_INTERVAL_SECONDS", 900)),
+        graph_refresh_interval_seconds=max(600, _int("SOORIN_GRAPH_REFRESH_INTERVAL_SECONDS", 3600)),
         graph_refresh_on_startup=_bool("SOORIN_GRAPH_REFRESH_ON_STARTUP", True),
         graph_refresh_startup_delay_seconds=_int("SOORIN_GRAPH_REFRESH_STARTUP_DELAY_SECONDS", 5),
         graph_refresh_jitter_seconds=_int("SOORIN_GRAPH_REFRESH_JITTER_SECONDS", 30),
         graph_refresh_max_consecutive_failures=_int("SOORIN_GRAPH_REFRESH_MAX_CONSECUTIVE_FAILURES", 5),
         graph_refresh_keep_raw_snapshots=_int("SOORIN_GRAPH_REFRESH_KEEP_RAW_SNAPSHOTS", 5),
-        graph_refresh_keep_processed_snapshots=_int("SOORIN_GRAPH_REFRESH_KEEP_PROCESSED_SNAPSHOTS", 3),
         graph_snapshot_ttl_hours=max(0, _int("SOORIN_GRAPH_SNAPSHOT_TTL_HOURS", 72)),
-        graph_optional_exports_enabled=_bool("SOORIN_GRAPH_OPTIONAL_EXPORTS_ENABLED", False),
         graph_refresh_lock_timeout_seconds=_int("SOORIN_GRAPH_REFRESH_LOCK_TIMEOUT_SECONDS", 60),
         graph_refresh_min_nodes=_int("SOORIN_GRAPH_REFRESH_MIN_NODES", 1),
         graph_refresh_min_edges=_int("SOORIN_GRAPH_REFRESH_MIN_EDGES", 0),

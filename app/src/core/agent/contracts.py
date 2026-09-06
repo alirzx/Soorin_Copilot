@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import json
 from typing import Annotated, Any, Literal, TypedDict
 import operator
 
@@ -58,6 +59,35 @@ class EvidenceFact:
 
 
 @dataclass(frozen=True)
+class EvidenceReceipt:
+    """Immutable acquisition record, deliberately separate from model context."""
+
+    source_capability: str
+    entities: tuple[str, ...]
+    status: ToolStatus
+    freshness: str
+    completeness: Completeness
+    retrieved_at: str
+    source_payload_complete: bool
+    projection_usable: bool
+    truncated: bool = False
+    projection_truncated: bool = False
+    schema_version: str = "evidence-receipt-v1"
+    payload_json: str = "{}"
+    scope: str = "none"
+    direction: str = "none"
+    depth: int = 0
+
+    @classmethod
+    def from_payload(cls, *, payload: Any, **kwargs: Any) -> "EvidenceReceipt":
+        encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
+        return cls(payload_json=encoded, **kwargs)
+
+    def payload(self) -> Any:
+        return json.loads(self.payload_json)
+
+
+@dataclass(frozen=True)
 class ToolResult:
     status: ToolStatus
     entities: tuple[str, ...]
@@ -105,6 +135,35 @@ class ToolResult:
     projection_truncated: bool = False
     projection_omitted_count: int = 0
     projection_schema_version: str = ""
+    evidence_receipt: EvidenceReceipt | None = None
+
+
+@dataclass(frozen=True)
+class TaskEnvelope:
+    """Immutable deterministic authority carried from resolution through planning.
+
+    Semantic routing may select providers, but it must not change the resolved
+    entity order, temporal authority, or an already-established comparison.
+    """
+
+    ordered_entities: tuple[str, ...] = ()
+    reference_type: str = "none"
+    operation: ConversationOperation = "new_task"
+    temporal_scope: TemporalMode = "current"
+    freshness_requirement: str = "current_when_available"
+    allow_live: bool = True
+    require_current: bool = False
+    comparison_required: bool = False
+    task_family: str = "general"
+    reason_codes: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if len(self.ordered_entities) > 2:
+            raise ValueError("Task envelopes support at most two entities")
+        if len(set(self.ordered_entities)) != len(self.ordered_entities):
+            raise ValueError("Task envelope entities must be distinct")
+        if self.comparison_required and len(self.ordered_entities) != 2:
+            raise ValueError("Comparison envelopes require exactly two entities")
 
 
 @dataclass(frozen=True)
@@ -155,6 +214,7 @@ class TurnPolicy:
     target_entities: tuple[str, ...] = ()
     requires_domain_router: bool = True
     episode_transition: EpisodeTransition = "keep"
+    operational_state_mutation_allowed: bool = True
     reason_codes: tuple[str, ...] = ()
 
 
@@ -321,6 +381,7 @@ class InvestigationState(TypedDict, total=False):
     recent_messages: list[dict[str, str]]
     request_constraints: RequestConstraints
     turn_policy: TurnPolicy
+    task_envelope: TaskEnvelope
     pending_working_facts: tuple[Any, ...]
     routing_result: Any
     plan_validation_result: dict[str, Any]

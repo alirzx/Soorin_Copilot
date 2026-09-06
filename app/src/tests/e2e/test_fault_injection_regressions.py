@@ -192,7 +192,11 @@ def test_t20_reasoning_only_length_uses_one_bounded_trace_preserving_fallback() 
         ],
         fallback_text="bounded recovery answer",
     )
-    service = CopilotService(service_settings(llm_expose_reasoning=False), llm, MemoryStore(0))  # type: ignore[arg-type]
+    service = CopilotService(
+        service_settings(llm_expose_reasoning=False, synthesizer_retry_max_tokens=3072),
+        llm,
+        MemoryStore(0),
+    )  # type: ignore[arg-type]
     metrics = {
         "streaming_requested": True, "streaming_used": False,
         "first_reasoning_chunk_latency_ms": None, "first_answer_chunk_latency_ms": None,
@@ -207,7 +211,7 @@ def test_t20_reasoning_only_length_uses_one_bounded_trace_preserving_fallback() 
     )
     assert result.text == "bounded recovery answer"
     assert len(llm.chat_calls) == 1
-    assert llm.chat_calls[0]["max_tokens"] == 2048
+    assert llm.chat_calls[0]["max_tokens"] == 3072
     assert llm.chat_calls[0]["trace_id"] == "t20-trace"
     assert metrics["fallback_reason"] == "provider_stream_reasoning_exhausted"
     assert [item.text for item in emitted] == ["bounded recovery answer"]

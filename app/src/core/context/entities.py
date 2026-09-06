@@ -29,6 +29,11 @@ RECENT_REFERENCE_RE = re.compile(
     r"\b(?:it|this|that|previous|prior|last|recent|same|asset|host|node|ip|one)\b",
     re.IGNORECASE,
 )
+TIMELINE_REFERENCE_RE = re.compile(
+    r"\b(?P<ordinal>first|second|last|previous)\s+"
+    r"(?:investigated\s+)?(?:asset|entity|host|ip|investigation)\b",
+    re.IGNORECASE,
+)
 REFERENTIAL_ENTITY_PATTERNS: dict[str, re.Pattern[str]] = {
     "this_entity": re.compile(r"\b(?:this|that|the\s+selected|the\s+current)\s+(?:ip|asset|host|node)\b", re.IGNORECASE),
     "same_entity": re.compile(r"\b(?:the\s+)?(?:same|previous)\s+(?:ip|asset|host|node)\b", re.IGNORECASE),
@@ -178,6 +183,27 @@ def _extract_recent_entity_candidates(recent_messages: list[dict[str, str]] | No
     return tuple(candidates[:2])
 
 
+def _timeline_reference(
+    message: str,
+    routing_state: SessionRoutingState | None,
+) -> tuple[tuple[str, ...], str] | None:
+    """Resolve ordinal history from persisted visit order, never summary prose."""
+    match = TIMELINE_REFERENCE_RE.search(message or "")
+    timeline = tuple(routing_state.entity_timeline if routing_state else ())
+    if match is None or not timeline:
+        return None
+    ordinal = match.group("ordinal").casefold()
+    index = {
+        "first": 0,
+        "second": 1,
+        "last": len(timeline) - 1,
+        "previous": len(timeline) - 2,
+    }.get(ordinal)
+    if index is None or index < 0 or index >= len(timeline):
+        return None
+    return timeline[index].ordered_entity_ids, f"timeline_{ordinal}"
+
+
 class EntityResolver:
     """Resolve only IPv4 entities for the frozen baseline."""
 
@@ -207,6 +233,7 @@ class EntityResolver:
         *,
         recent_messages: list[dict[str, str]] | None = None,
         request_id: str = "",
+        conversation_scope: bool = False,
     ) -> EntityResolution:
         started = time.perf_counter()
         logger.info(
@@ -242,8 +269,15 @@ class EntityResolver:
         reference_detected, reference_type = self._detect_reference(message)
         pair_reference_detected, pair_reference_type = self._detect_pair_reference(message)
         comparison_reference_detected = bool(COMPARISON_REFERENCE_RE.search(message or ""))
+        comparison_current = (
+            ResolvedEntity(type="ip", value=message_ips[0], source="message")
+            if len(message_ips) == 1
+            else ResolvedEntity(type="ip", value=ui_selected_ip, source="ui")
+            if not message_ips and ui_selected_ip
+            else None
+        )
         comparative_reference_signal = bool(
-            len(message_ips) == 1
+            comparison_current
             and COMPARATIVE_SIGNAL_RE.search(message or "")
             and (reference_detected or RECENT_REFERENCE_RE.search(message or "") or recent_entity_candidates or active_entities)
         )
@@ -259,26 +293,29 @@ class EntityResolver:
             reference_type = None
             pair_reference_detected = False
             pair_reference_type = None
+        timeline_reference = (
+            None if reference_suppressed or message_ips else _timeline_reference(message, routing_state)
+        )
 
         if (
-            len(message_ips) == 1
+            comparison_current is not None
             and comparison_reference_detected
             and (active_ip or recent_entity_candidates)
             and next(
                 (
                     ip
                     for ip in [*active_entities, *recent_entity_candidates]
-                    if ip != message_ips[0]
+                    if ip != comparison_current.value
                 ),
                 None,
             )
             and not reference_suppressed
         ):
             comparison_peer = next(
-                ip for ip in [*active_entities, *recent_entity_candidates] if ip != message_ips[0]
+                ip for ip in [*active_entities, *recent_entity_candidates] if ip != comparison_current.value
             )
             entities = [
-                ResolvedEntity(type="ip", value=message_ips[0], source="message"),
+                comparison_current,
                 ResolvedEntity(type="ip", value=comparison_peer, source="conversation"),
             ]
             resolution = EntityResolution(
@@ -295,20 +332,20 @@ class EntityResolver:
                 suppression_reason=suppression_reason,
             )
         elif (
-            len(message_ips) == 1
+            comparison_current is not None
             and comparative_reference_signal
             and not reference_suppressed
             and (comparison_peer := next(
                 (
                     ip
                     for ip in [*active_entities, *recent_entity_candidates]
-                    if ip != message_ips[0]
+                    if ip != comparison_current.value
                 ),
                 None,
             ))
         ):
             entities = [
-                ResolvedEntity(type="ip", value=message_ips[0], source="message"),
+                comparison_current,
                 ResolvedEntity(type="ip", value=comparison_peer, source="conversation"),
             ]
             resolution = EntityResolution(
@@ -354,20 +391,34 @@ class EntityResolver:
                 reference_suppressed=reference_suppressed,
                 suppression_reason=suppression_reason,
             )
-        elif ui_selected_ip and not reference_suppressed:
-            primary = ResolvedEntity(type="ip", value=ui_selected_ip, source="ui")
+        elif conversation_scope:
+            # Whole-thread recall is not an asset operation. UI selection,
+            # active cursors, timeline ordinals, and implicit references are
+            # incidental unless the user supplied an explicit entity above.
             resolution = EntityResolution(
-                status="resolved",
-                entities=[primary],
-                primary_entity=primary,
-                entity_mode="single",
-                candidate_count=1,
+                status="none",
                 explicit_candidate_count=len(explicit_candidates),
-                valid_entity_count=1,
-                reference_detected=reference_detected,
-                reference_type=reference_type,
+                reference_detected=False,
                 reference_suppressed=reference_suppressed,
                 suppression_reason=suppression_reason,
+            )
+        elif timeline_reference is not None:
+            timeline_entities, timeline_reference_type = timeline_reference
+            entities = [
+                ResolvedEntity(type="ip", value=value, source="conversation")
+                for value in timeline_entities
+            ]
+            resolution = EntityResolution(
+                status="resolved",
+                entities=entities,
+                primary_entity=entities[0] if len(entities) == 1 else None,
+                entity_mode="single" if len(entities) == 1 else "multiple",
+                candidate_count=len(entities),
+                explicit_candidate_count=len(explicit_candidates),
+                valid_entity_count=len(entities),
+                reference_detected=True,
+                reference_type=timeline_reference_type,
+                reference_suppressed=False,
             )
         elif pair_reference_detected and len(active_entities) >= 2 and not reference_suppressed:
             entities = [
@@ -384,6 +435,21 @@ class EntityResolver:
                 valid_entity_count=len(entities),
                 reference_detected=True,
                 reference_type=pair_reference_type,
+                reference_suppressed=reference_suppressed,
+                suppression_reason=suppression_reason,
+            )
+        elif ui_selected_ip and not reference_suppressed:
+            primary = ResolvedEntity(type="ip", value=ui_selected_ip, source="ui")
+            resolution = EntityResolution(
+                status="resolved",
+                entities=[primary],
+                primary_entity=primary,
+                entity_mode="single",
+                candidate_count=1,
+                explicit_candidate_count=len(explicit_candidates),
+                valid_entity_count=1,
+                reference_detected=reference_detected,
+                reference_type=reference_type,
                 reference_suppressed=reference_suppressed,
                 suppression_reason=suppression_reason,
             )

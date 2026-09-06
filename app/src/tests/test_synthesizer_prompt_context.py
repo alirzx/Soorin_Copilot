@@ -35,7 +35,7 @@ from src.core.copilot.service import CopilotService
 from src.core.llm.providers.base import LLMProviderResult
 from src.core.memory.retrieval import LongTermMemorySelection
 from src.core.memory.retrieval import LazyCrossEncoderReranker
-from src.core.memory.episodes import MemoryContextKey
+from src.core.memory.episodes import MemoryContextKey, MemoryContextPackage
 from src.core.memory.store import MemoryStore
 
 
@@ -274,6 +274,46 @@ def test_rendered_contract_uses_internal_term_hiding_and_historical_modules() ->
     assert "temporal.historical" in modules
     assert "memory.historical_memory_only" in modules
     assert "ordinary user-facing responses" in contract
+    assert "never claim" in contract.casefold()
+    assert "exhaustive" in contract.casefold()
+    assert "absence" in contract.casefold()
+
+
+def test_bounded_thread_recall_coverage_is_machine_readable_in_synth_contract() -> None:
+    package = MemoryContextPackage(
+        thread_recall_requested=True,
+        thread_recall_complete=False,
+        sources_considered=("relevant_turns", "episodes"),
+        omitted=("older_relevant_turn_over_budget",),
+    )
+    selection = LongTermMemorySelection(
+        status="available",
+        inventory_available=False,
+        limitations=("long_term_memory_inventory_unavailable",),
+    )
+    context = SynthesizerPromptBuilder().build_context(
+        _task(
+            intent="memory_recall",
+            required_capabilities=(),
+            evidence_mode="memory_only",
+            temporal_mode="historical",
+        ),
+        (),
+        snapshot=SimpleNamespace(memory_context=package, recent_message_count=1),
+        long_term_selection=selection,
+    )
+    contract, _ = SynthesizerPromptBuilder().render_contract(context)
+    metadata = json.loads(
+        contract.split("[SOORIN SYNTHESIZER TASK CONTRACT]\n", 1)[1].split(
+            "\n[SELECTED INSTRUCTIONS]", 1
+        )[0]
+    )
+
+    assert metadata["memory"]["thread_recall_requested"] is True
+    assert metadata["memory"]["thread_recall_complete"] is False
+    assert metadata["memory"]["memory_context_truncated"] is True
+    assert metadata["memory"]["inventory_available"] is False
+    assert metadata["memory"]["sources_omitted"] == ["older_relevant_turn_over_budget"]
 
 
 def test_no_live_refresh_preserves_underlying_task_identity() -> None:

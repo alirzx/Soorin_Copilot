@@ -30,6 +30,9 @@ def settings(**overrides: Any):
         "llm_context_window_tokens": 32768,
         "llm_reserved_output_tokens": 12288,
         "llm_context_safety_margin_tokens": 2048,
+        "synthesizer_brief_output_tokens": 1536,
+        "synthesizer_standard_output_tokens": 4096,
+        "synthesizer_deep_output_tokens": 6144,
         "graph_max_context_tokens": 8000,
         "graph_context_max_enumerated_nodes": 500,
         "graph_context_max_enumerated_edges": 500,
@@ -372,9 +375,29 @@ class ExhaustiveGraphBudgetTests(unittest.TestCase):
         estimate = estimator.estimate_text("x" * 4000)
         self.assertEqual(estimate.raw_tokens, 1000)
         self.assertEqual(estimate.calibrated_tokens, 1350)
-        self.assertEqual(estimator.output_reservation("brief", 12000), 1536)
-        self.assertEqual(estimator.output_reservation("standard", 12000), 4096)
-        self.assertEqual(estimator.output_reservation("deep", 5000), 5000)
+        configured = settings()
+        reservation_kwargs = {
+            "brief_output_tokens": configured.synthesizer_brief_output_tokens,
+            "standard_output_tokens": configured.synthesizer_standard_output_tokens,
+            "deep_output_tokens": configured.synthesizer_deep_output_tokens,
+        }
+        self.assertEqual(estimator.output_reservation("brief", 12000, **reservation_kwargs), 1536)
+        self.assertEqual(estimator.output_reservation("standard", 12000, **reservation_kwargs), 4096)
+        self.assertEqual(estimator.output_reservation("deep", 5000, **reservation_kwargs), 5000)
+
+        custom = settings(
+            synthesizer_brief_output_tokens=700,
+            synthesizer_standard_output_tokens=1700,
+            synthesizer_deep_output_tokens=2700,
+        )
+        custom_reservation_kwargs = {
+            "brief_output_tokens": custom.synthesizer_brief_output_tokens,
+            "standard_output_tokens": custom.synthesizer_standard_output_tokens,
+            "deep_output_tokens": custom.synthesizer_deep_output_tokens,
+        }
+        self.assertEqual(estimator.output_reservation("brief", 12000, **custom_reservation_kwargs), 700)
+        self.assertEqual(estimator.output_reservation("standard", 12000, **custom_reservation_kwargs), 1700)
+        self.assertEqual(estimator.output_reservation("deep", 12000, **custom_reservation_kwargs), 2700)
 
         composer = ContextComposer(settings(llm_context_window_tokens=8000))
         composer.compose(

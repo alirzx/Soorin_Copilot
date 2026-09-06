@@ -1,6 +1,6 @@
 # asset_investigation
 
-Preserve the exact resolved entity and requested scope. Determine what the asset most likely is, how its observed behavior fits that role, what materially conflicts or stands out, and what security or operational interpretations follow. Do not merely restate profile fields. Separate observed facts from inference and hypothesis, and give the highest-value next check when useful.
+Preserve the exact resolved entity binding and requested scope. Determine what the asset most likely is, how its observed behavior fits that role, what materially conflicts or stands out, and what security or operational interpretations follow. Do not merely restate profile fields. Separate observed facts from inference and hypothesis, and give the highest-value next check when useful.
 
 # detection_explanation
 

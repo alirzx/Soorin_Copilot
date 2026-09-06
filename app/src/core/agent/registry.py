@@ -16,6 +16,7 @@ from pydantic import BaseModel, Field
 from src.core.agent.contracts import (
     CapabilitySpec,
     EvidenceFact,
+    EvidenceReceipt,
     RetryPolicy,
     ToolResult,
 )
@@ -184,6 +185,54 @@ def _provider_result(
         else getattr(result, "error_type", None) or getattr(result, "error_reason", None)
     )
     fact_payload = evidence_view.payload if evidence_view else payload
+    receipt_payload: Any = payload
+    receipt_schema_version = "graph-baseline-v1" if capability.startswith("graph.") else ""
+    receipt_scope = "none"
+    receipt_direction = "none"
+    receipt_depth = 0
+    if evidence_view is not None:
+        # A full Product view remains raw for established presentation contracts,
+        # but its immutable acquisition receipt always has the same view wrapper.
+        receipt_payload = {
+            "provider": evidence_view.provider,
+            "views": {
+                view: (
+                    evidence_view.payload.get("views", {}).get(view)
+                    if evidence_view.selected_views != ("full",)
+                    and isinstance(evidence_view.payload, dict)
+                    and isinstance(evidence_view.payload.get("views"), dict)
+                    else evidence_view.payload
+                )
+                for view in evidence_view.selected_views
+            },
+            "projection_metadata": {
+                "source_payload_complete": evidence_view.source_payload_complete,
+                "selected_views": list(evidence_view.selected_views),
+                "receipt_version": "v1",
+            },
+        }
+        receipt_schema_version = evidence_view.schema_version
+    elif capability.startswith("graph.") and isinstance(payload, dict):
+        receipt_scope = str(payload.get("requested_scope") or payload.get("scope") or "none")
+        receipt_direction = str(payload.get("direction") or "none")
+        receipt_depth = int(payload.get("depth") or 0)
+    receipt = EvidenceReceipt.from_payload(
+        payload=receipt_payload,
+        source_capability=capability,
+        entities=entities,
+        status=status,  # type: ignore[arg-type]
+        freshness="stale" if stale else "current" if status in {"ok", "not_found"} else "unknown",
+        completeness=completeness,  # type: ignore[arg-type]
+        retrieved_at=str(getattr(result, "fetched_at", None) or _now()),
+        source_payload_complete=evidence_view.source_payload_complete if evidence_view else payload is not None,
+        projection_usable=evidence_view.projection_usable if evidence_view else payload is not None,
+        truncated=not complete,
+        projection_truncated=evidence_view.truncated if evidence_view else False,
+        schema_version=receipt_schema_version or "evidence-receipt-v1",
+        scope=receipt_scope,
+        direction=receipt_direction,
+        depth=receipt_depth,
+    )
     return ToolResult(
         status=status,  # type: ignore[arg-type]
         entities=entities,
@@ -222,6 +271,7 @@ def _provider_result(
         projection_truncated=evidence_view.truncated if evidence_view else False,
         projection_omitted_count=evidence_view.projection_omitted_count if evidence_view else 0,
         projection_schema_version=evidence_view.schema_version if evidence_view else "",
+        evidence_receipt=receipt,
     )
 
 

@@ -203,6 +203,8 @@ Do not invent Graph policy arguments when runtime or capability wrappers already
 
 ## Knowledge Planning
 
+Mark `knowledge.search` optional by default; model knowledge cannot substitute for current environment facts.
+
 Use `knowledge.search` only when Knowledge remains an authorized unresolved requirement.
 
 The Planner never independently decides that background knowledge would improve the answer.
