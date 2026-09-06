@@ -329,6 +329,13 @@ class CopilotWorkflowNodes:
                 task_envelope = derive_task_envelope(
                     route_entities, constraints, turn_policy, routing_state
                 )
+                logger.info(
+                    "event=comparison_pair_recovered request_id=%s "
+                    "comparison_pair_recovered=true comparison_pair_source=active_operational_pair "
+                    "active_pair=%s",
+                    state["request_id"],
+                    ",".join(active_pair),
+                )
         evidence_mode = evidence_mode_from_request(state["message"])
         if (
             evidence_mode in {"memory_only", "no_live_refresh"}
@@ -459,6 +466,11 @@ class CopilotWorkflowNodes:
     def _authorized_memory_context_key(self, state: InvestigationState, task: Any) -> MemoryContextKey:
         candidate = MemoryContextKey.from_task(task)
         policy = state.get("turn_policy")
+        if not getattr(policy, "operational_state_mutation_allowed", True):
+            # Recall scope controls selection only. It must not be replaced by
+            # the active operational key merely because no episode transition
+            # is allowed.
+            return candidate
         if getattr(policy, "episode_transition", "switch") != "keep":
             return candidate
         working = self.service.memory_store.repository.get_working(state["session_id"])
@@ -877,6 +889,8 @@ class CopilotWorkflowNodes:
                 request_id=state["request_id"],
                 long_term_memories=long_term_memories,
                 activate_context=(
+                    getattr(state.get("turn_policy"), "operational_state_mutation_allowed", True)
+                    and
                     getattr(state.get("turn_policy"), "episode_transition", "switch") in {"switch", "detach"}
                 ),
                 thread_recall=(
@@ -1333,6 +1347,9 @@ class CopilotWorkflowNodes:
                 limitations=tuple(state["evidence_pack"].limitations),
                 scope=task.scope,
                 request_id=state["request_id"],
+                mutate_operational_episode=bool(
+                    getattr(state.get("turn_policy"), "operational_state_mutation_allowed", True)
+                ),
             )
             if not baseline_rejection_reason:
                 baseline = investigation_baseline_from_results(
@@ -1369,6 +1386,9 @@ class CopilotWorkflowNodes:
         timeline = previous.entity_timeline
         turn_policy = state.get("turn_policy")
         transition = getattr(turn_policy, "episode_transition", "switch")
+        operational_state_mutation_allowed = bool(
+            getattr(turn_policy, "operational_state_mutation_allowed", True)
+        )
         detached_without_target = (
             transition == "detach"
             and getattr(turn_policy, "operation", "") != "topic_detach"
@@ -1381,6 +1401,8 @@ class CopilotWorkflowNodes:
             active_ip = None
             last_resolved = ()
         can_update = (
+            operational_state_mutation_allowed
+            and
             resolved.status == "resolved"
             and bool(resolved.entities)
             and route.intent
@@ -1453,7 +1475,20 @@ class CopilotWorkflowNodes:
             last_capability_statuses=tuple(f"{item.source_capability}:{item.status}" for item in results),
             entity_timeline=timeline,
         )
-        if self.settings.chat_store_history:
+        logger.info(
+            "event=operational_state_update request_id=%s "
+            "operational_state_mutation_allowed=%s active_entities_before=%s "
+            "active_entities_after=%s active_pair_before=%s active_pair_after=%s "
+            "episode_transition=%s",
+            state["request_id"],
+            operational_state_mutation_allowed,
+            ",".join(previous.active_entities) or "none",
+            ",".join(new_state.active_entities) or "none",
+            ",".join(previous.active_entities) if len(previous.active_entities) == 2 else "none",
+            ",".join(new_state.active_entities) if len(new_state.active_entities) == 2 else "none",
+            bool(getattr(state.get("conversation_snapshot"), "episode_transition", False)),
+        )
+        if self.settings.chat_store_history and operational_state_mutation_allowed:
             self.service.memory_store.compact_if_needed(
                 state["session_id"],
                 self.settings,

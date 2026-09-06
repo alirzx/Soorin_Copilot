@@ -164,6 +164,7 @@ class LongTermMemorySelection:
     candidate_record_count: int = 0
     active_record_count: int = 0
     selected_count: int = 0
+    inventory_available: bool | None = None
     limitations: tuple[str, ...] = ()
 
 

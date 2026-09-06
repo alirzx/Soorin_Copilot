@@ -4,13 +4,11 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass
-
-import networkx as nx
+from typing import Any, Protocol
 
 from src.config.settings import Settings
 from src.core.context.models import GraphDirection, GraphScope, IntentName, RelationshipMode, ResolvedEntity
-from src.core.graph.loader import get_graph
-from src.core.graph.service import get_subnet
+from src.core.graph.subnet import get_subnet
 
 
 GRAPH_CONTEXT_LIMITATIONS = [
@@ -49,6 +47,21 @@ class GraphRetrievalPolicy:
             two_hop_max_nodes=min(settings.graph_two_hop_max_nodes, cls.two_hop_max_nodes),
             two_hop_max_edges=min(settings.graph_max_edges, cls.two_hop_max_edges),
         )
+
+
+class GraphAdjacency(Protocol):
+    """Minimal directed adjacency contract used for deterministic normalization."""
+
+    nodes: dict[str, dict[str, object]]
+
+    def __contains__(self, node: object) -> bool: ...
+    def predecessors(self, node: str) -> Any: ...
+    def successors(self, node: str) -> Any: ...
+    def degree(self, node: str) -> int: ...
+    def in_degree(self, node: str) -> int: ...
+    def out_degree(self, node: str) -> int: ...
+    def has_edge(self, source: str, target: str) -> bool: ...
+    def edge_weight(self, source: str, target: str) -> int: ...
 
 
 def _apply_completeness_contract(
@@ -123,8 +136,8 @@ def _empty_result(spec: GraphRetrievalSpec, target_ip: str, *, node_found: bool)
     }
 
 
-def _edge_dict(src: str, dst: str, graph: nx.DiGraph) -> dict[str, object]:
-    return {"source": src, "target": dst, "weight": graph[src][dst].get("weight", 1)}
+def _edge_dict(src: str, dst: str, graph: GraphAdjacency) -> dict[str, object]:
+    return {"source": src, "target": dst, "weight": graph.edge_weight(src, dst)}
 
 
 def _node_dict(node: str, *, target: str = "", hop: int = 1, inbound: bool = False, outbound: bool = False) -> dict[str, object]:
@@ -138,7 +151,7 @@ def _node_dict(node: str, *, target: str = "", hop: int = 1, inbound: bool = Fal
     }
 
 
-def _neighbors(graph: nx.DiGraph, target: str, direction: GraphDirection) -> tuple[list[str], list[str], list[str]]:
+def _neighbors(graph: GraphAdjacency, target: str, direction: GraphDirection) -> tuple[list[str], list[str], list[str]]:
     inbound = sorted(graph.predecessors(target))
     outbound = sorted(graph.successors(target))
     bidirectional = sorted(set(inbound).intersection(outbound))
@@ -168,8 +181,12 @@ def _reason_string(reasons: list[dict[str, object]]) -> str | None:
     return f"{first['type']}:{first['limit']}"
 
 
-def retrieve_graph_context(spec: GraphRetrievalSpec, settings: Settings) -> dict[str, object]:
-    graph = get_graph()
+def retrieve_graph_context(graph: GraphAdjacency, spec: GraphRetrievalSpec, settings: Settings) -> dict[str, object]:
+    """Normalize an explicitly supplied directed adjacency view.
+
+    Neo4j hydrates this bounded view from the active projection; this module
+    deliberately owns no graph store or fallback backend.
+    """
     if spec.intent == "graph_relationships" and len(spec.entities) == 2:
         if spec.scope == "multi_entity_comparison" or spec.relationship_mode == "compare":
             result = _comparison_context(graph, spec, settings)
@@ -188,7 +205,7 @@ def retrieve_graph_context(spec: GraphRetrievalSpec, settings: Settings) -> dict
     return _apply_completeness_contract(result, spec)
 
 
-def _neighbor_context(graph: nx.DiGraph, spec: GraphRetrievalSpec, settings: Settings) -> dict[str, object]:
+def _neighbor_context(graph: GraphAdjacency, spec: GraphRetrievalSpec, settings: Settings) -> dict[str, object]:
     target = spec.entities[0].value
     inbound_all = sorted(graph.predecessors(target))
     outbound_all = sorted(graph.successors(target))
@@ -286,7 +303,7 @@ def _neighbor_context(graph: nx.DiGraph, spec: GraphRetrievalSpec, settings: Set
     }
 
 
-def _two_hop_context(graph: nx.DiGraph, spec: GraphRetrievalSpec, settings: Settings) -> dict[str, object]:
+def _two_hop_context(graph: GraphAdjacency, spec: GraphRetrievalSpec, settings: Settings) -> dict[str, object]:
     target = spec.entities[0].value
     seen = {target}
     hops = {target: 0}
@@ -385,7 +402,27 @@ def _two_hop_context(graph: nx.DiGraph, spec: GraphRetrievalSpec, settings: Sett
     }
 
 
-def _path_context(graph: nx.DiGraph, spec: GraphRetrievalSpec, settings: Settings) -> dict[str, object]:
+def _shortest_directed_path(graph: GraphAdjacency, source: str, target: str) -> list[str] | None:
+    if source == target:
+        return [source]
+    parents: dict[str, str | None] = {source: None}
+    queue: deque[str] = deque([source])
+    while queue:
+        node = queue.popleft()
+        for peer in sorted(graph.successors(node)):
+            if peer in parents:
+                continue
+            parents[peer] = node
+            if peer == target:
+                path = [target]
+                while parents[path[-1]] is not None:
+                    path.append(str(parents[path[-1]]))
+                return list(reversed(path))
+            queue.append(peer)
+    return None
+
+
+def _path_context(graph: GraphAdjacency, spec: GraphRetrievalSpec, settings: Settings) -> dict[str, object]:
     source = spec.entities[0].value if spec.entities else ""
     target = spec.entities[1].value if len(spec.entities) > 1 else ""
     source_present = source in graph
@@ -407,9 +444,8 @@ def _path_context(graph: nx.DiGraph, spec: GraphRetrievalSpec, settings: Setting
     )
     if source not in graph or target not in graph:
         return base
-    try:
-        candidate_path_nodes = nx.shortest_path(graph, source=source, target=target)
-    except (nx.NetworkXNoPath, nx.NodeNotFound):
+    candidate_path_nodes = _shortest_directed_path(graph, source, target)
+    if candidate_path_nodes is None:
         base.update({"node_found": True})
         return base
     candidate_node_count = len(candidate_path_nodes)
@@ -458,7 +494,7 @@ def _path_context(graph: nx.DiGraph, spec: GraphRetrievalSpec, settings: Setting
     return base
 
 
-def _relationship_context(graph: nx.DiGraph, spec: GraphRetrievalSpec) -> dict[str, object]:
+def _relationship_context(graph: GraphAdjacency, spec: GraphRetrievalSpec) -> dict[str, object]:
     source = spec.entities[0].value
     target = spec.entities[1].value
     source_present = source in graph
@@ -518,7 +554,7 @@ def _relationship_context(graph: nx.DiGraph, spec: GraphRetrievalSpec) -> dict[s
     }
 
 
-def _direct_peer_sets(graph: nx.DiGraph, node: str) -> tuple[set[str], set[str], set[str]]:
+def _direct_peer_sets(graph: GraphAdjacency, node: str) -> tuple[set[str], set[str], set[str]]:
     if node not in graph:
         return set(), set(), set()
     inbound = set(graph.predecessors(node))
@@ -526,7 +562,7 @@ def _direct_peer_sets(graph: nx.DiGraph, node: str) -> tuple[set[str], set[str],
     return inbound, outbound, inbound.intersection(outbound)
 
 
-def _entity_summary(graph: nx.DiGraph, node: str, settings: Settings) -> dict[str, object]:
+def _entity_summary(graph: GraphAdjacency, node: str, settings: Settings) -> dict[str, object]:
     inbound, outbound, bidirectional = _direct_peer_sets(graph, node)
     peers = sorted(inbound.union(outbound))
     limited_peers = peers[: settings.graph_comparison_max_peers_per_entity]
@@ -544,7 +580,7 @@ def _entity_summary(graph: nx.DiGraph, node: str, settings: Settings) -> dict[st
     }
 
 
-def _comparison_context(graph: nx.DiGraph, spec: GraphRetrievalSpec, settings: Settings) -> dict[str, object]:
+def _comparison_context(graph: GraphAdjacency, spec: GraphRetrievalSpec, settings: Settings) -> dict[str, object]:
     entity_a = spec.entities[0].value
     entity_b = spec.entities[1].value
     a_summary = _entity_summary(graph, entity_a, settings)

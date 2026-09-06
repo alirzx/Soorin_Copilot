@@ -66,7 +66,7 @@ class EnvironmentAndRuntimeContractsTests(unittest.TestCase):
         self.assertFalse((ROOT / "app" / ".env").exists())
         self.assertFalse((ROOT / "compose.env").exists())
 
-    def test_compose_uses_fail_fast_host_binds_and_isolates_ui_secrets(self) -> None:
+    def test_compose_uses_fail_fast_api_binds_and_keeps_ui_off_local_graph_data(self) -> None:
         compose = (ROOT / "docker-compose.yaml").read_text(encoding="utf-8")
         api, ui = compose.split("  ui:", 1)
         self.assertIn("source: ./data", api)
@@ -74,11 +74,10 @@ class EnvironmentAndRuntimeContractsTests(unittest.TestCase):
         self.assertIn("SOORIN_RAG_QDRANT_PATH: /workspace/data/qdrant-local", api)
         self.assertIn("create_host_path: false", api)
         self.assertIn("read_only: false", api)
-        self.assertIn("source: ./data", ui)
-        self.assertIn("target: /workspace/data", ui)
-        self.assertIn("create_host_path: false", ui)
-        self.assertIn("read_only: true", ui)
-        self.assertNotIn("env_file:", ui)
+        self.assertNotIn("source: ./data", ui)
+        self.assertNotIn("target: /workspace/data", ui)
+        self.assertIn("SOORIN_API_BASE_URL: http://api:6998", ui)
+        self.assertIn('SOORIN_NEO4J_PASSWORD: ""', ui)
         self.assertNotIn("SOORIN_RAG_SOURCE_HOST_PATH", compose)
         self.assertNotIn("copilot-qdrant", compose)
         self.assertNotIn("copilot-data", compose)
@@ -86,9 +85,11 @@ class EnvironmentAndRuntimeContractsTests(unittest.TestCase):
     def test_makefile_has_preflight_without_obsolete_volume_seeding(self) -> None:
         makefile = (ROOT / "Makefile").read_text(encoding="utf-8")
         self.assertIn("preflight:", makefile)
+        self.assertIn("deploy: preflight build preflight-image", makefile)
         self.assertIn("test-local:", makefile)
         self.assertIn("inspect-size:", makefile)
         self.assertNotIn("seed-qdrant", makefile)
+        self.assertNotIn('"$(DATA_DIR)/processed/topology_graph.pkl"', makefile)
 
     def test_checkpoint_runtime_is_absent_from_source_config_and_dependencies(self) -> None:
         workflow = (ROOT / "app/src/core/agent/workflow.py").read_text(encoding="utf-8")

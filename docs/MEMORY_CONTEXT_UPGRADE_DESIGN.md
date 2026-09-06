@@ -44,7 +44,7 @@ POST /chat or /chat/stream
 ```
 
 Direct tasks skip the Planner. The Planner is a bounded proposal mechanism,
-not a tool loop. The registry currently wraps Profile, Detection, NetworkX
+not a tool loop. The registry currently wraps Profile, Detection, Neo4j-backed
 Graph, and `knowledge.search`.
 
 ### 2.2 Current contracts and authority
@@ -67,7 +67,7 @@ logic validates, normalizes, and safely falls back only when needed.
 | --- | --- | --- |
 | Asset Profile | Product API via shared client | point-in-time operational evidence |
 | Asset Detection | Product API via shared client | point-in-time operational evidence |
-| Graph | validated NetworkX last-known-good graph | observed topology snapshot |
+| Graph | validated last-known-good Neo4j Community projection | current observed topology evidence |
 | Knowledge | optional local/server Qdrant RAG | documentation only |
 
 `ToolResult` preserves status, entity binding, retrieval time, freshness,

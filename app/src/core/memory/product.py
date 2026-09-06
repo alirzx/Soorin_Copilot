@@ -52,9 +52,11 @@ def _refs_from_wire(refs: Any) -> tuple[str, ...]:
     values: list[str] = []
     for ref in refs:
         if isinstance(ref, dict):
-            if ref.get("type") != "canonical_ref" or not isinstance(ref.get("id"), str):
+            ref_type = ref.get("type", ref.get("referenceType", ref.get("refType")))
+            ref_id = ref.get("id", ref.get("referenceId", ref.get("refId")))
+            if ref_type not in {"canonical_ref", "canonical"} or not isinstance(ref_id, str):
                 raise ProductMemoryContractError("Product memory evidence reference is not lossless.")
-            values.append(ref["id"])
+            values.append(ref_id)
         elif isinstance(ref, str):
             values.append(ref)
         else:
@@ -62,8 +64,45 @@ def _refs_from_wire(refs: Any) -> tuple[str, ...]:
     return tuple(values)
 
 
-def _memory_from_wire(value: Any) -> LongTermMemoryRecord:
+_MEMORY_WIRE_ALIASES = {
+    "memoryId": ("memory_id", "id"),
+    "memoryType": ("memory_type",),
+    "userId": ("user_id",),
+    "entityIds": ("entity_ids",),
+    "epistemicStatus": ("epistemic_status",),
+    "sourceRequestId": ("source_request_id",),
+    "sourceConversationId": ("source_conversation_id", "conversationId"),
+    "evidenceRefs": ("evidence_refs",),
+    "provenanceCategory": ("provenance_category",),
+    "validFrom": ("valid_from",),
+    "validUntil": ("valid_until",),
+    "createdAt": ("created_at",),
+    "updatedAt": ("updated_at",),
+    "indexStatus": ("index_status",),
+    "supersedesMemoryId": ("supersedes_memory_id",),
+    "idempotencyFingerprint": ("idempotency_fingerprint", "fingerprint"),
+    "logicalMemoryKey": ("logical_memory_key", "logicalKey"),
+    "hasUnresolvedConflict": ("has_unresolved_conflict",),
+    "policyVersion": ("policy_version",),
+}
+
+
+def _normalize_memory_wire(value: Any) -> dict[str, Any]:
+    """Normalize documented Product DTO aliases before strict validation."""
     item = _object(value, "memory", "record")
+    normalized = dict(item)
+    for canonical, aliases in _MEMORY_WIRE_ALIASES.items():
+        if canonical in normalized:
+            continue
+        for alias in aliases:
+            if alias in item:
+                normalized[canonical] = item[alias]
+                break
+    return normalized
+
+
+def _memory_from_wire(value: Any) -> LongTermMemoryRecord:
+    item = _normalize_memory_wire(value)
     required = ("memoryId", "memoryType", "userId", "statement", "epistemicStatus", "confidence", "sourceRequestId", "sourceConversationId", "evidenceRefs", "validFrom", "revision", "status", "indexStatus", "idempotencyFingerprint", "logicalMemoryKey")
     if any(key not in item for key in required):
         raise ProductMemoryContractError("Product memory canonical response was incomplete.")
@@ -147,7 +186,7 @@ class ProductLongTermMemoryStore:
         return self.local_test_user_id or domain_user_id
 
     def _domain_record(self, value: Any, *, domain_user_id: str) -> LongTermMemoryRecord:
-        item = _object(value, "memory", "record")
+        item = _normalize_memory_wire(value)
         if item.get("userId") != self._owner(domain_user_id):
             raise LocalPersistenceOwnershipError("Product long-term memory owner did not match the transport owner.")
         # Product's transport owner can be a local test account while the

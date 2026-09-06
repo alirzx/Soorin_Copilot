@@ -380,11 +380,11 @@ memory updates add no LLM calls.
 | --- | ---: | --- | --- | --- | --- |
 | `asset.get_profile` | 1 | Product API | current asset identity/security/network/activity | yes | one entity per step; Product serialization lock |
 | `asset.get_detection` | 1 | Product API | current classifier/rule/similarity/cluster evidence | yes | one entity per step; Product serialization lock |
-| `graph.get_summary` | 1 | NetworkX snapshot | node topology summary | yes | depth 0 |
-| `graph.get_neighbors` | 1 | NetworkX snapshot | one/two-hop or exhaustive direct peers | yes | depth <= 2 and configured node/edge limits |
-| `graph.get_relationship` | 2 | NetworkX snapshot | direct relation | yes | exactly two entities |
-| `graph.compare_assets` | 2 | NetworkX snapshot | bounded topology comparison | yes | exactly two entities; per-entity/shared-peer limits |
-| `graph.find_path` | 2 | NetworkX snapshot | observed graph shortest path | yes | exactly two entities; bounded path length |
+| `graph.get_summary` | 1 | published Neo4j projection | node topology summary | yes | depth 0 |
+| `graph.get_neighbors` | 1 | published Neo4j projection | one/two-hop or exhaustive direct peers | yes | depth <= 2 and configured node/edge limits |
+| `graph.get_relationship` | 2 | published Neo4j projection | direct relation | yes | exactly two entities |
+| `graph.compare_assets` | 2 | published Neo4j projection | bounded topology comparison | yes | exactly two entities; per-entity/shared-peer limits |
+| `graph.find_path` | 2 | published Neo4j projection | observed graph directed path | yes | exactly two entities; bounded path length |
 | `knowledge.search` | 0 | Qdrant SOC corpus | documentation/runbook knowledge | yes | Top-K, score, token, and citation limits |
 
 All registered capabilities are read-only. The executor runs dependency-ready
@@ -406,13 +406,13 @@ projection omissions/counts explicit. Explicit deep/full requests may still be
 large. A request-scoped fetch cache avoids duplicate Product retrieval inside one
 request, but there is no durable operational-evidence cache across requests.
 
-### NetworkX graph evidence
+### Neo4j graph evidence
 
-- Startup loads the last-known-good pickle into an active in-memory graph.
+- Startup verifies the last successfully published Neo4j graph projection.
 - The current local configuration enables background refresh, startup refresh,
-  and a 900-second interval. Refresh calls Product, validates node/edge/drop
-  thresholds, writes required artifacts and bounded snapshots atomically, then
-  replaces the active graph only after validation.
+  and a 3600-second interval. Refresh calls Product, validates node/edge/drop
+  thresholds, stages a versioned Neo4j projection, then publishes it only after
+  validation. Raw Product JSON remains audit/debug material, not a fallback.
 - Retrieval and serialization have separate completeness contracts. Returned
   totals are not silently rewritten when context serialization omits nodes/edges.
 - Current effective limits include one-hop 350 nodes, two-hop 800 nodes, 4,000
@@ -725,7 +725,7 @@ Result: the system safely refreshes, but deterministic change analysis is
 | LTM canonical records | LongTermMemoryStore | local SQLite | yes | local-development implementation only |
 | LTM semantic projection | SemanticMemoryIndex | separate Qdrant collection | yes if storage available | accelerator only, never canonical |
 | SOC Knowledge | KnowledgeSearchService | separate Qdrant collection | yes | externally maintained index |
-| Graph | GraphRefreshService/loader | files + in-memory NetworkX | last-known-good file survives | operational artifact, not conversation memory |
+| Graph | GraphRefreshService/GraphService | Neo4j Community versioned projection | last-known-good projection survives | current graph evidence, not conversation memory |
 | LangGraph execution | InvestigationState | memory only | no | checkpointing deferred |
 | LLM usage report | request-local collector | outbound Product POST when enabled | Product-owned after delivery | non-fatal and idempotent per request |
 | Metrics/logs | observability subsystem | Prometheus/log files/stdout | deployment dependent | operational telemetry, not evidence |
@@ -862,7 +862,7 @@ classifies failure classes from source and tests, not from live execution.
 | Direct vs bounded Planner workflow | working | high |
 | Capability allowlist, validation, cardinality, DAG, and budgets | working | high |
 | Product projection and request-scoped reuse | working | high |
-| NetworkX scoped retrieval and separate serialization completeness | working | high |
+| Neo4j scoped retrieval and separate serialization completeness | working | high |
 | Knowledge RAG as optional documentation evidence | working when configured/index available | medium: offline tests, no live audit |
 | No-refresh/memory-only hard authority | working for covered deterministic forms | high |
 | Latest completed raw turn retention and topic detachment | working | high |
