@@ -18,13 +18,13 @@ runtime overrides directly. The root `.env` remains private and ignored.
 
 ## Persistent Data
 
-The current Compose file bind-mounts the repository `data/` directory at
-`/workspace/data`; the API has read/write access and the UI has read-only access.
-That directory must already contain the validated Graph artifacts and, when
-local Qdrant is enabled, the configured Qdrant data. The Hugging Face model cache
-is mounted from the repository `huggingface/` directory and is read-only inside
-the containers. No model, Graph artifact, Qdrant data, or SOC source corpus is
-baked into the image.
+The API bind-mounts the repository `data/` directory at `/workspace/data` with
+read/write access for refresh snapshots and local Qdrant. The Streamlit UI has
+no graph-data mount: it reads the published Neo4j projection through the
+authenticated Graph API. The Hugging Face model cache is mounted from the
+repository `huggingface/` directory and is read-only inside the API container.
+No model, Graph artifact, Qdrant data, or SOC source corpus is baked into the
+image.
 
 The original SOC corpus is external to normal runtime retrieval. It is used by
 the separate indexing maintenance flow and is not scanned during application
@@ -49,12 +49,10 @@ Keep host bindings on `127.0.0.1` unless LAN exposure is intentional. Validate
 the root environment and current data/cache prerequisites before starting:
 
 ```bash
-make preflight
+make deploy
 make test-local
-make build
 make inspect-image
 make inspect-size
-make up
 make health
 ```
 
@@ -70,10 +68,9 @@ The optional observability profile is documented in
    destination host.
 4. Create the root `.env` from the matching `.env.example` and configure the
    destination's private credentials and bind addresses.
-5. Copy the validated `data/` and `huggingface/` trees before `make preflight`.
+5. Copy the validated `data/` and `huggingface/` trees before `make preflight-image`.
 6. Use `0.0.0.0` bind addresses only when remote access is intentionally required.
-7. Run `make up` only after preflight passes.
+7. After loading the imported image, run `make preflight-image` and `make up`. For a source checkout, use `make deploy` to preflight, build the current source image, and recreate only API/UI. Both flows preserve the Neo4j volume and container.
 
 Compose uses `pull_policy: never`; the exact tagged image must already exist on
-the destination host. Dockerfile, Compose, and Makefile behavior are unchanged
-by the environment normalization documented here.
+the destination host.

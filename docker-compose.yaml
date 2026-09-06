@@ -63,6 +63,8 @@ services:
 
       SOORIN_HOST: 0.0.0.0
       SOORIN_PORT: "6998"
+      # Containers must use the same Community service rather than a host-local URI.
+      SOORIN_NEO4J_URI: bolt://neo4j:7687
 
       SOORIN_RAG_SOURCE_ROOT: ""
       SOORIN_RAG_QDRANT_MODE: local
@@ -150,6 +152,11 @@ services:
       # These intentionally override any host/local values from .env.
       SOORIN_API_BASE_URL: http://api:6998
       SOORIN_COPILOT_API_URL: http://api:6998
+      # The UI has no direct graph-store client; it only calls the authenticated API.
+      SOORIN_NEO4J_URI: ""
+      SOORIN_NEO4J_USER: ""
+      SOORIN_NEO4J_PASSWORD: ""
+      SOORIN_NEO4J_DATABASE: ""
 
       STREAMLIT_SERVER_ADDRESS: 0.0.0.0
       STREAMLIT_SERVER_PORT: "8501"
@@ -158,14 +165,6 @@ services:
 
     ports:
       - "${SOORIN_UI_BIND_IP:-0.0.0.0}:${SOORIN_UI_HOST_PORT:-8503}:8501"
-
-    volumes:
-      - type: bind
-        source: ./data
-        target: /workspace/data
-        read_only: true
-        bind:
-          create_host_path: false
 
     depends_on:
       api:

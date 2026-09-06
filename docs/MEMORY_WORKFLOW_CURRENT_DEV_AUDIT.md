@@ -410,7 +410,7 @@ request, but there is no durable operational-evidence cache across requests.
 
 - Startup loads the last-known-good pickle into an active in-memory graph.
 - The current local configuration enables background refresh, startup refresh,
-  and a 900-second interval. Refresh calls Product, validates node/edge/drop
+  and a 3600-second interval. Refresh calls Product, validates node/edge/drop
   thresholds, writes required artifacts and bounded snapshots atomically, then
   replaces the active graph only after validation.
 - Retrieval and serialization have separate completeness contracts. Returned

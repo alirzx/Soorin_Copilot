@@ -11,14 +11,13 @@ import requests
 import streamlit as st
 
 from src.config.settings import get_settings
-from src.core.graph.loader import set_graph_path, load_graph
 from src.web.chat_stream import ChatStreamProtocolError, parse_sse_events
 from src.web.chat_backend import ConversationController, LegacyDirectBackend
 from src.web.chat_ui import render_conversation_chat
 from src.web.local_simulation import copilot_auth_headers
 from src.web.local_simulation_ui import run_local_simulation_workspace
 from src.web.product_user_ui import run_product_workspace
-from src.web.pages.topology import build_copilot_ui_context, show_topology_page
+from src.web.pages.topology import GraphApiError, build_copilot_ui_context, fetch_graph_status, show_topology_page
 
 logger = logging.getLogger(__name__)
 settings = get_settings()
@@ -57,23 +56,6 @@ if settings.streamlit_auth_backend == "oidc":
     st.title("Soorin Copilot")
     st.info("OIDC is reserved for a future configured integration. Use the local simulation mode for offline development.")
     st.stop()
-
-# ============================================================
-# INIT GRAPH (Load once at startup)
-# ============================================================
-def init_graph():
-    """Load the topology graph through the version-aware graph loader."""
-    set_graph_path(settings.graph_pickle_path)
-    return load_graph()
-
-# Load graph on first run
-try:
-    _graph = init_graph()
-    graph_loaded = True
-    graph_node_count = _graph.number_of_nodes()
-except FileNotFoundError:
-    graph_loaded = False
-    graph_node_count = 0
 
 # ============================================================
 # SESSION STATE
@@ -146,6 +128,19 @@ def get_active_llm_label() -> str:
     if not model:
         return "unavailable"
     return f"{model} ({provider.title()})" if provider else model
+
+
+def get_graph_status_label() -> str:
+    """Render graph availability from the authoritative API, never a local artifact."""
+    try:
+        status = fetch_graph_status(settings)
+    except GraphApiError:
+        return "offline"
+    if not status.get("loaded"):
+        return "not ready"
+    version = str(status.get("active_graph_version") or "").strip()
+    suffix = f", version {version}" if version else ""
+    return f"ready ({int(status.get('nodes') or 0)} nodes{suffix})"
 
 
 def ask_copilot(message: str) -> tuple[str | None, str | None]:
@@ -278,7 +273,7 @@ with st.sidebar:
     st.divider()
     st.write(f"Backend: {'ready' if get_backend_health()[0] else 'offline'}")
     st.write(f"LLM: {get_active_llm_label()}")
-    st.write(f"Graph: {'loaded' if graph_loaded else 'not found'} ({graph_node_count} nodes)")
+    st.write(f"Graph: {get_graph_status_label()}")
     if st.session_state.get(SELECTED_COPILOT_IP_KEY):
         st.caption(f"Selected topology target: {st.session_state[SELECTED_COPILOT_IP_KEY]}")
     else:
