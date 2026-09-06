@@ -292,10 +292,6 @@ class Settings:
     detection_cache_ttl_seconds: int
     detection_stale_on_error: bool
     graph_raw_path: str
-    graph_pickle_path: str
-    graph_stats_path: str
-    graph_graphml_path: str
-    graph_gexf_path: str
     neo4j_uri: str
     neo4j_user: str
     neo4j_password: str
@@ -350,9 +346,7 @@ class Settings:
     graph_refresh_jitter_seconds: int
     graph_refresh_max_consecutive_failures: int
     graph_refresh_keep_raw_snapshots: int
-    graph_refresh_keep_processed_snapshots: int
     graph_snapshot_ttl_hours: int
-    graph_optional_exports_enabled: bool
     graph_refresh_lock_timeout_seconds: int
     graph_refresh_min_nodes: int
     graph_refresh_min_edges: int
@@ -755,10 +749,6 @@ def get_settings() -> Settings:
         detection_cache_ttl_seconds=max(600, _int("SOORIN_DETECTION_CACHE_TTL_SECONDS", 600)),
         detection_stale_on_error=_bool("SOORIN_DETECTION_STALE_ON_ERROR", True),
         graph_raw_path=os.getenv("SOORIN_GRAPH_RAW_PATH", "data/raw/topology_raw.json").strip(),
-        graph_pickle_path=os.getenv("SOORIN_GRAPH_PICKLE_PATH", "data/processed/topology_graph.pkl").strip(),
-        graph_stats_path=os.getenv("SOORIN_GRAPH_STATS_PATH", "data/processed/topology_stats.json").strip(),
-        graph_graphml_path=os.getenv("SOORIN_GRAPH_GRAPHML_PATH", "data/processed/topology_graph.graphml").strip(),
-        graph_gexf_path=os.getenv("SOORIN_GRAPH_GEXF_PATH", "data/processed/topology_graph.gexf").strip(),
         neo4j_uri=os.getenv("SOORIN_NEO4J_URI", "bolt://127.0.0.1:7687").strip(),
         neo4j_user=os.getenv("SOORIN_NEO4J_USER", "neo4j").strip(),
         neo4j_password=os.getenv("SOORIN_NEO4J_PASSWORD", "").strip(),
@@ -822,9 +812,7 @@ def get_settings() -> Settings:
         graph_refresh_jitter_seconds=_int("SOORIN_GRAPH_REFRESH_JITTER_SECONDS", 30),
         graph_refresh_max_consecutive_failures=_int("SOORIN_GRAPH_REFRESH_MAX_CONSECUTIVE_FAILURES", 5),
         graph_refresh_keep_raw_snapshots=_int("SOORIN_GRAPH_REFRESH_KEEP_RAW_SNAPSHOTS", 5),
-        graph_refresh_keep_processed_snapshots=_int("SOORIN_GRAPH_REFRESH_KEEP_PROCESSED_SNAPSHOTS", 3),
         graph_snapshot_ttl_hours=max(0, _int("SOORIN_GRAPH_SNAPSHOT_TTL_HOURS", 72)),
-        graph_optional_exports_enabled=_bool("SOORIN_GRAPH_OPTIONAL_EXPORTS_ENABLED", False),
         graph_refresh_lock_timeout_seconds=_int("SOORIN_GRAPH_REFRESH_LOCK_TIMEOUT_SECONDS", 60),
         graph_refresh_min_nodes=_int("SOORIN_GRAPH_REFRESH_MIN_NODES", 1),
         graph_refresh_min_edges=_int("SOORIN_GRAPH_REFRESH_MIN_EDGES", 0),

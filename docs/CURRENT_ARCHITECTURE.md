@@ -505,21 +505,18 @@ Graph source:
 
 - Product topology unique IP pairs.
 - Parsed into `TopologyConnectionRecord`.
-- Built as a directed `networkx.DiGraph`.
+- Published as a versioned Neo4j Community projection.
 - Edge `src_ip -> dst_ip` means an observed unique communication pair.
 - Duplicate records increase edge weight.
 
 Artifacts:
 
-- Raw JSON: `SOORIN_GRAPH_RAW_PATH`.
-- Pickle graph: `SOORIN_GRAPH_PICKLE_PATH`.
-- Stats JSON: `SOORIN_GRAPH_STATS_PATH`.
-- Optional GraphML: `SOORIN_GRAPH_GRAPHML_PATH`.
-- Optional GEXF: `SOORIN_GRAPH_GEXF_PATH`.
+- Raw Product JSON snapshots: `SOORIN_GRAPH_RAW_PATH`, retained only for audit and debugging.
+- Active graph status, aggregate stats, and topology queries: Neo4j Community.
 
 Startup and refresh:
 
-- API startup loads the last-known-good pickle if available.
+- API startup verifies the last successfully published Neo4j projection.
 - Background refresh is controlled by `SOORIN_GRAPH_AUTO_REFRESH_ENABLED`, `SOORIN_GRAPH_REFRESH_ON_STARTUP`, interval, jitter, failure, and validation settings.
 - Refresh fetches topology, validates minimum nodes/edges and drop ratios, writes artifacts atomically, writes snapshots, prunes old snapshots, and atomically replaces the active in-memory graph.
 - Failed refresh preserves the previous active graph.

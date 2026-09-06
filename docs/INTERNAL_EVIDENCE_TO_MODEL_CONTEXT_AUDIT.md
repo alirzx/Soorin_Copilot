@@ -259,7 +259,7 @@ flowchart LR
     J --> M[final model messages]
 ```
 
-Raw graph source is the active NetworkX graph returned by `get_graph()` in `app/src/core/graph/loader.py`; retrieval behavior is in `app/src/core/graph/retrieval.py`.
+Raw graph source is the active Neo4j projection queried through `GraphService`; backend-neutral retrieval normalization remains in `app/src/core/graph/retrieval.py`.
 
 Graph mode selection:
 

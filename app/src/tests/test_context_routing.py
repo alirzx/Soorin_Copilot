@@ -2,16 +2,11 @@
 
 from __future__ import annotations
 
-import pickle
-import tempfile
 import unittest
 from dataclasses import replace
-from datetime import datetime, timedelta, timezone
-from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-import networkx as nx
 
 from src.config.settings import get_settings
 from src.core.agent.contracts import EvidenceFact, ToolResult
@@ -33,15 +28,9 @@ from src.core.context.models import (
     ProviderProvenance,
     ResolvedEntity,
 )
-from src.core.context.providers.graph import GraphContextProvider
 from src.core.context.router import DeterministicFallbackRouter, normalize_intent_route
 from src.core.copilot.service import CopilotService
 from src.core.copilot.trace import CopilotRequestTrace, render_human_copilot_trace
-from src.core.graph.loader import get_cached_graph, load_graph, replace_active_graph, set_graph_path
-from src.core.graph.refresh import GraphRefreshService
-from src.core.graph.retrieval import GraphRetrievalSpec, retrieve_graph_context
-from src.core.graph.service import get_subnet
-from src.core.graph.visualization import _filter_graph_by_subnet, _inject_node_click_bridge, generate_pyvis_graph
 from src.core.llm.errors import LLMError
 from src.core.llm.providers.base import LLMProviderResult, LLMStreamEvent
 from src.core.memory.routing_state import SessionRoutingState, SessionRoutingStateStore
@@ -50,6 +39,7 @@ from src.core.memory.store import MemoryStore
 from src.core.product_client.schemas import ProductTopologyResponse, TopologyConnectionRecord
 from src.web.copilot_help import choose_help_ui_pattern, get_copilot_help_content
 from src.web.pages.topology import (
+    _inject_node_click_bridge,
     _resolve_graph_selection_event,
     _retained_selected_graph_ip,
     _should_reload_graph_snapshot,
@@ -1521,9 +1511,7 @@ class DeterministicFallbackPolicyTests(unittest.TestCase):
 
 class TopologyGraphSelectionTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.graph = nx.DiGraph()
-        self.graph.add_edge("192.168.0.125", "192.168.0.126")
-        self.graph.add_node("192.168.30.115")
+        self.graph = {"192.168.0.125", "192.168.0.126", "192.168.30.115"}
 
     def test_graph_node_click_selects_ip(self) -> None:
         action, selected_ip, event_id = _resolve_graph_selection_event(
@@ -1548,8 +1536,7 @@ class TopologyGraphSelectionTests(unittest.TestCase):
     def test_pyvis_bridge_emits_background_clear_event(self) -> None:
         html = _inject_node_click_bridge("<html><body></body></html>")
 
-        self.assertIn('action: "clear"', html)
-        self.assertIn("sendClearSelection", html)
+        self.assertIn('send("clear", null)', html)
         self.assertIn("unselectAll", html)
 
     def test_copilot_request_context_omits_selected_ip_after_clear(self) -> None:
@@ -1585,21 +1572,16 @@ class TopologyGraphSelectionTests(unittest.TestCase):
 
     def test_snapshot_refresh_retains_selection_when_node_exists_in_replacement_graph(self) -> None:
         selected_ip = "192.168.30.115"
-        large = nx.DiGraph()
-        large.add_node(selected_ip)
-        large.add_nodes_from(f"large-{index}" for index in range(62_814))
-        small = nx.DiGraph()
-        small.add_node(selected_ip)
-        small.add_nodes_from(f"small-{index}" for index in range(342))
+        large = {selected_ip, *(f"large-{index}" for index in range(62_814))}
+        small = {selected_ip, *(f"small-{index}" for index in range(342))}
 
-        self.assertEqual(large.number_of_nodes(), 62_815)
-        self.assertEqual(small.number_of_nodes(), 343)
+        self.assertEqual(len(large), 62_815)
+        self.assertEqual(len(small), 343)
         self.assertEqual(_retained_selected_graph_ip(selected_ip, small), selected_ip)
         self.assertEqual(_retained_selected_graph_ip(selected_ip, large), selected_ip)
 
     def test_snapshot_refresh_clears_selection_when_node_is_absent(self) -> None:
-        replacement = nx.DiGraph()
-        replacement.add_node("192.168.30.116")
+        replacement = {"192.168.30.116"}
 
         self.assertIsNone(_retained_selected_graph_ip("192.168.30.115", replacement))
 
@@ -1732,6 +1714,7 @@ class ExhaustiveConnectionRoutingTests(unittest.TestCase):
         self.assertTrue(pair_decision.requires_multiple_entities)
 
 
+@unittest.skip("obsolete NetworkX graph-runtime fixtures removed; Neo4j and adjacency-contract tests cover these behaviors")
 class GraphRetrievalTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp_dir = tempfile.TemporaryDirectory()
@@ -2257,6 +2240,7 @@ class GraphRetrievalTests(unittest.TestCase):
         self.assertIn("10.0.0.0/24", result.context["subnet_comparison"]["shared_subnets"])
 
 
+@unittest.skip("obsolete NetworkX artifact lifecycle removed; Neo4j refresh tests cover active behavior")
 class GraphRefreshTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp_dir = tempfile.TemporaryDirectory()
@@ -2415,6 +2399,7 @@ class GraphRefreshTests(unittest.TestCase):
         self.assertEqual(result.status, "skipped")
 
 
+@unittest.skip("obsolete NetworkX fixture wiring removed; adjacency-contract tests cover completeness semantics")
 class GraphCompletenessContractTests(unittest.TestCase):
     def setUp(self) -> None:
         self.target = "192.168.0.125"

@@ -34,7 +34,6 @@ class GraphStatusResponse(BaseModel):
     refresh_last_error_message: str | None = None
     refresh_consecutive_failures: int = Field(default=0, ge=0)
     raw_snapshot_path: str | None = None
-    processed_snapshot_path: str | None = None
     last_known_good: bool = False
 
 

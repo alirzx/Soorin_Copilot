@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import logging
 import random
 import threading
@@ -43,7 +42,6 @@ class GraphRefreshStatus:
     active_graph_edges: int = 0
     active_graph_version: str | None = None
     raw_snapshot_path: str | None = None
-    processed_snapshot_path: str | None = None
 
     def to_dict(self) -> dict[str, object]:
         return asdict(self)
@@ -59,7 +57,6 @@ class GraphRefreshResult:
     processed_records: int
     snapshot_version: str
     raw_snapshot_path: str
-    processed_snapshot_path: str
     message: str = ""
 
     def to_dict(self) -> dict[str, object]:
@@ -158,7 +155,6 @@ class GraphRefreshService:
                 processed_records=0,
                 snapshot_version=projection.active_graph_version or "",
                 raw_snapshot_path="",
-                processed_snapshot_path="",
                 message="active_snapshot_fresh",
             )
         if not self._lock.acquire(timeout=self.settings.graph_refresh_lock_timeout_seconds):
@@ -172,7 +168,6 @@ class GraphRefreshService:
                 processed_records=0,
                 snapshot_version="",
                 raw_snapshot_path="",
-                processed_snapshot_path="",
                 message="refresh_already_running",
             )
 
@@ -210,13 +205,12 @@ class GraphRefreshService:
             self._record_success(projection, raw_snapshot_path)
             elapsed_ms = int((time.perf_counter() - started) * 1000)
             logger.info(
-                "event=graph_activated snapshot_version=%s nodes=%s edges=%s elapsed_ms=%s raw_path=%s pickle_path=%s",
+                "event=graph_activated snapshot_version=%s nodes=%s edges=%s elapsed_ms=%s raw_path=%s",
                 snapshot_version,
                 projection.nodes,
                 projection.edges,
                 elapsed_ms,
                 raw_snapshot_path,
-                "neo4j",
             )
             return GraphRefreshResult(
                 status="ok",
@@ -227,7 +221,6 @@ class GraphRefreshService:
                 processed_records=len(pairs),
                 snapshot_version=snapshot_version,
                 raw_snapshot_path=str(raw_snapshot_path),
-                processed_snapshot_path="",
             )
         except Exception as exc:
             elapsed_ms = int((time.perf_counter() - started) * 1000)
@@ -250,7 +243,6 @@ class GraphRefreshService:
                 processed_records=0,
                 snapshot_version=snapshot_version,
                 raw_snapshot_path="",
-                processed_snapshot_path="",
                 message=error_type,
             )
         finally:
@@ -285,80 +277,6 @@ class GraphRefreshService:
         if loaded.tzinfo is None:
             loaded = loaded.replace(tzinfo=timezone.utc)
         return max(0, int((datetime.now(timezone.utc) - loaded).total_seconds()))
-
-    def _validate_graph(self, graph: nx.DiGraph) -> None:
-        if not isinstance(graph, nx.DiGraph):
-            raise GraphRefreshError("Graph builder returned an invalid graph type.")
-        if graph.number_of_nodes() < self.settings.graph_refresh_min_nodes:
-            raise GraphRefreshError("Graph node count is below configured minimum.")
-        if graph.number_of_edges() < self.settings.graph_refresh_min_edges:
-            raise GraphRefreshError("Graph edge count is below configured minimum.")
-        for node in graph.nodes:
-            if not isinstance(node, str) or not node.strip():
-                raise GraphRefreshError("Graph contains an invalid node identifier.")
-        node_set = set(graph.nodes)
-        for source, target in graph.edges:
-            if source not in node_set or target not in node_set:
-                raise GraphRefreshError("Graph contains an edge with invalid endpoints.")
-
-    def _write_required_artifacts(self, raw_payload: Any, graph: nx.DiGraph, stats: dict[str, object]) -> tuple[Path, Path]:
-        raw_path = resolve_path(self.settings.graph_raw_path)
-        stats_path = resolve_path(self.settings.graph_stats_path)
-        pickle_path = resolve_path(self.settings.graph_pickle_path)
-        for path in (raw_path, stats_path, pickle_path):
-            path.parent.mkdir(parents=True, exist_ok=True)
-
-        temp_paths = [
-            raw_path.with_name(f"{raw_path.name}.{uuid.uuid4().hex}.tmp"),
-            stats_path.with_name(f"{stats_path.name}.{uuid.uuid4().hex}.tmp"),
-            pickle_path.with_name(f"{pickle_path.name}.{uuid.uuid4().hex}.tmp"),
-        ]
-        temp_raw, temp_stats, temp_pickle = temp_paths
-        try:
-            temp_raw.write_text(json.dumps(raw_payload, indent=2), encoding="utf-8")
-            temp_stats.write_text(json.dumps(stats, indent=2), encoding="utf-8")
-            with temp_pickle.open("wb") as handle:
-                pickle.dump(graph, handle)
-            for temp_path, final_path in ((temp_raw, raw_path), (temp_stats, stats_path), (temp_pickle, pickle_path)):
-                temp_path.replace(final_path)
-        except Exception:
-            for temp_path in temp_paths:
-                if temp_path.exists():
-                    temp_path.unlink(missing_ok=True)
-            raise
-        logger.info(
-            "event=graph_artifacts_written nodes=%s edges=%s raw_path=%s stats_path=%s pickle_path=%s",
-            graph.number_of_nodes(),
-            graph.number_of_edges(),
-            self.settings.graph_raw_path,
-            self.settings.graph_stats_path,
-            self.settings.graph_pickle_path,
-        )
-        return raw_path, pickle_path
-
-    def _write_optional_exports(self, graph: nx.DiGraph) -> list[str]:
-        failures: list[str] = []
-        for name, writer, path in (
-            ("graphml", atomic_write_graphml, self.settings.graph_graphml_path),
-            ("gexf", atomic_write_gexf, self.settings.graph_gexf_path),
-        ):
-            try:
-                writer(graph, path)
-            except Exception:
-                logger.exception("event=graph_optional_export_failed export=%s path=%s", name, path)
-                failures.append(name)
-        return failures
-
-    def _write_snapshots(self, raw_payload: Any, graph: nx.DiGraph, snapshot_version: str) -> tuple[Path, Path]:
-        raw_path = resolve_path(self.settings.graph_raw_path)
-        pickle_path = resolve_path(self.settings.graph_pickle_path)
-        raw_snapshot = raw_path.with_name(f"{raw_path.stem}.snapshot.{snapshot_version}{raw_path.suffix}")
-        pickle_snapshot = pickle_path.with_name(f"{pickle_path.stem}.snapshot.{snapshot_version}{pickle_path.suffix}")
-        if self.settings.graph_refresh_keep_raw_snapshots > 0:
-            atomic_write_json(raw_payload, raw_snapshot)
-        if self.settings.graph_refresh_keep_processed_snapshots > 0:
-            atomic_write_pickle(graph, pickle_snapshot)
-        return raw_snapshot, pickle_snapshot
 
     @staticmethod
     def _prune_snapshots(
@@ -414,7 +332,6 @@ class GraphRefreshService:
             self._status.last_error_message = None
             self._status.consecutive_failures = 0
             self._status.raw_snapshot_path = str(raw_snapshot_path)
-            self._status.processed_snapshot_path = None
             self._status.active_graph_loaded_at = projection.last_successful_sync
             self._status.active_graph_source = "neo4j_projection"
             self._status.active_graph_nodes = projection.nodes
