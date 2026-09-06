@@ -279,6 +279,7 @@ class CopilotService:
                 return replace(
                     selection,
                     selected_count=len(selection.memories),
+                    inventory_available=False,
                     limitations=tuple(item for item in dict.fromkeys((
                         *selection.limitations,
                         "long_term_memory_inventory_unavailable",
@@ -312,6 +313,7 @@ class CopilotService:
                 candidate_record_count=len(candidates),
                 active_record_count=len(active),
                 selected_count=len(selection.memories),
+                inventory_available=True,
             )
         except Exception as exc:
             logger.warning(

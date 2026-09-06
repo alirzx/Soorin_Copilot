@@ -3,7 +3,7 @@
 ## Baseline boundary
 
 The existing entity resolver, semantic LLM router, deterministic route validation,
-Profile/Detection/NetworkX providers, context budget controls, final model, streaming
+Profile/Detection/Neo4j graph providers, context budget controls, final model, streaming
 events, and session-state updates remain the direct execution path. LangGraph now
 provides a bounded workflow shell around that path. It does not introduce a planner,
 tool loop, external action, or new public API.

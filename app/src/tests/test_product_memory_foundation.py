@@ -263,6 +263,43 @@ def test_product_ltm_search_preserves_current_request_id():
     assert kwargs["operation"] == "memory_search"
 
 
+def test_product_ltm_inventory_normalizes_snake_case_and_reference_aliases():
+    record = _candidate()
+    canonical = _canonical_wire(record)
+    snake = {
+        "memory_id": canonical["memoryId"],
+        "memory_type": canonical["memoryType"],
+        "user_id": canonical["userId"],
+        "entity_ids": canonical["entityIds"],
+        "statement": canonical["statement"],
+        "epistemic_status": canonical["epistemicStatus"],
+        "confidence": canonical["confidence"],
+        "source_request_id": canonical["sourceRequestId"],
+        "source_conversation_id": canonical["sourceConversationId"],
+        "evidence_refs": [
+            {"refType": "canonical", "refId": record.evidence_refs[0]}
+        ],
+        "provenance_category": canonical["provenanceCategory"],
+        "valid_from": canonical["validFrom"],
+        "valid_until": canonical["validUntil"],
+        "created_at": canonical["createdAt"],
+        "updated_at": canonical["updatedAt"],
+        "revision": canonical["revision"],
+        "status": canonical["status"],
+        "index_status": canonical["indexStatus"],
+        "idempotency_fingerprint": canonical["idempotencyFingerprint"],
+        "logical_memory_key": canonical["logicalMemoryKey"],
+        "policy_version": canonical["policyVersion"],
+    }
+    store = ProductLongTermMemoryStore(
+        ProductMemoryClient(FakeProductClient({"records": [{"record": snake}]}))
+    )
+
+    records = store.list(user_id=record.user_id, statuses=("candidate",))
+
+    assert records == (record,)
+
+
 def test_product_ltm_get_preserves_current_request_id():
     record = __import__("src.core.memory.long_term", fromlist=["LongTermMemoryRecord"]).LongTermMemoryRecord.candidate(
         memory_type="validated_finding", user_id="owner", entity_ids=("192.0.2.1",), statement="{}",

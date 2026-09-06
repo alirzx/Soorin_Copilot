@@ -346,6 +346,11 @@ def test_broad_recall_context_includes_bounded_thread_chronology_and_facts() -> 
     assert "THREAD CHRONOLOGY" in rendered
     assert snapshot.memory_context is not None
     assert len(snapshot.memory_context.entity_timeline) == 2
+    assert snapshot.memory_context.thread_recall_requested
+    assert not snapshot.memory_context.thread_recall_complete
+    assert "relevant_turns" in snapshot.memory_context.sources_considered
+    assert "entities=192.168.20.103" in rendered
+    assert "entities=192.168.20.120,192.168.20.103" in rendered
 
 
 def test_product_contract_failures_have_a_distinct_error_type() -> None:

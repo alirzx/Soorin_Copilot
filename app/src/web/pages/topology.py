@@ -6,7 +6,7 @@ import hashlib
 import logging
 import tempfile
 import time
-from collections.abc import Collection, Mapping
+from collections.abc import Collection, Mapping, MutableMapping
 from ipaddress import ip_address, ip_network
 from pathlib import Path
 from typing import Any
@@ -25,6 +25,7 @@ logger = logging.getLogger(__name__)
 SELECTED_COPILOT_IP_KEY = "selected_copilot_ip"
 LAST_GRAPH_SELECTION_EVENT_KEY = "topology_graph_last_selection_event_id"
 TOPOLOGY_GRAPH_VERSION_KEY = "topology_graph_snapshot_version"
+TOPOLOGY_GRAPH_CACHE_KEY = "topology_graph_versioned_api_cache"
 
 _SUBNET_COLORS = {
     "192.168.0.": "#FF6B6B",
@@ -98,6 +99,40 @@ def _fetch_topology(settings: Any, *, max_nodes: int, min_degree: int, subnet: s
     if not isinstance(payload.get("nodes"), list) or not isinstance(payload.get("edges"), list):
         raise GraphApiError("Graph API returned an invalid topology response.")
     return payload
+
+
+def _versioned_graph_data(
+    settings: Any,
+    state: MutableMapping[str, Any],
+    *,
+    active_version: str | None,
+    max_nodes: int,
+    min_degree: int,
+    subnet: str,
+) -> tuple[dict[str, Any], dict[str, Any], bool]:
+    """Cache bounded topology and stats until the published version changes."""
+    version = active_version or "unknown"
+    cache = state.get(TOPOLOGY_GRAPH_CACHE_KEY)
+    if not isinstance(cache, dict) or cache.get("version") != version:
+        cache = {"version": version, "topologies": {}, "stats": None}
+    topologies = cache.get("topologies")
+    if not isinstance(topologies, dict):
+        topologies = {}
+        cache["topologies"] = topologies
+    query_key = (max_nodes, min_degree, subnet)
+    refetched = False
+    if query_key not in topologies:
+        if len(topologies) >= 8:
+            topologies.pop(next(iter(topologies)))
+        topologies[query_key] = _fetch_topology(
+            settings, max_nodes=max_nodes, min_degree=min_degree, subnet=subnet
+        )
+        refetched = True
+    if not isinstance(cache.get("stats"), dict):
+        cache["stats"] = _graph_api_get(settings, "/graph/stats")
+        refetched = True
+    state[TOPOLOGY_GRAPH_CACHE_KEY] = cache
+    return topologies[query_key], cache["stats"], refetched
 
 
 def _fetch_node(settings: Any, ip: str) -> dict[str, Any]:
@@ -291,7 +326,12 @@ def show_topology_page(*, embedded: bool = False) -> None:
     version_changed = _should_reload_graph_snapshot(known_version, snapshot_version)
     if version_changed:
         st.session_state[TOPOLOGY_GRAPH_VERSION_KEY] = snapshot_version
-        logger.info("event=ui_graph_snapshot_reloaded provider=graph_api version=%s", snapshot_version)
+        logger.info(
+            "event=ui_graph_snapshot_reloaded provider=graph_api "
+            "ui_graph_version_previous=%s ui_graph_version_current=%s",
+            known_version or "none",
+            snapshot_version,
+        )
     selected_ip = st.session_state.get(SELECTED_COPILOT_IP_KEY)
     if _clear_missing_selected_ip(settings, selected_ip, version_changed=version_changed):
         st.session_state[SELECTED_COPILOT_IP_KEY] = None
@@ -301,7 +341,21 @@ def show_topology_page(*, embedded: bool = False) -> None:
     ui_min_nodes = min(50, ui_max_nodes)
     default_min_degree = max(0, int(settings.graph_default_min_degree))
     try:
-        seed_topology = _fetch_topology(settings, max_nodes=ui_max_nodes, min_degree=default_min_degree, subnet="")
+        seed_topology, seed_stats, seed_refetched = _versioned_graph_data(
+            settings,
+            st.session_state,
+            active_version=snapshot_version,
+            max_nodes=ui_max_nodes,
+            min_degree=default_min_degree,
+            subnet="",
+        )
+        logger.info(
+            "event=ui_graph_poll_completed ui_graph_version_previous=%s "
+            "ui_graph_version_current=%s ui_topology_refetch=%s",
+            known_version or "none",
+            snapshot_version or "none",
+            seed_refetched,
+        )
     except GraphApiError as exc:
         st.warning(str(exc))
         return
@@ -319,8 +373,17 @@ def show_topology_page(*, embedded: bool = False) -> None:
             subnet_filter = st.selectbox("Filter by subnet", options=subnet_options, help="Show only nodes in a specific subnet.")
         subnet_value = "" if subnet_filter == "All Subnets" else subnet_filter
         try:
-            topology = seed_topology if (max_nodes == ui_max_nodes and min_degree == int(seed_topology.get("min_degree") or 0) and not subnet_value) else _fetch_topology(settings, max_nodes=max_nodes, min_degree=min_degree, subnet=subnet_value)
-            stats = _graph_api_get(settings, "/graph/stats")
+            if max_nodes == ui_max_nodes and min_degree == default_min_degree and not subnet_value:
+                topology, stats = seed_topology, seed_stats
+            else:
+                topology, stats, _ = _versioned_graph_data(
+                    settings,
+                    st.session_state,
+                    active_version=snapshot_version,
+                    max_nodes=max_nodes,
+                    min_degree=min_degree,
+                    subnet=subnet_value,
+                )
         except GraphApiError as exc:
             st.warning(str(exc))
             return

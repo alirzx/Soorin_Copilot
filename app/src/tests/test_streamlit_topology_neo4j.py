@@ -63,6 +63,58 @@ def test_published_version_change_preserves_or_clears_selection_only_via_api_nod
     assert topology._clear_missing_selected_ip(_settings(), "10.0.0.1", version_changed=True) is True
 
 
+def test_same_graph_version_reuses_topology_and_stats(monkeypatch) -> None:
+    calls = {"topology": 0, "stats": 0}
+    monkeypatch.setattr(
+        topology,
+        "_fetch_topology",
+        lambda *_args, **_kwargs: calls.__setitem__("topology", calls["topology"] + 1) or _topology(),
+    )
+    monkeypatch.setattr(
+        topology,
+        "_graph_api_get",
+        lambda *_args, **_kwargs: calls.__setitem__("stats", calls["stats"] + 1) or {"total_nodes": 2},
+    )
+    state: dict[str, object] = {}
+
+    first = topology._versioned_graph_data(
+        _settings(), state, active_version="v1", max_nodes=100, min_degree=1, subnet=""
+    )
+    second = topology._versioned_graph_data(
+        _settings(), state, active_version="v1", max_nodes=100, min_degree=1, subnet=""
+    )
+
+    assert first[2] is True and second[2] is False
+    assert calls == {"topology": 1, "stats": 1}
+
+
+def test_new_graph_version_refetches_topology_and_stats_once(monkeypatch) -> None:
+    calls = {"topology": 0, "stats": 0}
+    monkeypatch.setattr(
+        topology,
+        "_fetch_topology",
+        lambda *_args, **_kwargs: calls.__setitem__("topology", calls["topology"] + 1) or _topology(),
+    )
+    monkeypatch.setattr(
+        topology,
+        "_graph_api_get",
+        lambda *_args, **_kwargs: calls.__setitem__("stats", calls["stats"] + 1) or {"total_nodes": 2},
+    )
+    state: dict[str, object] = {}
+    topology._versioned_graph_data(
+        _settings(), state, active_version="v1", max_nodes=100, min_degree=1, subnet=""
+    )
+    changed = topology._versioned_graph_data(
+        _settings(), state, active_version="v2", max_nodes=100, min_degree=1, subnet=""
+    )
+    unchanged = topology._versioned_graph_data(
+        _settings(), state, active_version="v2", max_nodes=100, min_degree=1, subnet=""
+    )
+
+    assert changed[2] is True and unchanged[2] is False
+    assert calls == {"topology": 2, "stats": 2}
+
+
 def test_selection_accepts_only_nodes_returned_by_bounded_topology() -> None:
     nodes = topology._topology_node_ids(_topology())
     assert topology._resolve_graph_selection_event({"action": "select", "node": "10.0.0.1", "event_id": "1"}, nodes) == ("select", "10.0.0.1", "1")

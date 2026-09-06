@@ -214,6 +214,7 @@ class TurnPolicy:
     target_entities: tuple[str, ...] = ()
     requires_domain_router: bool = True
     episode_transition: EpisodeTransition = "keep"
+    operational_state_mutation_allowed: bool = True
     reason_codes: tuple[str, ...] = ()
 
 

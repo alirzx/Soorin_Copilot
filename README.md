@@ -7,32 +7,32 @@ approved Knowledge/RAG material, and bounded conversation memory. Models explain
 and correlate evidence; they do not become the authority for live operational
 facts.
 
-## Request Workflow
+## Current Architecture
 
 ```mermaid
 flowchart TD
-    U[User or Product UI] --> API[FastAPI /chat or /chat/stream]
-    API --> ID[Request identity and Product ThreadState]
-    ID --> ER[Deterministic entity and reference resolution]
-    ER --> CP[Deterministic constraints, turn policy, and immutable task envelope]
-    CP -->|memory-only or thread recall| MR[Bounded working, episode, and Product LTM retrieval]
-    CP -->|live evidence allowed| RT[Semantic Router with deterministic normalization]
-    RT --> TS[Validated TaskSpec]
-    MR --> TS
-    TS --> GAP[Memory sufficiency and evidence-gap policy]
-    GAP --> PLAN{Direct plan or bounded Planner}
-    PLAN --> PV[PlanValidator]
-    PV --> EX[Capability executor]
-    EX --> E[Product Profile and Detection, Graph, Knowledge/RAG]
-    E --> EP[Immutable acquisition receipts, ToolResults, EvidencePack, and evidence review]
-    EP --> CC[Memory and evidence context composition]
-    MR --> CC
-    CC --> SYN[Synthesizer]
-    SYN --> MU[ThreadState, working facts, episodes, and Product LTM updates]
-    MU -. canonical records .-> PI[Qdrant semantic index]
-    MU --> OUT[Response or UTF-8 SSE]
-    OUT --> API
-    API -. metrics, traces, logs .-> OBS[Observability]
+    U[User] --> UI[Streamlit or Chat API]
+    UI --> LG[LangGraph Router and Planner]
+    LG --> EX[CapabilityExecutor]
+    EX --> AS[asset.*]
+    EX --> GS[graph.*]
+    EX --> KS[knowledge.*]
+    AS --> PB[Product Backend]
+    GS --> GP[GraphContextProvider]
+    GP --> SVC[GraphService]
+    SVC --> REPO[Neo4jGraphRepository]
+    REPO --> NEO[Neo4j Community]
+    KS --> QR[Qdrant RAG]
+    PB --> SYNC[Versioned Graph Sync]
+    SYNC --> NEO
+    EX --> TR[ToolResult]
+    TR --> ER[EvidenceReceipt]
+    ER --> EP[EvidencePack]
+    EP --> SYN[Synthesizer]
+    MEM[ThreadState, working facts, episodes] --> SYN
+    MEM --> LTM[Product-backed durable memory and LTM]
+    SYN --> OUT[Response or UTF-8 SSE]
+    UI -. metrics, traces, logs .-> OBS[Observability]
 ```
 
 Entity and evidence authority is deterministic: an explicit entity in the
@@ -48,8 +48,9 @@ limitations rather than as a verified finding.
 - **Asset Profile:** current identity and profile data from the Product API.
 - **Detection:** current classification and detection evidence from Product API
   views, with bounded context projections.
-- **Graph:** observed NetworkX topology for summaries, neighbors, relationships,
-  comparisons, and bounded paths.
+- **Graph:** the current bounded Neo4j Community projection for summaries,
+  neighbors, relationships, comparisons, and directed paths. Product remains the
+  topology source of truth.
 - **Knowledge/RAG:** approved SOC documentation and runbooks through the configured
   Qdrant-backed retrieval service; it does not override current Product or Graph
   evidence.
@@ -72,6 +73,25 @@ summaries. Product Long-Term Memory is canonical for durable validated findings;
 Qdrant is derivative semantic retrieval only. Evidence acquisition receipts are
 immutable snapshots for baseline comparison, independent of later model-context
 projection or compaction.
+
+Pure memory recall is read-only with respect to the operational entity cursor
+and active episode. Recall context carries entity/source/temporal provenance and
+explicit bounded-coverage metadata. Investigation baselines use deterministic
+canonical projections when full Product views are too large, preserving every
+required capability without storing arbitrary provider JSON.
+
+The graph baseline is a single Neo4j Community 2026.07.1 instance. Product
+topology sync publishes versioned projections every 3600 seconds by default;
+failed refreshes preserve the last-known-good version. Raw Product topology JSON
+is retained only for audit/debugging. There is no active NetworkX, pickle,
+GraphML, or GEXF graph runtime. Streamlit uses authenticated Graph APIs, polls
+the small status/version response about every 30 seconds, and refetches bounded
+topology/stats only when the active version or user filters change.
+
+Authority is deliberately separated: Product owns topology truth; Neo4j holds
+the current graph projection/evidence; memory owns conversation and
+investigation continuity; Qdrant supplies knowledge/RAG and derivative semantic
+memory lookup.
 
 ## Run Locally
 
@@ -101,7 +121,8 @@ also consumes the root `.env` and is documented in [Deployment](docs/DEPLOYMENT.
 - `app/src/core/copilot`: request facade and bounded workflow integration.
 - `app/src/core/agent`: typed state, plans, capabilities, execution, and review.
 - `app/src/core/context`: entity resolution, routing, views, and context budgets.
-- `app/src/core/graph`: topology loading, retrieval, refresh, and visualization.
+- `app/src/core/graph`: Product topology sync, Neo4j repository, bounded query
+  policy, service, and provider integration.
 - `app/src/core/rag`: source, chunking, BGE embeddings, Qdrant, citations, and safety.
 - `app/src/core/memory`: conversation, routing state, episodes, and typed memory.
 - `app/src/core/observability`: logs, metrics, traces, usage, and evidence snapshots.
@@ -123,7 +144,7 @@ also consumes the root `.env` and is documented in [Deployment](docs/DEPLOYMENT.
 Use focused offline tests while developing:
 
 ```bash
-PYTHONPATH=app .venv/bin/python -m unittest discover -s app/src/tests -p 'test_*.py' -v
+PYTHONPATH=app .venv/bin/python -m pytest app/src/tests -q
 ```
 
 Unit tests use local fakes and fixtures. They do not require Product, LLM,

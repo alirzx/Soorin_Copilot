@@ -518,8 +518,8 @@ Startup and refresh:
 
 - API startup verifies the last successfully published Neo4j projection.
 - Background refresh is controlled by `SOORIN_GRAPH_AUTO_REFRESH_ENABLED`, `SOORIN_GRAPH_REFRESH_ON_STARTUP`, interval, jitter, failure, and validation settings.
-- Refresh fetches topology, validates minimum nodes/edges and drop ratios, writes artifacts atomically, writes snapshots, prunes old snapshots, and atomically replaces the active in-memory graph.
-- Failed refresh preserves the previous active graph.
+- Refresh fetches topology, validates minimum nodes/edges and drop ratios, retains the raw Product snapshot for audit, stages a versioned Neo4j projection, and atomically publishes its metadata only after validation.
+- Failed refresh preserves the previous last-known-good Neo4j projection.
 
 Retrieval scopes:
 
@@ -534,7 +534,7 @@ Graph limitations are always attached to Copilot graph context.
 
 ## 12. Graph API and Visualization
 
-Graph API endpoints are read-only and deterministic. They use the active in-memory graph or the configured graph artifact.
+Graph API endpoints are read-only and deterministic. Every route uses `GraphService → GraphQueryPolicy → Neo4jGraphRepository`; routes contain neither Cypher nor direct Neo4j sessions.
 
 The Streamlit topology page:
 
@@ -546,6 +546,7 @@ The Streamlit topology page:
 - Supports node-click selection for Copilot UI context.
 - Clears node selection when the graph canvas background is clicked.
 - Preserves zooming, dragging, node details, shortest path lookup, IP exploration, and all nodes views.
+- Polls `/graph/status` every 30 seconds and retains version-keyed topology/stats in Streamlit session state. The same active version performs no topology/stats refetch; a new version invalidates both once and validates the selected node through the Graph API.
 
 The visualization uses explicit vis-network physics options, stable random seed, and a default "stabilize once, then freeze" mode.
 
@@ -677,6 +678,13 @@ Conversation memory:
   fresh operational evidence remains authoritative over memory.
 
 Memory-only wording is resolved before semantic routing. `allow_live=false` is also enforced at plan validation/execution, so router repair or fallback cannot authorize Product, Detection, Graph, or Knowledge calls. Active episodes are not counted as archived episodes; their recent text is reconstructed from Product/SQLite transcript rows and ThreadState turn references. `EpisodeRecord.supported_findings` remains a reserved, unpopulated compatibility field; conclusions continue to use the existing deterministic `key_findings`/contradiction/summary fields rather than inventing duplicate semantics.
+
+`TurnPolicy.operational_state_mutation_allowed` is false for pure recall/write
+turns. Such turns may be persisted in the transcript and selected by their own
+historical context key, but cannot replace active entities, pair order,
+operational scope, timeline, or episode identity. Broad recall also carries
+machine-readable source, omission, inventory, truncation, and completeness
+metadata; bounded storage never implies exhaustive thread coverage.
 
 Typed long-term memory (Gate 6/7, disabled by default):
 
@@ -886,7 +894,8 @@ Implemented:
 - Semantic LLM router with deterministic validation and fallback.
 - Deterministic IPv4 entity authority.
 - Product auth/client for topology, detection, profile, and login.
-- NetworkX graph build, storage, refresh, retrieval, and visualization.
+- Product-to-Neo4j versioned graph sync, bounded repository/service retrieval,
+  graph capabilities, authenticated APIs, and API-only visualization.
 - Optional Qdrant-backed RAG foundation.
 - BGE embedding configuration and lazy Hugging Face embedder.
 - Context composer with provider coverage, budgets, and limitations.
@@ -909,7 +918,7 @@ Partial or structural:
 Deferred or not implemented:
 
 - LLM evidence reviewer.
-- Neo4j, GraphStore migration, Cypher, text-to-Cypher, Graph Data Science.
+- Text-to-Cypher and Neo4j Graph Data Science.
 - GraphRAG and bulk graph enrichment.
 - MCP.
 - SIEM/Splunk integrations.

@@ -414,7 +414,7 @@ Secrets such as API keys, passwords, Product tokens, captcha bypass values, and 
 
 ### `SOORIN_PRODUCT_TOPOLOGY_PATH`
 
-`SOORIN_PRODUCT_TOPOLOGY_PATH` is the HTTP endpoint path appended to the Product base URL to retrieve unique network-connection IP pairs used for Graph refresh. It is an API route, not a filesystem path. Changing it changes the source contract for the NetworkX topology and must match the Product backend endpoint schema.
+`SOORIN_PRODUCT_TOPOLOGY_PATH` is the HTTP endpoint path appended to the Product base URL to retrieve unique network-connection IP pairs used for Graph refresh. It is an API route, not a filesystem path. Changing it changes the source contract for the versioned Neo4j projection and must match the Product backend endpoint schema.
 
 ### `SOORIN_PRODUCT_ASSET_DETECTION_PATH`
 

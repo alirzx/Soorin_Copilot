@@ -827,7 +827,7 @@ def test_broad_thread_recall_selects_bounded_archived_and_current_context_with_p
     assert working is not None and working.context_key == asset_b
 
 
-def test_explicit_memory_only_return_reactivates_archived_a_after_product_style_reload() -> None:
+def test_explicit_memory_only_return_reads_archived_a_without_mutating_active_b() -> None:
     asset_a = "192.168.0.62"
     asset_b = "192.168.30.115"
     session_id = "session-product-a-b-a"
@@ -930,7 +930,8 @@ def test_explicit_memory_only_return_reactivates_archived_a_after_product_style_
     assert [item.value for item in resolution.entities] == [asset_a]
     assert resolution.entities[0].source == "message"
     assert constraints.memory_only and not constraints.allow_live
-    assert policy.episode_transition == "switch"
+    assert policy.episode_transition == "keep"
+    assert not policy.operational_state_mutation_allowed
     assert not policy.requires_domain_router
 
     service = SimpleNamespace(
@@ -989,11 +990,12 @@ def test_explicit_memory_only_return_reactivates_archived_a_after_product_style_
         activate_context=policy.episode_transition == "switch",
     )
     working = restored.repository.get_working(session_id)
-    assert snapshot.episode_transition
+    assert not snapshot.episode_transition
     assert working is not None
-    assert working.episode_id == episode_a
-    assert working.context_key == key_a
-    assert "workstation-A" in snapshot.memory_context.working_summary  # type: ignore[union-attr]
+    assert working.episode_id == episode_b
+    assert working.context_key == key_b
+    assert snapshot.memory_context.working_summary == ""  # type: ignore[union-attr]
+    assert snapshot.memory_context.episode_summaries[0].episode_id == episode_a  # type: ignore[union-attr]
     assert [item.request_id for item in snapshot.memory_context.relevant_turns] == ["a-1"]  # type: ignore[union-attr]
     assert "server-B" not in "\n".join(item["content"] for item in snapshot.messages)
 
@@ -1020,11 +1022,11 @@ def test_explicit_memory_only_return_reactivates_archived_a_after_product_style_
     )
     active_a = update["active_entity_state"]
     working = restored.repository.get_working(session_id)
-    assert active_a.active_entities == (asset_a,)
-    assert working is not None and working.context_key == key_a
-    assert working.episode_id == episode_a
+    assert active_a.active_entities == (asset_b,)
+    assert working is not None and working.context_key == key_b
+    assert working.episode_id == episode_b
     assert [(item.episode_id, item.context_key) for item in restored.repository.list_episodes(session_id)] == [
-        (episode_b, key_b)
+        (episode_a, key_a)
     ]
 
     saved_again = ThreadMemoryState.from_routing_state(
@@ -1043,10 +1045,10 @@ def test_explicit_memory_only_return_reactivates_archived_a_after_product_style_
         schema_version=THREAD_STATE_SCHEMA_VERSION,
     )
     assert reloaded_again.working_memory is not None
-    assert reloaded_again.working_memory.episode_id == episode_a
-    assert reloaded_again.working_memory.context_key == key_a
+    assert reloaded_again.working_memory.episode_id == episode_b
+    assert reloaded_again.working_memory.context_key == key_b
     assert [(item.episode_id, item.context_key) for item in reloaded_again.recent_episodes] == [
-        (episode_b, key_b)
+        (episode_a, key_a)
     ]
 
 
@@ -1075,7 +1077,7 @@ def test_explicit_memory_recall_without_archived_match_never_reuses_active_episo
     assert "Only B history" not in "\n".join(item["content"] for item in snapshot.messages)
 
 
-def test_compose_context_activates_an_explicit_cross_entity_memory_recall() -> None:
+def test_compose_context_does_not_activate_an_explicit_cross_entity_memory_recall() -> None:
     asset_a = "192.168.0.62"
     asset_b = "192.168.30.115"
     message = f"What did we previously conclude about {asset_a}? Use only memory."
@@ -1110,9 +1112,10 @@ def test_compose_context_activates_an_explicit_cross_entity_memory_recall() -> N
             }
         )
 
-    assert policy.episode_transition == "switch"
+    assert policy.episode_transition == "keep"
+    assert not policy.operational_state_mutation_allowed
     assert captured["context_key"] == MemoryContextKey.from_task(task)
-    assert captured["activate_context"] is True
+    assert captured["activate_context"] is False
 
 
 def test_normal_explicit_return_to_a_reactivates_the_archived_a_episode() -> None:
@@ -1311,6 +1314,78 @@ def test_execution_guard_refuses_live_steps_when_request_disallows_live() -> Non
     assert result["next_edge"] == "safe_failure"
     assert result["tool_results"] == []
     assert result["failure_metadata"]["safe_error_code"] == "live_capability_forbidden_by_request"
+
+
+def test_scoped_memory_recall_preserves_active_pair_and_comparison_episode() -> None:
+    pair = ("192.168.20.120", "192.168.20.103")
+    session_id = "pair-recall"
+    memory = MemoryStore(20)
+    comparison_key = MemoryContextKey(
+        tuple(sorted(pair)), "asset_comparison", "compare", "multi_entity_comparison"
+    )
+    memory.prepare_for_model(
+        session_id,
+        get_settings(),
+        SessionRoutingState(active_entities=pair),
+        context_key=comparison_key,
+    )
+    episode_before = memory.repository.get_working(session_id).episode_id  # type: ignore[union-attr]
+    message = f"What did I ask you to remember about {pair[1]}? Use only memory."
+    active = SessionRoutingState(
+        active_entities=pair,
+        previous_scope="multi_entity_comparison",
+        previous_intent="graph_relationships",
+    )
+    resolution = EntityResolver().resolve(message, routing_state=active)
+    constraints = derive_request_constraints(message)
+    policy = derive_turn_policy(message, constraints, resolution, active)
+    task = TaskSpec(
+        request=message,
+        intent="memory_recall",
+        scope="node_summary",
+        direction="both",
+        entities=(pair[1],),
+        required_capabilities=(),
+        evidence_mode="memory_only",
+        temporal_mode="historical",
+    )
+    service = SimpleNamespace(
+        settings=get_settings(),
+        memory_store=memory,
+        routing_state_store=SessionRoutingStateStore(),
+        long_term_memory_coordinator=None,
+        persist_thread_continuity=lambda *_args, **_kwargs: None,
+        persist_completed_local_turn=lambda *_args, **_kwargs: None,
+    )
+
+    result = CopilotWorkflowNodes(service).update_memory({
+        "task": task,
+        "tool_results": [],
+        "synthesis_result": {"answer": "Recalled fact."},
+        "memory_context_key": MemoryContextKey.from_task(task),
+        "pending_working_facts": (),
+        "session_id": session_id,
+        "request_id": "pair-recall-turn",
+        "request_identity": None,
+        "message": message,
+        "evidence_pack": SimpleNamespace(limitations=()),
+        "active_entity_state": active,
+        "resolved_entities": resolution,
+        "routing_result": SimpleNamespace(
+            intent="asset_investigation", scope="node_summary", direction="both", depth=0,
+            use_detection=False, use_asset_profile=False,
+        ),
+        "execution_plan": ExecutionPlan(task=task, steps=()),
+        "review_decision": ReviewDecision(outcome="sufficient"),
+        "turn_policy": policy,
+        "conversation_snapshot": SimpleNamespace(episode_transition=False),
+    })
+
+    working = memory.repository.get_working(session_id)
+    assert result["active_entity_state"].active_entities == pair
+    assert working is not None and working.episode_id == episode_before
+    assert working.context_key == comparison_key
+    assert not policy.operational_state_mutation_allowed
 
 
 CURRENT_FOLLOWUP = (

@@ -333,6 +333,7 @@ class MemoryStore:
         limitations: tuple[str, ...] = (),
         scope: str = "none",
         request_id: str = "",
+        mutate_operational_episode: bool = True,
     ) -> None:
         """Record one bounded turn without storing provider payloads or prompts."""
         if self.max_messages == 0:
@@ -347,8 +348,12 @@ class MemoryStore:
                 )
                 return
         working = self.repository.get_working(session_id)
-        opened = working is None or working.context_key != context_key
-        if working is None or working.context_key != context_key:
+        opened = mutate_operational_episode and (
+            working is None or working.context_key != context_key
+        )
+        if mutate_operational_episode and (
+            working is None or working.context_key != context_key
+        ):
             working = WorkingMemory(
                 session_id=session_id,
                 context_key=context_key,
@@ -360,20 +365,26 @@ class MemoryStore:
             {"role": "user", "content": user_content},
             {"role": "assistant", "content": assistant_content},
         ]
-        working.latest_user_turn = compact_preview(user_content, limit=400)
-        working.latest_assistant_turn = compact_preview(assistant_content, limit=600)
-        working.last_providers = tuple(dict.fromkeys(providers))
-        working.last_scope = scope
-        working.limitations = tuple(dict.fromkeys(compact_preview(item, limit=200) for item in limitations))[:8]
-        self.repository.set_working(working)
-        logger.info(
-            "event=%s request_id=%s episode_ref=%s provider_count=%s limitation_count=%s",
-            "episode_opened" if opened else "episode_updated",
-            request_id,
-            working.episode_id,
-            len(working.last_providers),
-            len(working.limitations),
-        )
+        if mutate_operational_episode and working is not None:
+            working.latest_user_turn = compact_preview(user_content, limit=400)
+            working.latest_assistant_turn = compact_preview(assistant_content, limit=600)
+            working.last_providers = tuple(dict.fromkeys(providers))
+            working.last_scope = scope
+            working.limitations = tuple(dict.fromkeys(compact_preview(item, limit=200) for item in limitations))[:8]
+            self.repository.set_working(working)
+            logger.info(
+                "event=%s request_id=%s episode_ref=%s provider_count=%s limitation_count=%s",
+                "episode_opened" if opened else "episode_updated",
+                request_id,
+                working.episode_id,
+                len(working.last_providers),
+                len(working.limitations),
+            )
+        else:
+            logger.info(
+                "event=memory_recall_turn_recorded request_id=%s operational_episode_mutated=false",
+                request_id,
+            )
         now = datetime.now(timezone.utc).isoformat()
         self._turns.setdefault(session_id, []).append(
             RelevantTurn(
@@ -532,7 +543,20 @@ class MemoryStore:
             0,
             int(getattr(settings, "memory_context_long_term_token_budget", 500)),
         )
+        working = self.repository.get_working(session_id) or WorkingMemory(
+            session_id=session_id,
+            context_key=context_key or MemoryContextKey(),
+            episode_id="",
+        )
         summary = str(self._summaries.get(session_id, {}).get("text") or "")
+        if (
+            not thread_recall
+            and context_key is not None
+            and working.context_key != context_key
+        ):
+            # A scoped historical read may inspect an archived episode, but it
+            # must not borrow the active episode's summary or activate it.
+            summary = ""
         summary_tokens = approx_tokens(summary)
         omitted: list[str] = []
         if summary_tokens > total_budget:
@@ -705,11 +729,6 @@ class MemoryStore:
             seen_statements.add(normalized)
             used_long_term_tokens += item.estimated_tokens
 
-        working = self.repository.get_working(session_id) or WorkingMemory(
-            session_id=session_id,
-            context_key=context_key or MemoryContextKey(),
-            episode_id="",
-        )
         fact_candidates = list(working.working_facts)
         if thread_recall:
             for episode in reversed(self.repository.list_episodes(session_id)):
@@ -769,6 +788,18 @@ class MemoryStore:
             active_entities=tuple(active_entities),
             estimated_tokens=max(0, used + used_long_term_tokens),
             omitted=tuple(dict.fromkeys(omitted)),
+            thread_recall_requested=thread_recall,
+            # Local storage is bounded by retention and token budgets, so it
+            # cannot independently prove exhaustive thread coverage.
+            thread_recall_complete=False,
+            sources_considered=tuple(name for name, present in (
+                ("working_summary", bool(summary)),
+                ("relevant_turns", bool(candidates)),
+                ("episodes", bool(episodes)),
+                ("working_facts", bool(fact_candidates)),
+                ("entity_timeline", bool(entity_timeline)),
+                ("product_ltm_selection", bool(long_term_memories)),
+            ) if present),
         )
         package = MemoryContextPackage(
             **{
@@ -786,7 +817,7 @@ class MemoryStore:
             latency_ms,
         )
         logger.info(
-            "event=memory_context_composed request_id=%s selected_turns=%s raw_turn_count=%s digest_turn_count=%s summary_tokens=%s working_fact_count=%s episode_count=%s long_term_count=%s thread_recall=%s estimated_tokens=%s omitted_count=%s",
+            "event=memory_context_composed request_id=%s selected_turns=%s raw_turn_count=%s digest_turn_count=%s summary_tokens=%s working_fact_count=%s episode_count=%s long_term_count=%s thread_recall=%s thread_recall_complete=%s memory_context_truncated=%s estimated_tokens=%s omitted_count=%s",
             request_id,
             len(selected),
             sum(item.source_representation == "raw" for item in selected),
@@ -796,6 +827,8 @@ class MemoryStore:
             len(selected_episodes),
             len(selected_long_term),
             thread_recall,
+            package.thread_recall_complete,
+            bool(package.omitted),
             package.estimated_tokens,
             len(package.omitted),
         )

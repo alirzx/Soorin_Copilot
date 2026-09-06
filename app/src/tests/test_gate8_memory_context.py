@@ -815,6 +815,119 @@ def test_mapping_provider_result_is_supported_for_graph_baseline_projection() ->
     assert baseline.projections[0].capability == "graph.get_summary"
 
 
+def test_oversized_required_detection_is_compacted_not_dropped() -> None:
+    result = _complete_product_result(
+        "asset.get_detection",
+        view="full",
+        payload={
+            "classification": "server",
+            "risk": 9,
+            "status": "review",
+            "evidence": [
+                {"feature": f"feature-{index}", "score": index / 1000}
+                for index in range(1000)
+            ],
+        },
+    )
+
+    baseline = investigation_baseline_from_results(
+        (result,),
+        owner_id="user_test",
+        source_request_id="oversized-detection",
+        scope="node_summary",
+        required_capabilities=("asset.get_detection",),
+    )
+
+    assert baseline is not None
+    projection = baseline.projections[0]
+    assert projection.view == "canonical"
+    assert projection.payload["facts"]["views.full.classification"] == "server"
+    assert projection.payload["facts"]["views.full.risk"] == 9
+    assert len(json.dumps(projection.payload).encode("utf-8")) < 6_000
+
+
+def test_multi_view_pair_baseline_keeps_graph_comparison_under_projection_limit() -> None:
+    def multi(entity: str, capability: str) -> ToolResult:
+        return replace(
+            _complete_product_result(capability),
+            entities=(entity,),
+            selected_views=("identity", "risk", "behavior", "evidence"),
+            view_payload={
+                "provider": capability,
+                "views": {
+                    name: {"entity": entity, "status": name, "risk": 7}
+                    for name in ("identity", "risk", "behavior", "evidence")
+                },
+            },
+        )
+
+    graph = replace(
+        _complete_graph_result(),
+        entities=("192.0.2.10", "192.0.2.20"),
+        source_capability="graph.compare_assets",
+    )
+    results = (
+        multi("192.0.2.10", "asset.get_profile"),
+        multi("192.0.2.20", "asset.get_profile"),
+        multi("192.0.2.10", "asset.get_detection"),
+        multi("192.0.2.20", "asset.get_detection"),
+        graph,
+    )
+
+    baseline = investigation_baseline_from_results(
+        results,
+        owner_id="user_test",
+        source_request_id="pair-baseline",
+        scope="multi_entity_comparison",
+        required_capabilities=(
+            "asset.get_profile", "asset.get_detection", "graph.compare_assets"
+        ),
+    )
+
+    assert baseline is not None
+    assert len(baseline.projections) == 5
+    assert {item.capability for item in baseline.projections} == {
+        "asset.get_profile", "asset.get_detection", "graph.compare_assets"
+    }
+
+
+def test_high_peer_graph_baseline_is_bounded_and_keeps_active_version() -> None:
+    graph = replace(
+        _complete_graph_result(),
+        provider_result=SimpleNamespace(context={
+            "target_ip": IP,
+            "requested_scope": "full_neighbors",
+            "direction": "both",
+            "depth": 1,
+            "active_graph_version": "published-v9",
+            "retrieval_complete": True,
+            "retrieval_truncated": False,
+            "complete_for_user_request": True,
+            "nodes": [
+                {"id": IP},
+                *(
+                    {"id": f"192.0.2.{index}", "outbound": True, "hop": 1}
+                    for index in range(1, 200)
+                ),
+            ],
+        }),
+    )
+
+    baseline = investigation_baseline_from_results(
+        (graph,),
+        owner_id="user_test",
+        source_request_id="high-peer-graph",
+        scope="full_neighbors",
+        required_capabilities=("graph.get_summary",),
+    )
+
+    assert baseline is not None
+    projection = baseline.projections[0]
+    assert projection.payload["active_graph_version"] == "published-v9"
+    assert len(projection.payload["peers"]) == 48
+    assert len(json.dumps(projection.payload).encode("utf-8")) < 6_000
+
+
 def test_weak_or_memory_only_turn_cannot_create_baseline() -> None:
     complete = _complete_product_result()
     failed = replace(complete, status="unavailable", completeness="unknown")

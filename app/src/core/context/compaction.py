@@ -34,6 +34,12 @@ _DEDUP_KEYS = frozenset({
     "ip", "ipaddress", "hostname", "name", "mac", "macaddress", "vendor",
     "product", "role", "assetrole", "detectionrole", "tag", "subtag", "status",
 })
+_BASELINE_FACT_PRIORITY = re.compile(
+    r"(?:^|\.)(?:ip|id|name|hostname|owner|role|status|risk|score|classification|"
+    r"severity|direction|source|target|protocol|service|label|vendor|product)$",
+    re.IGNORECASE,
+)
+_MAX_CANONICAL_PRODUCT_BYTES = 1_400
 
 
 @dataclass(frozen=True)
@@ -106,6 +112,59 @@ class HistoricalBaselineProjection:
         ))
 
 
+def _bounded_canonical_payload(
+    payload: Mapping[str, Any], *, max_bytes: int = _MAX_CANONICAL_PRODUCT_BYTES
+) -> dict[str, Any]:
+    """Reduce a provider DTO to stable scalar facts and collection cardinalities."""
+    facts: list[tuple[int, str, Any]] = []
+    counts: dict[str, int] = {}
+
+    def visit(value: Any, path: tuple[str, ...], depth: int) -> None:
+        dotted = ".".join(path) or "value"
+        if depth > 6:
+            return
+        if isinstance(value, Mapping):
+            counts[dotted] = len(value)
+            for key in sorted(value, key=str):
+                visit(value[key], (*path, str(key)), depth + 1)
+            return
+        if isinstance(value, (list, tuple)):
+            counts[dotted] = len(value)
+            for index, item in enumerate(value[:24]):
+                visit(item, (*path, f"[{index}]"), depth + 1)
+            return
+        if value is None or isinstance(value, (str, int, float, bool)):
+            priority = 0 if _BASELINE_FACT_PRIORITY.search(dotted) else 1
+            facts.append((priority, dotted, value))
+
+    visit(payload, (), 0)
+    selected_counts: dict[str, int] = {}
+    for path, count in sorted(counts.items()):
+        candidate_counts = {**selected_counts, path: count}
+        if len(json.dumps(candidate_counts, separators=(",", ":")).encode("utf-8")) <= max_bytes // 4:
+            selected_counts[path] = count
+    selected: dict[str, Any] = {}
+    omitted = 0
+    for _priority, path, value in sorted(facts, key=lambda item: (item[0], item[1])):
+        candidate = {
+            "facts": {**selected, path: value},
+            "collection_counts": selected_counts,
+        }
+        encoded = json.dumps(
+            candidate, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+        if len(encoded) <= max_bytes:
+            selected[path] = value
+        else:
+            omitted += 1
+    return {
+        "facts": selected,
+        "collection_counts": selected_counts,
+        "projection_truncated": bool(omitted),
+        "omitted_fact_count": omitted,
+    }
+
+
 def _graph_projection_payload(context: Mapping[str, Any]) -> dict[str, Any]:
     """Return stable bounded graph counts, peers, and path/relationship facts."""
     count_keys = (
@@ -119,7 +178,12 @@ def _graph_projection_payload(context: Mapping[str, Any]) -> dict[str, Any]:
             key: context[key]
             for key in count_keys
             if isinstance(context.get(key), (int, float))
-        }
+        },
+        "active_graph_version": str(context.get("active_graph_version") or ""),
+        "provider": str(context.get("provider") or "graph"),
+        "retrieval_complete": bool(context.get("retrieval_complete", True)),
+        "retrieval_truncated": bool(context.get("retrieval_truncated", False)),
+        "truncation_reason": context.get("truncation_reason"),
     }
     target = str(context.get("target_ip") or "")
     peers: list[dict[str, Any]] = []
@@ -193,15 +257,49 @@ def current_evidence_projections(
             schema_version = str(receipt.schema_version if receipt is not None else getattr(result, "projection_schema_version", "") or "")
             if not isinstance(views, dict) or not schema_version:
                 continue
-            for view in tuple(getattr(result, "selected_views", ()) or ()):
-                payload = views.get(view)
-                if isinstance(payload, dict):
+            selected_views = {
+                str(view): views[view]
+                for view in tuple(getattr(result, "selected_views", ()) or ())
+                if isinstance(views.get(view), dict)
+            }
+            selected_views_bytes = len(json.dumps(
+                selected_views,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8"))
+            requires_canonical_baseline = (
+                len(selected_views) > 1
+                or selected_views_bytes > MAX_BASELINE_PROJECTION_BYTES
+            )
+            if selected_views and requires_canonical_baseline:
+                canonical = _bounded_canonical_payload({
+                    "views": selected_views,
+                    "provenance": {
+                        "provider": str(getattr(receipt, "provider", "") or getattr(result, "provider", "")),
+                        "capability": capability,
+                        "complete": complete,
+                    },
+                })
+                projections.append(CurrentEvidenceProjection(
+                    owner_id=owner_id,
+                    entity=entities[0],
+                    entity_ids=entities,
+                    capability=capability,
+                    view="canonical",
+                    schema_version=f"{schema_version}:baseline-v2",
+                    payload=canonical,
+                    retrieved_at=str(receipt.retrieved_at if receipt is not None else getattr(result, "valid_at", None) or result.retrieved_at),
+                    complete=complete,
+                ))
+            else:
+                for view, payload in selected_views.items():
                     projections.append(CurrentEvidenceProjection(
                         owner_id=owner_id,
                         entity=entities[0],
                         entity_ids=entities,
                         capability=capability,
-                        view=str(view),
+                        view=view,
                         schema_version=schema_version,
                         payload=payload,
                         retrieved_at=str(receipt.retrieved_at if receipt is not None else getattr(result, "valid_at", None) or result.retrieved_at),
@@ -425,10 +523,18 @@ def investigation_baseline_from_results(
     ))
     captured_at = max((item.valid_at for item in retained), default="")
     logger.info(
-        "event=baseline_captured request_id=%s entity_count=%s projection_count=%s",
+        "event=baseline_captured request_id=%s entity_count=%s projection_count=%s "
+        "baseline_required_capabilities=%s baseline_preserved_capabilities=%s "
+        "baseline_compacted_capabilities=%s baseline_dropped_capabilities=none",
         source_request_id,
         len(entities),
         len(retained),
+        ",".join(sorted(required_operational)) or "none",
+        ",".join(item.capability for item in retained),
+        ",".join(
+            item.capability for item in retained
+            if item.view == "canonical" or item.payload.get("projection_truncated")
+        ) or "none",
     )
     return InvestigationBaseline(
         entity_ids=entities,

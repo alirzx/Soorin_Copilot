@@ -88,9 +88,9 @@ class GraphQueryPolicy:
 class _ProjectionAdjacency:
     """Minimal directed adjacency view hydrated from the active Neo4j projection.
 
-    It deliberately implements only the topology operations used by the legacy
-    bounded-context contract.  It is not a second graph store and keeps the
-    Community repository's shadow parity path independent of NetworkX.
+    It deliberately implements only the topology operations used by the bounded
+    context contract. It is not a second graph store; all source records come
+    from a bounded query of the active Community projection.
     """
 
     def __init__(self, nodes: list[str], edges: list[dict[str, object]]) -> None:
@@ -339,12 +339,7 @@ class Neo4jGraphRepository:
                 "truncated": bool(row and int(row["total"] or 0) > len(rows))}
 
     def get_context(self, spec: GraphRetrievalSpec) -> dict[str, object]:
-        """Shadow-only exact context contract over the active Community projection.
-
-        Runtime callers remain on NetworkX until the dedicated cutover task.  A
-        two-hop projection is the narrowest data needed to reproduce the
-        established BFS, ordering, de-duplication, and limit semantics.
-        """
+        """Return the exact bounded context contract from the active projection."""
         target = spec.entities[0].value if spec.entities else ""
         if spec.intent == "graph_relationships" and len(spec.entities) == 2:
             left, right = spec.entities[0].value, spec.entities[1].value
@@ -392,9 +387,8 @@ class Neo4jGraphRepository:
         if not found:
             return _apply_completeness_contract(_empty_result(spec, target, node_found=False), spec)
         graph = _ProjectionAdjacency(nodes, edges)
-        # The existing helper is duck-typed: it requires directed adjacency, not
-        # NetworkX. Reusing it protects every ordering and completeness detail
-        # until the dedicated runtime-cutover task makes Neo4j primary.
+        # The helper consumes only this bounded directed adjacency view, keeping
+        # ordering and completeness behavior independent of a graph library.
         return _apply_completeness_contract(_two_hop_context(graph, spec, self.settings), spec)
 
     def _active_neighborhood(self, target: str, hops: int) -> tuple[bool, list[str], list[dict[str, object]]]:

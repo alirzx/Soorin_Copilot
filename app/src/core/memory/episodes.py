@@ -183,6 +183,9 @@ class MemoryContextPackage:
     active_entities: tuple[str, ...] = ()
     estimated_tokens: int = 0
     omitted: tuple[str, ...] = ()
+    thread_recall_requested: bool = False
+    thread_recall_complete: bool = False
+    sources_considered: tuple[str, ...] = ()
 
     def model_messages(self) -> list[dict[str, str]]:
         messages: list[dict[str, str]] = []
@@ -212,19 +215,22 @@ class MemoryContextPackage:
                         "[SOORIN CONVERSATION SUMMARY]\n"
                         "Source: compact working summary — conversation-derived.\n"
                         "Authority: bounded continuity summary; do not treat it as current verification.\n"
+                        f"Entity scope: {','.join(self.active_entities) or 'conversation/mixed'}.\n"
                         f"{self.working_summary}"
                     ),
                 }
             )
         if self.episode_summaries:
             summaries = "\n".join(
-                episode.compact_summary or "\n".join(
+                f"- entities={','.join(episode.context_key.entities) or 'conversation'}; "
+                f"source=episode_summary; temporal=historical; "
+                + (episode.compact_summary or " | ".join(
                     (
                         *(f"contradiction: {item}" for item in episode.contradictions),
                         *(f"finding: {item}" for item in episode.key_findings),
                         *(f"next_check: {item}" for item in episode.next_checks),
                     )
-                )
+                ))
                 for episode in self.episode_summaries
                 if (episode.compact_summary or episode.contradictions or episode.key_findings)
                 and (episode.compact_summary or "").strip().casefold() not in normalized_long_term
@@ -274,11 +280,21 @@ class MemoryContextPackage:
                     "content": (
                         "[SOORIN SHORT-TERM RECENT TURN CONTEXT]\n"
                         "Authority: bounded conversation history. It may contain user assertions or prior assistant text, "
-                        "not independent current operational evidence."
+                        "not independent current operational evidence. Entity bindings below are authoritative for attribution; "
+                        "do not transfer facts between entities or infer protocol, service, or relationship direction."
                     ),
                 }
             )
         for turn in self.relevant_turns:
+            messages.append({
+                "role": "system",
+                "content": (
+                    "[SOORIN RELEVANT TURN PROVENANCE]\n"
+                    f"request_id={turn.request_id}; entities={','.join(turn.context_key.entities) or 'conversation'}; "
+                    f"topic={turn.context_key.topic_family}; source={turn.source_representation}; temporal=historical; "
+                    "user text is analyst-supplied and assistant text is a prior conclusion, not fresh evidence."
+                ),
+            })
             messages.extend(
                 (
                     {"role": "user", "content": turn.user_content},

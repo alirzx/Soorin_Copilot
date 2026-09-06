@@ -1,4 +1,4 @@
-"""NetworkX graph evidence specialist subgraph."""
+"""Neo4j-backed graph evidence specialist subgraph."""
 
 from __future__ import annotations
 
