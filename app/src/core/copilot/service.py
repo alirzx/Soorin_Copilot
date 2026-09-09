@@ -22,6 +22,7 @@ from src.core.agent.reviewer import EvidenceReviewer
 from src.core.agent.workflow import BoundedCopilotWorkflow
 from src.core.agent.nodes import CopilotWorkflowNodes
 from src.core.context import ContextComposer, DeterministicFallbackRouter, EntityResolver, SemanticIntentRouter
+from src.core.copilot.input_guard import prompt_injection_refusal
 from src.core.context.providers import AssetProfileContextProvider, DetectionContextProvider, GraphContextProvider
 from src.core.llm.client import LLMClient
 from src.core.llm.errors import LLMError
@@ -945,6 +946,34 @@ class CopilotService:
         resolved_session_id = identity.session_id
         self.restore_thread_continuity(identity)
         self.begin_local_request(identity)
+        guarded = prompt_injection_refusal(message)
+        if guarded is not None:
+            self.persist_completed_local_turn(
+                identity,
+                user_content=message.strip(),
+                assistant_content=guarded,
+            )
+            if stream_sink is not None:
+                stream_sink(LLMStreamEvent("answer_delta", text=guarded))
+            logger.warning(
+                "event=prompt_injection_refused request_id=%s session_id=%s "
+                "streaming=%s router_called=false planner_called=false provider_called=false",
+                resolved_request_id,
+                resolved_session_id,
+                stream_sink is not None,
+            )
+            get_metrics().observe_copilot(
+                "completed",
+                "direct",
+                time.perf_counter() - request_started,
+            )
+            return {
+                "session_id": resolved_session_id,
+                "answer": guarded,
+                "provider": "deterministic",
+                "model": "prompt-injection-guard",
+                "_warnings": [],
+            }
         trivial = self._trivial_response(message)
         if trivial is not None:
             session = resolved_session_id
