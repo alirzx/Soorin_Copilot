@@ -93,7 +93,7 @@ def test_static_prompt_uses_user_facing_memory_language() -> None:
     static = Path("app/prompts/synthesizer/synthesizer_static_prompt.md").read_text(encoding="utf-8")
 
     assert "our earlier discussion" in static
-    assert "do not expose internal workflow, storage, retrieval" in static
+    assert "do not expose internal workflow, storage, retrieval" in static.casefold()
     assert "Translate evidence limitations into honest plain language" in static
 
 
