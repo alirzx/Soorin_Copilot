@@ -1,4 +1,4 @@
-"""Isolated Neo4j Community coverage for Phase 4A structured retrieval."""
+"""Isolated Neo4j Community coverage for structured retrieval through Phase 4B.3."""
 
 from __future__ import annotations
 
@@ -10,12 +10,18 @@ import pytest
 
 from src.config.settings import get_settings
 from src.core.agent.contracts import TaskSpec
+from src.core.agent.evidence import context_package_from_evidence
 from src.core.agent.executor import CapabilityExecutor
 from src.core.agent.plan_validator import PlanValidator
 from src.core.agent.registry import build_capability_registry
+from src.core.agent.reviewer import EvidenceReviewer
+from src.core.agent.structured_evidence import expected_structured_query_identity
 from src.core.agent.specialists import GraphAnalysisSpecialist
 from src.core.agent.task_mapping import compile_direct_plan
+from src.core.context.composer import ContextComposer
+from src.core.context.models import EntityResolution
 from src.core.context.providers.graph import GraphContextProvider
+from src.core.context.synthesizer_prompt import SynthesizerPromptBuilder
 from src.core.graph.enrichment_models import AssetEnrichmentMutation
 from src.core.graph.neo4j import Neo4jDriver, Neo4jGraphRepository
 from src.core.graph.service import GraphService
@@ -246,3 +252,28 @@ def test_agent_capability_path_reaches_active_structured_projection(
         "10.20.0.2",
     ]
     assert all(row["graph_version"] == "structured-active-v2" for row in result.raw_payload["rows"])
+    assert result.evidence_type == "graph_asset_search"
+    assert result.structured_asset_set is not None
+    assert result.structured_asset_set.active_graph_version == "structured-active-v2"
+    expected_identity = expected_structured_query_identity(query, result.structured_asset_set)
+    assert result.structured_asset_set.query_identity == expected_identity, result.structured_asset_set
+
+    reviewer = EvidenceReviewer()
+    review = reviewer.review(task, [result])
+    assert review.outcome == "sufficient", review
+    pack = reviewer.build_pack(task, [result], plan=plan, review=review)
+    package = context_package_from_evidence(pack, EntityResolution(status="none"))
+    composer = ContextComposer(settings)
+    dynamic_context = composer.compose(
+        package,
+        base_input_tokens=200,
+        reserved_output_tokens=1024,
+        request_id="phase4b3-neo4j",
+    )
+    builder = SynthesizerPromptBuilder()
+    synth_context = builder.build_context(task, (result,), review=review)
+    prompt, modules = builder.render_contract(synth_context)
+    assert "SOORIN_STRUCTURED_ASSET_SET_CONTEXT_JSON" in dynamic_context
+    assert '"matched_total":2' in dynamic_context
+    assert "task.asset_search" in modules
+    assert "enrichment-derived organizational projection" in prompt

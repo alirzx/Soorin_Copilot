@@ -1,12 +1,12 @@
 # Phase 4 Structured Graph Routing
 
-Status: current `dev` implementation record for Phase 4A.1 through Phase 4B.2.
+Status: current `dev` implementation record for Phase 4A.1 through Phase 4B.3.
 
 ## Current boundary
 
-Phase 4A provides typed, bounded, active-version-only Neo4j Asset search and aggregation. Phase 4A.1 adds external cursor request/version binding plus a read-only query-plan audit. Phase 4B.1 adds the semantic contract for structured Asset-set requests. Phase 4B.2 connects that contract to bounded agent execution.
+Phase 4A provides typed, bounded, active-version-only Neo4j Asset search and aggregation. Phase 4A.1 adds external cursor request/version binding plus a read-only query-plan audit. Phase 4B.1 adds the semantic contract for structured Asset-set requests. Phase 4B.2 connects that contract to bounded agent execution. Phase 4B.3 carries those results through typed evidence, deterministic review, bounded context, and task-specific synthesis.
 
-No Product backend, frontend, public API, PostgreSQL schema, Qdrant schema, Neo4j schema, Memory schema, EvidencePack, ContextComposer, or Synthesizer contract is changed by 4B.2.
+No Product backend, frontend, public API, PostgreSQL schema, Qdrant schema, Neo4j schema, or Memory schema is changed by 4B.3.
 
 ## Semantic contract
 
@@ -68,6 +68,26 @@ They reuse the Phase 4A selector and enum contracts, accept no cursor or arbitra
 
 The Graph Specialist remains a deterministic bounded subgraph, not an LLM agent. Existing generic `ToolResult` fields carry the typed result and bounded count/truncation metadata. Asset-set-aware EvidencePack and model-context semantics are intentionally not introduced here.
 
+## Phase 4B.3 evidence-to-answer contract
+
+```text
+graph.search_assets / graph.aggregate_assets
+→ typed ToolResult Asset-set evidence
+→ EvidencePack
+→ deterministic EvidenceReviewer
+→ dedicated bounded ContextComposer serialization
+→ deterministic Synthesizer task module
+→ existing Synthesizer transport
+```
+
+Search and aggregate use distinct evidence classes. Their query identity is a canonical SHA-256 fingerprint of normalized mode/filter/sort/direction or operation/grouping semantics plus the active graph version; retrieval limits and timestamps are intentionally excluded. EvidencePack retains the typed object and its Neo4j organizational-projection provenance.
+
+The Reviewer accepts zero focal entities and treats one capability result as one set receipt. It validates capability, mode, query identity, graph version, provenance, counts, groups, and truncation locally. A valid empty search or zero aggregate is sufficient. A valid truncated result remains answerable with limitations. Missing evidence can use the existing single supplemental Graph retrieval; no returned row triggers a Product or Detection call.
+
+Context composition uses a dedicated structured serializer. Search retrieval may retain up to the configured retrieval limit, while model context includes at most 20 rows and may include fewer under the existing token budget and output reservation. Identity, requested selector fields, sort field, and a stable allow-listed analyst projection are retained; individual strings and list values are bounded. Aggregate evidence uses a smaller context cap and preserves the total even when grouped output is context-bounded. The model receives explicit retrieval-versus-context counts, truncation state, limitations, and projection authority.
+
+Synthesizer module selection adds no model call. `asset_search` and `asset_aggregate` modules require direct grounded answers, explicit subset caveats, valid-zero handling, and no invented Product truth. Result-set continuity remains deferred to Phase 4B.4 and selective cross-source deepening remains deferred to Phase 4C.
+
 ## Router prompt policy
 
 The Router prompt is extended only with the minimum structured-query rules:
@@ -117,4 +137,4 @@ Two measured decisions remain intentionally separate from semantic routing:
 
 ## Next phases
 
-Phase 4B.3 adds set-aware EvidencePack/Reviewer/ContextComposer and Synthesizer handling. Phase 4B.4 adds bounded short-term result-set continuity. Phase 4C adds selective cross-source Product/Detection/topology deepening; Phase 4B.2 performs no such fan-out.
+Phase 4B.3 set-aware EvidencePack/Reviewer/ContextComposer/Synthesizer handling is implemented. Phase 4B.4 adds bounded short-term result-set continuity. Phase 4C adds selective cross-source Product/Detection/topology deepening; Phase 4B.3 performs no such fan-out.

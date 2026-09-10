@@ -261,6 +261,8 @@ Capability registry entries:
 - `graph.get_relationship`
 - `graph.compare_assets`
 - `graph.find_path`
+- `graph.search_assets`
+- `graph.aggregate_assets`
 - `knowledge.search`
 
 Active graph nodes:
@@ -384,6 +386,8 @@ URLs, disable freshness checks, or force unvalidated full payloads.
 
 `EvidencePack` is constructed only from `ToolResult` records. It carries request/trace/plan IDs, resolved entities, plan summary, capability coverage, identity-keyed result coverage, graph completeness, citations, missing evidence, limitations, contradictions, supplemental history, and review outcome. Repeated capabilities remain separate ToolResults.
 
+Phase 4B.3 adds first-class `graph_asset_search` and `graph_asset_aggregate` evidence. Each structured receipt carries normalized query semantics, active graph version, canonical SHA-256 query identity, Neo4j organizational-projection provenance, counts, bounded rows/groups, truncation, retrieval time, and limitations. These receipts remain zero-focal-entity evidence and are retained by EvidencePack without turning returned Assets into task entities or memory objects.
+
 ### Supplemental validation
 
 The only allowed sequence is implemented:
@@ -438,6 +442,8 @@ Outcomes:
 - `safe_failure`
 
 There is no LLM evidence reviewer.
+
+Structured Asset-set review is deterministic and local. It validates task/result mode and query identity, active graph version, provenance, generic/typed count agreement, row/group consistency, and truncation semantics without a verification query. Valid empty searches and zero aggregates are sufficient evidence. Valid truncation produces `answer_with_limitations`; it does not make the capability missing. Missing structured evidence may use the existing one-call supplemental Graph path, but result rows never cause Product/Detection fan-out.
 
 Graph completeness is evaluated in authority order: `complete_for_user_request`, then `requested_scope_complete`, then `serialized_context_complete_for_retrieved_subset`, and only then general retrieval completeness. A complete `node_summary` remains complete when a broader neighborhood was bounded; that broader truncation is retained as an informational limitation.
 
@@ -616,6 +622,8 @@ The context composer produces a dynamic system message with:
 - Source semantics and limitations.
 - Explicit warning that operational evidence outranks documentation.
 - A compact reviewed-EvidencePack summary containing plan identity, provider coverage, graph completeness, review outcome, missing evidence, contradictions, and limitations.
+
+Structured Asset sets use a dedicated serializer inside the same Graph context path. It separates retrieval coverage from model-visible coverage, caps search rows at 20 before token fitting, bounds long values, prioritizes required Graph evidence ahead of optional Knowledge, and uses the existing context window/output reservation calculations. Aggregate count/group-count context uses a smaller fixed scope cap and always retains the overall count when the minimum envelope fits. Both forms identify the active graph version and state that enrichment-derived Neo4j projection evidence is not live Product Profile/Detection truth.
 
 The composer input is rebuilt from canonical reviewed `ToolResult` objects.
 Complete provider objects remain unchanged internally; `view_payload` is the

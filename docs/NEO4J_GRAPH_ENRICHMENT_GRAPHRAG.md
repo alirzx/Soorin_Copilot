@@ -13,7 +13,8 @@ Phase 3.5     DONE
 Phase 4A      IMPLEMENTED
 Phase 4A.1    CODE COMPLETE; CI/PROFILE VALIDATION GATE
 Phase 4B.1    IMPLEMENTED
-Phase 4B.2    NEXT
+Phase 4B.2    IMPLEMENTED
+Phase 4B.3    IMPLEMENTED
 ```
 
 ## 1. Purpose and authority
@@ -259,13 +260,13 @@ This validation path prevents developers from having to point mutating integrati
 
 ## 13. External boundaries unchanged
 
-Phase 4A/4A.1/4B.1/4B.2 do not change Product backend endpoints, Product PostgreSQL schema, Streamlit/Product frontend request contracts, public graph API routes, Qdrant collections, memory schema, EvidencePack, ContextComposer or Synthesizer contracts.
+Phase 4A/4A.1/4B.1/4B.2/4B.3 do not change Product backend endpoints, Product PostgreSQL schema, Streamlit/Product frontend request contracts, public graph API routes, Qdrant collections, or memory schema. Phase 4B.3 changes only internal evidence, review, context, and Synthesizer task-module contracts.
 
 Current chat identity fields remain `conversation_id`, `session_id`, `request_id`, `message`, and optional `ui_context.selected_ip`.
 
 ## 14. Next phases
 
-Phase 4B.3 owns set-aware evidence classes, EvidencePack/Reviewer semantics, bounded model-context projection, and task-aware synthesis. Phase 4B.4 owns short-term result-set continuity such as “those assets” without turning result rows into focal entities. Phase 4C owns bounded candidate selection and cross-source deepening.
+Phase 4B.3 implements set-aware evidence classes, EvidencePack/Reviewer semantics, bounded model-context projection, and task-aware synthesis. Phase 4B.4 owns short-term result-set continuity such as “those assets” without turning result rows into focal entities. Phase 4C owns bounded candidate selection and cross-source deepening.
 
 ## 15. Near-future GraphRAG roadmap
 

@@ -1,6 +1,6 @@
 # Documentation map and current authority
 
-Last synchronized: 2026-09-11 (`dev`, Phase 4B.2 capability integration).
+Last synchronized: 2026-09-11 (`dev`, Phase 4B.3 evidence/context integration).
 
 This directory contains both living specifications and historical audit records. Historical audit files are intentionally retained as snapshots of the repository state at the date written; they are not silently rewritten to look current. For implementation decisions, source code on `dev` is authoritative, followed by the living/current documents below.
 
@@ -10,7 +10,7 @@ This directory contains both living specifications and historical audit records.
 |---|---|---|
 | `CURRENT_ARCHITECTURE.md` | Living architecture baseline with dated addenda | Overall bounded LangGraph, LLM roles, evidence, context, memory, Product, Neo4j and Qdrant architecture. Read together with the current Phase 4 records below. |
 | `NEO4J_GRAPH_ENRICHMENT_GRAPHRAG.md` | Living graph architecture record | Authoritative graph/enrichment/structured-search/GraphRAG roadmap. |
-| `PHASE4_STRUCTURED_GRAPH_ROUTING.md` | Current Phase 4A.1/4B.2 implementation record | Exact-search hardening, Router semantic Asset-set contract, and bounded capability execution. |
+| `PHASE4_STRUCTURED_GRAPH_ROUTING.md` | Current Phase 4A.1–4B.3 implementation record | Exact-search hardening, Router/capability execution, and bounded Asset-set evidence-to-answer flow. |
 | `ENVIRONMENT_VARIABLES.md` | Living configuration reference | Current settings and deployment knobs. Phase 4A search limits are documented here. |
 | `DEPLOYMENT.md` | Current deployment guidance | Runtime/deployment mechanics. No Phase 4B.1 deployment-contract change. |
 | `OBSERVABILITY.md` | Current observability guidance | Metrics/logging boundaries. No Phase 4B.1 metric contract change. |
@@ -32,11 +32,14 @@ Phase 4A      IMPLEMENTED
 Phase 4A.1    CODE HARDENED; isolated CI/profile validation added
 Phase 4B.1    SEMANTIC CONTRACT IMPLEMENTED
 Phase 4B.2    IMPLEMENTED: capability/execution integration
+Phase 4B.3    IMPLEMENTED: evidence/reviewer/context/synthesis integration
 ```
 
 Phase 4A contains typed exact/range Asset filters, count/group-count aggregation, active-version-only Neo4j queries, bounded keyset pagination and fixed sort/group allow-lists. Phase 4A.1 binds the service cursor to normalized query identity and active graph version, hardens refresh/storage failure paths, and provides a read-only `EXPLAIN/PROFILE` audit plus isolated CI Neo4j validation.
 
 Phase 4B.1 adds a typed `StructuredQuerySpec`, Router semantic intents `asset_search` and `asset_aggregate`, deterministic validation, and structured-query fields in semantic/task contracts. Phase 4B.2 registers planner-visible, read-only `graph.search_assets` and `graph.aggregate_assets` capabilities with zero focal-entity cardinality. Simple set queries compile deterministically into one validated Graph Specialist call through `GraphService` to the active Neo4j projection. Cursor replay remains internal, configured result limits remain authoritative, and no Product fan-out or new LLM is added.
+
+Phase 4B.3 adds distinct `graph_asset_search` and `graph_asset_aggregate` evidence classes, canonical SHA-256 query identity bound to the active graph version, EvidencePack retention, deterministic zero-entity review, and dedicated bounded context serialization. Retrieval row limits remain separate from model-visible row limits. Valid empty results remain sufficient evidence; retrieval or context truncation remains answerable with explicit limitations. The Synthesizer selects small task modules for search and aggregate and preserves the Neo4j organizational-projection authority boundary.
 
 The semantic rule remains fixed:
 
@@ -48,7 +51,7 @@ structured retrieval output     = Asset set
 
 Asset-set rows do not consume the two-focal-entity budget. A later bounded result-set continuity object may reference a set, while only selected Assets become focal entities for Product/Detection/topology deepening.
 
-Phase 4B.3 remains responsible for Asset-set-aware EvidencePack, Reviewer, ContextComposer, citation, and Synthesizer behavior. Phase 4B.4 remains responsible for short-term result-set continuity, and Phase 4C for selective cross-source deepening.
+Phase 4B.4 remains responsible for short-term result-set continuity, and Phase 4C for selective cross-source deepening. Phase 4B.3 does not persist result sets, reinterpret selectors as focal entities, or fan out to Product/Detection.
 
 ## Authority boundaries for GraphRAG
 

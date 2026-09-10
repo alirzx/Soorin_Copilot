@@ -7,12 +7,15 @@ from types import SimpleNamespace
 
 from src.config.settings import get_settings
 from src.core.agent.contracts import RequestConstraints, TaskSpec
-from src.core.agent.evidence import context_package_from_evidence
+from src.core.agent.evidence import apply_context_inclusion, context_package_from_evidence
 from src.core.agent.evidence_policy import EvidenceRequirementPolicy, MemorySufficiencyGate
+from src.core.agent.executor import CapabilityExecutor
+from src.core.agent.plan_validator import PlanValidator
 from src.core.agent.registry import build_capability_registry
 from src.core.agent.reviewer import EvidenceReviewer
+from src.core.agent.specialists import GraphAnalysisSpecialist
 from src.core.agent.structured_evidence import structured_query_identity
-from src.core.agent.task_mapping import task_spec_from_route
+from src.core.agent.task_mapping import compile_direct_plan, task_spec_from_route
 from src.core.context.models import GraphProviderResult, ProviderProvenance, RouteDecision
 from src.core.context.composer import ContextComposer
 from src.core.context.models import EntityResolution, approx_tokens
@@ -21,12 +24,16 @@ from src.core.graph.structured import StructuredQuerySpec
 
 
 class _UnusedProvider:
-    settings = SimpleNamespace(product_read_timeout_seconds=1, rag_qdrant_timeout_seconds=1, rag_top_k=3)
+    def __init__(self) -> None:
+        self.settings = SimpleNamespace(product_read_timeout_seconds=1, rag_qdrant_timeout_seconds=1, rag_top_k=3)
+        self.calls = 0
 
     def fetch(self, *_args, **_kwargs):
+        self.calls += 1
         raise AssertionError("Product provider must not be called")
 
     def search(self, *_args, **_kwargs):
+        self.calls += 1
         raise AssertionError("Knowledge provider must not be called")
 
 
@@ -40,8 +47,11 @@ class _StructuredGraphProvider:
     def __init__(self, *, version: str = "graph-v7", empty: bool = False) -> None:
         self.version = version
         self.empty = empty
+        self.search_calls = 0
+        self.aggregate_calls = 0
 
     def search_assets(self, request):
+        self.search_calls += 1
         rows = [] if self.empty else [
             {
                 "graph_key": "asset-1",
@@ -71,6 +81,7 @@ class _StructuredGraphProvider:
         )
 
     def aggregate_assets(self, request):
+        self.aggregate_calls += 1
         groups = (
             [{"value": "CONFIRMED", "count": 9}, {"value": "REVIEW", "count": 3}]
             if request.group_by
@@ -510,3 +521,92 @@ def test_synthesizer_selects_compact_asset_aggregate_module_without_llm_call() -
     assert "Treat zero as a valid observed aggregate" in rendered.dynamic_prompt
     assert "bounded groups" in rendered.dynamic_prompt
     assert any('"count":12' in message["content"] for message in rendered.messages)
+
+
+class _SynthStub:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def invoke(self, messages) -> str:
+        self.calls += 1
+        assert any("SOORIN_STRUCTURED_ASSET_SET_CONTEXT_JSON" in item["content"] for item in messages)
+        return "grounded structured answer"
+
+
+def _run_bounded_pipeline(query: StructuredQuerySpec):
+    product = _UnusedProvider()
+    knowledge = _UnusedProvider()
+    graph = _StructuredGraphProvider()
+    registry = build_capability_registry(
+        asset_profile_provider=product,
+        detection_provider=product,
+        graph_provider=graph,
+        knowledge_service=knowledge,
+    )
+    task = _task(query)
+    plan = PlanValidator(registry).validate(compile_direct_plan(task))
+    specialist = GraphAnalysisSpecialist(CapabilityExecutor(registry)).run({
+        "request_id": "phase4b3-e2e",
+        "session_id": "phase4b3",
+        "workflow_id": "phase4b3-workflow",
+        "execution_plan": plan,
+    })
+    results = list(specialist["tool_results"])
+    reviewer = EvidenceReviewer()
+    review = reviewer.review(task, results, allow_supplemental=True)
+    pack = reviewer.build_pack(task, results, plan=plan, review=review)
+    package = context_package_from_evidence(pack, EntityResolution(status="none"))
+    composer = ContextComposer(replace(get_settings(), llm_context_window_tokens=32768))
+    dynamic = composer.compose(
+        package,
+        base_input_tokens=200,
+        reserved_output_tokens=1024,
+        request_id="phase4b3-e2e",
+    )
+    reviewed_results = tuple(apply_context_inclusion(results, composer.last_inclusion))
+    builder = SynthesizerPromptBuilder()
+    synth_context = builder.build_context(task, reviewed_results, review=review)
+    rendered = builder.render_messages(
+        static_core="Ground every claim in current evidence.",
+        context=synth_context,
+        dynamic_evidence=dynamic,
+        history=[],
+        user_message=task.request,
+    )
+    synth = _SynthStub()
+    answer = synth.invoke(rendered.messages)
+    return task, plan, results, review, composer, synth, answer, product, knowledge, graph
+
+
+def test_bounded_search_pipeline_reaches_synth_with_one_graph_call_and_no_fanout() -> None:
+    query = StructuredQuerySpec.model_validate({
+        "mode": "search",
+        "filters": {"status": "CONFIRMED", "role": "Domain Controller"},
+        "limit": 50,
+    })
+    task, plan, results, review, composer, synth, answer, product, knowledge, graph = _run_bounded_pipeline(query)
+
+    assert task.entities == () and len(plan.steps) == 1
+    assert len(results) == 1 and results[0].source_capability == "graph.search_assets"
+    assert review.outcome == "answer_with_limitations"
+    assert composer.last_budget["total_dynamic_tokens"] <= composer.last_budget["max_dynamic_tokens"]
+    assert synth.calls == 1 and answer == "grounded structured answer"
+    assert graph.search_calls == 1 and graph.aggregate_calls == 0
+    assert product.calls == knowledge.calls == 0
+
+
+def test_bounded_aggregate_pipeline_reaches_synth_without_product_or_qdrant_calls() -> None:
+    query = StructuredQuerySpec.model_validate({
+        "mode": "aggregate",
+        "filters": {"role": "Domain Controller"},
+        "operation": "count",
+    })
+    task, plan, results, review, composer, synth, answer, product, knowledge, graph = _run_bounded_pipeline(query)
+
+    assert task.entities == () and len(plan.steps) == 1
+    assert len(results) == 1 and results[0].source_capability == "graph.aggregate_assets"
+    assert review.outcome == "sufficient"
+    assert '"count":12' in composer.last_parts["graph"]
+    assert synth.calls == 1 and answer == "grounded structured answer"
+    assert graph.aggregate_calls == 1 and graph.search_calls == 0
+    assert product.calls == knowledge.calls == 0
