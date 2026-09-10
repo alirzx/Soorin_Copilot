@@ -310,6 +310,8 @@ class Settings:
     graph_enrichment_max_pages_per_cycle: int
     graph_enrichment_lease_ttl_seconds: int
     graph_enrichment_shutdown_timeout_seconds: int
+    graph_asset_search_default_limit: int
+    graph_asset_search_max_limit: int
     graph_max_ui_nodes: int
     graph_default_min_degree: int
     graph_api_max_neighbors: int
@@ -418,6 +420,11 @@ class Settings:
         if self.graph_enrichment_lease_ttl_seconds < 3:
             raise ValueError(
                 "SOORIN_GRAPH_ENRICHMENT_LEASE_TTL_SECONDS must be at least 3."
+            )
+        if self.graph_asset_search_default_limit > self.graph_asset_search_max_limit:
+            raise ValueError(
+                "SOORIN_GRAPH_ASSET_SEARCH_DEFAULT_LIMIT must not exceed "
+                "SOORIN_GRAPH_ASSET_SEARCH_MAX_LIMIT."
             )
 
     def validate_rag_qdrant_configuration(self) -> None:
@@ -807,6 +814,12 @@ def get_settings() -> Settings:
         ),
         graph_enrichment_shutdown_timeout_seconds=max(
             1, _int("SOORIN_GRAPH_ENRICHMENT_SHUTDOWN_TIMEOUT_SECONDS", 30)
+        ),
+        graph_asset_search_default_limit=max(
+            1, _int("SOORIN_GRAPH_ASSET_SEARCH_DEFAULT_LIMIT", 50)
+        ),
+        graph_asset_search_max_limit=max(
+            1, _int("SOORIN_GRAPH_ASSET_SEARCH_MAX_LIMIT", 200)
         ),
         graph_max_ui_nodes=_int("SOORIN_GRAPH_MAX_UI_NODES", 1000),
         graph_default_min_degree=_int("SOORIN_GRAPH_DEFAULT_MIN_DEGREE", 1),

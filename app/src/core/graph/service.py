@@ -9,6 +9,12 @@ from src.config.settings import Settings, get_settings
 from src.core.graph.neo4j import Neo4jDriver, Neo4jGraphRepository, Neo4jUnavailable
 from src.core.graph.refresh import get_refresh_status
 from src.core.graph.retrieval import GraphRetrievalSpec
+from src.core.graph.structured import (
+    AssetAggregateRequest,
+    AssetAggregateResult,
+    AssetSearchRequest,
+    AssetSearchResult,
+)
 
 
 @dataclass(frozen=True)
@@ -74,6 +80,18 @@ class GraphService:
         context = self.repository.get_context(spec)
         projection = self.repository.status()
         return {**context, "graph_provider": "neo4j_projection", "active_graph_version": projection.active_graph_version, "graph_last_successful_sync": projection.last_successful_sync}
+
+    def search_assets(self, request: AssetSearchRequest) -> AssetSearchResult:
+        """Validate query bounds before entering the Neo4j repository."""
+        limit = self.repository.policy.structured_limit(request.limit)
+        return self.repository.search_assets(request.model_copy(update={"limit": limit}))
+
+    def aggregate_assets(self, request: AssetAggregateRequest) -> AssetAggregateResult:
+        """Validate aggregate bounds before entering the Neo4j repository."""
+        if request.operation.value == "group_count":
+            limit = self.repository.policy.structured_limit(request.limit)
+            request = request.model_copy(update={"limit": limit})
+        return self.repository.aggregate_assets(request)
 
     def node(self, ip: str) -> dict[str, Any]:
         target_ip = ip.strip()

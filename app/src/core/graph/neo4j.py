@@ -8,6 +8,9 @@ from __future__ import annotations
 
 import logging
 import threading
+import base64
+import binascii
+import json
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -31,6 +34,18 @@ from src.core.graph.retrieval import (
     _two_hop_context,
 )
 from src.core.graph.subnet import get_subnet
+from src.core.graph.structured import (
+    AssetAggregateGroup,
+    AssetAggregateOperation,
+    AssetAggregateRequest,
+    AssetAggregateResult,
+    AssetGroupField,
+    AssetSearchRequest,
+    AssetSearchResult,
+    AssetSortField,
+    SortDirection,
+    StructuredAssetRow,
+)
 from src.core.product_client.schemas import TopologyConnectionRecord
 
 logger = logging.getLogger(__name__)
@@ -90,6 +105,8 @@ class GraphQueryPolicy:
     max_edges: int
     comparison_peer_limit: int
     comparison_shared_peer_limit: int
+    asset_search_default_limit: int
+    asset_search_max_limit: int
     timeout_seconds: int
 
     @classmethod
@@ -103,8 +120,21 @@ class GraphQueryPolicy:
             max_edges=settings.graph_max_edges,
             comparison_peer_limit=settings.graph_comparison_max_peers_per_entity,
             comparison_shared_peer_limit=settings.graph_comparison_max_shared_peers,
+            asset_search_default_limit=min(
+                settings.graph_asset_search_default_limit,
+                settings.graph_asset_search_max_limit,
+            ),
+            asset_search_max_limit=settings.graph_asset_search_max_limit,
             timeout_seconds=settings.neo4j_query_timeout_seconds,
         )
+
+    def structured_limit(self, requested: int | None) -> int:
+        limit = self.asset_search_default_limit if requested is None else int(requested)
+        if limit < 1 or limit > self.asset_search_max_limit:
+            raise ValueError(
+                f"Structured graph limit must be between 1 and {self.asset_search_max_limit}."
+            )
+        return limit
 
 
 class _ProjectionAdjacency:
@@ -616,6 +646,318 @@ class Neo4jGraphRepository:
                 return session.run(self._query(query), **params).single()
         except Exception as exc:
             raise Neo4jUnavailable("Neo4j graph query failed.") from exc
+
+    def search_assets(self, request: AssetSearchRequest) -> AssetSearchResult:
+        """Return one bounded keyset page from the active Asset projection."""
+        limit = self.policy.structured_limit(request.limit)
+        active_version = self._active_graph_version()
+        if active_version is None:
+            return AssetSearchResult(
+                active_graph_version=None,
+                filters=request.filters,
+                rows=(),
+                returned_count=0,
+                matched_total=0,
+                truncated=False,
+                sort=request.sort,
+                direction=request.direction,
+                retrieved_at=_utc_now(),
+                limitations=self._structured_limitations(),
+            )
+
+        clauses, params = self._structured_filter_clauses(request)
+        cursor = self._decode_asset_search_cursor(request.cursor, request)
+        sort_property = self._asset_sort_property(request.sort)
+        sort_null = f"CASE WHEN a.{sort_property} IS NULL THEN 1 ELSE 0 END"
+        comparison = ">" if request.direction is SortDirection.ASC else "<"
+        order = "ASC" if request.direction is SortDirection.ASC else "DESC"
+        if cursor is not None:
+            clauses.append(
+                f"({sort_null} > $cursor_null OR "
+                f"({sort_null} = $cursor_null AND ("
+                f"($cursor_null = 1 AND a.graph_key {comparison} $cursor_graph_key) OR "
+                f"($cursor_null = 0 AND (a.{sort_property} {comparison} $cursor_value OR "
+                f"(a.{sort_property} = $cursor_value AND a.graph_key {comparison} $cursor_graph_key))))))"
+            )
+            params.update(cursor)
+        where = " AND ".join(("a.graph_version = $active_version", *clauses))
+        query = f"""
+        MATCH (a:Asset)
+        WHERE {where}
+        RETURN a.graph_key AS graph_key,
+               a.graph_version AS graph_version,
+               a.ip AS ip,
+               a.asset_name AS asset_name,
+               a.status AS status,
+               a.suggested_type AS suggested_type,
+               a.model_confidence AS model_confidence,
+               a.mapping_confidence AS mapping_confidence,
+               a.unknown_score AS unknown_score,
+               a.classification_summary AS classification_summary,
+               a.vendor AS vendor,
+               a.product AS product,
+               a.role AS role,
+               a.roles AS roles,
+               a.tag AS tag,
+               a.sub_tag AS sub_tag,
+               a.last_detection_at AS last_detection_at,
+               a.enrichment_status AS enrichment_status,
+               a.enrichment_updated_at AS enrichment_updated_at,
+               a.enrichment_last_attempt_at AS enrichment_last_attempt_at,
+               a.enrichment_last_success_at AS enrichment_last_success_at,
+               a.enrichment_next_due_at AS enrichment_next_due_at,
+               a.enrichment_source AS enrichment_source,
+               a.enrichment_version AS enrichment_version,
+               {sort_null} AS _sort_null,
+               a.{sort_property} AS _sort_value
+        ORDER BY _sort_null ASC, _sort_value {order}, graph_key {order}
+        LIMIT $fetch_limit
+        """
+        count_where = " AND ".join(("a.graph_version = $active_version", *self._structured_filter_clauses(request)[0]))
+        count_query = f"MATCH (a:Asset) WHERE {count_where} RETURN count(a) AS matched_total"
+        query_params = {
+            **params,
+            "active_version": active_version,
+            "fetch_limit": limit + 1,
+        }
+        count_params = {
+            **self._structured_filter_clauses(request)[1],
+            "active_version": active_version,
+        }
+        try:
+            with self.driver.session() as session:
+                records = list(session.run(self._query(query), **query_params))
+                count_record = session.run(self._query(count_query), **count_params).single()
+        except Exception as exc:
+            raise Neo4jUnavailable("Neo4j structured Asset search failed.") from exc
+
+        selected = records[:limit]
+        rows = tuple(
+            StructuredAssetRow.model_validate(
+                {key: value for key, value in dict(record).items() if not key.startswith("_")}
+            )
+            for record in selected
+        )
+        truncated = len(records) > limit
+        next_cursor = None
+        if truncated and selected:
+            last = selected[-1]
+            next_cursor = self._encode_asset_search_cursor(
+                request,
+                sort_null=int(last["_sort_null"]),
+                sort_value=last["_sort_value"],
+                graph_key=str(last["graph_key"]),
+            )
+        return AssetSearchResult(
+            active_graph_version=active_version,
+            filters=request.filters,
+            rows=rows,
+            returned_count=len(rows),
+            matched_total=int(count_record["matched_total"] or 0) if count_record else 0,
+            truncated=truncated,
+            next_cursor=next_cursor,
+            sort=request.sort,
+            direction=request.direction,
+            retrieved_at=_utc_now(),
+            limitations=self._structured_limitations(),
+        )
+
+    def aggregate_assets(self, request: AssetAggregateRequest) -> AssetAggregateResult:
+        """Aggregate active Assets in Neo4j without hydrating matching rows."""
+        active_version = self._active_graph_version()
+        if active_version is None:
+            return AssetAggregateResult(
+                active_graph_version=None,
+                filters=request.filters,
+                operation=request.operation,
+                count=0,
+                group_by=request.group_by,
+                retrieved_at=_utc_now(),
+                limitations=self._structured_limitations(),
+            )
+        clauses, params = self._structured_filter_clauses(request)
+        where = " AND ".join(("a.graph_version = $active_version", *clauses))
+        params["active_version"] = active_version
+        if request.operation is AssetAggregateOperation.COUNT:
+            row = self._single(
+                f"MATCH (a:Asset) WHERE {where} RETURN count(a) AS count",
+                **params,
+            )
+            return AssetAggregateResult(
+                active_graph_version=active_version,
+                filters=request.filters,
+                operation=request.operation,
+                count=int(row["count"] or 0) if row else 0,
+                retrieved_at=_utc_now(),
+                limitations=self._structured_limitations(),
+            )
+
+        assert request.group_by is not None
+        limit = self.policy.structured_limit(request.limit)
+        group_property = self._asset_group_property(request.group_by)
+        query = f"""
+        MATCH (a:Asset)
+        WHERE {where}
+        WITH a.{group_property} AS value, count(a) AS count
+        RETURN value, count
+        ORDER BY count DESC, value ASC
+        LIMIT $fetch_limit
+        """
+        params["fetch_limit"] = limit + 1
+        count_query = f"MATCH (a:Asset) WHERE {where} RETURN count(a) AS count"
+        try:
+            with self.driver.session() as session:
+                records = list(session.run(self._query(query), **params))
+                count_record = session.run(
+                    self._query(count_query),
+                    **{key: value for key, value in params.items() if key != "fetch_limit"},
+                ).single()
+        except Exception as exc:
+            raise Neo4jUnavailable("Neo4j structured Asset aggregation failed.") from exc
+        selected = records[:limit]
+        groups = tuple(
+            AssetAggregateGroup(value=record["value"], count=int(record["count"] or 0))
+            for record in selected
+        )
+        return AssetAggregateResult(
+            active_graph_version=active_version,
+            filters=request.filters,
+            operation=request.operation,
+            count=int(count_record["count"] or 0) if count_record else 0,
+            group_by=request.group_by,
+            groups=groups,
+            truncated=len(records) > limit,
+            retrieved_at=_utc_now(),
+            limitations=self._structured_limitations(),
+        )
+
+    def _active_graph_version(self) -> str | None:
+        row = self._single(
+            "MATCH (m:GraphMetadata {id: 'active'}) RETURN m.active_graph_version AS version"
+        )
+        return str(row["version"]) if row and row["version"] is not None else None
+
+    @staticmethod
+    def _structured_filter_clauses(
+        request: AssetSearchRequest | AssetAggregateRequest,
+    ) -> tuple[list[str], dict[str, object]]:
+        values = request.filters.query_values()
+        clauses: list[str] = []
+        exact_properties = {
+            "ip": "ip",
+            "asset_name": "asset_name",
+            "status": "status",
+            "suggested_type": "suggested_type",
+            "role": "role",
+            "vendor": "vendor",
+            "product": "product",
+            "tag": "tag",
+            "sub_tag": "sub_tag",
+            "enrichment_status": "enrichment_status",
+        }
+        for parameter, property_name in exact_properties.items():
+            if parameter in values:
+                clauses.append(f"a.{property_name} = ${parameter}")
+        if "roles" in values:
+            clauses.append("$roles IN coalesce(a.roles, [])")
+        range_properties = {
+            "model_confidence_min": ("model_confidence", ">="),
+            "model_confidence_max": ("model_confidence", "<="),
+            "mapping_confidence_min": ("mapping_confidence", ">="),
+            "mapping_confidence_max": ("mapping_confidence", "<="),
+            "unknown_score_min": ("unknown_score", ">="),
+            "unknown_score_max": ("unknown_score", "<="),
+            "last_detection_at_from": ("last_detection_at", ">="),
+            "last_detection_at_to": ("last_detection_at", "<="),
+        }
+        for parameter, (property_name, operator) in range_properties.items():
+            if parameter in values:
+                clauses.append(f"a.{property_name} {operator} ${parameter}")
+        return clauses, values
+
+    @staticmethod
+    def _asset_sort_property(sort: AssetSortField) -> str:
+        return {
+            AssetSortField.GRAPH_KEY: "graph_key",
+            AssetSortField.IP: "ip",
+            AssetSortField.ASSET_NAME: "asset_name",
+            AssetSortField.MODEL_CONFIDENCE: "model_confidence",
+            AssetSortField.MAPPING_CONFIDENCE: "mapping_confidence",
+            AssetSortField.UNKNOWN_SCORE: "unknown_score",
+            AssetSortField.LAST_DETECTION_AT: "last_detection_at",
+            AssetSortField.ENRICHMENT_NEXT_DUE_AT: "enrichment_next_due_at",
+        }[sort]
+
+    @staticmethod
+    def _asset_group_property(group: AssetGroupField) -> str:
+        return {
+            AssetGroupField.STATUS: "status",
+            AssetGroupField.SUGGESTED_TYPE: "suggested_type",
+            AssetGroupField.ROLE: "role",
+            AssetGroupField.VENDOR: "vendor",
+            AssetGroupField.PRODUCT: "product",
+            AssetGroupField.TAG: "tag",
+            AssetGroupField.SUB_TAG: "sub_tag",
+            AssetGroupField.ENRICHMENT_STATUS: "enrichment_status",
+        }[group]
+
+    @staticmethod
+    def _structured_limitations() -> tuple[str, ...]:
+        return (
+            "Results include only the currently published Neo4j graph version.",
+            "Enrichment is a discovery projection, not live Product profile or detection evidence.",
+            "Exact roles[] membership is scan-based unless a future schema changes its representation.",
+        )
+
+    @staticmethod
+    def _encode_asset_search_cursor(
+        request: AssetSearchRequest,
+        *,
+        sort_null: int,
+        sort_value: object,
+        graph_key: str,
+    ) -> str:
+        payload = {
+            "v": 1,
+            "sort": request.sort.value,
+            "direction": request.direction.value,
+            "null": sort_null,
+            "value": sort_value,
+            "graph_key": graph_key,
+        }
+        encoded = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
+        return base64.urlsafe_b64encode(encoded).decode("ascii").rstrip("=")
+
+    @staticmethod
+    def _decode_asset_search_cursor(
+        cursor: str | None,
+        request: AssetSearchRequest,
+    ) -> dict[str, object] | None:
+        if cursor is None:
+            return None
+        try:
+            padding = "=" * (-len(cursor) % 4)
+            payload = json.loads(
+                base64.b64decode(cursor + padding, altchars=b"-_", validate=True)
+            )
+        except (binascii.Error, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValueError("Invalid structured Asset search cursor.") from exc
+        if (
+            not isinstance(payload, dict)
+            or payload.get("v") != 1
+            or payload.get("sort") != request.sort.value
+            or payload.get("direction") != request.direction.value
+            or payload.get("null") not in {0, 1}
+            or not isinstance(payload.get("graph_key"), str)
+            or not payload["graph_key"]
+            or (payload.get("null") == 0 and payload.get("value") is None)
+        ):
+            raise ValueError("Structured Asset search cursor does not match the request.")
+        return {
+            "cursor_null": int(payload["null"]),
+            "cursor_value": payload.get("value"),
+            "cursor_graph_key": payload["graph_key"],
+        }
 
     def list_due_enrichment_assets(
         self,

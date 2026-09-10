@@ -512,6 +512,19 @@ Secrets such as API keys, passwords, Product tokens, captcha bypass values, and 
 
 `SOORIN_GRAPH_RAW_PATH` is the filesystem path for retained raw Product topology payloads. These JSON snapshots support audit and debugging only; the active graph and all graph evidence are published from Neo4j.
 
+### `SOORIN_GRAPH_ASSET_SEARCH_DEFAULT_LIMIT`
+
+`SOORIN_GRAPH_ASSET_SEARCH_DEFAULT_LIMIT` is the default row or group-page size
+for Phase 4A structured Asset retrieval. The default is `50`. It is independent
+of conversational entity cardinality and graph-neighbor expansion limits.
+
+### `SOORIN_GRAPH_ASSET_SEARCH_MAX_LIMIT`
+
+`SOORIN_GRAPH_ASSET_SEARCH_MAX_LIMIT` is the hard row or group-page maximum for
+structured Asset retrieval. The default is `200`. Requests above this bound are
+rejected; potentially large searches use opaque keyset cursors rather than
+offset pagination.
+
 ### `SOORIN_GRAPH_MAX_UI_NODES`
 
 `SOORIN_GRAPH_MAX_UI_NODES` limits how many graph nodes the Streamlit topology visualization may render. Increasing it can display more of the topology but raises browser rendering, layout, memory, and interaction cost; decreasing it keeps visualization responsive by showing a more bounded subset. It does not change backend Graph evidence.
