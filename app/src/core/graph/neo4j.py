@@ -7,12 +7,19 @@ that version.  This keeps the prior graph readable if a refresh fails.
 from __future__ import annotations
 
 import logging
+import threading
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from functools import wraps
 from typing import Any, Iterator
 
 from src.config.settings import Settings
+from src.core.graph.enrichment_models import (
+    AssetEnrichmentMutation,
+    EnrichmentAssetPage,
+    EnrichmentWriteResult,
+)
 from src.core.graph.retrieval import (
     GraphRetrievalSpec,
     _apply_completeness_contract,
@@ -26,6 +33,19 @@ from src.core.graph.subnet import get_subnet
 from src.core.product_client.schemas import TopologyConnectionRecord
 
 logger = logging.getLogger(__name__)
+
+_GRAPH_MUTATION_LOCK = threading.RLock()
+
+
+def _serialized_graph_mutation(method: Any) -> Any:
+    """Serialize topology publication and enrichment writes within one runtime."""
+    @wraps(method)
+    def wrapped(*args: Any, **kwargs: Any) -> Any:
+        with _GRAPH_MUTATION_LOCK:
+            return method(*args, **kwargs)
+
+    return wrapped
+
 
 try:  # Keep configuration/import checks usable before the production image is rebuilt.
     from neo4j import GraphDatabase, Query
@@ -189,6 +209,7 @@ class Neo4jGraphRepository:
             "CREATE CONSTRAINT asset_graph_identity IF NOT EXISTS FOR (a:Asset) REQUIRE (a.graph_key, a.graph_version) IS UNIQUE",
             "CREATE CONSTRAINT graph_metadata_id IF NOT EXISTS FOR (m:GraphMetadata) REQUIRE m.id IS UNIQUE",
             "CREATE INDEX asset_version_ip IF NOT EXISTS FOR (a:Asset) ON (a.graph_version, a.ip)",
+            "CREATE INDEX asset_enrichment_schedule IF NOT EXISTS FOR (a:Asset) ON (a.graph_version, a.enrichment_status, a.enrichment_next_due_at)",
         )
         try:
             with self.driver.session() as session:
@@ -198,6 +219,7 @@ class Neo4jGraphRepository:
             raise Neo4jSchemaError("Neo4j graph schema bootstrap failed.") from exc
         logger.info("event=graph_schema_bootstrapped database=%s", self.settings.neo4j_database)
 
+    @_serialized_graph_mutation
     def sync_snapshot(self, records: list[TopologyConnectionRecord], version: str) -> GraphProjectionStatus:
         pairs = self._normalize(records)
         if not pairs:
@@ -586,11 +608,144 @@ class Neo4jGraphRepository:
         except Exception as exc:
             raise Neo4jUnavailable("Neo4j graph query failed.") from exc
 
+    def list_due_enrichment_assets(
+        self,
+        *,
+        after_graph_key: str | None,
+        limit: int,
+        as_of: datetime,
+        stale_before: datetime,
+    ) -> EnrichmentAssetPage:
+        """Return one keyset page from the active projection only."""
+        cap = min(max(1, int(limit)), self.settings.graph_enrichment_page_size)
+        query = """
+        MATCH (m:GraphMetadata {id: 'active'})
+        MATCH (a:Asset {graph_version: m.active_graph_version})
+        WHERE ($after_graph_key IS NULL OR a.graph_key > $after_graph_key)
+          AND (
+            a.enrichment_status IS NULL
+            OR a.enrichment_status = 'pending'
+            OR a.enrichment_next_due_at <= $as_of
+            OR a.enrichment_last_success_at <= $stale_before
+          )
+        RETURN a.graph_key AS graph_key
+        ORDER BY a.graph_key ASC
+        LIMIT $fetch_limit
+        """
+        try:
+            with self.driver.session() as session:
+                result = session.run(
+                    self._query(query),
+                    after_graph_key=after_graph_key,
+                    as_of=as_of.isoformat(),
+                    stale_before=stale_before.isoformat(),
+                    fetch_limit=cap + 1,
+                )
+                keys = [str(record["graph_key"]) for record in result]
+        except Exception as exc:
+            raise Neo4jUnavailable("Neo4j enrichment enumeration failed.") from exc
+        selected = keys[:cap]
+        return EnrichmentAssetPage(
+            graph_keys=tuple(selected),
+            next_cursor=selected[-1] if selected else after_graph_key,
+            has_more=len(keys) > cap,
+        )
+
+    @_serialized_graph_mutation
+    def apply_enrichment_batch(
+        self,
+        mutations: list[AssetEnrichmentMutation],
+    ) -> EnrichmentWriteResult:
+        """Apply bounded semantic mutations to currently active Assets."""
+        if not mutations:
+            return EnrichmentWriteResult(attempted=0, updated=0)
+        query = """
+        MATCH (m:GraphMetadata {id: 'active'})
+        UNWIND $rows AS row
+        OPTIONAL MATCH (a:Asset {
+          graph_version: m.active_graph_version,
+          graph_key: row.graph_key
+        })
+        FOREACH (_ IN CASE WHEN a IS NOT NULL AND row.status = 'success' THEN [1] ELSE [] END |
+          SET a += row.properties,
+              a.enrichment_status = 'success',
+              a.enrichment_updated_at = row.succeeded_at,
+              a.enrichment_last_attempt_at = row.attempted_at,
+              a.enrichment_last_success_at = row.succeeded_at,
+              a.enrichment_next_due_at = row.next_due_at,
+              a.enrichment_source = row.source,
+              a.enrichment_version = row.version,
+              a.enrichment_error = null
+        )
+        FOREACH (_ IN CASE WHEN a IS NOT NULL AND row.status <> 'success' THEN [1] ELSE [] END |
+          SET a.enrichment_status = CASE
+                WHEN a.enrichment_last_success_at IS NULL THEN row.status
+                ELSE 'stale'
+              END,
+              a.enrichment_last_attempt_at = row.attempted_at,
+              a.enrichment_next_due_at = row.next_due_at,
+              a.enrichment_source = row.source,
+              a.enrichment_error = row.error
+        )
+        RETURN count(a) AS updated,
+               collect(CASE WHEN a IS NULL THEN row.graph_key END) AS missing_graph_keys
+        """
+        updated = 0
+        missing: list[str] = []
+        batch_size = self.settings.graph_enrichment_batch_size
+        try:
+            with self.driver.session() as session:
+                for offset in range(0, len(mutations), batch_size):
+                    rows = [item.to_row() for item in mutations[offset : offset + batch_size]]
+                    record = session.execute_write(
+                        lambda tx: tx.run(self._query(query), rows=rows).single()
+                    )
+                    if record is not None:
+                        updated += int(record["updated"] or 0)
+                        missing.extend(str(key) for key in (record["missing_graph_keys"] or []))
+        except Exception as exc:
+            raise Neo4jUnavailable("Neo4j enrichment batch write failed.") from exc
+        return EnrichmentWriteResult(
+            attempted=len(mutations),
+            updated=updated,
+            missing_graph_keys=tuple(missing),
+        )
+
     def _write_staging_nodes(self, nodes: list[str], version: str) -> None:
         query = """
         UNWIND $rows AS row
+        OPTIONAL MATCH (m:GraphMetadata {id: 'active'})
+        OPTIONAL MATCH (previous:Asset {
+          graph_key: row.ip,
+          graph_version: m.active_graph_version
+        })
         MERGE (a:Asset {graph_key: row.ip, graph_version: $version})
         SET a.ip = row.ip
+        FOREACH (_ IN CASE WHEN previous IS NULL THEN [] ELSE [1] END |
+          SET a.asset_name = previous.asset_name,
+              a.status = previous.status,
+              a.suggested_type = previous.suggested_type,
+              a.model_confidence = previous.model_confidence,
+              a.mapping_confidence = previous.mapping_confidence,
+              a.unknown_score = previous.unknown_score,
+              a.classification_summary = previous.classification_summary,
+              a.vendor = previous.vendor,
+              a.product = previous.product,
+              a.role = previous.role,
+              a.roles = previous.roles,
+              a.tag = previous.tag,
+              a.sub_tag = previous.sub_tag,
+              a.last_detection_at = previous.last_detection_at,
+              a.enrichment_status = previous.enrichment_status,
+              a.enrichment_updated_at = previous.enrichment_updated_at,
+              a.enrichment_last_attempt_at = previous.enrichment_last_attempt_at,
+              a.enrichment_last_success_at = previous.enrichment_last_success_at,
+              a.enrichment_next_due_at = previous.enrichment_next_due_at,
+              a.enrichment_source = previous.enrichment_source,
+              a.enrichment_version = previous.enrichment_version,
+              a.enrichment_error = previous.enrichment_error
+        )
+        SET a.enrichment_status = coalesce(a.enrichment_status, 'pending')
         """
         self._batched(query, [{"ip": ip} for ip in nodes], version)
 

@@ -299,6 +299,12 @@ class Settings:
     neo4j_query_timeout_seconds: int
     neo4j_sync_batch_size: int
     neo4j_max_connection_pool_size: int
+    graph_enrichment_enabled: bool
+    graph_enrichment_concurrency: int
+    graph_enrichment_batch_size: int
+    graph_enrichment_page_size: int
+    graph_enrichment_refresh_seconds: int
+    graph_enrichment_retry_seconds: int
     graph_max_ui_nodes: int
     graph_default_min_degree: int
     graph_api_max_neighbors: int
@@ -392,6 +398,18 @@ class Settings:
         """Validate asset path templates without exposing configured URLs."""
         if self.product_asset_profile_path.count("{ip}") != 1 or ".." in self.product_asset_profile_path:
             raise ValueError("SOORIN_PRODUCT_ASSET_PROFILE_PATH must contain exactly one safe {ip} placeholder.")
+
+    def validate_graph_enrichment_configuration(self) -> None:
+        """Keep Product enrichment bounded and strictly serialized."""
+        if self.graph_enrichment_concurrency != 1:
+            raise ValueError(
+                "SOORIN_GRAPH_ENRICHMENT_CONCURRENCY must be 1 for the current Product backend."
+            )
+        if self.graph_enrichment_batch_size > self.graph_enrichment_page_size:
+            raise ValueError(
+                "SOORIN_GRAPH_ENRICHMENT_BATCH_SIZE must not exceed "
+                "SOORIN_GRAPH_ENRICHMENT_PAGE_SIZE."
+            )
 
     def validate_rag_qdrant_configuration(self) -> None:
         """Validate Qdrant settings only when RAG actually uses Qdrant."""
@@ -756,6 +774,16 @@ def get_settings() -> Settings:
         neo4j_query_timeout_seconds=max(1, _int("SOORIN_NEO4J_QUERY_TIMEOUT_SECONDS", 8)),
         neo4j_sync_batch_size=max(1, _int("SOORIN_NEO4J_SYNC_BATCH_SIZE", 1000)),
         neo4j_max_connection_pool_size=max(1, _int("SOORIN_NEO4J_MAX_CONNECTION_POOL_SIZE", 50)),
+        graph_enrichment_enabled=_bool("SOORIN_GRAPH_ENRICHMENT_ENABLED", False),
+        graph_enrichment_concurrency=max(1, _int("SOORIN_GRAPH_ENRICHMENT_CONCURRENCY", 1)),
+        graph_enrichment_batch_size=max(1, _int("SOORIN_GRAPH_ENRICHMENT_BATCH_SIZE", 100)),
+        graph_enrichment_page_size=max(1, _int("SOORIN_GRAPH_ENRICHMENT_PAGE_SIZE", 500)),
+        graph_enrichment_refresh_seconds=max(
+            60, _int("SOORIN_GRAPH_ENRICHMENT_REFRESH_SECONDS", 259200)
+        ),
+        graph_enrichment_retry_seconds=max(
+            1, _int("SOORIN_GRAPH_ENRICHMENT_RETRY_SECONDS", 3600)
+        ),
         graph_max_ui_nodes=_int("SOORIN_GRAPH_MAX_UI_NODES", 1000),
         graph_default_min_degree=_int("SOORIN_GRAPH_DEFAULT_MIN_DEGREE", 1),
         graph_api_max_neighbors=_int("SOORIN_GRAPH_API_MAX_NEIGHBORS", 1000),
@@ -848,6 +876,7 @@ def get_settings() -> Settings:
         ).strip(),
     )
     settings.validate_product_paths()
+    settings.validate_graph_enrichment_configuration()
     settings.validate_observability_configuration()
     settings.validate_local_persistence_configuration()
     settings.validate_long_term_memory_configuration()

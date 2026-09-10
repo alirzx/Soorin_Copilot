@@ -346,6 +346,17 @@ class ProductApiClient:
             request_id=request_id,
         )
 
+    def get_asset_detection_overview(
+        self,
+        ip: str,
+        *,
+        request_id: str = "",
+    ) -> ProductAssetResponse:
+        """Fetch the configured compact overview through shared auth/retries."""
+        return self.get_asset_detection(
+            ip, request_id=request_id, view="overview"
+        )
+
     def get_asset_profile(self, ip: str, *, request_id: str = "") -> ProductAssetResponse:
         """Fetch one complete Asset Profile JSON payload through shared authentication."""
         return self._get_asset_json(
