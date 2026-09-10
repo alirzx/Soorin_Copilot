@@ -4,6 +4,15 @@ Status: living architecture record. Update this document whenever graph schema,
 topology synchronization, enrichment, scheduling, graph capabilities, GraphRAG
 retrieval, or Copilot evidence integration changes.
 
+```text
+Phase 1       DONE
+Phase 2       DONE
+Phase 2.5     PASS
+Phase 3       DONE
+Phase 3.5     DONE
+Phase 4       NEXT
+```
+
 ## 1. Purpose
 
 Neo4j is Soorin Copilot's operational organizational graph and the intended
@@ -44,8 +53,13 @@ last-known-good topology rather than a staging version.
 ## 4. Current Enrichment Plane
 
 ```text
-active Neo4j Asset
-→ AssetEnrichmentService bounded keyset page
+FastAPI startup
+→ GraphEnrichmentRuntimeService managed scheduler
+→ acquire graph_enrichment_scheduler lease
+→ select prioritized due page from active Neo4j Assets
+→ AssetEnrichmentService bounded worker page
+→ process-local Product lock
+→ acquire graph_enrichment_product_request lease
 → ProductApiClient.get_asset_detection_overview
 → GET /asset-detection/{ip}/overview
 → ProductAssetDetectionOverview DTO
@@ -54,11 +68,30 @@ active Neo4j Asset
 → parameterized UNWIND update of active Asset
 ```
 
-Product overview concurrency is exactly one. All service instances in one
-process share the same request lock. A worker invocation processes one bounded
-page and returns a resume cursor; it is not a load-all sweep. Successful
-enrichment has a 259,200-second (72-hour) freshness target. Phase 2.5 does not
-register the worker with the runtime scheduler; that is Phase 3.
+Product overview concurrency is exactly one across scheduled, manual, and
+on-demand work. All service instances in one process share the same request
+lock, and all processes contend for the same expiring Neo4j Product lease. A
+worker invocation processes one priority-aware keyset page and returns an
+opaque resume cursor; it is not a load-all sweep. Successful enrichment has a
+259,200-second (72-hour) freshness target.
+
+The runtime owns `start()`, `stop()`, `wake()`, one bounded cycle, runtime
+status, scheduler ownership, and cached backlog gauges. Each cycle processes at
+most `SOORIN_GRAPH_ENRICHMENT_MAX_PAGES_PER_CYCLE`; every page remains bounded
+by `SOORIN_GRAPH_ENRICHMENT_PAGE_SIZE`. It starts each runtime page from the
+durable Neo4j due set, so process memory and cursors are optimizations rather
+than correctness checkpoints. Missing or pending Assets sort before stale/due
+Assets, with deterministic graph-key order inside each priority. In a
+multi-page cycle the final reserved page reverses that priority, so sustained
+new-node intake cannot starve stale work; if no stale work exists, pending work
+still fills the page.
+
+FastAPI startup starts the scheduler thread only when enrichment is enabled and
+does not wait for Product work. Shutdown signals stop, wakes idle waits, starts
+no additional page, lets the current bounded page preserve its write contract,
+releases ownership, and joins with the configured timeout. Scheduler failures
+are logged and measured at the runtime boundary; they do not terminate FastAPI,
+topology refresh, chat, or graph reads.
 
 ## 5. Exact Product / Neo4j Schema Mapping
 
@@ -120,10 +153,43 @@ published V1 Asset + valid enrichment
 New V2 Assets without a V1 match start as `pending`. Carry-forward separates
 the one-hour topology cadence from the 72-hour enrichment cadence: publishing
 fresh topology must not erase still-valid Product enrichment. Topology
-publication and enrichment writes share an in-process graph mutation lock;
-Phase 3 must decide distributed ownership before multi-process scheduling.
+publication and enrichment writes share an in-process graph mutation lock.
+Staging writes return the number of new pending Assets without constructing a
+second million-node Python set. After V2 is published and inactive versions are
+retired, a non-blocking callback wakes the enrichment runtime when this count is
+positive. Enrichment never blocks topology publication.
 
-## 8. Configuration
+## 8. Runtime Ownership, Recovery, and Operations
+
+`SoorinRuntimeLease` nodes are protected by a unique lease-name constraint.
+Acquire, renew, release, and expiry recovery each use a short transaction. No
+Neo4j transaction remains open during Product HTTP. The scheduler lease is held
+and renewed by one API process; peers keep serving requests and retry ownership
+after the poll interval. A crashed owner is recoverable after lease expiry, and
+a non-owner cannot release the current lease.
+
+The Product request lease is separate from scheduler ownership. Every actual
+overview request enters both the process-local lock and this distributed lane,
+which preserves global Product overview concurrency `1` even when a scheduled
+worker in one process competes with manual or on-demand work in another.
+
+Authenticated operational routes are:
+
+- `GET /graph/enrichment/status`: cached lifecycle, ownership, progress, and
+  backlog status; it does not scan Neo4j.
+- `POST /graph/enrichment/wake`: interrupt idle polling and request another
+  bounded scheduled cycle.
+- `POST /graph/enrichment/assets/{ip}?mode=refresh_if_stale|force_refresh`:
+  execute the canonical single-Asset path. Fresh `refresh_if_stale` calls skip
+  Product; stale, pending, and missing enrichment refresh; `force_refresh`
+  always refreshes an active Asset. Missing active Assets return without a
+  Product request.
+
+The same `AssetEnrichmentService.enrich_asset` operation is the future
+on-demand integration boundary; no second DTO, normalizer, Product client, or
+write path exists.
+
+## 9. Configuration
 
 These are application defaults from `Settings`; deployment examples may set
 stricter bounds.
@@ -146,12 +212,17 @@ stricter bounds.
 
 | Variable | Default | Purpose |
 |---|---:|---|
-| `SOORIN_GRAPH_ENRICHMENT_ENABLED` | `false` | Enables explicit worker invocations; no scheduler yet. |
+| `SOORIN_GRAPH_ENRICHMENT_ENABLED` | `false` | Enables managed scheduled and explicit enrichment operations. |
 | `SOORIN_GRAPH_ENRICHMENT_CONCURRENCY` | `1` | Only supported Product request concurrency. |
 | `SOORIN_GRAPH_ENRICHMENT_BATCH_SIZE` | `100` | Maximum mutations per Neo4j `UNWIND` transaction. |
 | `SOORIN_GRAPH_ENRICHMENT_PAGE_SIZE` | `500` | Maximum Assets in one keyset page. |
 | `SOORIN_GRAPH_ENRICHMENT_REFRESH_SECONDS` | `259200` | Successful enrichment freshness target. |
 | `SOORIN_GRAPH_ENRICHMENT_RETRY_SECONDS` | `3600` | Transient Product failure retry eligibility. |
+| `SOORIN_GRAPH_ENRICHMENT_POLL_INTERVAL_SECONDS` | `60` | Maximum idle wait between bounded cycles; wakes interrupt it. |
+| `SOORIN_GRAPH_ENRICHMENT_STARTUP_DELAY_SECONDS` | `5` | Delay before background ownership/work begins. |
+| `SOORIN_GRAPH_ENRICHMENT_MAX_PAGES_PER_CYCLE` | `4` | Hard page bound for one scheduler cycle. |
+| `SOORIN_GRAPH_ENRICHMENT_LEASE_TTL_SECONDS` | `900` | Renewable scheduler and Product lease expiry. |
+| `SOORIN_GRAPH_ENRICHMENT_SHUTDOWN_TIMEOUT_SECONDS` | `30` | Managed scheduler join timeout. |
 
 ### Phase 2.5 validation-only controls
 
@@ -211,7 +282,21 @@ Never point these mutating validation paths at a production database.
 | `SOORIN_GRAPH_REFRESH_MIN_NODES` | `1` |
 | `SOORIN_GRAPH_REFRESH_MIN_EDGES` | `0` |
 
-## 9. Current Capabilities
+## 10. Operational Observability
+
+The existing `SoorinMetrics` singleton registry and authenticated `/metrics`
+exposition now include cycle started/completed/failed counters, Asset
+attempted/succeeded/failed/unavailable/updated/skipped counters, Product
+overview request outcomes, cycle duration, Product overview latency, scheduler
+running/ownership gauges, cached pending/stale/error/unavailable/backlog gauges,
+and last-run/last-success timestamps.
+
+Metric labels are limited to `trigger=scheduled|manual|on_demand`, bounded
+outcomes, and the five fixed backlog states. Asset identity, IP, graph key,
+request ID, URL, and error text are never labels. Backlog counts are refreshed
+once after a cycle and cached in gauges; `/metrics` performs no graph scan.
+
+## 11. Current Capabilities
 
 The stable public capabilities are `graph.get_summary`,
 `graph.get_neighbors`, `graph.get_relationship`, `graph.find_path`, and
@@ -221,7 +306,7 @@ driver objects do not leak into capability or EvidencePack contracts. Direction,
 hop, node, edge, peer, path, and query-time bounds are enforced by
 `GraphQueryPolicy` and parameterized repository queries.
 
-## 10. GraphRAG Retrieval Roadmap
+## 12. GraphRAG Retrieval Roadmap
 
 ### Phase 1 — DONE: Asset Enrichment Foundation
 
@@ -240,19 +325,20 @@ Neo4j Community schema, persistence, carry-forward, failure, and multi-page
 pagination were validated. Eight real Product Assets were requested
 sequentially and persisted to an isolated projection with measured latency.
 
-### Phase 3 — NEXT: Runtime Scheduling
+### Phase 3 — DONE: Runtime Scheduling
 
-Integrate rolling due-page processing with the runtime scheduler: one-hour
-topology, 72-hour stale target, immediate new-node enrichment, manual refresh,
-on-demand single-Asset refresh, and an explicit multi-process/distributed
-ownership decision.
+Managed rolling due-page processing, immediate post-publication new-node wakeup,
+manual wake, freshness-aware single-Asset refresh, bounded shutdown, durable
+restart discovery, scheduler ownership, and global Product serialization are
+implemented.
 
-### Phase 3.5 — PLANNED: Operational Observability
+### Phase 3.5 — DONE: Operational Observability
 
-Add coverage percentage, pending/stale/failure counts, Product latency,
-throughput, backlog depth, and sweep progress.
+Low-cardinality lifecycle, throughput, outcome, latency, ownership, progress,
+timestamp, and cached backlog metrics are integrated with the existing
+Prometheus registry and protected exposition path.
 
-### Phase 4 — PLANNED: Exact / Structured Graph Search
+### Phase 4 — NEXT: Exact / Structured Graph Search
 
 Add indexed structured lookup for exact IP, asset name, role, type, status,
 OS/platform when authoritative, vendor, product, confidence, grouping/counts,
@@ -286,7 +372,7 @@ Add scheduled community detection, cluster summaries, centrality,
 network-wide dependencies, blast radius, organizational questions, and
 temporal/history modeling. Expensive analytics remain offline, not chat-time.
 
-## 11. Exact Search Question Coverage
+## 13. Exact Search Question Coverage
 
 Phase 4 should support questions such as:
 
@@ -302,7 +388,7 @@ Phase 4 should support questions such as:
 
 These are structured lookup/traversal goals, not current Phase 2.5 claims.
 
-## 12. Semantic / Hybrid Search Examples
+## 14. Semantic / Hybrid Search Examples
 
 Future semantic or hybrid retrieval should address questions such as:
 
@@ -314,22 +400,51 @@ Future semantic or hybrid retrieval should address questions such as:
 These require later full-text/vector/hybrid phases and must not be represented as
 current exact graph capability coverage.
 
-## 13. Known Constraints / Risks
+## 15. Known Constraints / Risks
 
 - Product overview concurrency is fixed at `1`; raising it fails configuration.
 - Sequential throughput is a material 1M-node freshness risk and must be
   monitored under real scheduler conditions.
 - IP remains a transitional Asset identity until Product exposes a durable ID.
-- The request and mutation locks are process-local; multi-process/distributed
-  scheduler ownership is unresolved.
+- Neo4j availability is required to acquire scheduler and Product leases;
+  enrichment backs off while the rest of the API remains available.
 - The 72-hour value is a freshness target, not a guaranteed full-sweep
   wall-clock SLA.
 - Product and database latency may vary; eight requests are directional evidence,
   not a capacity benchmark under sustained load.
-- No scheduler, exact enriched-property search, full-text index, embedding, vector
-  index, or semantic GraphRAG is included in Phase 2.5.
+- Exact enriched-property search, full-text index, embeddings, vector indexes,
+  and semantic GraphRAG remain outside Phase 3/3.5.
 
-## 14. Validation History
+## 16. Validation History
+
+### 2026-09-10 — Phase 3 + Phase 3.5 DONE
+
+- Starting revision: `929eb01` (`dev`, equal to `origin/dev`, clean).
+- Affected offline coverage: 231 passed, 41 skipped, and 65 subtests passed.
+  This included enrichment, runtime lifecycle, Neo4j repository, topology
+  refresh integration, API startup/shutdown and auth, Product client contracts,
+  metrics, settings, graph API, Streamlit graph compatibility, and context
+  routing/capability contracts.
+- Neo4j Community `2026.07.1`: 14 passed against a fresh, no-volume isolated
+  container. The gate covered the lease-name uniqueness constraint, atomic
+  acquire/deny/renew/release, expiry recovery, non-owner release denial,
+  all Phase 2.5 enrichment/LKG/carry-forward contracts, and priority-aware
+  keyset paging.
+- Runtime tests prove disabled/enabled startup, non-blocking startup, clean
+  shutdown, wake interruption, scheduler fault containment, exact cycle page
+  bounds, stale-work progress, durable due-work rediscovery, all four
+  freshness/force cases, post-publication new-node wakeup, and two logical
+  owners preserving global Product concurrency `1`.
+- Observability tests verify metric families, counters/gauges/histograms,
+  bounded trigger/outcome/state labels, and rejection of Asset IP or request ID
+  label values. Prometheus exposition reads cached gauges and does not query
+  Neo4j.
+- `python -m compileall app/src` and `git diff --check` passed.
+- Incremental Graphify refresh produced 4,495 nodes, 13,233 edges, and 164
+  communities. Path/query checks confirmed startup-to-runtime,
+  topology-publication-to-wake, runtime-to-worker, worker-to-Product,
+  worker-to-repository, manual/on-demand-to-worker, and runtime-to-metrics
+  relationships with no Phase 4 retriever implementation.
 
 ### 2026-09-10 — Phase 2.5 PASS
 

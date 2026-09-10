@@ -574,11 +574,11 @@ Secrets such as API keys, passwords, Product tokens, captcha bypass values, and 
 
 ### `SOORIN_GRAPH_ENRICHMENT_ENABLED`
 
-`SOORIN_GRAPH_ENRICHMENT_ENABLED` enables explicit runs of the bounded Product-to-Neo4j Asset enrichment worker. It defaults to `false`. Phase 1/2 does not register a background scheduler, so this setting alone does not initiate Product traffic at startup or on a timer.
+`SOORIN_GRAPH_ENRICHMENT_ENABLED` enables the managed Product-to-Neo4j Asset enrichment runtime. It defaults to `false`. When enabled, FastAPI startup starts a non-blocking background scheduler; when disabled, no scheduler thread or scheduled Product traffic is created. Explicit single-Asset calls also honor this gate.
 
 ### `SOORIN_GRAPH_ENRICHMENT_CONCURRENCY`
 
-`SOORIN_GRAPH_ENRICHMENT_CONCURRENCY` documents and enforces the current Product detection-overview concurrency limit. The only supported value is `1`; any higher value fails settings validation. All enrichment service instances in one application process share one lock, so sweep and on-demand Product overview requests cannot overlap.
+`SOORIN_GRAPH_ENRICHMENT_CONCURRENCY` documents and enforces the current Product detection-overview concurrency limit. The only supported value is `1`; any higher value fails settings validation. Scheduled, manual, and on-demand calls first share one process-local lock and then acquire the expiring Neo4j `graph_enrichment_product_request` lease, so Product overview requests do not overlap across API processes either.
 
 ### `SOORIN_GRAPH_ENRICHMENT_BATCH_SIZE`
 
@@ -590,15 +590,35 @@ Secrets such as API keys, passwords, Product tokens, captcha bypass values, and 
 
 ### `SOORIN_GRAPH_ENRICHMENT_REFRESH_SECONDS`
 
-`SOORIN_GRAPH_ENRICHMENT_REFRESH_SECONDS` defines when a successful Asset enrichment becomes due again. The default is `259200` seconds (72 hours). This is a rolling freshness target used by eligibility metadata, not a monolithic 72-hour scheduler; Phase 3 will repeatedly consume bounded due pages.
+`SOORIN_GRAPH_ENRICHMENT_REFRESH_SECONDS` defines when a successful Asset enrichment becomes due again. The default is `259200` seconds (72 hours). This is a rolling freshness target used by durable Neo4j eligibility metadata; the scheduler repeatedly consumes bounded due pages rather than sleeping 72 hours and sweeping the full graph.
 
 ### `SOORIN_GRAPH_ENRICHMENT_RETRY_SECONDS`
 
 `SOORIN_GRAPH_ENRICHMENT_RETRY_SECONDS` defines when a transient Product transport/API failure becomes eligible for another worker attempt. The default is `3600` seconds. Unavailable and malformed-contract responses use the slower enrichment freshness cadence instead. Product HTTP retry/backoff remains owned by the existing shared `ProductApiClient`; this setting does not add nested HTTP retries.
 
+### `SOORIN_GRAPH_ENRICHMENT_POLL_INTERVAL_SECONDS`
+
+`SOORIN_GRAPH_ENRICHMENT_POLL_INTERVAL_SECONDS` is the maximum idle wait between bounded scheduled cycles. The default is `60` seconds. A topology new-node or authenticated manual wake interrupts this wait immediately. It is not a per-Asset delay.
+
+### `SOORIN_GRAPH_ENRICHMENT_STARTUP_DELAY_SECONDS`
+
+`SOORIN_GRAPH_ENRICHMENT_STARTUP_DELAY_SECONDS` delays the first background ownership attempt after FastAPI startup. The default is `5` seconds. Startup itself does not wait for enrichment.
+
+### `SOORIN_GRAPH_ENRICHMENT_MAX_PAGES_PER_CYCLE`
+
+`SOORIN_GRAPH_ENRICHMENT_MAX_PAGES_PER_CYCLE` bounds one scheduler cycle. The default is `4`; each page is separately bounded by `SOORIN_GRAPH_ENRICHMENT_PAGE_SIZE`. Remaining due work stays authoritative in Neo4j and is rediscovered by later cycles or after restart.
+
+### `SOORIN_GRAPH_ENRICHMENT_LEASE_TTL_SECONDS`
+
+`SOORIN_GRAPH_ENRICHMENT_LEASE_TTL_SECONDS` is the expiry for both the scheduler-owner lease and the global Product request lane. The default is `900` seconds and the minimum is `3`. Owned leases are renewed using short Neo4j transactions while Product HTTP and worker execution remain outside transactions. Expiry permits another process to recover ownership after a crash.
+
+### `SOORIN_GRAPH_ENRICHMENT_SHUTDOWN_TIMEOUT_SECONDS`
+
+`SOORIN_GRAPH_ENRICHMENT_SHUTDOWN_TIMEOUT_SECONDS` bounds FastAPI shutdown waiting for the managed scheduler thread. The default is `30` seconds. Shutdown wakes idle waits, prevents another page from starting, allows an in-progress bounded page to finish, releases owned leases, and joins the thread.
+
 ### Asset enrichment phase boundary
 
-Phase 1/2 stores validated detection-overview properties and operational enrichment metadata on the active versioned `Asset` nodes. New topology nodes begin as `pending`, and matching enrichment is carried to a newly published topology version. This foundation does not add a scheduler, search indexes for semantic fields, exact GraphRAG capabilities, full-text/vector retrieval, Qdrant changes, or on-demand graph-query integration.
+Phase 3/3.5 schedules the Phase 1/2 worker, adds distributed ownership and the shared Product request lease, exposes authenticated runtime/wake/single-Asset operations, and publishes low-cardinality runtime metrics. New topology nodes begin as `pending`, matching enrichment is carried to a newly published topology version, and publication wakes the scheduler asynchronously. Exact/structured search, full-text/vector retrieval, Qdrant changes, and GraphRAG retrieval remain Phase 4 or later work.
 
 ### `SOORIN_GRAPH_AUTO_REFRESH_ENABLED`
 
