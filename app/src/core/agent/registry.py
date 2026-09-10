@@ -21,6 +21,10 @@ from src.core.agent.contracts import (
     ToolResult,
 )
 from src.core.rag.models import KnowledgeSearchResult
+from src.core.graph.structured import (
+    AssetAggregateCapabilityInput,
+    AssetSearchCapabilityInput,
+)
 from src.core.context.product_views import (
     MAX_PRODUCT_VIEW_TOKENS,
     MIN_PRODUCT_VIEW_TOKENS,
@@ -378,6 +382,38 @@ def build_capability_registry(
     def detection(payload: EntityInput) -> ToolResult:
         return product_result("asset.get_detection", "detection", payload)
 
+    def structured_result(capability: str, result: Any) -> ToolResult:
+        normalized = _provider_result(capability, (), result)
+        context = result.context if isinstance(getattr(result, "context", None), dict) else {}
+        if capability == "graph.search_assets":
+            total_count = int(context.get("matched_total") or 0)
+            included_count = int(context.get("returned_count") or 0)
+        else:
+            total_count = int(context.get("count") or 0)
+            included_count = int(context.get("retrieved_node_count") or 0)
+        truncated = bool(context.get("truncated", False))
+        return replace(
+            normalized,
+            total_count=total_count,
+            included_count=included_count,
+            omitted_count=max(0, total_count - included_count),
+            truncated=truncated,
+            completeness="partial" if truncated else normalized.completeness,
+            evidence_type="organizational_asset_set",
+        )
+
+    def structured_search(payload: AssetSearchCapabilityInput) -> ToolResult:
+        result = graph_provider.search_assets(
+            payload.to_request(),
+        )
+        return structured_result("graph.search_assets", result)
+
+    def structured_aggregate(payload: AssetAggregateCapabilityInput) -> ToolResult:
+        result = graph_provider.aggregate_assets(
+            payload.to_request(),
+        )
+        return structured_result("graph.aggregate_assets", result)
+
     def graph(capability: str) -> CapabilityHandler:
         def run(payload: EntityInput) -> ToolResult:
             route = payload.route
@@ -469,6 +505,26 @@ def build_capability_registry(
         ("graph.get_relationship", "Observed direct relationship for two assets.", EntityInput, (2, 2), "graph_topology", "graph", 1, graph("graph.get_relationship")),
         ("graph.compare_assets", "Bounded topology comparison for two assets.", EntityInput, (2, 2), "graph_topology", "graph", 1, graph("graph.compare_assets")),
         ("graph.find_path", "Bounded observed graph path for two assets.", EntityInput, (2, 2), "graph_topology", "graph", 2, graph("graph.find_path")),
+        (
+            "graph.search_assets",
+            "Discover a bounded Asset set from the active Neo4j organizational projection using exact and range selectors.",
+            AssetSearchCapabilityInput,
+            (0, 0),
+            "organizational_asset_set",
+            "graph",
+            0,
+            structured_search,
+        ),
+        (
+            "graph.aggregate_assets",
+            "Count or bounded-group Assets in the active Neo4j organizational projection using exact and range selectors.",
+            AssetAggregateCapabilityInput,
+            (0, 0),
+            "organizational_asset_set",
+            "graph",
+            0,
+            structured_aggregate,
+        ),
         ("knowledge.search", "Approved SOC documentation retrieval.", KnowledgeInput, (0, 0), "documentation", "knowledge", 0, knowledge),
     )
     for name, description, input_schema, cardinality, evidence_type, group, max_depth, handler in specs:
@@ -481,6 +537,9 @@ def build_capability_registry(
         elif group == "knowledge":
             timeout_seconds = float(getattr(knowledge_settings, "rag_qdrant_timeout_seconds", 10))
             maximum_result_scope = int(getattr(knowledge_settings, "rag_top_k", 5))
+        elif name in {"graph.search_assets", "graph.aggregate_assets"}:
+            timeout_seconds = min(30.0, float(getattr(graph_settings, "agent_request_timeout_seconds", 30)))
+            maximum_result_scope = int(getattr(graph_settings, "graph_asset_search_max_limit", 200))
         else:
             timeout_seconds = min(30.0, float(getattr(graph_settings, "agent_request_timeout_seconds", 30)))
             maximum_result_scope = int(getattr(graph_settings, "graph_full_neighbors_hard_max", 5000))
@@ -501,6 +560,10 @@ def build_capability_registry(
         planner_arguments = (
             ("entities", "views", "detail", "max_context_tokens", "purpose")
             if group == "product"
+            else ("filters", "sort", "direction", "limit")
+            if name == "graph.search_assets"
+            else ("filters", "operation", "group_by", "limit")
+            if name == "graph.aggregate_assets"
             else ("entities",)
             if group == "graph"
             else ("query", "top_k", "filters", "purpose", "max_context_tokens")

@@ -201,9 +201,9 @@ Known scale debt: `Neo4jGraphRepository.stats()` still materializes active IPs t
 
 Mutating Community integration suites remain disposable-database-only. They must never run against the main Neo4j runtime.
 
-## 11. Phase 4B.1 semantic contract
+## 11. Phase 4B.1 semantic contract and Phase 4B.2 execution
 
-Phase 4B.1 introduces semantic representation only. It does not yet register the new execution capabilities.
+Phase 4B.1 introduces the semantic representation. Phase 4B.2 registers and executes the corresponding bounded capabilities.
 
 New typed contract:
 
@@ -235,11 +235,13 @@ requires_multiple_entities = false
 
 The Router prompt now explicitly distinguishes focal Asset identity from Asset-set selectors and forbids arbitrary properties, Cypher, regex, free-form operators, OR expressions and traversal instructions inside `structured_query`.
 
-Deterministic Pydantic validation reuses the Phase 4A allow-lists. `IntentDecision` and `RouteDecision` carry the structured semantic object. `TaskSpec` has an optional structured-query field reserved for the next execution integration. Existing non-set routes continue through the established validator.
+Deterministic Pydantic validation reuses the Phase 4A allow-lists. `IntentDecision` and `RouteDecision` carry the structured semantic object, and `TaskSpec.structured_query` is its single bridge into execution. Existing non-set routes continue through the established validator.
 
-No new LLM role is introduced. The existing Router remains semantic classification authority; deterministic code owns schema and invariants.
+For simple requests, the direct compiler transforms the validated structured query into exactly one typed `graph.search_assets` or `graph.aggregate_assets` step. Both capabilities are read-only, planner-visible, depth zero, and have `(0, 0)` focal-entity cardinality. The same schemas appear dynamically in the bounded Planner catalog for future composition, exposing only `filters/sort/direction/limit` or `filters/operation/group_by/limit`; cursor replay and arbitrary query fields are excluded.
 
-Until Phase 4B.2, the structured semantic contract is not proof that a set query executed. Existing topology primitives must not be presented as substitutes for exact Asset-set retrieval.
+The PlanValidator applies schema, duplicate-call, call-budget, zero-entity, depth, and configured result-limit checks. The existing Graph Specialist and CapabilityExecutor pass typed requests to `GraphService`, which delegates to the active-version-scoped `Neo4jGraphRepository`. One retrieval is one capability call regardless of result count, and rows remain an Asset set rather than active/focal entities.
+
+No new LLM role is introduced. The existing Router remains semantic classification authority; deterministic code owns schema and invariants. There is no Product fan-out, Qdrant call, or Memory mutation in this path.
 
 ## 12. CI validation
 
@@ -257,30 +259,18 @@ This validation path prevents developers from having to point mutating integrati
 
 ## 13. External boundaries unchanged
 
-Phase 4A/4A.1/4B.1 do not change Product backend endpoints, Product PostgreSQL schema, Streamlit/Product frontend request contracts, public graph API routes, Qdrant collections, memory schema, EvidencePack, ContextComposer or Synthesizer contracts.
+Phase 4A/4A.1/4B.1/4B.2 do not change Product backend endpoints, Product PostgreSQL schema, Streamlit/Product frontend request contracts, public graph API routes, Qdrant collections, memory schema, EvidencePack, ContextComposer or Synthesizer contracts.
 
 Current chat identity fields remain `conversation_id`, `session_id`, `request_id`, `message`, and optional `ui_context.selected_ip`.
 
-## 14. Next: Phase 4B.2
+## 14. Next phases
 
-Phase 4B.2 owns actual agent execution integration:
-
-```text
-graph.search_assets
-graph.aggregate_assets
-typed capability inputs
-PlanValidator support
-deterministic direct-plan compilation
-Planner catalog exposure
-Graph Specialist normalization
-```
-
-Phase 4B.3 then owns set-aware evidence classes, EvidencePack/Reviewer semantics and bounded model-context projection. Phase 4B.4 owns short-term result-set continuity such as “those assets” without turning result rows into focal entities.
+Phase 4B.3 owns set-aware evidence classes, EvidencePack/Reviewer semantics, bounded model-context projection, and task-aware synthesis. Phase 4B.4 owns short-term result-set continuity such as “those assets” without turning result rows into focal entities. Phase 4C owns bounded candidate selection and cross-source deepening.
 
 ## 15. Near-future GraphRAG roadmap
 
 ```text
-Phase 4B.2 capability/execution integration
+Phase 4B.2 capability/execution integration (implemented)
 Phase 4B.3 evidence/context integration
 Phase 4B.4 bounded result-set continuity
 Phase 4C   cross-source exact search → selective Product/Detection/topology deepening

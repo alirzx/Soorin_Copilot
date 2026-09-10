@@ -18,7 +18,11 @@ from src.core.agent.contracts import (
 )
 from src.core.context.models import EntityResolution, ResolvedEntity
 from src.core.context.product_views import select_product_views
-from src.core.graph.structured import StructuredQueryMode
+from src.core.graph.structured import (
+    AssetAggregateCapabilityInput,
+    AssetSearchCapabilityInput,
+    StructuredQueryMode,
+)
 from src.core.memory.routing_state import SessionRoutingState
 
 
@@ -484,14 +488,56 @@ def task_spec_from_route(
 
 
 def compile_direct_plan(task: TaskSpec, *, plan_id: str | None = None) -> ExecutionPlan:
-    """Compile a deterministic plan for a validated direct semantic task.
-
-    Phase 4B.1 deliberately does not invent arguments for the two future
-    structured capabilities. They remain unregistered until 4B.2, so the
-    existing PlanValidator rejects them before execution.
-    """
+    """Compile a deterministic plan for a validated direct semantic task."""
     steps: list[PlanStep] = []
     capabilities = (*task.required_capabilities, *task.optional_capabilities)
+    structured_intents = {
+        "asset_search": (StructuredQueryMode.SEARCH, "graph.search_assets"),
+        "asset_aggregate": (StructuredQueryMode.AGGREGATE, "graph.aggregate_assets"),
+    }
+    if task.intent in structured_intents or task.structured_query is not None:
+        if task.intent not in structured_intents or task.structured_query is None:
+            raise ValueError("Structured direct tasks require a matching intent and structured query.")
+        expected_mode, expected_capability = structured_intents[task.intent]
+        if task.structured_query.mode is not expected_mode:
+            raise ValueError("Structured query mode contradicts the task intent.")
+        if task.entities:
+            raise ValueError("Structured Asset-set tasks cannot carry focal entities.")
+        if capabilities != (expected_capability,):
+            raise ValueError("Structured direct tasks require exactly one matching capability.")
+        if expected_mode is StructuredQueryMode.SEARCH:
+            request = task.structured_query.to_search_request()
+            parsed = AssetSearchCapabilityInput.model_validate(
+                request.model_dump(mode="json", exclude={"cursor"}, exclude_none=True)
+            )
+        else:
+            request = task.structured_query.to_aggregate_request()
+            parsed = AssetAggregateCapabilityInput.model_validate(
+                request.model_dump(mode="json", exclude_none=True)
+            )
+        arguments = parsed.model_dump(
+            mode="json",
+            exclude_none=True,
+        )
+        steps.append(PlanStep(
+            id="step-1",
+            capability=expected_capability,
+            arguments=arguments,
+            requirement="required",
+            expected_evidence_type="organizational_asset_set",
+        ))
+        return ExecutionPlan(
+            task=task,
+            steps=tuple(steps),
+            max_iterations=1,
+            validated=False,
+            plan_id=plan_id or uuid4().hex[:12],
+            goal=task.request,
+            target_entities=(),
+            maximum_allowed_calls=6,
+            planner_called=False,
+            source="deterministic",
+        )
     for capability in capabilities:
         requirement = "required" if capability in task.required_capabilities else "optional"
         if capability in {"asset.get_profile", "asset.get_detection"}:
@@ -511,12 +557,6 @@ def compile_direct_plan(task: TaskSpec, *, plan_id: str | None = None) -> Execut
                 id=f"step-{len(steps) + 1}", capability=capability,
                 arguments={"query": task.request, "purpose": "interpret_evidence", "max_context_tokens": 3000},
                 requirement=requirement, expected_evidence_type="documentation",
-            ))
-        elif capability in {"graph.search_assets", "graph.aggregate_assets"}:
-            steps.append(PlanStep(
-                id=f"step-{len(steps) + 1}", capability=capability,
-                arguments={}, requirement=requirement,
-                expected_evidence_type="organizational_asset_set",
             ))
         else:
             steps.append(PlanStep(

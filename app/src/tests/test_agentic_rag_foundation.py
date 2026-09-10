@@ -520,6 +520,8 @@ class RoutingWorkflowAndReviewerTests(unittest.TestCase):
                 "graph.get_relationship",
                 "graph.compare_assets",
                 "graph.find_path",
+                "graph.search_assets",
+                "graph.aggregate_assets",
                 "knowledge.search",
             },
         )

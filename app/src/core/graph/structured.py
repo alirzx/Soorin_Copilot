@@ -148,6 +148,25 @@ class AssetSearchRequest(BaseModel):
     cursor: str | None = Field(default=None, min_length=1, max_length=2048)
 
 
+class AssetSearchCapabilityInput(BaseModel):
+    """Planner-safe search arguments; cursor replay remains service-internal."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    filters: AssetSearchFilters = Field(default_factory=AssetSearchFilters)
+    sort: AssetSortField = AssetSortField.GRAPH_KEY
+    direction: SortDirection = SortDirection.ASC
+    limit: int | None = Field(default=None, ge=1)
+
+    def to_request(self) -> AssetSearchRequest:
+        return AssetSearchRequest(
+            filters=self.filters,
+            sort=self.sort,
+            direction=self.direction,
+            limit=self.limit,
+        )
+
+
 class StructuredAssetRow(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -213,6 +232,30 @@ class AssetAggregateRequest(BaseModel):
         if self.operation is AssetAggregateOperation.COUNT and self.group_by is not None:
             raise ValueError("count does not accept group_by")
         return self
+
+
+class AssetAggregateCapabilityInput(BaseModel):
+    """Planner-safe bounded aggregate arguments over the same selector schema."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    filters: AssetSearchFilters = Field(default_factory=AssetSearchFilters)
+    operation: AssetAggregateOperation = AssetAggregateOperation.COUNT
+    group_by: AssetGroupField | None = None
+    limit: int | None = Field(default=None, ge=1)
+
+    @model_validator(mode="after")
+    def validate_grouping(self) -> "AssetAggregateCapabilityInput":
+        self.to_request()
+        return self
+
+    def to_request(self) -> AssetAggregateRequest:
+        return AssetAggregateRequest(
+            filters=self.filters,
+            operation=self.operation,
+            group_by=self.group_by,
+            limit=self.limit,
+        )
 
 
 class AssetAggregateGroup(BaseModel):

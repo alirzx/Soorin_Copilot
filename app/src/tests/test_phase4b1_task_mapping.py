@@ -1,4 +1,4 @@
-"""Phase 4B.1 task-mapping and fail-closed transition tests."""
+"""Structured task-mapping and fail-closed transition tests."""
 
 from __future__ import annotations
 
@@ -78,14 +78,18 @@ def test_comparison_envelope_remains_authoritative_over_structured_route() -> No
     assert route.scope == "multi_entity_comparison"
 
 
-def test_phase4b1_structured_capability_is_fail_closed_until_registration() -> None:
+def test_structured_direct_plan_compiles_typed_arguments_and_unknown_registry_fails_closed() -> None:
     query = StructuredQuerySpec.model_validate(
         {"mode": "search", "filters": {"vendor": "VMware"}}
     )
     task = task_spec_from_route(_route(query), "List VMware assets", RequestConstraints())
     plan = compile_direct_plan(task)
     assert plan.steps[0].capability == "graph.search_assets"
-    assert plan.steps[0].arguments == {}
+    assert plan.steps[0].arguments == {
+        "filters": {"vendor": "VMware"},
+        "sort": "graph_key",
+        "direction": "asc",
+    }
 
     with pytest.raises(PlanValidationError) as exc:
         PlanValidator(CapabilityRegistry()).validate(plan)

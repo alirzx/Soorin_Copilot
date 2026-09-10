@@ -149,7 +149,7 @@ class PlanValidator:
                             "A second Knowledge call requires a distinct purpose and meaningfully different query.",
                         )
                 knowledge_signatures.append((purpose, query_hash, query_terms))
-            else:
+            elif "entities" in allowed_arguments:
                 arguments.setdefault("entities", list(plan.task.entities))
             if step.capability in {"asset.get_profile", "asset.get_detection"}:
                 provider = "asset_profile" if step.capability == "asset.get_profile" else "detection"
@@ -222,7 +222,7 @@ class PlanValidator:
             if step.capability.startswith("graph.") and depth > min(self.max_graph_depth, spec.maximum_graph_depth or self.max_graph_depth):
                 raise PlanValidationError("maximum_graph_depth_exceeded", "Plan graph depth limit exceeded.")
             try:
-                spec.input_schema.model_validate(arguments)
+                parsed_arguments = spec.input_schema.model_validate(arguments)
             except ValidationError as exc:
                 first_error = exc.errors(include_url=False)[0] if exc.errors() else {}
                 location = ".".join(str(item) for item in first_error.get("loc", ())) or "arguments"
@@ -235,6 +235,20 @@ class PlanValidator:
                     field=location,
                     validation_rule=rule,
                 ) from exc
+            requested_limit = getattr(parsed_arguments, "limit", None)
+            if (
+                requested_limit is not None
+                and spec.maximum_result_scope is not None
+                and requested_limit > spec.maximum_result_scope
+            ):
+                raise PlanValidationError(
+                    "maximum_result_scope_exceeded",
+                    "Plan capability result limit exceeds the configured maximum.",
+                    step_id=step.id,
+                    capability=step.capability,
+                    field="limit",
+                    validation_rule="maximum_result_scope",
+                )
 
             signature = json.dumps(
                 {"capability": step.capability, "arguments": arguments},

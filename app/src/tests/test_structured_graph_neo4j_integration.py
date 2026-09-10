@@ -4,16 +4,26 @@ from __future__ import annotations
 
 import os
 from datetime import datetime, timezone
+from types import SimpleNamespace
 
 import pytest
 
 from src.config.settings import get_settings
+from src.core.agent.contracts import TaskSpec
+from src.core.agent.executor import CapabilityExecutor
+from src.core.agent.plan_validator import PlanValidator
+from src.core.agent.registry import build_capability_registry
+from src.core.agent.specialists import GraphAnalysisSpecialist
+from src.core.agent.task_mapping import compile_direct_plan
+from src.core.context.providers.graph import GraphContextProvider
 from src.core.graph.enrichment_models import AssetEnrichmentMutation
 from src.core.graph.neo4j import Neo4jDriver, Neo4jGraphRepository
+from src.core.graph.service import GraphService
 from src.core.graph.structured import (
     AssetAggregateRequest,
     AssetSearchFilters,
     AssetSearchRequest,
+    StructuredQuerySpec,
 )
 from src.core.product_client import ProductAssetDetectionOverview
 from src.core.product_client.schemas import TopologyConnectionRecord
@@ -184,3 +194,55 @@ def test_count_and_group_count_execute_in_neo4j(structured_repository: Neo4jGrap
     assert {(group.value, group.count) for group in grouped.groups} == {
         ("CONFIRMED", 3), ("REVIEW", 2)
     }
+
+
+def test_agent_capability_path_reaches_active_structured_projection(
+    structured_repository: Neo4jGraphRepository,
+) -> None:
+    settings = get_settings()
+    service = object.__new__(GraphService)
+    service.settings = settings
+    service.repository = structured_repository
+    provider = object.__new__(GraphContextProvider)
+    provider.settings = settings
+    provider.graph_service = service
+    unused = SimpleNamespace(settings=settings)
+    registry = build_capability_registry(
+        asset_profile_provider=unused,
+        detection_provider=unused,
+        graph_provider=provider,
+        knowledge_service=unused,
+    )
+    query = StructuredQuerySpec.model_validate({
+        "mode": "search",
+        "filters": {"status": "CONFIRMED", "role": "Domain Controller"},
+        "sort": "model_confidence",
+        "direction": "asc",
+        "limit": 10,
+    })
+    task = TaskSpec(
+        request="List confirmed Domain Controllers",
+        intent="asset_search",
+        scope="none",
+        direction="none",
+        entities=(),
+        required_capabilities=("graph.search_assets",),
+        structured_query=query,
+        workflow_mode="direct",
+    )
+    plan = PlanValidator(registry).validate(compile_direct_plan(task))
+    output = GraphAnalysisSpecialist(CapabilityExecutor(registry)).run({
+        "request_id": "phase4b2-neo4j",
+        "session_id": "phase4b2-neo4j",
+        "workflow_id": "phase4b2-neo4j",
+        "execution_plan": plan,
+    })
+    result = output["tool_results"][0]
+    assert result.status == "ok"
+    assert result.entities == ()
+    assert result.total_count == result.included_count == 2
+    assert [row["ip"] for row in result.raw_payload["rows"]] == [
+        "10.20.0.1",
+        "10.20.0.2",
+    ]
+    assert all(row["graph_version"] == "structured-active-v2" for row in result.raw_payload["rows"])

@@ -9,6 +9,10 @@ from src.config.settings import Settings
 from src.core.context.models import GraphProviderResult, ProviderProvenance, ResolvedEntity, RouteDecision, approx_tokens
 from src.core.graph.retrieval import GraphRetrievalSpec
 from src.core.graph.service import GraphService
+from src.core.graph.structured import (
+    AssetAggregateRequest,
+    AssetSearchRequest,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -143,4 +147,117 @@ class GraphContextProvider:
             provenance=provenance,
             limitations=list(context.get("limitations") or []),
             latency_ms=latency_ms,
+        )
+
+    def search_assets(
+        self,
+        request: AssetSearchRequest,
+        *,
+        request_id: str = "",
+    ) -> GraphProviderResult:
+        """Execute one typed Asset-set search without topology/entity coercion."""
+        started = time.perf_counter()
+        try:
+            result = self.graph_service.search_assets(request)
+        except Exception:
+            logger.exception(
+                "event=graph_structured_search_failed request_id=%s",
+                request_id,
+            )
+            return GraphProviderResult(
+                provider="graph",
+                status="unavailable",
+                provenance=ProviderProvenance(
+                    source="neo4j_structured_asset_projection",
+                    status="unavailable",
+                ),
+                error_reason="provider_exception",
+                latency_ms=int((time.perf_counter() - started) * 1000),
+            )
+        context = result.model_dump(mode="json", exclude={"next_cursor"})
+        context.update(
+            {
+                "scope": "asset_search",
+                "requested_scope": "asset_search",
+                "direction": "none",
+                "depth": 0,
+                "candidate_node_count": result.matched_total,
+                "retrieved_node_count": result.returned_count,
+                "returned_node_count": result.returned_count,
+                "retrieval_complete": not result.truncated,
+                "retrieval_truncated": result.truncated,
+                "requested_scope_complete": not result.truncated,
+                "complete_for_user_request": not result.truncated,
+                "serialized_context_complete_for_retrieved_subset": True,
+            }
+        )
+        return GraphProviderResult(
+            provider="graph",
+            status="available" if result.returned_count else "not_found",
+            context=context,
+            provenance=ProviderProvenance(
+                source="neo4j_structured_asset_projection",
+                status="available" if result.returned_count else "not_found",
+            ),
+            limitations=list(result.limitations),
+            latency_ms=int((time.perf_counter() - started) * 1000),
+        )
+
+    def aggregate_assets(
+        self,
+        request: AssetAggregateRequest,
+        *,
+        request_id: str = "",
+    ) -> GraphProviderResult:
+        """Execute one typed Asset-set aggregate entirely in Neo4j."""
+        started = time.perf_counter()
+        try:
+            result = self.graph_service.aggregate_assets(request)
+        except Exception:
+            logger.exception(
+                "event=graph_structured_aggregate_failed request_id=%s",
+                request_id,
+            )
+            return GraphProviderResult(
+                provider="graph",
+                status="unavailable",
+                provenance=ProviderProvenance(
+                    source="neo4j_structured_asset_projection",
+                    status="unavailable",
+                ),
+                error_reason="provider_exception",
+                latency_ms=int((time.perf_counter() - started) * 1000),
+            )
+        included_count = (
+            sum(group.count for group in result.groups)
+            if result.group_by
+            else result.count
+        )
+        context = result.model_dump(mode="json")
+        context.update(
+            {
+                "scope": "asset_aggregate",
+                "requested_scope": "asset_aggregate",
+                "direction": "none",
+                "depth": 0,
+                "candidate_node_count": result.count,
+                "retrieved_node_count": included_count,
+                "returned_node_count": included_count,
+                "retrieval_complete": not result.truncated,
+                "retrieval_truncated": result.truncated,
+                "requested_scope_complete": not result.truncated,
+                "complete_for_user_request": not result.truncated,
+                "serialized_context_complete_for_retrieved_subset": True,
+            }
+        )
+        return GraphProviderResult(
+            provider="graph",
+            status="available",
+            context=context,
+            provenance=ProviderProvenance(
+                source="neo4j_structured_asset_projection",
+                status="available",
+            ),
+            limitations=list(result.limitations),
+            latency_ms=int((time.perf_counter() - started) * 1000),
         )

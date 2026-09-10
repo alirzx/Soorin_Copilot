@@ -1,12 +1,12 @@
 # Phase 4 Structured Graph Routing
 
-Status: current `dev` implementation record for Phase 4A.1 and Phase 4B.1.
+Status: current `dev` implementation record for Phase 4A.1 through Phase 4B.2.
 
 ## Current boundary
 
-Phase 4A provides typed, bounded, active-version-only Neo4j Asset search and aggregation. Phase 4A.1 adds external cursor request/version binding plus a read-only query-plan audit. Phase 4B.1 adds the semantic contract for structured Asset-set requests without registering or executing the new capabilities yet.
+Phase 4A provides typed, bounded, active-version-only Neo4j Asset search and aggregation. Phase 4A.1 adds external cursor request/version binding plus a read-only query-plan audit. Phase 4B.1 adds the semantic contract for structured Asset-set requests. Phase 4B.2 connects that contract to bounded agent execution.
 
-No Product backend, frontend, public API, PostgreSQL schema, Qdrant schema, Neo4j schema, Memory schema, EvidencePack, ContextComposer, or Synthesizer contract is changed by 4B.1.
+No Product backend, frontend, public API, PostgreSQL schema, Qdrant schema, Neo4j schema, Memory schema, EvidencePack, ContextComposer, or Synthesizer contract is changed by 4B.2.
 
 ## Semantic contract
 
@@ -38,9 +38,35 @@ requires_multiple_entities = false
 
 Profile and Detection are not requested at this stage because no focal Asset has yet been selected. Later cross-source deepening remains bounded to selected focal Assets.
 
-`IntentDecision` and `RouteDecision` can carry the structured semantic object, and `TaskSpec` has an optional structured-query field reserved for the execution integration. Phase 4B.2 will connect that task contract to registered `graph.search_assets` / `graph.aggregate_assets` capabilities and deterministic direct-plan arguments.
+`IntentDecision` and `RouteDecision` carry the structured semantic object, and `TaskSpec.structured_query` remains the single semantic bridge into execution. The deterministic direct-plan compiler validates the intent/mode invariant and produces exactly one `graph.search_assets` or `graph.aggregate_assets` step with mode-specific typed arguments.
 
-Until 4B.2, existing graph primitives must not be treated as substitutes for Asset-set execution. Any incomplete transition must fail closed rather than synthesize an organizational answer without structured retrieval evidence.
+Malformed or contradictory structured tasks fail closed. Existing topology primitives are not substitutes for Asset-set execution.
+
+## Phase 4B.2 execution contract
+
+```text
+asset_search / asset_aggregate
+→ StructuredQuerySpec
+→ TaskSpec.structured_query
+→ deterministic Direct Plan (simple requests) or bounded Planner catalog
+→ PlanValidator
+→ Graph Specialist
+→ CapabilityExecutor
+→ graph.search_assets / graph.aggregate_assets
+→ GraphService
+→ Neo4jGraphRepository active projection
+```
+
+Both capabilities are read-only, planner-visible, depth zero, and require exactly zero focal entities. Their planner schemas expose only:
+
+```text
+search:    filters, sort, direction, limit
+aggregate: filters, operation, group_by, limit
+```
+
+They reuse the Phase 4A selector and enum contracts, accept no cursor or arbitrary query/property/operator fields, and enforce the configured structured-result maximum during plan validation. One Asset-set retrieval remains one capability call regardless of matched row count; returned rows never enter `TaskSpec.entities`, active entities, or the two-entity budget.
+
+The Graph Specialist remains a deterministic bounded subgraph, not an LLM agent. Existing generic `ToolResult` fields carry the typed result and bounded count/truncation metadata. Asset-set-aware EvidencePack and model-context semantics are intentionally not introduced here.
 
 ## Router prompt policy
 
@@ -89,18 +115,6 @@ Two measured decisions remain intentionally separate from semantic routing:
 - `matched_total` currently costs an extra count query. Keep the contract until PROFILE evidence demonstrates a material problem.
 - `/graph/stats` currently derives IP-range distribution from a full active-IP materialization. This is a known scale debt for the 1M-Asset target and should be refactored after profiling that public stats path, preserving its response contract.
 
-## Next: Phase 4B.2
+## Next phases
 
-Phase 4B.2 owns actual execution integration:
-
-```text
-graph.search_assets
-graph.aggregate_assets
-typed capability inputs
-PlanValidator support
-direct-plan compilation
-Planner catalog exposure
-Graph Specialist normalization
-```
-
-After that, Phase 4B.3 adds set-aware EvidencePack/Reviewer/ContextComposer handling, and Phase 4B.4 adds bounded short-term result-set continuity.
+Phase 4B.3 adds set-aware EvidencePack/Reviewer/ContextComposer and Synthesizer handling. Phase 4B.4 adds bounded short-term result-set continuity. Phase 4C adds selective cross-source Product/Detection/topology deepening; Phase 4B.2 performs no such fan-out.

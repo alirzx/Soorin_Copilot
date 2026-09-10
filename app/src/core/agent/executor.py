@@ -177,7 +177,15 @@ class CapabilityExecutor:
         timed_out: threading.Event,
     ) -> ToolResult:
         spec = self.registry.get(step.capability)
-        payload = {**step.arguments, **base_payload}
+        schema_fields = set(spec.input_schema.model_fields)
+        payload = {
+            **step.arguments,
+            **{
+                key: value
+                for key, value in base_payload.items()
+                if key in schema_fields
+            },
+        }
         started = time.perf_counter()
         if events:
             events.emit("step_started", plan_id=plan_id, step_id=step.id, capability=step.capability)
