@@ -1,6 +1,6 @@
 """Typed contracts for bounded structured Asset retrieval.
 
-These models describe selectors and Asset sets.  They are deliberately not
+These models describe selectors and Asset sets. They are deliberately not
 agent entities and expose no Cypher/property escape hatch.
 """
 
@@ -44,6 +44,11 @@ class AssetGroupField(str, Enum):
 class AssetAggregateOperation(str, Enum):
     COUNT = "count"
     GROUP_COUNT = "group_count"
+
+
+class StructuredQueryMode(str, Enum):
+    SEARCH = "search"
+    AGGREGATE = "aggregate"
 
 
 class AssetSearchFilters(BaseModel):
@@ -229,3 +234,58 @@ class AssetAggregateResult(BaseModel):
     truncated: bool = False
     retrieved_at: str
     limitations: tuple[str, ...] = ()
+
+
+class StructuredQuerySpec(BaseModel):
+    """Router-owned semantic contract for one bounded Asset-set query.
+
+    It reuses the repository allow-lists but intentionally excludes cursors and
+    arbitrary Cypher. Asset/IP conversational identity remains outside this
+    model; these fields are selectors over an Asset set.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    mode: StructuredQueryMode
+    filters: AssetSearchFilters = Field(default_factory=AssetSearchFilters)
+    sort: AssetSortField | None = None
+    direction: SortDirection | None = None
+    limit: int | None = Field(default=None, ge=1)
+    operation: AssetAggregateOperation | None = None
+    group_by: AssetGroupField | None = None
+
+    @model_validator(mode="after")
+    def validate_mode_contract(self) -> "StructuredQuerySpec":
+        if self.mode is StructuredQueryMode.SEARCH:
+            if self.operation is not None or self.group_by is not None:
+                raise ValueError("search structured queries do not accept aggregate fields")
+            return self
+        if self.sort is not None or self.direction is not None:
+            raise ValueError("aggregate structured queries do not accept sort or direction")
+        if self.operation is None:
+            raise ValueError("aggregate structured queries require operation")
+        if self.operation is AssetAggregateOperation.GROUP_COUNT and self.group_by is None:
+            raise ValueError("group_count requires group_by")
+        if self.operation is AssetAggregateOperation.COUNT and self.group_by is not None:
+            raise ValueError("count does not accept group_by")
+        return self
+
+    def to_search_request(self) -> AssetSearchRequest:
+        if self.mode is not StructuredQueryMode.SEARCH:
+            raise ValueError("structured query is not a search")
+        return AssetSearchRequest(
+            filters=self.filters,
+            sort=self.sort or AssetSortField.GRAPH_KEY,
+            direction=self.direction or SortDirection.ASC,
+            limit=self.limit,
+        )
+
+    def to_aggregate_request(self) -> AssetAggregateRequest:
+        if self.mode is not StructuredQueryMode.AGGREGATE or self.operation is None:
+            raise ValueError("structured query is not an aggregate")
+        return AssetAggregateRequest(
+            filters=self.filters,
+            operation=self.operation,
+            group_by=self.group_by,
+            limit=self.limit,
+        )

@@ -7,6 +7,7 @@ import json
 from typing import Annotated, Any, Literal, TypedDict
 import operator
 
+from src.core.graph.structured import StructuredQuerySpec
 from src.core.identity import RequestIdentity
 
 
@@ -175,6 +176,7 @@ class TaskSpec:
     entities: tuple[str, ...]
     required_capabilities: tuple[str, ...]
     optional_capabilities: tuple[str, ...] = ()
+    structured_query: StructuredQuerySpec | None = None
     workflow_mode: WorkflowMode = "direct"
     semantic_decision_source: str = "unknown"
     requires_multiple_entities: bool = False

@@ -1,6 +1,6 @@
 # Neo4j Graph Enrichment and GraphRAG
 
-Status: living architecture record. Update this document whenever graph schema, topology synchronization, enrichment, scheduling, structured graph retrieval, graph capabilities, GraphRAG retrieval, or Copilot evidence integration changes.
+Status: living architecture record. Update whenever graph schema, topology synchronization, enrichment, scheduling, structured retrieval, graph capabilities, GraphRAG retrieval, or Copilot evidence integration changes.
 
 Last synchronized: 2026-09-10.
 
@@ -11,15 +11,14 @@ Phase 2.5     PASS
 Phase 3       DONE
 Phase 3.5     DONE
 Phase 4A      IMPLEMENTED
-Phase 4A.1    HARDENING / PRE-4B
-Phase 4B      NEXT
+Phase 4A.1    CODE COMPLETE; CI/PROFILE VALIDATION GATE
+Phase 4B.1    IMPLEMENTED
+Phase 4B.2    NEXT
 ```
 
 ## 1. Purpose and authority
 
-Neo4j is Soorin Copilot's operational organizational graph and the structural substrate for GraphRAG. Product remains authoritative for current/deep Asset and Detection facts and for the topology source. Neo4j contains a versioned, query-bounded projection used for organizational discovery, exact structured lookup, topology analysis, and later hybrid GraphRAG. Qdrant continues to own semantic cybersecurity documentation and the derivative memory semantic index.
-
-Authority boundaries:
+Neo4j is Soorin Copilot's operational organizational graph and the structural substrate for GraphRAG. Product remains authoritative for current/deep Asset and Detection facts and for topology source data. Neo4j contains a versioned, query-bounded projection for organizational discovery, exact structured lookup, topology analysis, and later hybrid GraphRAG. Qdrant continues to own semantic cybersecurity documentation and the derivative memory semantic index.
 
 ```text
 Neo4j             organizational Asset discovery + topology projection
@@ -28,24 +27,24 @@ Qdrant Knowledge semantic cybersecurity documentation
 Memory            historical continuity, baselines, durable findings
 ```
 
-Neo4j enrichment is a discovery projection. It must never be presented as equivalent to a fresh Product Profile/Detection response.
+Neo4j enrichment is a discovery projection. It is not equivalent to a fresh Product Profile or Detection response.
 
 ## 2. Scale targets and non-negotiable bounds
 
 Target scale remains at least 1,000,000 `Asset` nodes, 10,000,000 `COMMUNICATES_WITH` relationships, and 15+ Product-derived properties per Asset.
 
-Runtime design therefore requires:
+Required properties of the design:
 
 - bounded memory and bounded model context;
 - active-version-only reads;
-- keyset pagination instead of large `SKIP`/offset scans;
+- keyset pagination instead of large offset scans;
 - parameterized Cypher values;
 - bounded batch writes;
 - controlled Product concurrency;
 - last-known-good topology behavior;
 - no full-graph hydration for ordinary requests;
 - no one-Product-call-per-search-result fan-out;
-- indexes added only after `EXPLAIN/PROFILE` evidence.
+- indexes added only after measured `EXPLAIN/PROFILE` evidence.
 
 ## 3. Topology plane
 
@@ -59,7 +58,7 @@ Product GET /zeek/connections/unique-ip-pairs
 → retire inactive projection
 ```
 
-A staging version is unreadable through normal active-graph queries until publication succeeds. Fetch/write/validation failure preserves the previously published graph. Topology refresh is independently scheduled from enrichment.
+A staging version is not readable through normal active-graph queries until publication succeeds. Fetch/write/validation failure preserves the previously published graph. Topology refresh is independently scheduled from enrichment.
 
 Relevant implementation:
 
@@ -67,7 +66,7 @@ Relevant implementation:
 - `app/src/core/graph/neo4j.py`
 - `app/src/core/graph/storage.py`
 
-Phase 4A.1 hardening additionally ensures that failure telemetry cannot mask the original refresh failure if Neo4j becomes unavailable while the error is being reported, and raw snapshot temporary files are removed when serialization/write/replace fails.
+Phase 4A.1 also ensures refresh-failure telemetry cannot mask the original failure if Neo4j is unavailable during failure reporting, and failed raw-snapshot writes remove temporary files.
 
 ## 4. Enrichment plane
 
@@ -87,17 +86,7 @@ FastAPI startup
 
 Product overview concurrency remains exactly `1` across scheduled/manual/on-demand enrichment. Product HTTP is never performed inside a Neo4j transaction. Scheduler and Product-request leases are separate.
 
-Enrichment states:
-
-| State | Meaning |
-|---|---|
-| `pending` | no successful enrichment yet |
-| `success` | validated current projection persisted |
-| `stale` | later refresh failed but prior successful values are retained |
-| `error` | failed before any successful enrichment |
-| `unavailable` | Product returned no usable overview before any successful enrichment |
-
-Failure does not erase previously valid enrichment properties.
+Enrichment states are `pending`, `success`, `stale`, `error`, and `unavailable`. Failure does not erase previously valid enrichment properties.
 
 ## 5. Product → Neo4j enrichment mapping
 
@@ -123,13 +112,13 @@ Operational metadata also includes enrichment status, timestamps, source, versio
 
 ## 6. Topology/enrichment version interaction
 
-Matching Assets copy enrichment from the active version into the next staging topology before publication. New Assets start `pending`. This separates the approximately hourly topology cadence from the longer enrichment freshness cadence.
+Matching Assets copy enrichment from the active version into the next staging topology before publication. New Assets start `pending`. This separates topology cadence from the longer enrichment freshness cadence.
 
-Topology publication and enrichment writes share the process-local graph mutation lock. Cross-process Product request serialization is protected by the renewable Neo4j lease.
+Topology publication and enrichment writes share the process-local graph mutation lock. Cross-process Product request serialization is protected by renewable Neo4j leases.
 
-## 7. Current stable graph capabilities
+## 7. Stable graph capabilities
 
-Current planner-visible/runtime graph capabilities remain:
+Current runtime graph capabilities remain:
 
 ```text
 graph.get_summary
@@ -139,25 +128,13 @@ graph.compare_assets
 graph.find_path
 ```
 
-They operate on already resolved focal Assets/IPs and provide topology evidence. No existing capability is removed in Phase 4A/4A.1.
+They operate on already resolved focal Assets/IPs and provide topology evidence. No existing capability is removed in Phase 4A/4B.1.
 
 ## 8. Phase 4A structured Asset retrieval
 
-Phase 4A is implemented at the graph data/service layer and is intentionally not agent-facing yet.
+Phase 4A is implemented at the graph data/service layer. Implemented contracts include `AssetSearchFilters`, `AssetSearchRequest`, `AssetSearchResult`, `StructuredAssetRow`, `AssetAggregateRequest`, `AssetAggregateGroup`, and `AssetAggregateResult`.
 
-Implemented typed contracts:
-
-```text
-AssetSearchFilters
-AssetSearchRequest
-StructuredAssetRow
-AssetSearchResult
-AssetAggregateRequest
-AssetAggregateGroup
-AssetAggregateResult
-```
-
-Supported exact selectors:
+Exact selectors:
 
 ```text
 ip
@@ -173,7 +150,7 @@ sub_tag
 enrichment_status
 ```
 
-Supported bounded ranges:
+Bounded ranges:
 
 ```text
 model_confidence min/max
@@ -182,135 +159,149 @@ unknown_score min/max
 last_detection_at from/to
 ```
 
-Supported aggregation:
+Aggregation supports `count` and `group_count`. Sort/group fields are fixed enums; callers cannot supply arbitrary property names or Cypher.
 
-```text
-count
-group_count
-```
-
-Supported sort fields are fixed enums; callers cannot supply arbitrary property names or Cypher.
-
-Current limits:
+Current row bounds:
 
 ```text
 SOORIN_GRAPH_ASSET_SEARCH_DEFAULT_LIMIT=50
 SOORIN_GRAPH_ASSET_SEARCH_MAX_LIMIT=200
 ```
 
-These limits bound repository results. They are not model-context row budgets and they do not change `SOORIN_AGENT_MAX_ENTITIES=2`.
+These are retrieval bounds, not model-context budgets and not conversational entity limits.
 
 ## 9. Entity vs selector semantics
 
-This rule is authoritative for Phase 4B design:
+This rule is authoritative:
 
 ```text
 Asset/IP                         = conversational entity
 role/vendor/product/status/...  = structured selector/filter/facet
-search result                    = Asset set
+structured retrieval result     = Asset set
 ```
 
-A result set of 50 Assets does not create 50 active entities. Only Assets explicitly selected for further analysis become focal entities, still bounded by the existing two-entity conversational limit.
+A result set does not create active conversational entities. Only Assets selected for deeper analysis may become focal entities, still bounded by `SOORIN_AGENT_MAX_ENTITIES=2`.
 
-## 10. Phase 4A.1 hardening
+## 10. Phase 4A.1 hardening and measurement
 
-Phase 4A.1 intentionally changes no Product backend, frontend, public API, PostgreSQL schema, Qdrant schema, Router, Planner, capability registry, EvidencePack, ContextComposer or memory schema.
+The service-level external search cursor is bound to normalized filters, sort field, sort direction, and the active graph version that created the page. Changing only page size is allowed. Reusing a cursor with different query identity or after active graph publication changes fails closed.
 
-### 10.1 Cursor safety
+`search_assets()` currently performs a separate count query for `matched_total`. That contract remains unchanged until measured evidence demonstrates material cost.
 
-The external `GraphService.search_assets()` cursor is bound to:
+`app/scripts/audit_phase4a1_query_plans.py` is a read-only measurement tool. It can run representative `EXPLAIN` and optional `PROFILE` plans for exact IP, role, product, vendor, status, confidence, enrichment status and `matched_total`. It performs no schema bootstrap, data mutation, index creation, or graph publication.
 
-- normalized filters;
-- sort field;
-- sort direction;
-- the active graph version that produced the previous page.
+```bash
+PYTHONPATH=app SOORIN_PHASE4A1_PROFILE=1 \
+.venv/bin/python app/scripts/audit_phase4a1_query_plans.py
+```
 
-The repository's keyset cursor is internal implementation detail. Replaying an external cursor with different selectors or after active topology publication changes must fail closed.
+No enriched-property indexes have been added by Phase 4A/4A.1. Index changes remain evidence-driven.
 
-Changing only page size is allowed because it does not change query identity.
+Known scale debt: `Neo4jGraphRepository.stats()` still materializes active IPs to derive range distribution. That public stats path must be measured/refactored before claiming 1M-node efficiency, while preserving its external response contract.
 
-### 10.2 `matched_total`
+Mutating Community integration suites remain disposable-database-only. They must never run against the main Neo4j runtime.
 
-`search_assets()` currently executes a separate `count(a)` query to return `matched_total`. This contract is kept unchanged in 4A.1. Before Phase 4B exposure, representative broad and selective queries must be measured with `PROFILE`; only measured evidence should justify making total-count optional or changing its implementation.
+## 11. Phase 4B.1 semantic contract
 
-### 10.3 Index policy
+Phase 4B.1 introduces semantic representation only. It does not yet register the new execution capabilities.
 
-Current schema bootstrap intentionally does not create one index per enriched property. Existing relevant indexes include active-version/IP and enrichment-scheduling support. Role/product/vendor/status/confidence indexes are not added merely because Phase 4A can filter those fields.
-
-Before 4B, run `EXPLAIN/PROFILE` for at least:
+New typed contract:
 
 ```text
-exact IP
-role
-product
-vendor
-status
-role + product + status
-model_confidence range
-unknown_score range
-enrichment_status
-roles[] membership
-count
-group_count
+StructuredQuerySpec
+  mode = search | aggregate
+  filters = Phase 4A AssetSearchFilters
+  search: optional sort/direction/limit
+  aggregate: operation=count|group_count, optional group_by/limit
 ```
 
-Add only the smallest indexes whose plans demonstrate material benefit on representative graph scale.
-
-`roles[]` membership remains a known scan-sensitive shape unless the future schema changes its representation.
-
-### 10.4 Known scale audit item outside the Phase 4A result contract
-
-`Neo4jGraphRepository.stats()` currently derives IP-range distribution from all active IPs. This is a separate `/graph/stats` performance path, not Phase 4A structured retrieval. It must be profiled/refactored before claiming 1M-node operational efficiency, but 4A.1 does not alter its public result contract without measured Neo4j evidence.
-
-## 11. Current Phase 4A limitations
-
-- structured search/aggregate methods are not registered agent capabilities yet;
-- Router/TaskSpec do not yet carry first-class structured Asset-set semantics;
-- EvidenceRequirementPolicy/Reviewer/ContextComposer do not yet have set-search evidence classes;
-- result-set conversational continuity (`those assets`, `the first two`) is not yet implemented;
-- no public `/graph/search` endpoint exists;
-- no Product fan-out from a structured result set is implemented;
-- no full-text/vector/hybrid Asset retrieval exists yet.
-
-These are Phase 4B+ work, not defects to solve by bypassing current bounded agent contracts.
-
-## 12. Phase 4B target
-
-Phase 4B should integrate exact structured retrieval into the bounded agent workflow in small patches:
+New Router intents:
 
 ```text
-1. typed structured-query semantic contract
-2. Router/TaskSpec representation
-3. graph.search_assets + graph.aggregate_assets capabilities
-4. direct-plan + Planner catalog support
-5. set-aware evidence classes and Reviewer behavior
-6. bounded model-context projection
-7. short result-set continuity without changing focal entity semantics
+asset_search
+asset_aggregate
 ```
 
-No fourth LLM role is required by default. Simple set queries should remain Router + deterministic validation/direct planning + Synthesizer; Planner remains for genuine multi-step tasks.
-
-## 13. Near-future GraphRAG roadmap
+For both intents:
 
 ```text
-Phase 4B  agent integration for exact structured retrieval
-Phase 5   measured Neo4j full-text retrieval
-Phase 6   semantic Asset search with controlled Asset text + vector index
-Phase 7   hybrid exact/full-text/vector seed selection + bounded traversal
-Phase 8   Organizational RAG across Neo4j + Product + Qdrant + Memory
-Phase 9   expensive/offline graph intelligence and temporal analytics
+scope = none
+direction = none
+depth = 0
+requires_graph = true
+entity_binding = none
+requires_multiple_entities = false
 ```
 
-Target retrieval flow:
+The Router prompt now explicitly distinguishes focal Asset identity from Asset-set selectors and forbids arbitrary properties, Cypher, regex, free-form operators, OR expressions and traversal instructions inside `structured_query`.
+
+Deterministic Pydantic validation reuses the Phase 4A allow-lists. `IntentDecision` and `RouteDecision` carry the structured semantic object. `TaskSpec` has an optional structured-query field reserved for the next execution integration. Existing non-set routes continue through the established validator.
+
+No new LLM role is introduced. The existing Router remains semantic classification authority; deterministic code owns schema and invariants.
+
+Until Phase 4B.2, the structured semantic contract is not proof that a set query executed. Existing topology primitives must not be presented as substitutes for exact Asset-set retrieval.
+
+## 12. CI validation
+
+`.github/workflows/phase4-validation.yml` uses a disposable Neo4j Community service on pushes to `dev`. It performs:
+
+```text
+compileall
+Phase 4 offline contract tests
+structured Neo4j integration regression
+read-only EXPLAIN/PROFILE audit
+existing Neo4j Community parity regression
+```
+
+This validation path prevents developers from having to point mutating integration tests at their main local Neo4j instance.
+
+## 13. External boundaries unchanged
+
+Phase 4A/4A.1/4B.1 do not change Product backend endpoints, Product PostgreSQL schema, Streamlit/Product frontend request contracts, public graph API routes, Qdrant collections, memory schema, EvidencePack, ContextComposer or Synthesizer contracts.
+
+Current chat identity fields remain `conversation_id`, `session_id`, `request_id`, `message`, and optional `ui_context.selected_ip`.
+
+## 14. Next: Phase 4B.2
+
+Phase 4B.2 owns actual agent execution integration:
+
+```text
+graph.search_assets
+graph.aggregate_assets
+typed capability inputs
+PlanValidator support
+deterministic direct-plan compilation
+Planner catalog exposure
+Graph Specialist normalization
+```
+
+Phase 4B.3 then owns set-aware evidence classes, EvidencePack/Reviewer semantics and bounded model-context projection. Phase 4B.4 owns short-term result-set continuity such as “those assets” without turning result rows into focal entities.
+
+## 15. Near-future GraphRAG roadmap
+
+```text
+Phase 4B.2 capability/execution integration
+Phase 4B.3 evidence/context integration
+Phase 4B.4 bounded result-set continuity
+Phase 4C   cross-source exact search → selective Product/Detection/topology deepening
+Phase 5    measured Neo4j full-text retrieval
+Phase 6    semantic Asset search with controlled Asset text + vector index
+Phase 7    hybrid exact/full-text/vector seeding + bounded traversal
+Phase 8    Organizational RAG across Neo4j + Product + Qdrant + Memory
+Phase 9    expensive/offline graph intelligence and temporal analytics
+```
+
+Target flow:
 
 ```text
 User
-→ TurnPolicy / entity + selector resolution
-→ Router
+→ TurnPolicy / entity authority
+→ semantic Router + optional StructuredQuerySpec
+→ deterministic task validation
 → direct plan or bounded Planner
 → Neo4j organizational candidate retrieval
 → bounded candidate selection
-→ selective Product Profile/Detection for at most the needed focal Assets
+→ selective Product Profile/Detection for only needed focal Assets
 → optional bounded topology expansion
 → optional Qdrant security knowledge
 → EvidencePack
@@ -318,54 +309,3 @@ User
 → Synthesizer
 → bounded memory/result-set continuity update
 ```
-
-## 14. Frontend/backend/database boundary
-
-Phase 4A/4A.1 changes no external contract.
-
-Current chat request fields remain:
-
-```text
-conversation_id
-session_id
-request_id
-message
-ui_context.selected_ip
-```
-
-Product-backed Streamlit and legacy/local Streamlit continue using `/chat` or `/chat/stream`. Existing graph routes remain unchanged. Product/PostgreSQL continues to own production chat/memory persistence where configured; Qdrant remains semantic knowledge/memory indexing; Neo4j remains graph projection/storage.
-
-A future Asset-set UI may render bounded rows/filter chips and allow selecting an Asset into `selected_ip`, but that is intentionally deferred until agent/backend contracts are stable.
-
-## 15. Validation history and next acceptance gate
-
-Completed before 4A.1:
-
-- Phase 3/3.5 focused offline suites passed;
-- isolated Neo4j Community regression suite passed (`14 passed` in the latest local run supplied for 4A);
-- Phase 4A structured retrieval suite passed (`9 passed`, one Neo4j driver preview warning in the latest supplied local run);
-- `git diff --check` was clean before the Phase 4A commit;
-- Phase 4A commit: `65c5a4d` (`feat(graph): add structured asset retrieval foundation`).
-
-After pulling Phase 4A.1 locally, run:
-
-```bash
-.venv/bin/python -m pytest \
-  app/src/tests/test_structured_graph_retrieval.py \
-  app/src/tests/test_graph_phase4a1_hardening.py -q
-
-SOORIN_RUN_NEO4J_INTEGRATION=1 \
-SOORIN_NEO4J_URI=bolt://127.0.0.1:<isolated-port> \
-SOORIN_NEO4J_USER=neo4j \
-SOORIN_NEO4J_PASSWORD='<isolated-password>' \
-.venv/bin/python -m pytest \
-  app/src/tests/test_structured_graph_neo4j_integration.py \
-  app/src/tests/test_neo4j_community_parity.py -q
-
-.venv/bin/python -m compileall -q app/src
-git diff --check
-```
-
-Never run the mutating integration suites against the main Neo4j runtime.
-
-The GitHub-side Phase 4A.1 commit can be statically reviewed and committed here, but local Docker/Neo4j execution remains the final runtime acceptance evidence before promoting the same commit to the organization repository.

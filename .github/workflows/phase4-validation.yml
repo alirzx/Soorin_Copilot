@@ -1,0 +1,61 @@
+name: Phase 4 Graph Validation
+
+on:
+  push:
+    branches: [dev]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  phase4-validation:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      neo4j:
+        image: neo4j:2026.07.1
+        env:
+          NEO4J_AUTH: neo4j/phase4a-ci-password
+        ports:
+          - 7687:7687
+        options: >-
+          --health-cmd "cypher-shell -u neo4j -p phase4a-ci-password 'RETURN 1' || exit 1"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 30
+    env:
+      PYTHONPATH: app
+      SOORIN_NEO4J_URI: bolt://127.0.0.1:7687
+      SOORIN_NEO4J_USER: neo4j
+      SOORIN_NEO4J_PASSWORD: phase4a-ci-password
+      SOORIN_NEO4J_DATABASE: neo4j
+      SOORIN_RUN_NEO4J_INTEGRATION: "1"
+      SOORIN_PHASE4A1_PROFILE: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install focused validation dependencies
+        run: python -m pip install pytest==9.1.1 pydantic==2.13.4 neo4j==6.1.0 requests==2.34.2
+      - name: Compile runtime modules
+        run: python -m compileall -q app/src
+      - name: Run Phase 4 offline contracts
+        run: >-
+          python -m pytest
+          app/src/tests/test_structured_graph_retrieval.py
+          app/src/tests/test_graph_phase4a1_hardening.py
+          app/src/tests/test_phase4b1_structured_routing.py
+          app/src/tests/test_phase4b1_task_mapping.py
+          -q
+      - name: Run structured Neo4j integration regression
+        run: python -m pytest app/src/tests/test_structured_graph_neo4j_integration.py -q
+      - name: Run read-only EXPLAIN and PROFILE audit
+        run: python app/scripts/audit_phase4a1_query_plans.py > phase4a1-query-plan.json
+      - name: Run Neo4j Community regression
+        run: python -m pytest app/src/tests/test_neo4j_community_parity.py -q
+      - name: Show Phase 4A.1 query-plan evidence
+        if: always()
+        run: cat phase4a1-query-plan.json 2>/dev/null || true

@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
+from src.core.graph.structured import StructuredQuerySpec
 from src.core.rag.models import KnowledgeSearchResult
 
 EntitySource = Literal["message", "ui", "conversation"]
@@ -15,6 +16,8 @@ EntityMode = Literal["none", "single", "multiple", "ambiguous", "invalid"]
 IntentName = Literal[
     "general_knowledge",
     "asset_investigation",
+    "asset_search",
+    "asset_aggregate",
     "graph_neighbors",
     "graph_relationships",
     "graph_path",
@@ -29,6 +32,8 @@ EntityBinding = Literal["explicit", "ui", "active_single", "active_pair", "none"
 
 
 def compact_preview(text: str, limit: int = 120) -> str:
+    if not text:
+        return ""
     return text.strip().replace("\n", " ")[:limit]
 
 
@@ -72,6 +77,7 @@ class IntentDecision:
     requires_detection: bool = False
     requires_asset_profile: bool = False
     requires_knowledge: bool = False
+    structured_query: StructuredQuerySpec | None = None
     entity_binding: EntityBinding = "none"
     requested_entity_binding: str = "none"
     binding_source: str = ""
@@ -126,6 +132,7 @@ class RouteDecision:
     use_detection: bool = False
     use_asset_profile: bool = False
     use_knowledge: bool = False
+    structured_query: StructuredQuerySpec | None = None
     entity_binding: EntityBinding = "none"
     requested_entity_binding: str = "none"
     resolved_entity_binding: EntityBinding = "none"

@@ -1,0 +1,226 @@
+"""Structured Asset-set routing extension for Phase 4B.1.
+
+This module intentionally wraps the established semantic router instead of
+replacing its entity/topology validation. Set queries are a separate semantic
+contract: selectors describe an Asset set and never become active entities.
+Execution is introduced by Phase 4B.2.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+from dataclasses import replace
+from typing import Any
+
+from pydantic import ValidationError
+
+from src.core.context.intent import (
+    SemanticIntentRouter as _BaseSemanticIntentRouter,
+    _extract_first_json_object,
+    validate_router_payload,
+)
+from src.core.context.models import EntityResolution, IntentDecision, RouteDecision
+from src.core.context.router import normalize_intent_route as _base_normalize_intent_route
+from src.core.graph.structured import StructuredQueryMode, StructuredQuerySpec
+from src.core.memory.routing_state import SessionRoutingState
+
+
+logger = logging.getLogger(__name__)
+_SET_INTENTS = {"asset_search", "asset_aggregate"}
+
+
+def validate_structured_router_payload(
+    payload: dict[str, Any],
+    entities: EntityResolution,
+    *,
+    min_confidence: float,
+    message: str = "",
+    routing_state: SessionRoutingState | None = None,
+    ui_context: dict[str, Any] | None = None,
+) -> IntentDecision:
+    """Validate either the established entity route or one typed Asset-set route."""
+    intent = str(payload.get("intent") or "")
+    raw_query = payload.get("structured_query")
+
+    if intent not in _SET_INTENTS:
+        if raw_query is not None:
+            raise ValueError("schema_validation_failed:structured_query_requires_set_intent")
+        legacy_payload = dict(payload)
+        legacy_payload.pop("structured_query", None)
+        return validate_router_payload(
+            legacy_payload,
+            entities,
+            min_confidence=min_confidence,
+            message=message,
+            routing_state=routing_state,
+            ui_context=ui_context,
+        )
+
+    if raw_query is None:
+        raise ValueError("schema_validation_failed:structured_query_required")
+    try:
+        query = StructuredQuerySpec.model_validate(raw_query)
+    except ValidationError as exc:
+        raise ValueError("schema_validation_failed:structured_query") from exc
+
+    expected_mode = (
+        StructuredQueryMode.SEARCH
+        if intent == "asset_search"
+        else StructuredQueryMode.AGGREGATE
+    )
+    if query.mode is not expected_mode:
+        raise ValueError("schema_validation_failed:structured_query_mode")
+
+    allowed = {
+        "intent",
+        "scope",
+        "direction",
+        "depth",
+        "requires_graph",
+        "requires_detection",
+        "requires_asset_profile",
+        "requires_knowledge",
+        "structured_query",
+        "entity_binding",
+        "requires_multiple_entities",
+        "is_followup",
+        "classification_confidence",
+        "reason",
+    }
+    if unexpected := sorted(set(payload).difference(allowed)):
+        raise ValueError(f"schema_validation_failed:unexpected={','.join(unexpected)}")
+    required = allowed.difference({"requires_knowledge"})
+    if missing := sorted(required.difference(payload)):
+        raise ValueError(f"schema_validation_failed:missing={','.join(missing)}")
+
+    try:
+        confidence = float(payload["classification_confidence"])
+    except (TypeError, ValueError) as exc:
+        raise ValueError("schema_validation_failed:classification_confidence") from exc
+    if not 0 <= confidence <= 1:
+        raise ValueError("schema_validation_failed:classification_confidence_range")
+    if confidence < min_confidence:
+        raise ValueError("low_confidence")
+
+    if payload.get("scope") != "none" or payload.get("direction") != "none":
+        raise ValueError("schema_validation_failed:structured_query_scope")
+    if payload.get("depth") != 0:
+        raise ValueError("schema_validation_failed:structured_query_depth")
+    if payload.get("entity_binding") != "none":
+        raise ValueError("schema_validation_failed:structured_query_entity_binding")
+    for name in (
+        "requires_graph",
+        "requires_detection",
+        "requires_asset_profile",
+        "requires_multiple_entities",
+        "is_followup",
+    ):
+        if not isinstance(payload.get(name), bool):
+            raise ValueError(f"schema_validation_failed:{name}")
+    if "requires_knowledge" in payload and not isinstance(payload["requires_knowledge"], bool):
+        raise ValueError("schema_validation_failed:requires_knowledge")
+    if not payload["requires_graph"]:
+        raise ValueError("schema_validation_failed:structured_query_requires_graph")
+    if payload["requires_detection"] or payload["requires_asset_profile"]:
+        raise ValueError("schema_validation_failed:structured_query_cannot_deepen_without_focal_entity")
+    if payload["requires_multiple_entities"]:
+        raise ValueError("schema_validation_failed:structured_query_is_not_entity_pair")
+
+    return IntentDecision(
+        intent=intent,  # type: ignore[arg-type]
+        scope="none",
+        direction="none",
+        depth=0,
+        requires_graph=True,
+        requires_detection=False,
+        requires_asset_profile=False,
+        requires_knowledge=bool(payload.get("requires_knowledge", False)),
+        structured_query=query,
+        entity_binding="none",
+        requested_entity_binding="none",
+        binding_source="none",
+        binding_available=True,
+        materialized_entity_count=0,
+        materialized_entities=(),
+        requires_multiple_entities=False,
+        relationship_mode="none",
+        is_followup=bool(payload["is_followup"]),
+        classification_confidence=confidence,
+        reason=str(payload.get("reason") or "")[:220],
+        decision_source="semantic_router",
+        router_called=True,
+        content_present=True,
+    )
+
+
+class SemanticIntentRouter(_BaseSemanticIntentRouter):
+    """Established router plus deterministic validation of Asset-set output."""
+
+    def _decision_from_content(
+        self,
+        content: str,
+        finish_reason: str | None,
+        entities: EntityResolution,
+        routing_context: dict[str, Any],
+        routing_state: SessionRoutingState | None,
+        ui_context: dict[str, Any] | None,
+        request_id: str,
+    ) -> IntentDecision:
+        if not content:
+            raise ValueError("missing_content")
+        if finish_reason == "length":
+            raise ValueError("finish_reason_length")
+        try:
+            payload = json.loads(_extract_first_json_object(content))
+        except (ValueError, json.JSONDecodeError):
+            logger.warning(
+                "event=intent_router_json_parse_failed request_id=%s reason=structured_extension_parse",
+                request_id,
+            )
+            raise
+        if not isinstance(payload, dict):
+            raise ValueError("malformed_json:not_object")
+        return validate_structured_router_payload(
+            payload,
+            entities,
+            min_confidence=self.settings.intent_router_min_confidence,
+            message=str(routing_context.get("message") or ""),
+            routing_state=routing_state,
+            ui_context=ui_context,
+        )
+
+
+def normalize_intent_route(
+    decision: IntentDecision,
+    entities: EntityResolution,
+) -> RouteDecision:
+    """Preserve existing routes and carry Asset-set semantics without entity pollution."""
+    route = _base_normalize_intent_route(decision, entities)
+    if decision.structured_query is None:
+        return route
+    return replace(
+        route,
+        use_graph=True,
+        use_detection=False,
+        use_asset_profile=False,
+        structured_query=decision.structured_query,
+        entity_binding="none",
+        requested_entity_binding="none",
+        resolved_entity_binding="none",
+        binding_source="none",
+        binding_available=True,
+        materialized_entity_count=0,
+        materialized_entities=(),
+        target_entity=None,
+        target_entities=[],
+        matched_signals=[decision.intent, "structured_asset_set"],
+        graph_intent_detected=True,
+        asset_investigation_detected=False,
+        intent=decision.intent,
+        scope="none",
+        direction="none",
+        depth=0,
+        requires_multiple_entities=False,
+        relationship_mode="none",
+    )
