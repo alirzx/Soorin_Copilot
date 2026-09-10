@@ -179,7 +179,7 @@ class GraphContextProvider:
             {
                 "scope": "asset_search",
                 "requested_scope": "asset_search",
-                "direction": "none",
+                "graph_direction": "none",
                 "depth": 0,
                 "candidate_node_count": result.matched_total,
                 "retrieved_node_count": result.returned_count,

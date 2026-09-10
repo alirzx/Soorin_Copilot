@@ -59,7 +59,11 @@ def structured_evidence_from_context(
 ) -> StructuredAssetSetEvidence | None:
     """Create a typed evidence envelope from the allow-listed provider context."""
     active_graph_version = _optional_string(context.get("active_graph_version"))
-    filters = dict(context.get("filters") or {})
+    filters = {
+        str(key): value
+        for key, value in dict(context.get("filters") or {}).items()
+        if value is not None
+    }
     retrieved_at = str(context.get("retrieved_at") or "")
     if capability == "graph.search_assets":
         query = {
