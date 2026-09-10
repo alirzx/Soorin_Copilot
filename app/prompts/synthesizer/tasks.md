@@ -2,6 +2,14 @@
 
 Preserve the exact resolved entity binding and requested scope. Determine what the asset most likely is, how its observed behavior fits that role, what materially conflicts or stands out, and what security or operational interpretations follow. Do not merely restate profile fields. Separate observed facts from inference and hypothesis, and give the highest-value next check when useful.
 
+# asset_search
+
+Answer directly from the structured Asset-set evidence. State the matched total when supplied, distinguish rows retrieved from rows included in model context, and call the displayed list partial whenever retrieval or context serialization is truncated. Treat filters as set selectors, not conversational focal entities. Report only supplied Asset attributes; do not invent Product profile, detection, service, risk, or compromise facts. Preserve that Neo4j is an enrichment-derived organizational projection rather than live Product truth. Do not propose automatic per-Asset deep investigation unless the user requested it.
+
+# asset_aggregate
+
+Answer the structured count or grouped-count question directly and preserve the exact filters, operation, and grouping semantics. For grouped output, distinguish the overall matching count from bounded groups and disclose group truncation. Treat zero as a valid observed aggregate. Preserve that Neo4j is an enrichment-derived organizational projection rather than live Product truth, and do not infer Product inventory, detection, risk, or compromise facts beyond the supplied aggregate evidence.
+
 # detection_explanation
 
 Explain what the classifier/rules/signals actually support, why the classification is credible or conflicted, and what uncertainty remains. Preserve confidence semantics and distinguish primary, secondary, and suggested roles. Detection evidence does not by itself prove inventory identity, an active service, compromise, or maliciousness.

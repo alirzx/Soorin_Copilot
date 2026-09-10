@@ -111,7 +111,7 @@ class PromptModuleRegistry:
         "output_constraints": "output_constraints.md",
     }
     _REQUIRED = {
-        "tasks": frozenset({"asset_investigation", "detection_explanation", "graph_summary", "relationship", "path", "comparison", "memory_recall", "general_security", "knowledge_explanation"}),
+        "tasks": frozenset({"asset_investigation", "asset_search", "asset_aggregate", "detection_explanation", "graph_summary", "relationship", "path", "comparison", "memory_recall", "general_security", "knowledge_explanation"}),
         "temporal": frozenset({"current", "historical", "mixed", "compare_previous_current"}),
         "evidence_mode": frozenset({"normal", "memory_only", "no_live_refresh", "current_verification", "verify_if_stale"}),
         "execution": frozenset({"current_retrieval_completed", "current_retrieval_partial", "current_retrieval_not_performed", "baseline_available", "baseline_unavailable", "working_memory_write"}),
@@ -473,6 +473,10 @@ class SynthesizerPromptBuilder:
     def _task_category(task: TaskSpec) -> str:
         if task.evidence_mode == "memory_only" or task.intent == "memory_recall":
             return "memory_recall"
+        if task.intent == "asset_search":
+            return "asset_search"
+        if task.intent == "asset_aggregate":
+            return "asset_aggregate"
         if task.scope == "path":
             return "path"
         if task.scope == "multi_entity_comparison" or task.relationship_mode == "compare":

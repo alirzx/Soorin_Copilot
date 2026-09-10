@@ -16,6 +16,7 @@ from src.core.agent.task_mapping import task_spec_from_route
 from src.core.context.models import GraphProviderResult, ProviderProvenance, RouteDecision
 from src.core.context.composer import ContextComposer
 from src.core.context.models import EntityResolution, approx_tokens
+from src.core.context.synthesizer_prompt import SynthesizerPromptBuilder
 from src.core.graph.structured import StructuredQuerySpec
 
 
@@ -460,3 +461,52 @@ def test_aggregate_context_is_compact_and_preserves_count_and_groups() -> None:
     assert '"group_by":"status"' in text
     assert '"value":"CONFIRMED"' in text
     assert approx_tokens(text) < 900
+
+
+def test_synthesizer_selects_asset_search_module_with_partial_set_rules() -> None:
+    query = StructuredQuerySpec.model_validate({
+        "mode": "search",
+        "filters": {"status": "CONFIRMED"},
+    })
+    result = _registry().execute("graph.search_assets", {
+        "filters": {"status": "CONFIRMED"},
+    })
+    review = EvidenceReviewer().review(_task(query), [result])
+    builder = SynthesizerPromptBuilder()
+    context = builder.build_context(_task(query), (result,), review=review)
+    prompt, modules = builder.render_contract(context)
+
+    assert context.task_category == "asset_search"
+    assert "task.asset_search" in modules
+    assert "State the matched total" in prompt
+    assert "displayed list partial" in prompt
+    assert "not conversational focal entities" in prompt
+    assert "rather than live Product truth" in prompt
+    assert context.graph.truncated
+
+
+def test_synthesizer_selects_compact_asset_aggregate_module_without_llm_call() -> None:
+    query = StructuredQuerySpec.model_validate({
+        "mode": "aggregate",
+        "filters": {"role": "Domain Controller"},
+        "operation": "count",
+    })
+    result = _registry().execute("graph.aggregate_assets", {
+        "filters": {"role": "Domain Controller"},
+        "operation": "count",
+    })
+    builder = SynthesizerPromptBuilder()
+    context = builder.build_context(_task(query), (result,))
+    rendered = builder.render_messages(
+        static_core="Ground every claim.",
+        context=context,
+        dynamic_evidence='{"count":12,"mode":"aggregate"}',
+        history=[],
+        user_message="How many Domain Controllers do we have?",
+    )
+
+    assert context.task_category == "asset_aggregate"
+    assert "task.asset_aggregate" in rendered.selected_module_names
+    assert "Treat zero as a valid observed aggregate" in rendered.dynamic_prompt
+    assert "bounded groups" in rendered.dynamic_prompt
+    assert any('"count":12' in message["content"] for message in rendered.messages)
