@@ -572,6 +572,34 @@ Secrets such as API keys, passwords, Product tokens, captcha bypass values, and 
 
 `SOORIN_GRAPH_COMPARISON_MAX_SHARED_PEERS` limits how many shared peer identities are explicitly included in two-asset comparison evidence. A larger value preserves more overlap detail at higher token cost; a smaller value retains aggregate shared-peer counts while showing fewer concrete identities.
 
+### `SOORIN_GRAPH_ENRICHMENT_ENABLED`
+
+`SOORIN_GRAPH_ENRICHMENT_ENABLED` enables explicit runs of the bounded Product-to-Neo4j Asset enrichment worker. It defaults to `false`. Phase 1/2 does not register a background scheduler, so this setting alone does not initiate Product traffic at startup or on a timer.
+
+### `SOORIN_GRAPH_ENRICHMENT_CONCURRENCY`
+
+`SOORIN_GRAPH_ENRICHMENT_CONCURRENCY` documents and enforces the current Product detection-overview concurrency limit. The only supported value is `1`; any higher value fails settings validation. All enrichment service instances in one application process share one lock, so sweep and on-demand Product overview requests cannot overlap.
+
+### `SOORIN_GRAPH_ENRICHMENT_BATCH_SIZE`
+
+`SOORIN_GRAPH_ENRICHMENT_BATCH_SIZE` is the maximum number of success or failure mutations sent through one parameterized Neo4j `UNWIND` transaction. The default is `100`. It must be positive and must not exceed the page size. Product calls remain serial regardless of this write batch size.
+
+### `SOORIN_GRAPH_ENRICHMENT_PAGE_SIZE`
+
+`SOORIN_GRAPH_ENRICHMENT_PAGE_SIZE` bounds one keyset page selected from the active topology projection. The default is `500`. Increasing it permits more serial Product calls per explicit worker-page run and increases the largest in-memory page/buffer envelope; it never enables full-graph loading or offset pagination.
+
+### `SOORIN_GRAPH_ENRICHMENT_REFRESH_SECONDS`
+
+`SOORIN_GRAPH_ENRICHMENT_REFRESH_SECONDS` defines when a successful Asset enrichment becomes due again. The default is `259200` seconds (72 hours). This is a rolling freshness target used by eligibility metadata, not a monolithic 72-hour scheduler; Phase 3 will repeatedly consume bounded due pages.
+
+### `SOORIN_GRAPH_ENRICHMENT_RETRY_SECONDS`
+
+`SOORIN_GRAPH_ENRICHMENT_RETRY_SECONDS` defines when a transient Product transport/API failure becomes eligible for another worker attempt. The default is `3600` seconds. Unavailable and malformed-contract responses use the slower enrichment freshness cadence instead. Product HTTP retry/backoff remains owned by the existing shared `ProductApiClient`; this setting does not add nested HTTP retries.
+
+### Asset enrichment phase boundary
+
+Phase 1/2 stores validated detection-overview properties and operational enrichment metadata on the active versioned `Asset` nodes. New topology nodes begin as `pending`, and matching enrichment is carried to a newly published topology version. This foundation does not add a scheduler, search indexes for semantic fields, exact GraphRAG capabilities, full-text/vector retrieval, Qdrant changes, or on-demand graph-query integration.
+
 ### `SOORIN_GRAPH_AUTO_REFRESH_ENABLED`
 
 `SOORIN_GRAPH_AUTO_REFRESH_ENABLED` controls the background Graph refresh scheduler. `true` periodically retrieves current topology from Product and safely replaces the active graph after validation; `false` leaves the loaded last-known-good artifact unchanged until an explicit/manual refresh path is used.
