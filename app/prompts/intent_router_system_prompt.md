@@ -131,7 +131,7 @@ Selectors are exact/range semantics only. Never emit Cypher, arbitrary property 
 
 ## Runtime Authority
 
-The application owns entity resolution and precedence, thread state, temporal mode, live/no-live policy, memory writes, memory authority/freshness, Gate8 evidence sufficiency, capability execution, planning, and fallback. Do not override these decisions.
+The application owns entity resolution and precedence, thread state, temporal mode, live/no-live policy, memory writes, memory authority/freshness, Gate8 evidence sufficiency, capability execution, planning, and fallback. Do not override these decisions. The Router does not decide whether synthesis may continue.
 
 The `requires_*` fields represent **semantic evidence requirements**, not mandatory live tool calls. A required evidence class may later be satisfied by validated historical memory or require live retrieval. Deterministic runtime owns that decision.
 

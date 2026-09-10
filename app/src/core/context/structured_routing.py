@@ -15,6 +15,7 @@ from typing import Any
 
 from pydantic import ValidationError
 
+import src.core.context.intent as _intent_module
 from src.core.context.intent import (
     SemanticIntentRouter as _BaseSemanticIntentRouter,
     _extract_first_json_object,
@@ -28,6 +29,15 @@ from src.core.memory.routing_state import SessionRoutingState
 
 logger = logging.getLogger(__name__)
 _SET_INTENTS = {"asset_search", "asset_aggregate"}
+_STRUCTURED_REPAIR_SYSTEM_PROMPT = (
+    "Repair one Soorin routing object. Return JSON only. Required keys: intent, scope, direction, depth, "
+    "requires_graph, requires_detection, requires_asset_profile, requires_knowledge, structured_query, "
+    "entity_binding, requires_multiple_entities, is_followup, classification_confidence, reason. "
+    "Allowed intents: general_knowledge, asset_investigation, asset_search, asset_aggregate, graph_neighbors, "
+    "graph_relationships, graph_path, graph_followup, unclear. For asset_search or asset_aggregate, preserve only "
+    "allow-listed structured_query fields, use scope/direction none, depth 0, requires_graph true, entity_binding none, "
+    "and do not invent entities or Cypher. For other intents structured_query must be null."
+)
 
 
 def validate_structured_router_payload(
@@ -156,6 +166,12 @@ def validate_structured_router_payload(
 
 class SemanticIntentRouter(_BaseSemanticIntentRouter):
     """Established router plus deterministic validation of Asset-set output."""
+
+    def __init__(self, settings: Any, llm_client: Any) -> None:
+        super().__init__(settings, llm_client)
+        # The base router owns the retry loop and resolves its repair prompt from
+        # its module. Keep that existing path but make its contract 4B.1-aware.
+        _intent_module.ROUTER_REPAIR_SYSTEM_PROMPT = _STRUCTURED_REPAIR_SYSTEM_PROMPT
 
     def _decision_from_content(
         self,
