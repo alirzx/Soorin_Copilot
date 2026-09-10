@@ -20,6 +20,7 @@ from src.core.agent.contracts import (
     RetryPolicy,
     ToolResult,
 )
+from src.core.agent.structured_evidence import structured_evidence_from_context
 from src.core.rag.models import KnowledgeSearchResult
 from src.core.graph.structured import (
     AssetAggregateCapabilityInput,
@@ -392,6 +393,11 @@ def build_capability_registry(
             total_count = int(context.get("count") or 0)
             included_count = int(context.get("retrieved_node_count") or 0)
         truncated = bool(context.get("truncated", False))
+        structured_evidence = structured_evidence_from_context(
+            capability,
+            context,
+            limitations=tuple(normalized.limitations),
+        )
         return replace(
             normalized,
             total_count=total_count,
@@ -399,7 +405,18 @@ def build_capability_registry(
             omitted_count=max(0, total_count - included_count),
             truncated=truncated,
             completeness="partial" if truncated else normalized.completeness,
-            evidence_type="organizational_asset_set",
+            evidence_type=(
+                "graph_asset_search"
+                if capability == "graph.search_assets"
+                else "graph_asset_aggregate"
+            ),
+            normalized_query_hash=(
+                structured_evidence.query_identity if structured_evidence else ""
+            ),
+            context_identity=(
+                structured_evidence.query_identity if structured_evidence else ""
+            ),
+            structured_asset_set=structured_evidence,
         )
 
     def structured_search(payload: AssetSearchCapabilityInput) -> ToolResult:

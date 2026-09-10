@@ -21,7 +21,8 @@ EvidenceClass = Literal[
     "asset_network_activity", "detection_classification", "detection_explanation",
     "detection_contradictions", "detection_similarity", "detection_cluster",
     "detection_raw_behavior", "graph_summary", "graph_neighbors",
-    "graph_relationship", "graph_path", "knowledge_background",
+    "graph_relationship", "graph_path", "graph_asset_search",
+    "graph_asset_aggregate", "knowledge_background",
 ]
 MemoryDecision = Literal[
     "memory_sufficient", "memory_sufficient_verification_required",
@@ -33,6 +34,7 @@ VOLATILE_EVIDENCE = frozenset({
     "detection_explanation", "detection_contradictions", "detection_similarity",
     "detection_cluster", "detection_raw_behavior", "graph_summary", "graph_neighbors",
     "graph_relationship", "graph_path",
+    "graph_asset_search", "graph_asset_aggregate",
 })
 HISTORICAL_WORDS = frozenset({"previously", "historical", "formerly", "was", "past", "last"})
 
@@ -173,6 +175,8 @@ class EvidenceRequirementPolicy:
         "graph.get_relationship": "graph_relationship",
         "graph.compare_assets": "graph_relationship",
         "graph.find_path": "graph_path",
+        "graph.search_assets": "graph_asset_search",
+        "graph.aggregate_assets": "graph_asset_aggregate",
     }
 
     def derive(self, task: TaskSpec) -> EvidenceRequirementSet:

@@ -25,6 +25,8 @@ def context_result_identity(
         parts.append(entity_part)
     if capability == "graph.get_neighbors" and scope:
         parts.append(scope)
+    if capability in {"graph.search_assets", "graph.aggregate_assets"} and query_hash:
+        parts.append(query_hash)
     if capability == "knowledge.search":
         if query_hash:
             parts.append(query_hash)

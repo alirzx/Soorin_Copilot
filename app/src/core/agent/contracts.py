@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import json
-from typing import Annotated, Any, Literal, TypedDict
+from typing import Annotated, Any, Literal, TypeAlias, TypedDict
 import operator
 
 from src.core.graph.structured import StructuredQuerySpec
@@ -89,6 +89,52 @@ class EvidenceReceipt:
 
 
 @dataclass(frozen=True)
+class StructuredAssetSearchEvidence:
+    """Canonical evidence for one zero-entity Asset-set search receipt."""
+
+    capability: Literal["graph.search_assets"]
+    query_identity: str
+    normalized_filters: dict[str, Any]
+    active_graph_version: str | None
+    sort: str
+    direction: str
+    matched_total: int
+    returned_count: int
+    truncated: bool
+    rows: tuple[dict[str, Any], ...]
+    retrieved_at: str
+    limitations: tuple[str, ...] = ()
+    mode: Literal["search"] = "search"
+    provenance: str = "neo4j_active_organizational_projection"
+    schema_version: str = "structured-asset-search-evidence-v1"
+
+
+@dataclass(frozen=True)
+class StructuredAssetAggregateEvidence:
+    """Canonical evidence for one zero-entity Asset-set aggregate receipt."""
+
+    capability: Literal["graph.aggregate_assets"]
+    query_identity: str
+    normalized_filters: dict[str, Any]
+    active_graph_version: str | None
+    operation: str
+    group_by: str | None
+    count: int
+    groups: tuple[dict[str, Any], ...]
+    truncated: bool
+    retrieved_at: str
+    limitations: tuple[str, ...] = ()
+    mode: Literal["aggregate"] = "aggregate"
+    provenance: str = "neo4j_active_organizational_projection"
+    schema_version: str = "structured-asset-aggregate-evidence-v1"
+
+
+StructuredAssetSetEvidence: TypeAlias = (
+    StructuredAssetSearchEvidence | StructuredAssetAggregateEvidence
+)
+
+
+@dataclass(frozen=True)
 class ToolResult:
     status: ToolStatus
     entities: tuple[str, ...]
@@ -137,6 +183,7 @@ class ToolResult:
     projection_omitted_count: int = 0
     projection_schema_version: str = ""
     evidence_receipt: EvidenceReceipt | None = None
+    structured_asset_set: StructuredAssetSetEvidence | None = None
 
 
 @dataclass(frozen=True)
@@ -272,6 +319,7 @@ class EvidencePack:
     open_questions: tuple[str, ...] = ()
     supplemental_history: tuple[dict[str, Any], ...] = ()
     review_outcome: ReviewOutcome | None = None
+    structured_asset_sets: tuple[StructuredAssetSetEvidence, ...] = ()
 
 
 @dataclass(frozen=True)

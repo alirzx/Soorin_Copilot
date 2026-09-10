@@ -298,6 +298,11 @@ class EvidenceReviewer:
             missing_evidence=missing,
             supplemental_history=supplemental_history,
             review_outcome=review.outcome if review else None,
+            structured_asset_sets=tuple(
+                result.structured_asset_set
+                for result in results
+                if result.structured_asset_set is not None
+            ),
         )
 
     @staticmethod
