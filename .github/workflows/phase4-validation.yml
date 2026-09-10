@@ -49,6 +49,8 @@ jobs:
           app/src/tests/test_graph_phase4a1_hardening.py
           app/src/tests/test_phase4b1_structured_routing.py
           app/src/tests/test_phase4b1_task_mapping.py
+          app/src/tests/test_phase4b2_structured_capabilities.py
+          app/src/tests/test_phase4b3_structured_evidence.py
           app/src/tests/test_context_routing.py
           app/src/tests/test_agentic_rag_foundation.py
           -q
