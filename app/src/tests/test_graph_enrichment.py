@@ -15,6 +15,7 @@ import pytest
 from src.config.settings import get_settings
 from src.core.graph.enrichment import AssetEnrichmentService
 from src.core.graph.enrichment_models import (
+    AssetEnrichmentEligibility,
     AssetEnrichmentMutation,
     EnrichmentAssetPage,
     EnrichmentWriteResult,
@@ -211,11 +212,15 @@ class RecordingWorkerRepository:
     def __init__(self, pages: dict[str | None, EnrichmentAssetPage]) -> None:
         self.pages = pages
         self.page_calls: list[dict[str, Any]] = []
+        self.page_called = threading.Event()
         self.batches: list[list[AssetEnrichmentMutation]] = []
         self._write_lock = threading.Lock()
+        self._lease_lock = threading.Lock()
+        self._leases: dict[str, str] = {}
 
     def list_due_enrichment_assets(self, **kwargs: Any) -> EnrichmentAssetPage:
         self.page_calls.append(kwargs)
+        self.page_called.set()
         return self.pages[kwargs["after_graph_key"]]
 
     def apply_enrichment_batch(
@@ -226,6 +231,34 @@ class RecordingWorkerRepository:
         return EnrichmentWriteResult(
             attempted=len(mutations), updated=len(mutations)
         )
+
+    def get_asset_enrichment_eligibility(
+        self, graph_key: str, **_kwargs: Any
+    ) -> AssetEnrichmentEligibility:
+        return AssetEnrichmentEligibility(graph_key, True, True, "pending")
+
+    def try_acquire_lease(
+        self, lease_name: str, owner_id: str, **_kwargs: Any
+    ) -> bool:
+        with self._lease_lock:
+            current = self._leases.get(lease_name)
+            if current not in {None, owner_id}:
+                return False
+            self._leases[lease_name] = owner_id
+            return True
+
+    def renew_lease(
+        self, lease_name: str, owner_id: str, **_kwargs: Any
+    ) -> bool:
+        with self._lease_lock:
+            return self._leases.get(lease_name) == owner_id
+
+    def release_lease(self, lease_name: str, owner_id: str) -> bool:
+        with self._lease_lock:
+            if self._leases.get(lease_name) != owner_id:
+                return False
+            del self._leases[lease_name]
+            return True
 
 
 def test_concurrent_sweep_and_on_demand_callers_share_one_product_lane() -> None:
@@ -391,9 +424,11 @@ class RecordingSession:
         self,
         *,
         read_records: list[dict[str, Any]] | None = None,
+        read_record: dict[str, Any] | None = None,
         missing_keys: set[str] | None = None,
     ) -> None:
         self.read_records = read_records or []
+        self.read_record = read_record
         self.missing_keys = missing_keys or set()
         self.read_calls: list[tuple[str, dict[str, Any]]] = []
         self.write_calls: list[tuple[str, dict[str, Any]]] = []
@@ -403,7 +438,7 @@ class RecordingSession:
     def run(self, query: Any, **params: Any) -> Result:
         text = getattr(query, "text", query)
         self.read_calls.append((text, params))
-        return Result(records=self.read_records)
+        return Result(records=self.read_records, record=self.read_record)
 
     def execute_write(self, callback):
         self.transactions += 1
@@ -436,11 +471,11 @@ def test_repository_uses_active_version_keyset_and_fetches_only_page_plus_one() 
 
     query, params = session.read_calls[0]
     assert page == EnrichmentAssetPage(
-        ("10.0.0.1", "10.0.0.2", "10.0.0.3"), "10.0.0.3", True
+        ("10.0.0.1", "10.0.0.2", "10.0.0.3"), "0|10.0.0.3", True
     )
     assert "graph_version: m.active_graph_version" in query
-    assert "a.graph_key > $after_graph_key" in query
-    assert "ORDER BY a.graph_key ASC" in query
+    assert "priority = $after_priority AND a.graph_key > $after_graph_key" in query
+    assert "ORDER BY priority ASC, a.graph_key ASC" in query
     assert "LIMIT $fetch_limit" in query
     assert "enrichment_status IS NULL" in query
     assert "enrichment_status = 'pending'" in query
@@ -485,6 +520,54 @@ def test_repository_batches_updates_and_reports_missing_without_creating_assets(
     assert "WHEN a.enrichment_last_success_at IS NULL THEN row.status" in query
 
 
+def test_repository_single_asset_freshness_and_cached_backlog_inputs_are_bounded() -> None:
+    session = RecordingSession(
+        read_record={
+            "found": True,
+            "needs_refresh": False,
+            "status": "success",
+            "last_success_at": NOW.isoformat(),
+            "next_due_at": (NOW + timedelta(hours=72)).isoformat(),
+            "pending": 1,
+            "stale": 2,
+            "error": 3,
+            "unavailable": 4,
+            "backlog": 10,
+        }
+    )
+    repository = Neo4jGraphRepository(
+        RecordingDriver(session), settings()  # type: ignore[arg-type]
+    )
+
+    eligibility = repository.get_asset_enrichment_eligibility(
+        "192.0.2.1",
+        as_of=NOW,
+        stale_before=NOW - timedelta(hours=72),
+    )
+    backlog = repository.enrichment_backlog_counts(
+        as_of=NOW,
+        stale_before=NOW - timedelta(hours=72),
+    )
+
+    assert eligibility == AssetEnrichmentEligibility(
+        "192.0.2.1",
+        True,
+        False,
+        "success",
+        NOW.isoformat(),
+        (NOW + timedelta(hours=72)).isoformat(),
+    )
+    assert backlog == {
+        "pending": 1,
+        "stale": 2,
+        "error": 3,
+        "unavailable": 4,
+        "backlog": 10,
+    }
+    assert len(session.read_calls) == 2
+    assert all("m.active_graph_version" in query for query, _ in session.read_calls)
+
+
 def test_schema_bootstrap_adds_only_the_enrichment_schedule_index() -> None:
     session = RecordingSession()
     repository = Neo4jGraphRepository(
@@ -494,7 +577,8 @@ def test_schema_bootstrap_adds_only_the_enrichment_schedule_index() -> None:
     repository.bootstrap_schema()
 
     statements = [query for query, _ in session.read_calls]
-    assert len(statements) == 4
+    assert len(statements) == 5
+    assert sum("soorin_runtime_lease_name" in query for query in statements) == 1
     assert sum("asset_enrichment_schedule" in query for query in statements) == 1
     assert "enrichment_next_due_at" in statements[-1]
 
@@ -603,6 +687,11 @@ def test_enrichment_settings_defaults_and_bounds() -> None:
     configured = get_settings()
     assert configured.graph_enrichment_concurrency == 1
     assert configured.graph_enrichment_refresh_seconds == 259200
+    assert configured.graph_enrichment_poll_interval_seconds == 60
+    assert configured.graph_enrichment_startup_delay_seconds == 5
+    assert configured.graph_enrichment_max_pages_per_cycle == 4
+    assert configured.graph_enrichment_lease_ttl_seconds == 900
+    assert configured.graph_enrichment_shutdown_timeout_seconds == 30
     with pytest.raises(ValueError, match="must be 1"):
         replace(
             configured, graph_enrichment_concurrency=2
@@ -610,6 +699,10 @@ def test_enrichment_settings_defaults_and_bounds() -> None:
     with pytest.raises(ValueError, match="must not exceed"):
         replace(
             configured, graph_enrichment_batch_size=6, graph_enrichment_page_size=5
+        ).validate_graph_enrichment_configuration()
+    with pytest.raises(ValueError, match="at least 3"):
+        replace(
+            configured, graph_enrichment_lease_ttl_seconds=2
         ).validate_graph_enrichment_configuration()
 
 
@@ -627,3 +720,32 @@ def test_disabled_worker_does_not_enumerate_or_call_product() -> None:
     assert product.calls == []
     assert repository.page_calls == []
     assert repository.batches == []
+
+
+def test_worker_waiting_for_local_product_lane_honors_shutdown_signal() -> None:
+    graph_key = "192.0.2.1"
+    product = RecordingProductClient({graph_key: product_response(graph_key)})
+    repository = RecordingWorkerRepository(
+        {None: EnrichmentAssetPage((graph_key,), graph_key, False)}
+    )
+    held_lane = threading.Lock()
+    held_lane.acquire()
+    cancel = threading.Event()
+    service = AssetEnrichmentService(
+        settings(),
+        product,
+        repository,  # type: ignore[arg-type]
+        product_request_lock=held_lane,
+        now=lambda: NOW,
+    )
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(service.run_page, cancel_event=cancel)
+        assert repository.page_called.wait(timeout=1)
+        cancel.set()
+        result = future.result(timeout=1)
+    held_lane.release()
+
+    assert result.attempted == 0
+    assert result.has_more is True
+    assert product.calls == []

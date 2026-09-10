@@ -305,6 +305,11 @@ class Settings:
     graph_enrichment_page_size: int
     graph_enrichment_refresh_seconds: int
     graph_enrichment_retry_seconds: int
+    graph_enrichment_poll_interval_seconds: int
+    graph_enrichment_startup_delay_seconds: int
+    graph_enrichment_max_pages_per_cycle: int
+    graph_enrichment_lease_ttl_seconds: int
+    graph_enrichment_shutdown_timeout_seconds: int
     graph_max_ui_nodes: int
     graph_default_min_degree: int
     graph_api_max_neighbors: int
@@ -409,6 +414,10 @@ class Settings:
             raise ValueError(
                 "SOORIN_GRAPH_ENRICHMENT_BATCH_SIZE must not exceed "
                 "SOORIN_GRAPH_ENRICHMENT_PAGE_SIZE."
+            )
+        if self.graph_enrichment_lease_ttl_seconds < 3:
+            raise ValueError(
+                "SOORIN_GRAPH_ENRICHMENT_LEASE_TTL_SECONDS must be at least 3."
             )
 
     def validate_rag_qdrant_configuration(self) -> None:
@@ -783,6 +792,21 @@ def get_settings() -> Settings:
         ),
         graph_enrichment_retry_seconds=max(
             1, _int("SOORIN_GRAPH_ENRICHMENT_RETRY_SECONDS", 3600)
+        ),
+        graph_enrichment_poll_interval_seconds=max(
+            1, _int("SOORIN_GRAPH_ENRICHMENT_POLL_INTERVAL_SECONDS", 60)
+        ),
+        graph_enrichment_startup_delay_seconds=max(
+            0, _int("SOORIN_GRAPH_ENRICHMENT_STARTUP_DELAY_SECONDS", 5)
+        ),
+        graph_enrichment_max_pages_per_cycle=max(
+            1, _int("SOORIN_GRAPH_ENRICHMENT_MAX_PAGES_PER_CYCLE", 4)
+        ),
+        graph_enrichment_lease_ttl_seconds=max(
+            3, _int("SOORIN_GRAPH_ENRICHMENT_LEASE_TTL_SECONDS", 900)
+        ),
+        graph_enrichment_shutdown_timeout_seconds=max(
+            1, _int("SOORIN_GRAPH_ENRICHMENT_SHUTDOWN_TIMEOUT_SECONDS", 30)
         ),
         graph_max_ui_nodes=_int("SOORIN_GRAPH_MAX_UI_NODES", 1000),
         graph_default_min_degree=_int("SOORIN_GRAPH_DEFAULT_MIN_DEGREE", 1),

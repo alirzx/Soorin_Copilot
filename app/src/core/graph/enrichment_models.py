@@ -12,6 +12,8 @@ from src.core.product_client import ProductAssetDetectionOverview
 
 
 EnrichmentStatus = Literal["pending", "success", "stale", "error", "unavailable"]
+EnrichmentRefreshMode = Literal["refresh_if_stale", "force_refresh"]
+EnrichmentTrigger = Literal["scheduled", "manual", "on_demand"]
 
 
 @dataclass(frozen=True)
@@ -107,6 +109,28 @@ class EnrichmentWriteResult:
     attempted: int
     updated: int
     missing_graph_keys: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class AssetEnrichmentEligibility:
+    graph_key: str
+    found: bool
+    needs_refresh: bool
+    status: EnrichmentStatus | None = None
+    last_success_at: str | None = None
+    next_due_at: str | None = None
+
+
+@dataclass(frozen=True)
+class AssetEnrichmentActionResult:
+    graph_key: str
+    mode: EnrichmentRefreshMode
+    found: bool
+    refreshed: bool
+    skipped: bool
+    status: EnrichmentStatus | None = None
+    updated: int = 0
+    message: str = ""
 
 
 @dataclass(frozen=True)

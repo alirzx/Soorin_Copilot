@@ -356,6 +356,64 @@ class SoorinMetrics:
             ("kind",),
             registry=self.registry,
         )
+        self.graph_enrichment_cycles = Counter(
+            "soorin_graph_enrichment_scheduler_cycles_total",
+            "Graph enrichment scheduler cycle lifecycle outcomes.",
+            ("trigger", "outcome"),
+            registry=self.registry,
+        )
+        self.graph_enrichment_assets = Counter(
+            "soorin_graph_enrichment_assets_total",
+            "Graph enrichment Asset outcomes.",
+            ("trigger", "outcome"),
+            registry=self.registry,
+        )
+        self.graph_enrichment_product_requests = Counter(
+            "soorin_graph_enrichment_product_overview_requests_total",
+            "Product detection-overview outcomes for graph enrichment.",
+            ("trigger", "outcome"),
+            registry=self.registry,
+        )
+        self.graph_enrichment_cycle_duration = Histogram(
+            "soorin_graph_enrichment_scheduler_cycle_duration_seconds",
+            "Duration of one bounded graph enrichment scheduler cycle.",
+            ("trigger",),
+            buckets=WORKFLOW_DURATION_BUCKETS,
+            registry=self.registry,
+        )
+        self.graph_enrichment_product_duration = Histogram(
+            "soorin_graph_enrichment_product_overview_duration_seconds",
+            "Product detection-overview latency for graph enrichment.",
+            ("trigger",),
+            buckets=DEPENDENCY_DURATION_BUCKETS,
+            registry=self.registry,
+        )
+        self.graph_enrichment_scheduler_running = Gauge(
+            "soorin_graph_enrichment_scheduler_running",
+            "Whether this process is executing an enrichment cycle.",
+            registry=self.registry,
+        )
+        self.graph_enrichment_scheduler_owns_lease = Gauge(
+            "soorin_graph_enrichment_scheduler_owns_lease",
+            "Whether this process owns the distributed enrichment scheduler lease.",
+            registry=self.registry,
+        )
+        self.graph_enrichment_backlog = Gauge(
+            "soorin_graph_enrichment_backlog_assets",
+            "Cached active-projection enrichment counts by bounded state.",
+            ("state",),
+            registry=self.registry,
+        )
+        self.graph_enrichment_last_run_timestamp = Gauge(
+            "soorin_graph_enrichment_last_run_timestamp_seconds",
+            "Unix timestamp of the latest completed enrichment cycle.",
+            registry=self.registry,
+        )
+        self.graph_enrichment_last_success_timestamp = Gauge(
+            "soorin_graph_enrichment_last_success_timestamp_seconds",
+            "Unix timestamp of the latest successful enrichment cycle.",
+            registry=self.registry,
+        )
 
         for collector in self.registry._collector_to_names:
             labels = tuple(getattr(collector, "_labelnames", ()))
@@ -532,6 +590,97 @@ class SoorinMetrics:
         if self.enabled:
             self.workflow_fallbacks.labels(_bounded(kind, WORKFLOW_FALLBACK_KINDS)).inc()
 
+    def graph_enrichment_cycle_started(self, trigger: str) -> None:
+        if not self.enabled:
+            return
+        safe_trigger = _bounded(trigger, GRAPH_ENRICHMENT_TRIGGERS)
+        self.graph_enrichment_cycles.labels(safe_trigger, "started").inc()
+        self.graph_enrichment_scheduler_running.set(1)
+
+    def observe_graph_enrichment_cycle(
+        self,
+        trigger: str,
+        *,
+        outcome: str,
+        duration_seconds: float,
+        timestamp: float | None = None,
+    ) -> None:
+        if not self.enabled:
+            return
+        safe_trigger = _bounded(trigger, GRAPH_ENRICHMENT_TRIGGERS)
+        safe_outcome = _bounded(outcome, {"completed", "failed"}, "failed")
+        self.graph_enrichment_cycles.labels(safe_trigger, safe_outcome).inc()
+        self.graph_enrichment_cycle_duration.labels(safe_trigger).observe(
+            max(0.0, duration_seconds)
+        )
+        completed_at = time.time() if timestamp is None else max(0.0, timestamp)
+        self.graph_enrichment_last_run_timestamp.set(completed_at)
+        if safe_outcome == "completed":
+            self.graph_enrichment_last_success_timestamp.set(completed_at)
+        self.graph_enrichment_scheduler_running.set(0)
+
+    def observe_graph_enrichment_assets(
+        self,
+        trigger: str,
+        *,
+        attempted: int = 0,
+        succeeded: int = 0,
+        failed: int = 0,
+        unavailable: int = 0,
+        updated: int = 0,
+        skipped: int = 0,
+    ) -> None:
+        if not self.enabled:
+            return
+        safe_trigger = _bounded(trigger, GRAPH_ENRICHMENT_TRIGGERS)
+        values = {
+            "attempted": attempted,
+            "succeeded": succeeded,
+            "failed": failed,
+            "unavailable": unavailable,
+            "updated": updated,
+            "skipped": skipped,
+        }
+        for outcome, value in values.items():
+            if int(value) > 0:
+                self.graph_enrichment_assets.labels(safe_trigger, outcome).inc(
+                    int(value)
+                )
+
+    def observe_graph_enrichment_product(
+        self,
+        trigger: str,
+        *,
+        outcome: str,
+        duration_seconds: float,
+    ) -> None:
+        if not self.enabled:
+            return
+        safe_trigger = _bounded(trigger, GRAPH_ENRICHMENT_TRIGGERS)
+        safe_outcome = _bounded(
+            outcome,
+            GRAPH_ENRICHMENT_PRODUCT_OUTCOMES,
+            "error",
+        )
+        self.graph_enrichment_product_requests.labels(
+            safe_trigger, safe_outcome
+        ).inc()
+        self.graph_enrichment_product_duration.labels(safe_trigger).observe(
+            max(0.0, duration_seconds)
+        )
+
+    def set_graph_enrichment_lease_owned(self, owned: bool) -> None:
+        if self.enabled:
+            self.graph_enrichment_scheduler_owns_lease.set(1 if owned else 0)
+
+    def set_graph_enrichment_backlog(self, counts: dict[str, int]) -> None:
+        if not self.enabled:
+            return
+        for state in GRAPH_ENRICHMENT_BACKLOG_STATES:
+            self.graph_enrichment_backlog.labels(state).set(
+                max(0, int(counts.get(state, 0)))
+            )
+
     def observe_view(self, capability: str, views: Iterable[str]) -> None:
         if not self.enabled:
             return
@@ -593,6 +742,11 @@ BOUNDED_WORKFLOW_STAGES = frozenset(
         "safe_failure",
         "safe_failure_response",
     }
+)
+GRAPH_ENRICHMENT_TRIGGERS = frozenset({"scheduled", "manual", "on_demand"})
+GRAPH_ENRICHMENT_PRODUCT_OUTCOMES = frozenset({"success", "error", "unavailable"})
+GRAPH_ENRICHMENT_BACKLOG_STATES = frozenset(
+    {"pending", "stale", "error", "unavailable", "backlog"}
 )
 
 

@@ -120,3 +120,39 @@ class GraphTopologyResponse(BaseModel):
     max_nodes: int = Field(ge=1)
     min_degree: int = Field(ge=0)
     subnet: str = ""
+
+
+class GraphEnrichmentRuntimeStatusResponse(BaseModel):
+    enabled: bool
+    started: bool
+    running: bool
+    owns_lease: bool
+    poll_interval_seconds: int = Field(ge=0)
+    max_pages_per_cycle: int = Field(ge=0)
+    last_wake_at: str | None = None
+    last_wake_reason: str | None = None
+    last_run_at: str | None = None
+    last_success_at: str | None = None
+    last_failure_at: str | None = None
+    last_error_type: str | None = None
+    consecutive_failures: int = Field(ge=0)
+    last_pages: int = Field(ge=0)
+    last_attempted: int = Field(ge=0)
+    last_updated: int = Field(ge=0)
+    backlog: dict[str, int]
+
+
+class GraphEnrichmentWakeResponse(BaseModel):
+    accepted: bool
+    reason: str
+
+
+class GraphAssetEnrichmentResponse(BaseModel):
+    graph_key: str
+    mode: Literal["refresh_if_stale", "force_refresh"]
+    found: bool
+    refreshed: bool
+    skipped: bool
+    status: Literal["pending", "success", "stale", "error", "unavailable"] | None = None
+    updated: int = Field(ge=0)
+    message: str

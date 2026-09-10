@@ -5,6 +5,9 @@ from __future__ import annotations
 from functools import lru_cache
 
 from src.config.settings import Settings, get_settings
+from src.core.graph.enrichment import AssetEnrichmentService
+from src.core.graph.enrichment_runtime import GraphEnrichmentRuntimeService
+from src.core.graph.neo4j import Neo4jDriver, Neo4jGraphRepository
 from src.core.graph.refresh import GraphRefreshService
 from src.core.graph.service import GraphService
 from src.core.memory.factory import LocalPersistenceAdapters, build_local_persistence
@@ -29,9 +32,41 @@ def get_product_memory_client() -> ProductMemoryClient:
 
 
 @lru_cache(maxsize=1)
+def get_graph_repository() -> Neo4jGraphRepository:
+    settings = get_settings()
+    return Neo4jGraphRepository(Neo4jDriver(settings), settings)
+
+
+@lru_cache(maxsize=1)
+def get_asset_enrichment_service() -> AssetEnrichmentService:
+    return AssetEnrichmentService(
+        get_settings(),
+        get_product_api_client(),
+        get_graph_repository(),
+    )
+
+
+@lru_cache(maxsize=1)
+def get_graph_enrichment_runtime_service() -> GraphEnrichmentRuntimeService:
+    return GraphEnrichmentRuntimeService(
+        get_settings(),
+        get_asset_enrichment_service(),
+        get_graph_repository(),
+    )
+
+
+@lru_cache(maxsize=1)
 def get_graph_refresh_service() -> GraphRefreshService:
     settings: Settings = get_settings()
-    return GraphRefreshService(settings, get_product_api_client())
+    runtime = get_graph_enrichment_runtime_service()
+    return GraphRefreshService(
+        settings,
+        get_product_api_client(),
+        get_graph_repository(),
+        on_new_pending_assets=lambda _count, _version: runtime.wake(
+            reason="new_assets"
+        ),
+    )
 
 
 @lru_cache(maxsize=1)

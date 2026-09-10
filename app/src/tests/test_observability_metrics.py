@@ -49,6 +49,20 @@ def test_metrics_registry_exposes_expected_prometheus_families() -> None:
     metrics.observe_memory_canonical_reload("product", "success")
     metrics.observe_memory_vector("search", "failure")
     metrics.observe_workflow_fallback("routing")
+    metrics.graph_enrichment_cycle_started("scheduled")
+    metrics.observe_graph_enrichment_assets(
+        "scheduled", attempted=2, succeeded=1, unavailable=1, updated=1
+    )
+    metrics.observe_graph_enrichment_product(
+        "scheduled", outcome="success", duration_seconds=0.04
+    )
+    metrics.set_graph_enrichment_lease_owned(True)
+    metrics.set_graph_enrichment_backlog(
+        {"pending": 1, "stale": 2, "error": 3, "unavailable": 4, "backlog": 10}
+    )
+    metrics.observe_graph_enrichment_cycle(
+        "scheduled", outcome="completed", duration_seconds=0.2, timestamp=1.0
+    )
     metrics.observe_view("asset.get_profile", ("overview",))
     metrics.observe_llm(
         SimpleNamespace(
@@ -84,6 +98,16 @@ def test_metrics_registry_exposes_expected_prometheus_families() -> None:
         "soorin_memory_canonical_reload",
         "soorin_memory_vector_operations",
         "soorin_workflow_fallbacks",
+        "soorin_graph_enrichment_scheduler_cycles",
+        "soorin_graph_enrichment_assets",
+        "soorin_graph_enrichment_product_overview_requests",
+        "soorin_graph_enrichment_scheduler_cycle_duration_seconds",
+        "soorin_graph_enrichment_product_overview_duration_seconds",
+        "soorin_graph_enrichment_scheduler_running",
+        "soorin_graph_enrichment_scheduler_owns_lease",
+        "soorin_graph_enrichment_backlog_assets",
+        "soorin_graph_enrichment_last_run_timestamp_seconds",
+        "soorin_graph_enrichment_last_success_timestamp_seconds",
     } <= names
 
 
@@ -104,10 +128,19 @@ def test_product_and_stream_label_values_are_bounded() -> None:
         status_code=503,
     )
     metrics.observe_stream(duration_seconds=0.3, status="arbitrary-client-value")
+    metrics.observe_graph_enrichment_product(
+        "192.0.2.1", outcome="request-123", duration_seconds=0.1
+    )
     rendered = metrics.render().decode("utf-8")
     assert 'soorin_product_requests_total{operation="other",status_class="5xx"} 1.0' in rendered
     assert 'soorin_errors_total{error_class="unavailable",subsystem="product"} 1.0' in rendered
     assert 'soorin_stream_completions_total{status="error"} 1.0' in rendered
+    assert (
+        'soorin_graph_enrichment_product_overview_requests_total{outcome="error",trigger="other"} 1.0'
+        in rendered
+    )
+    assert "192.0.2.1" not in rendered
+    assert "request-123" not in rendered
 
 
 @pytest.mark.parametrize(

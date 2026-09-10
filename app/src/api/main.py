@@ -8,7 +8,11 @@ from fastapi import Depends, FastAPI, Response
 from fastapi.middleware.cors import CORSMiddleware
 
 from src.api.auth import verify_api_key
-from src.api.dependencies import get_graph_refresh_service as get_api_graph_refresh_service
+from src.api.dependencies import (
+    get_graph_enrichment_runtime_service,
+    get_graph_refresh_service as get_api_graph_refresh_service,
+    get_graph_repository,
+)
 from src.api.graph_routes import router as graph_router
 from src.api.local_simulation_routes import router as local_simulation_router
 from src.api.routes import copilot_service, router
@@ -74,6 +78,7 @@ def create_app() -> FastAPI:
             settings.agent_executor_max_concurrency,
         )
         refresh_service = get_api_graph_refresh_service()
+        enrichment_runtime = get_graph_enrichment_runtime_service()
         set_graph_refresh_service(refresh_service)
         loaded = refresh_service.load_last_known_good()
         logger.info(
@@ -83,12 +88,15 @@ def create_app() -> FastAPI:
             settings.graph_refresh_on_startup,
             settings.graph_refresh_interval_seconds,
         )
+        enrichment_runtime.start()
         refresh_service.start_background()
 
     @app.on_event("shutdown")
     def on_shutdown() -> None:
         refresh_service = get_api_graph_refresh_service()
         refresh_service.stop_background()
+        get_graph_enrichment_runtime_service().stop()
+        get_graph_repository().driver.close()
         set_graph_refresh_service(None)
         copilot_service.close()
         logger.info("event=application_shutdown")

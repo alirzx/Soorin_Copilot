@@ -17,6 +17,7 @@ from typing import Any, Iterator
 from src.config.settings import Settings
 from src.core.graph.enrichment_models import (
     AssetEnrichmentMutation,
+    AssetEnrichmentEligibility,
     EnrichmentAssetPage,
     EnrichmentWriteResult,
 )
@@ -75,6 +76,7 @@ class GraphProjectionStatus:
     nodes: int
     edges: int
     last_successful_sync: str | None
+    new_pending_assets: int = 0
 
 
 @dataclass(frozen=True)
@@ -208,6 +210,7 @@ class Neo4jGraphRepository:
         statements = (
             "CREATE CONSTRAINT asset_graph_identity IF NOT EXISTS FOR (a:Asset) REQUIRE (a.graph_key, a.graph_version) IS UNIQUE",
             "CREATE CONSTRAINT graph_metadata_id IF NOT EXISTS FOR (m:GraphMetadata) REQUIRE m.id IS UNIQUE",
+            "CREATE CONSTRAINT soorin_runtime_lease_name IF NOT EXISTS FOR (lease:SoorinRuntimeLease) REQUIRE lease.name IS UNIQUE",
             "CREATE INDEX asset_version_ip IF NOT EXISTS FOR (a:Asset) ON (a.graph_version, a.ip)",
             "CREATE INDEX asset_enrichment_schedule IF NOT EXISTS FOR (a:Asset) ON (a.graph_version, a.enrichment_status, a.enrichment_next_due_at)",
         )
@@ -225,12 +228,18 @@ class Neo4jGraphRepository:
         if not pairs:
             raise GraphSyncValidationError("Product topology response contained no valid graph records.")
         nodes = sorted({ip for pair in pairs for ip in (pair["source"], pair["target"])})
-        self._write_staging_nodes(nodes, version)
+        new_pending_assets = self._write_staging_nodes(nodes, version)
         self._write_staging_edges(pairs, version)
         self._validate_staging(version, len(nodes), len(pairs))
         self._publish(version)
         self._delete_inactive_versions(version)
-        return GraphProjectionStatus(version, len(nodes), len(pairs), _utc_now())
+        return GraphProjectionStatus(
+            version,
+            len(nodes),
+            len(pairs),
+            _utc_now(),
+            int(new_pending_assets or 0),
+        )
 
     def status(self) -> GraphProjectionStatus:
         query = """
@@ -615,41 +624,211 @@ class Neo4jGraphRepository:
         limit: int,
         as_of: datetime,
         stale_before: datetime,
+        prefer_stale: bool = False,
     ) -> EnrichmentAssetPage:
         """Return one keyset page from the active projection only."""
         cap = min(max(1, int(limit)), self.settings.graph_enrichment_page_size)
+        after_priority, after_key = self._decode_enrichment_cursor(after_graph_key)
         query = """
         MATCH (m:GraphMetadata {id: 'active'})
         MATCH (a:Asset {graph_version: m.active_graph_version})
-        WHERE ($after_graph_key IS NULL OR a.graph_key > $after_graph_key)
-          AND (
+        WITH a, CASE
+          WHEN a.enrichment_status IS NULL OR a.enrichment_status = 'pending'
+            THEN CASE WHEN $prefer_stale THEN 1 ELSE 0 END
+          ELSE CASE WHEN $prefer_stale THEN 0 ELSE 1 END
+        END AS priority
+        WHERE (
             a.enrichment_status IS NULL
             OR a.enrichment_status = 'pending'
             OR a.enrichment_next_due_at <= $as_of
             OR a.enrichment_last_success_at <= $stale_before
           )
-        RETURN a.graph_key AS graph_key
-        ORDER BY a.graph_key ASC
+          AND (
+            $after_priority IS NULL
+            OR priority > $after_priority
+            OR (priority = $after_priority AND a.graph_key > $after_graph_key)
+          )
+        RETURN a.graph_key AS graph_key, priority
+        ORDER BY priority ASC, a.graph_key ASC
         LIMIT $fetch_limit
         """
         try:
             with self.driver.session() as session:
                 result = session.run(
                     self._query(query),
-                    after_graph_key=after_graph_key,
+                    after_graph_key=after_key,
+                    after_priority=after_priority,
                     as_of=as_of.isoformat(),
                     stale_before=stale_before.isoformat(),
+                    prefer_stale=prefer_stale,
                     fetch_limit=cap + 1,
                 )
-                keys = [str(record["graph_key"]) for record in result]
+                rows = [
+                    (int(record.get("priority", 0)), str(record["graph_key"]))
+                    for record in result
+                ]
         except Exception as exc:
             raise Neo4jUnavailable("Neo4j enrichment enumeration failed.") from exc
-        selected = keys[:cap]
+        selected = rows[:cap]
         return EnrichmentAssetPage(
-            graph_keys=tuple(selected),
-            next_cursor=selected[-1] if selected else after_graph_key,
-            has_more=len(keys) > cap,
+            graph_keys=tuple(graph_key for _, graph_key in selected),
+            next_cursor=(
+                self._encode_enrichment_cursor(*selected[-1])
+                if selected
+                else after_graph_key
+            ),
+            has_more=len(rows) > cap,
         )
+
+    def get_asset_enrichment_eligibility(
+        self,
+        graph_key: str,
+        *,
+        as_of: datetime,
+        stale_before: datetime,
+    ) -> AssetEnrichmentEligibility:
+        """Inspect one active Asset without contacting Product."""
+        query = """
+        MATCH (m:GraphMetadata {id: 'active'})
+        OPTIONAL MATCH (a:Asset {
+          graph_version: m.active_graph_version,
+          graph_key: $graph_key
+        })
+        RETURN a IS NOT NULL AS found,
+               a.enrichment_status AS status,
+               a.enrichment_last_success_at AS last_success_at,
+               a.enrichment_next_due_at AS next_due_at,
+               CASE WHEN a IS NULL THEN false ELSE (
+                 a.enrichment_status IS NULL
+                 OR a.enrichment_status = 'pending'
+                 OR a.enrichment_next_due_at <= $as_of
+                 OR a.enrichment_last_success_at <= $stale_before
+               ) END AS needs_refresh
+        """
+        row = self._single(
+            query,
+            graph_key=graph_key,
+            as_of=as_of.isoformat(),
+            stale_before=stale_before.isoformat(),
+        )
+        if row is None or not bool(row["found"]):
+            return AssetEnrichmentEligibility(graph_key, False, False)
+        return AssetEnrichmentEligibility(
+            graph_key=graph_key,
+            found=True,
+            needs_refresh=bool(row["needs_refresh"]),
+            status=row["status"],
+            last_success_at=row["last_success_at"],
+            next_due_at=row["next_due_at"],
+        )
+
+    def enrichment_backlog_counts(
+        self,
+        *,
+        as_of: datetime,
+        stale_before: datetime,
+    ) -> dict[str, int]:
+        """Calculate bounded state gauges once per scheduler cycle, never per scrape."""
+        query = """
+        MATCH (m:GraphMetadata {id: 'active'})
+        MATCH (a:Asset {graph_version: m.active_graph_version})
+        RETURN
+          count(CASE WHEN a.enrichment_status IS NULL OR a.enrichment_status = 'pending' THEN 1 END) AS pending,
+          count(CASE WHEN a.enrichment_status = 'stale' THEN 1 END) AS stale,
+          count(CASE WHEN a.enrichment_status = 'error' THEN 1 END) AS error,
+          count(CASE WHEN a.enrichment_status = 'unavailable' THEN 1 END) AS unavailable,
+          count(CASE WHEN
+            a.enrichment_status IS NULL
+            OR a.enrichment_status = 'pending'
+            OR a.enrichment_next_due_at <= $as_of
+            OR a.enrichment_last_success_at <= $stale_before
+          THEN 1 END) AS backlog
+        """
+        row = self._single(
+            query,
+            as_of=as_of.isoformat(),
+            stale_before=stale_before.isoformat(),
+        )
+        return {
+            state: int((row or {}).get(state, 0) or 0)
+            for state in ("pending", "stale", "error", "unavailable", "backlog")
+        }
+
+    def try_acquire_lease(
+        self,
+        lease_name: str,
+        owner_id: str,
+        *,
+        ttl_seconds: int,
+        now: datetime | None = None,
+    ) -> bool:
+        """Atomically acquire an absent, owned, or expired runtime lease."""
+        instant = now or datetime.now(timezone.utc)
+        expires_at = datetime.fromtimestamp(
+            instant.timestamp() + ttl_seconds, tz=timezone.utc
+        )
+        query = """
+        MERGE (lease:SoorinRuntimeLease {name: $lease_name})
+        ON CREATE SET lease.owner_id = $owner_id,
+                      lease.lease_expires_at = $expires_at,
+                      lease.updated_at = $now
+        WITH lease
+        WHERE lease.owner_id = $owner_id
+           OR lease.lease_expires_at IS NULL
+           OR datetime(lease.lease_expires_at) <= datetime($now)
+        SET lease.owner_id = $owner_id,
+            lease.lease_expires_at = $expires_at,
+            lease.updated_at = $now
+        RETURN lease.owner_id = $owner_id AS acquired
+        """
+        return self._lease_write(
+            query,
+            lease_name=lease_name,
+            owner_id=owner_id,
+            now=instant.isoformat(),
+            expires_at=expires_at.isoformat(),
+        )
+
+    def renew_lease(
+        self,
+        lease_name: str,
+        owner_id: str,
+        *,
+        ttl_seconds: int,
+        now: datetime | None = None,
+    ) -> bool:
+        instant = now or datetime.now(timezone.utc)
+        expires_at = datetime.fromtimestamp(
+            instant.timestamp() + ttl_seconds, tz=timezone.utc
+        )
+        query = """
+        MATCH (lease:SoorinRuntimeLease {name: $lease_name, owner_id: $owner_id})
+        SET lease.lease_expires_at = $expires_at, lease.updated_at = $now
+        RETURN true AS acquired
+        """
+        return self._lease_write(
+            query,
+            lease_name=lease_name,
+            owner_id=owner_id,
+            now=instant.isoformat(),
+            expires_at=expires_at.isoformat(),
+        )
+
+    def release_lease(self, lease_name: str, owner_id: str) -> bool:
+        query = """
+        MATCH (lease:SoorinRuntimeLease {name: $lease_name, owner_id: $owner_id})
+        DELETE lease
+        RETURN true AS acquired
+        """
+        return self._lease_write(query, lease_name=lease_name, owner_id=owner_id)
+
+    def _lease_write(self, query: str, **params: object) -> bool:
+        try:
+            with self.driver.session() as session:
+                row = session.execute_write(lambda tx: tx.run(query, **params).single())
+        except Exception as exc:
+            raise Neo4jUnavailable("Neo4j runtime lease operation failed.") from exc
+        return bool(row and row.get("acquired", False))
 
     @_serialized_graph_mutation
     def apply_enrichment_batch(
@@ -711,7 +890,7 @@ class Neo4jGraphRepository:
             missing_graph_keys=tuple(missing),
         )
 
-    def _write_staging_nodes(self, nodes: list[str], version: str) -> None:
+    def _write_staging_nodes(self, nodes: list[str], version: str) -> int:
         query = """
         UNWIND $rows AS row
         OPTIONAL MATCH (m:GraphMetadata {id: 'active'})
@@ -746,8 +925,9 @@ class Neo4jGraphRepository:
               a.enrichment_error = previous.enrichment_error
         )
         SET a.enrichment_status = coalesce(a.enrichment_status, 'pending')
+        RETURN sum(CASE WHEN previous IS NULL THEN 1 ELSE 0 END) AS new_assets
         """
-        self._batched(query, [{"ip": ip} for ip in nodes], version)
+        return self._batched(query, [{"ip": ip} for ip in nodes], version, count_key="new_assets")
 
     def _write_staging_edges(self, pairs: list[dict[str, Any]], version: str) -> None:
         query = """
@@ -759,16 +939,31 @@ class Neo4jGraphRepository:
         """
         self._batched(query, pairs, version)
 
-    def _batched(self, query: str, rows: list[dict[str, Any]], version: str) -> None:
+    def _batched(
+        self,
+        query: str,
+        rows: list[dict[str, Any]],
+        version: str,
+        *,
+        count_key: str | None = None,
+    ) -> int:
         size = self.settings.neo4j_sync_batch_size
+        total = 0
         try:
             with self.driver.session() as session:
                 for offset in range(0, len(rows), size):
                     batch = rows[offset : offset + size]
-                    session.execute_write(lambda tx: tx.run(query, rows=batch, version=version).consume())
+                    if count_key is None:
+                        session.execute_write(lambda tx: tx.run(query, rows=batch, version=version).consume())
+                    else:
+                        record = session.execute_write(
+                            lambda tx: tx.run(query, rows=batch, version=version).single()
+                        )
+                        total += int((record or {}).get(count_key, 0) or 0)
                     logger.info("event=graph_sync_batch_completed version=%s rows=%s", version, len(batch))
         except Exception as exc:
             raise Neo4jUnavailable("Neo4j batch synchronization failed.") from exc
+        return total
 
     def _validate_staging(self, version: str, expected_nodes: int, expected_edges: int) -> None:
         query = """
@@ -810,6 +1005,19 @@ class Neo4jGraphRepository:
         if Query is None:
             return cypher
         return Query(cypher, timeout=self.policy.timeout_seconds)
+
+    @staticmethod
+    def _encode_enrichment_cursor(priority: int, graph_key: str) -> str:
+        return f"{priority}|{graph_key}"
+
+    @staticmethod
+    def _decode_enrichment_cursor(cursor: str | None) -> tuple[int | None, str | None]:
+        if cursor is None:
+            return None, None
+        priority, separator, graph_key = cursor.partition("|")
+        if separator and priority in {"0", "1"}:
+            return int(priority), graph_key
+        return 0, cursor
 
 
 def _utc_now() -> str:

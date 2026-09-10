@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -117,7 +117,11 @@ def test_community_schema_contains_graph_identity_and_enrichment_indexes(
             for record in session.run("SHOW INDEXES YIELD name RETURN name")
         }
 
-    assert {"asset_graph_identity", "graph_metadata_id"}.issubset(
+    assert {
+        "asset_graph_identity",
+        "graph_metadata_id",
+        "soorin_runtime_lease_name",
+    }.issubset(
         constraint_names
     )
     assert {"asset_version_ip", "asset_enrichment_schedule"}.issubset(
@@ -434,3 +438,42 @@ def test_community_keyset_paging_crosses_real_pages_without_skips_or_duplicates(
     assert page_count == 8
     assert collected == expected
     assert len(collected) == len(set(collected))
+
+
+def test_community_runtime_lease_atomic_ownership_and_expiry(
+    repository: Neo4jGraphRepository,
+) -> None:
+    lease_name = "community-enrichment-lease-test"
+    owner_a = "owner-a"
+    owner_b = "owner-b"
+    now = datetime(2026, 9, 10, 8, 0, tzinfo=timezone.utc)
+    repository.release_lease(lease_name, owner_a)
+    repository.release_lease(lease_name, owner_b)
+
+    assert repository.try_acquire_lease(
+        lease_name, owner_a, ttl_seconds=30, now=now
+    ) is True
+    assert repository.try_acquire_lease(
+        lease_name, owner_b, ttl_seconds=30, now=now
+    ) is False
+    assert repository.renew_lease(
+        lease_name, owner_a, ttl_seconds=30, now=now + timedelta(seconds=5)
+    ) is True
+    assert repository.release_lease(lease_name, owner_b) is False
+    assert repository.release_lease(lease_name, owner_a) is True
+    assert repository.try_acquire_lease(
+        lease_name, owner_b, ttl_seconds=30, now=now
+    ) is True
+    assert repository.release_lease(lease_name, owner_b) is True
+
+    assert repository.try_acquire_lease(
+        lease_name, owner_a, ttl_seconds=3, now=now
+    ) is True
+    assert repository.try_acquire_lease(
+        lease_name,
+        owner_b,
+        ttl_seconds=30,
+        now=now + timedelta(seconds=4),
+    ) is True
+    assert repository.release_lease(lease_name, owner_a) is False
+    assert repository.release_lease(lease_name, owner_b) is True

@@ -9,7 +9,7 @@ import time
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from src.config.settings import Settings
 from src.core.graph.neo4j import GraphProjectionStatus, Neo4jDriver, Neo4jGraphRepository
@@ -70,10 +70,18 @@ class GraphRefreshError(RuntimeError):
 class GraphRefreshService:
     """Fetch, validate, persist, and atomically activate product topology graphs."""
 
-    def __init__(self, settings: Settings, product_client: ProductApiClient, repository: Neo4jGraphRepository | None = None) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        product_client: ProductApiClient,
+        repository: Neo4jGraphRepository | None = None,
+        *,
+        on_new_pending_assets: Callable[[int, str], None] | None = None,
+    ) -> None:
         self.settings = settings
         self.product_client = product_client
         self.repository = repository or Neo4jGraphRepository(Neo4jDriver(settings), settings)
+        self._on_new_pending_assets = on_new_pending_assets
         self._lock = threading.Lock()
         self._status_lock = threading.RLock()
         self._stop_event = threading.Event()
@@ -203,6 +211,18 @@ class GraphRefreshService:
 
             raw_snapshot_path = self._write_raw_snapshot(topology.raw_payload, snapshot_version)
             self._record_success(projection, raw_snapshot_path)
+            if projection.new_pending_assets > 0 and self._on_new_pending_assets is not None:
+                try:
+                    self._on_new_pending_assets(
+                        projection.new_pending_assets,
+                        snapshot_version,
+                    )
+                except Exception:
+                    logger.exception(
+                        "event=enrichment_wakeup_callback_failed snapshot_version=%s new_pending_assets=%s",
+                        snapshot_version,
+                        projection.new_pending_assets,
+                    )
             elapsed_ms = int((time.perf_counter() - started) * 1000)
             logger.info(
                 "event=graph_activated snapshot_version=%s nodes=%s edges=%s elapsed_ms=%s raw_path=%s",

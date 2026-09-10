@@ -4,14 +4,22 @@ from __future__ import annotations
 
 import ipaddress
 import logging
+from dataclasses import asdict
 from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 
 from src.api.auth import verify_api_key
-from src.api.dependencies import get_graph_service
+from src.api.dependencies import (
+    get_asset_enrichment_service,
+    get_graph_enrichment_runtime_service,
+    get_graph_service,
+)
 from src.api.schemas.graph import (
+    GraphAssetEnrichmentResponse,
     GraphContextResponse,
+    GraphEnrichmentRuntimeStatusResponse,
+    GraphEnrichmentWakeResponse,
     GraphNeighborsResponse,
     GraphNodeResponse,
     GraphPathResponse,
@@ -22,6 +30,9 @@ from src.api.schemas.graph import (
 from src.config.settings import get_settings
 from src.core.context.models import ResolvedEntity
 from src.core.graph.retrieval import GraphRetrievalSpec
+from src.core.graph.enrichment import AssetEnrichmentService
+from src.core.graph.enrichment_runtime import GraphEnrichmentRuntimeService
+from src.core.graph.neo4j import Neo4jUnavailable
 from src.core.graph.service import GraphService
 
 
@@ -173,3 +184,57 @@ def graph_topology(
         len(result["nodes"]), len(result["edges"]), result["max_nodes"], result["min_degree"], result["subnet"],
     )
     return GraphTopologyResponse(**result)
+
+
+@router.get(
+    "/enrichment/status",
+    response_model=GraphEnrichmentRuntimeStatusResponse,
+)
+def graph_enrichment_status(
+    runtime: GraphEnrichmentRuntimeService = Depends(
+        get_graph_enrichment_runtime_service
+    ),
+    _auth: None = Depends(verify_api_key),
+) -> GraphEnrichmentRuntimeStatusResponse:
+    return GraphEnrichmentRuntimeStatusResponse(**runtime.status())
+
+
+@router.post("/enrichment/wake", response_model=GraphEnrichmentWakeResponse)
+def graph_enrichment_wake(
+    runtime: GraphEnrichmentRuntimeService = Depends(
+        get_graph_enrichment_runtime_service
+    ),
+    _auth: None = Depends(verify_api_key),
+) -> GraphEnrichmentWakeResponse:
+    accepted = runtime.wake(reason="manual")
+    return GraphEnrichmentWakeResponse(accepted=accepted, reason="manual")
+
+
+@router.post(
+    "/enrichment/assets/{ip}",
+    response_model=GraphAssetEnrichmentResponse,
+)
+def graph_enrichment_asset(
+    ip: str,
+    mode: Literal["refresh_if_stale", "force_refresh"] = Query(
+        default="refresh_if_stale"
+    ),
+    service: AssetEnrichmentService = Depends(get_asset_enrichment_service),
+    _auth: None = Depends(verify_api_key),
+) -> GraphAssetEnrichmentResponse:
+    target_ip = _validate_ip(ip)
+    try:
+        result = service.enrich_asset(
+            target_ip,
+            request_id="graph-enrichment-manual",
+            mode=mode,
+            trigger="manual",
+        )
+    except Neo4jUnavailable as exc:
+        raise HTTPException(
+            status_code=503,
+            detail="Graph enrichment persistence is unavailable.",
+        ) from exc
+    if not result.found and result.message == "asset_not_found":
+        raise HTTPException(status_code=404, detail="Active graph Asset not found.")
+    return GraphAssetEnrichmentResponse(**asdict(result))
