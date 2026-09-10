@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import base64
+import binascii
+import hashlib
+import json
 from dataclasses import dataclass
 from typing import Any
 
@@ -43,6 +47,8 @@ class GraphStatus:
 class GraphService:
     """Controlled graph facade over the active Neo4j projection."""
 
+    _STRUCTURED_CURSOR_VERSION = 1
+
     def __init__(self, settings: Settings | None = None) -> None:
         self.settings = settings or get_settings()
         self.driver = Neo4jDriver(self.settings)
@@ -82,9 +88,49 @@ class GraphService:
         return {**context, "graph_provider": "neo4j_projection", "active_graph_version": projection.active_graph_version, "graph_last_successful_sync": projection.last_successful_sync}
 
     def search_assets(self, request: AssetSearchRequest) -> AssetSearchResult:
-        """Validate query bounds before entering the Neo4j repository."""
+        """Validate bounds and expose a cursor bound to query identity and graph version.
+
+        The repository cursor remains an internal keyset position.  The service
+        envelope prevents callers from replaying that position with different
+        filters/sort semantics or after the active topology projection changes.
+        """
         limit = self.repository.policy.structured_limit(request.limit)
-        return self.repository.search_assets(request.model_copy(update={"limit": limit}))
+        repository_cursor: str | None = None
+        expected_graph_version: str | None = None
+        if request.cursor is not None:
+            repository_cursor, expected_graph_version = self._decode_structured_cursor(
+                request.cursor,
+                request,
+            )
+
+        repository_request = request.model_copy(
+            update={"limit": limit, "cursor": repository_cursor}
+        )
+        result = self.repository.search_assets(repository_request)
+
+        if (
+            expected_graph_version is not None
+            and result.active_graph_version != expected_graph_version
+        ):
+            raise ValueError(
+                "Structured Asset search cursor was created for a different active graph version."
+            )
+
+        if result.next_cursor is None:
+            return result
+        if result.active_graph_version is None:
+            raise ValueError(
+                "Structured Asset search returned a cursor without an active graph version."
+            )
+        return result.model_copy(
+            update={
+                "next_cursor": self._encode_structured_cursor(
+                    request,
+                    graph_version=result.active_graph_version,
+                    repository_cursor=result.next_cursor,
+                )
+            }
+        )
 
     def aggregate_assets(self, request: AssetAggregateRequest) -> AssetAggregateResult:
         """Validate aggregate bounds before entering the Neo4j repository."""
@@ -92,6 +138,68 @@ class GraphService:
             limit = self.repository.policy.structured_limit(request.limit)
             request = request.model_copy(update={"limit": limit})
         return self.repository.aggregate_assets(request)
+
+    @staticmethod
+    def _structured_request_fingerprint(request: AssetSearchRequest) -> str:
+        payload = {
+            "filters": request.filters.query_values(),
+            "sort": request.sort.value,
+            "direction": request.direction.value,
+        }
+        canonical = json.dumps(
+            payload,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        return hashlib.sha256(canonical).hexdigest()
+
+    @classmethod
+    def _encode_structured_cursor(
+        cls,
+        request: AssetSearchRequest,
+        *,
+        graph_version: str,
+        repository_cursor: str,
+    ) -> str:
+        payload = {
+            "v": cls._STRUCTURED_CURSOR_VERSION,
+            "request": cls._structured_request_fingerprint(request),
+            "graph_version": graph_version,
+            "repository_cursor": repository_cursor,
+        }
+        encoded = json.dumps(
+            payload,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        return base64.urlsafe_b64encode(encoded).decode("ascii").rstrip("=")
+
+    @classmethod
+    def _decode_structured_cursor(
+        cls,
+        cursor: str,
+        request: AssetSearchRequest,
+    ) -> tuple[str, str]:
+        try:
+            padding = "=" * (-len(cursor) % 4)
+            payload = json.loads(
+                base64.b64decode(cursor + padding, altchars=b"-_", validate=True)
+            )
+        except (binascii.Error, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValueError("Invalid structured Asset search cursor.") from exc
+        if (
+            not isinstance(payload, dict)
+            or payload.get("v") != cls._STRUCTURED_CURSOR_VERSION
+            or payload.get("request") != cls._structured_request_fingerprint(request)
+            or not isinstance(payload.get("graph_version"), str)
+            or not payload["graph_version"]
+            or not isinstance(payload.get("repository_cursor"), str)
+            or not payload["repository_cursor"]
+        ):
+            raise ValueError("Structured Asset search cursor does not match the request.")
+        return payload["repository_cursor"], payload["graph_version"]
 
     def node(self, ip: str) -> dict[str, Any]:
         target_ip = ip.strip()

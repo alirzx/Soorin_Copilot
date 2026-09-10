@@ -246,12 +246,13 @@ class GraphRefreshService:
             elapsed_ms = int((time.perf_counter() - started) * 1000)
             error_type = type(exc).__name__
             self._record_failure(error_type, str(exc)[:220])
+            active_snapshot_preserved = self._active_snapshot_preserved()
             logger.warning(
                 "event=graph_refresh_failed snapshot_version=%s error_type=%s elapsed_ms=%s active_snapshot_preserved=%s message=%s",
                 snapshot_version,
                 error_type,
                 elapsed_ms,
-                self.repository.status().active_graph_version is not None,
+                active_snapshot_preserved,
                 str(exc)[:160],
             )
             return GraphRefreshResult(
@@ -365,6 +366,17 @@ class GraphRefreshService:
             self._status.last_error_type = error_type
             self._status.last_error_message = message[:220]
             self._status.consecutive_failures += 1
+
+    def _active_snapshot_preserved(self) -> bool:
+        """Best-effort failure telemetry must never replace the original refresh result."""
+        try:
+            return self.repository.status().active_graph_version is not None
+        except Exception as exc:
+            logger.warning(
+                "event=graph_refresh_failure_status_unavailable error_type=%s",
+                type(exc).__name__,
+            )
+            return False
 
     def _sync_active_metadata(self) -> None:
         try:
