@@ -141,6 +141,27 @@ class ProductAssetEndpointTests(unittest.TestCase):
         with patch("src.core.product_client.client.requests.Session", return_value=session):
             return ProductApiClient(make_settings(**settings_overrides))
 
+    def test_overview_uses_configured_path_and_shared_authenticated_get(self) -> None:
+        payload = {"ip": "192.0.2.10", "role": "Domain Controller"}
+        session = FakeSession([FakeResponse(200, payload)])
+        client = self.client(
+            session,
+            product_asset_detection_overview_path="/custom-overview/{ip}",
+        )
+
+        result = client.get_asset_detection_overview(
+            " 192.0.2.10 ", request_id="req-enrichment"
+        )
+
+        self.assertEqual(result.raw_payload, payload)
+        self.assertEqual(result.endpoint_path, "/custom-overview/192.0.2.10")
+        self.assertEqual(
+            session.get_calls[0]["url"],
+            "http://product.invalid/custom-overview/192.0.2.10",
+        )
+        self.assertEqual(session.get_calls[0]["headers"]["Authorization"], "Bearer bootstrap-token")
+        self.assertEqual(session.get_calls[0]["headers"]["x-hwid"], "test-hwid")
+
     def test_profile_uses_safe_get_path_shared_bearer_and_hwid_without_body(self) -> None:
         session = FakeSession([FakeResponse(200, profile_payload())])
         result = self.client(session).get_asset_profile(" 192.0.2.10 ", request_id="req-profile")

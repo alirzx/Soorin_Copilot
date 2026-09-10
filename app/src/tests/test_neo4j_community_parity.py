@@ -7,14 +7,17 @@ from __future__ import annotations
 
 import os
 from dataclasses import replace
+from datetime import datetime, timezone
 
 import pytest
 
 from src.config.settings import get_settings
 from src.core.graph.neo4j import Neo4jDriver, Neo4jGraphRepository, _ProjectionAdjacency
+from src.core.graph.enrichment_models import AssetEnrichmentMutation
 from src.core.graph.retrieval import GraphRetrievalSpec, _apply_completeness_contract, _two_hop_context
 from src.core.graph.neo4j import GraphSyncValidationError
 from src.core.context.models import ResolvedEntity
+from src.core.product_client import ProductAssetDetectionOverview
 from src.core.product_client.schemas import TopologyConnectionRecord
 
 
@@ -221,3 +224,124 @@ def test_comparison_peer_caps_match_adjacency_contract(repository: Neo4jGraphRep
     assert actual["retrieval_truncated"] is True
     assert actual["retrieval_complete"] is False
     assert actual["retrieval_truncation_reason"] == "comparison_peer_limit:1"
+
+
+def test_enrichment_lkg_idempotency_and_topology_version_carry_forward(
+    repository: Neo4jGraphRepository,
+) -> None:
+    now = datetime(2026, 9, 10, 8, 0, tzinfo=timezone.utc)
+    overview = ProductAssetDetectionOverview.from_payload(
+        {
+            "assetName": "SOORIN-DC",
+            "ip": "10.0.0.1",
+            "status": "CONFIRMED",
+            "suggestedType": "Domain Controller",
+            "modelConfidence": 0.99,
+            "mappingConfidence": 0.98,
+            "unknownScore": 0.01,
+            "classificationSummary": "Validated Community enrichment fixture.",
+            "vendor": "VMware",
+            "product": "Active Directory",
+            "role": "Domain Controller",
+            "roles": ["Domain Controller", "DNS Server"],
+            "tag": "services",
+            "subTag": "Active Directory",
+            "lastDetectionAt": "2026-09-09T13:04:41.835Z",
+        },
+        expected_ip="10.0.0.1",
+    )
+    success = AssetEnrichmentMutation.success(
+        overview, attempted_at=now, freshness_seconds=259200
+    )
+
+    with repository.driver.session() as session:
+        session.run(
+            "MATCH (m:GraphMetadata {id: 'active'}) "
+            "MATCH (a:Asset {graph_version: m.active_graph_version, graph_key: $key}) "
+            "SET a.unrelated_marker = 'keep'",
+            key="10.0.0.1",
+        ).consume()
+    first = repository.apply_enrichment_batch([success])
+    second = repository.apply_enrichment_batch([success])
+    assert first == second
+    assert first.updated == 1
+
+    with repository.driver.session() as session:
+        before_failure = session.run(
+            "MATCH (m:GraphMetadata {id: 'active'}) "
+            "MATCH (a:Asset {graph_version: m.active_graph_version, graph_key: $key}) "
+            "OPTIONAL MATCH (a)-[r:COMMUNICATES_WITH {graph_version: m.active_graph_version}]->() "
+            "RETURN properties(a) AS properties, count(r) AS outgoing",
+            key="10.0.0.1",
+        ).single()
+    assert before_failure["properties"]["role"] == "Domain Controller"
+    assert before_failure["properties"]["roles"] == ["Domain Controller", "DNS Server"]
+    assert before_failure["properties"]["unrelated_marker"] == "keep"
+    assert before_failure["outgoing"] > 0
+
+    failure = AssetEnrichmentMutation.failure(
+        "10.0.0.1",
+        attempted_at=now,
+        retry_seconds=3600,
+        unavailable=False,
+        error="Product timeout after bounded retries",
+    )
+    repository.apply_enrichment_batch([failure])
+    with repository.driver.session() as session:
+        after_failure = session.run(
+            "MATCH (m:GraphMetadata {id: 'active'}) "
+            "MATCH (a:Asset {graph_version: m.active_graph_version, graph_key: $key}) "
+            "RETURN properties(a) AS properties",
+            key="10.0.0.1",
+        ).single()["properties"]
+    assert after_failure["role"] == "Domain Controller"
+    assert after_failure["vendor"] == "VMware"
+    assert after_failure["enrichment_status"] == "stale"
+    assert after_failure["enrichment_last_success_at"] == success.succeeded_at
+
+    due_after_retry = repository.list_due_enrichment_assets(
+        after_graph_key=None,
+        limit=repository.settings.graph_enrichment_page_size,
+        as_of=now.replace(hour=10),
+        stale_before=now,
+    )
+    assert "10.0.0.1" in due_after_retry.graph_keys
+
+    version_two_records = [
+        *_records(),
+        TopologyConnectionRecord("10.77.0.1", "10.77.0.2"),
+    ]
+    repository.sync_snapshot(version_two_records, "community-enrichment-v2")
+    with repository.driver.session() as session:
+        carried = session.run(
+            "MATCH (m:GraphMetadata {id: 'active'}) "
+            "MATCH (a:Asset {graph_version: m.active_graph_version, graph_key: $key}) "
+            "OPTIONAL MATCH (a)-[r:COMMUNICATES_WITH {graph_version: m.active_graph_version}]->() "
+            "RETURN m.active_graph_version AS version, properties(a) AS properties, "
+            "count(r) AS outgoing",
+            key="10.0.0.1",
+        ).single()
+        old_nodes = session.run(
+            "MATCH (a:Asset {graph_version: 'community-parity-v1'}) RETURN count(a) AS count"
+        ).single()["count"]
+    assert carried["version"] == "community-enrichment-v2"
+    assert carried["properties"]["role"] == "Domain Controller"
+    assert carried["properties"]["roles"] == ["Domain Controller", "DNS Server"]
+    assert carried["properties"]["enrichment_last_success_at"] == success.succeeded_at
+    assert carried["outgoing"] == before_failure["outgoing"]
+    assert old_nodes == 0
+    status = repository.status()
+    assert status.nodes == len(
+        {ip for record in version_two_records for ip in (record.src_ip, record.dst_ip)}
+    )
+    assert status.edges == len(version_two_records)
+    eligible = repository.list_due_enrichment_assets(
+        after_graph_key=None, limit=500, as_of=now, stale_before=now
+    )
+    assert {"10.77.0.1", "10.77.0.2"}.issubset(eligible.graph_keys)
+
+    missing = repository.apply_enrichment_batch(
+        [replace(success, graph_key="10.99.99.99")]
+    )
+    assert missing.updated == 0
+    assert missing.missing_graph_keys == ("10.99.99.99",)
