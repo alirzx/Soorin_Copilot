@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 
 from src.core.agent.plan_validator import PlanValidationError, PlanValidator
-from src.core.agent.registry import build_capability_registry
+from src.core.agent.registry import CapabilityRegistry
 from src.core.agent.task_mapping import compile_direct_plan, enforce_task_envelope, task_spec_from_route
 from src.core.agent.contracts import RequestConstraints, TaskEnvelope, TurnPolicy
 from src.core.context.models import RouteDecision
@@ -87,7 +87,6 @@ def test_phase4b1_structured_capability_is_fail_closed_until_registration() -> N
     assert plan.steps[0].capability == "graph.search_assets"
     assert plan.steps[0].arguments == {}
 
-    registry = build_capability_registry()
     with pytest.raises(PlanValidationError) as exc:
-        PlanValidator(registry).validate(plan)
+        PlanValidator(CapabilityRegistry()).validate(plan)
     assert exc.value.code == "unknown_capability"
