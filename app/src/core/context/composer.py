@@ -8,6 +8,10 @@ from dataclasses import replace
 from typing import Any
 
 from src.config.settings import Settings, get_settings
+from src.core.agent.contracts import (
+    StructuredAssetAggregateEvidence,
+    StructuredAssetSearchEvidence,
+)
 from src.core.context.models import CopilotContextPackage, approx_tokens
 from src.core.context.compaction import (
     CurrentEvidenceProjection,
@@ -62,6 +66,9 @@ ONE_HOP_CONTEXT_MAX_TOKENS = 1800
 TWO_HOP_CONTEXT_MAX_TOKENS = 2500
 COMPARISON_CONTEXT_MAX_TOKENS = 2200
 FULL_NEIGHBORS_CONTEXT_MAX_TOKENS = 3000
+STRUCTURED_ASSET_SEARCH_CONTEXT_MAX_TOKENS = 1800
+STRUCTURED_ASSET_AGGREGATE_CONTEXT_MAX_TOKENS = 700
+STRUCTURED_ASSET_SEARCH_MAX_CONTEXT_ROWS = 20
 PROFILE_CONTEXT_MAX_TOKENS = 3200
 DETECTION_CONTEXT_MAX_TOKENS = 2400
 
@@ -556,6 +563,10 @@ class ContextComposer:
             return COMPARISON_CONTEXT_MAX_TOKENS
         if capability == "graph.get_relationship" or context.get("relationship_mode") == "direct":
             return RELATIONSHIP_CONTEXT_MAX_TOKENS
+        if capability == "graph.search_assets" or scope == "asset_search":
+            return STRUCTURED_ASSET_SEARCH_CONTEXT_MAX_TOKENS
+        if capability == "graph.aggregate_assets" or scope == "asset_aggregate":
+            return STRUCTURED_ASSET_AGGREGATE_CONTEXT_MAX_TOKENS
         return {
             "node_summary": NODE_SUMMARY_CONTEXT_MAX_TOKENS,
             "path": PATH_CONTEXT_MAX_TOKENS,
@@ -995,6 +1006,12 @@ class ContextComposer:
             self._graph_context_cap(context),
             token_budget if token_budget is not None else self._graph_context_cap(context),
         )
+        if source_capability in {"graph.search_assets", "graph.aggregate_assets"}:
+            return self._compose_structured_asset_set(
+                graph,
+                token_budget=resolved_budget,
+                request_id=request_id,
+            )
         if (
             context.get("relationship_mode") == "compare"
             or scope == "multi_entity_comparison"
@@ -1132,6 +1149,226 @@ class ContextComposer:
             len(text),
         )
         return text
+
+    def _compose_structured_asset_set(
+        self,
+        graph: Any,
+        *,
+        token_budget: int,
+        request_id: str,
+    ) -> str:
+        """Serialize typed Asset-set evidence separately from topology payloads."""
+        context = graph.context
+        evidence = context.get("structured_asset_set")
+        if not isinstance(
+            evidence,
+            (StructuredAssetSearchEvidence, StructuredAssetAggregateEvidence),
+        ):
+            return ""
+        authority = (
+            "Exact values are from the active Neo4j organizational projection; "
+            "they are not live Product profile or detection truth."
+        )
+        base = {
+            "schema_version": evidence.schema_version,
+            "capability": evidence.capability,
+            "mode": evidence.mode,
+            "query_identity": evidence.query_identity,
+            "query": {"filters": evidence.normalized_filters},
+            "source": {
+                "provenance": evidence.provenance,
+                "active_graph_version": evidence.active_graph_version,
+                "retrieved_at": evidence.retrieved_at,
+                "authority": authority,
+            },
+            "limitations": list(evidence.limitations),
+        }
+        if isinstance(evidence, StructuredAssetAggregateEvidence):
+            base["query"].update(
+                operation=evidence.operation,
+                group_by=evidence.group_by,
+            )
+            selected_groups: list[dict[str, Any]] = []
+            text = ""
+            for group in evidence.groups:
+                candidate = [*selected_groups, self._bounded_structured_value(group)]
+                payload = {
+                    **base,
+                    "result": {
+                        "count": evidence.count,
+                        "groups_retrieved": len(evidence.groups),
+                        "groups_in_model_context": len(candidate),
+                        "groups_omitted_from_model_context": len(evidence.groups) - len(candidate),
+                        "retrieval_truncated": evidence.truncated,
+                        "context_truncated": len(candidate) < len(evidence.groups),
+                        "groups": candidate,
+                    },
+                }
+                candidate_text = self._structured_asset_text(payload)
+                if approx_tokens(candidate_text) > max(0, token_budget):
+                    break
+                selected_groups = candidate
+                text = candidate_text
+            if not evidence.groups:
+                payload = {
+                    **base,
+                    "result": {
+                        "count": evidence.count,
+                        "groups_retrieved": 0,
+                        "groups_in_model_context": 0,
+                        "groups_omitted_from_model_context": 0,
+                        "retrieval_truncated": evidence.truncated,
+                        "context_truncated": False,
+                        "groups": [],
+                    },
+                }
+                text = self._structured_asset_text(payload)
+                if approx_tokens(text) > max(0, token_budget):
+                    return ""
+            self._record_structured_context(
+                context,
+                text,
+                token_budget,
+                included_count=len(selected_groups),
+                retrieved_count=len(evidence.groups),
+            )
+            return text
+
+        base["query"].update(sort=evidence.sort, direction=evidence.direction)
+        selected_rows: list[dict[str, Any]] = []
+        text = ""
+        candidate_rows = evidence.rows[:STRUCTURED_ASSET_SEARCH_MAX_CONTEXT_ROWS]
+        for row in candidate_rows:
+            candidate = [
+                *selected_rows,
+                self._structured_asset_row(row, evidence),
+            ]
+            payload = {
+                **base,
+                "coverage": {
+                    "matched_total": evidence.matched_total,
+                    "rows_retrieved": evidence.returned_count,
+                    "rows_in_model_context": len(candidate),
+                    "rows_omitted_from_model_context": evidence.returned_count - len(candidate),
+                    "retrieval_truncated": evidence.truncated,
+                    "context_truncated": len(candidate) < evidence.returned_count,
+                },
+                "assets": candidate,
+            }
+            candidate_text = self._structured_asset_text(payload)
+            if approx_tokens(candidate_text) > max(0, token_budget):
+                break
+            selected_rows = candidate
+            text = candidate_text
+        if not evidence.rows:
+            payload = {
+                **base,
+                "coverage": {
+                    "matched_total": evidence.matched_total,
+                    "rows_retrieved": 0,
+                    "rows_in_model_context": 0,
+                    "rows_omitted_from_model_context": 0,
+                    "retrieval_truncated": evidence.truncated,
+                    "context_truncated": False,
+                },
+                "assets": [],
+            }
+            text = self._structured_asset_text(payload)
+            if approx_tokens(text) > max(0, token_budget):
+                return ""
+        self._record_structured_context(
+            context,
+            text,
+            token_budget,
+            included_count=len(selected_rows),
+            retrieved_count=evidence.returned_count,
+        )
+        logger.info(
+            "event=structured_asset_context_composed request_id=%s mode=%s matched_total=%s retrieved_count=%s model_count=%s retrieval_truncated=%s context_truncated=%s context_tokens=%s",
+            request_id,
+            evidence.mode,
+            evidence.matched_total,
+            evidence.returned_count,
+            len(selected_rows),
+            evidence.truncated,
+            len(selected_rows) < evidence.returned_count,
+            approx_tokens(text),
+        )
+        return text
+
+    @staticmethod
+    def _structured_asset_text(payload: dict[str, Any]) -> str:
+        return (
+            "[SOORIN_STRUCTURED_ASSET_SET_CONTEXT_JSON]\n"
+            + json.dumps(payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+            + "\n[/SOORIN_STRUCTURED_ASSET_SET_CONTEXT_JSON]"
+        )
+
+    @classmethod
+    def _structured_asset_row(
+        cls,
+        row: dict[str, Any],
+        evidence: StructuredAssetSearchEvidence,
+    ) -> dict[str, Any]:
+        required = {"graph_key", "ip", "asset_name"}
+        requested = set(evidence.normalized_filters)
+        requested.add(evidence.sort)
+        useful = {
+            "status",
+            "suggested_type",
+            "role",
+            "roles",
+            "vendor",
+            "product",
+            "model_confidence",
+            "mapping_confidence",
+            "unknown_score",
+            "enrichment_status",
+            "last_detection_at",
+        }
+        selected = required | requested | useful
+        return {
+            key: cls._bounded_structured_value(value)
+            for key, value in row.items()
+            if key in selected and value is not None
+        }
+
+    @classmethod
+    def _bounded_structured_value(cls, value: Any) -> Any:
+        if isinstance(value, str):
+            return value[:160]
+        if isinstance(value, (list, tuple)):
+            return [cls._bounded_structured_value(item) for item in value[:5]]
+        if isinstance(value, dict):
+            return {
+                str(key)[:80]: cls._bounded_structured_value(item)
+                for key, item in list(value.items())[:12]
+            }
+        return value
+
+    @staticmethod
+    def _record_structured_context(
+        context: dict[str, Any],
+        text: str,
+        token_budget: int,
+        *,
+        included_count: int,
+        retrieved_count: int,
+    ) -> None:
+        context.update(
+            {
+                "included_node_count": included_count,
+                "model_context_included_count": included_count,
+                "model_context_omitted_count": max(0, retrieved_count - included_count),
+                "serialized_context_complete_for_retrieved_subset": included_count == retrieved_count,
+                "serialized_context_truncated": included_count < retrieved_count,
+                "context_truncated": included_count < retrieved_count,
+                "context_mode": "structured_asset_set",
+                "model_context_token_estimate": approx_tokens(text),
+                "model_context_token_cap": token_budget,
+                "model_input_graph_included": bool(text),
+            }
+        )
 
     @staticmethod
     def _graph_coverage(

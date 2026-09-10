@@ -44,8 +44,15 @@ def context_package_from_evidence(
         provider_result = result.provider_result
         if isinstance(provider_result, GraphProviderResult):
             identity = result.context_identity or identity_for_tool_result(result)
-            provider_result.context["context_identity"] = identity
-            provider_result.context["source_capability"] = result.source_capability
+            provider_result = replace(
+                provider_result,
+                context={
+                    **provider_result.context,
+                    "context_identity": identity,
+                    "source_capability": result.source_capability,
+                    "structured_asset_set": result.structured_asset_set,
+                },
+            )
             graphs.append(provider_result)
             graph = provider_result
         elif isinstance(provider_result, DetectionProviderResult):

@@ -2,15 +2,20 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from types import SimpleNamespace
 
+from src.config.settings import get_settings
 from src.core.agent.contracts import RequestConstraints, TaskSpec
+from src.core.agent.evidence import context_package_from_evidence
 from src.core.agent.evidence_policy import EvidenceRequirementPolicy, MemorySufficiencyGate
 from src.core.agent.registry import build_capability_registry
 from src.core.agent.reviewer import EvidenceReviewer
 from src.core.agent.structured_evidence import structured_query_identity
 from src.core.agent.task_mapping import task_spec_from_route
 from src.core.context.models import GraphProviderResult, ProviderProvenance, RouteDecision
+from src.core.context.composer import ContextComposer
+from src.core.context.models import EntityResolution, approx_tokens
 from src.core.graph.structured import StructuredQuerySpec
 
 
@@ -244,3 +249,214 @@ def test_existing_topology_requirement_class_is_unchanged() -> None:
     )
     requirements = EvidenceRequirementPolicy().derive(task)
     assert requirements.requirements[0].evidence_class == "graph_neighbors"
+
+
+def _complete_search_result():
+    result = _registry().execute("graph.search_assets", {
+        "filters": {"status": "CONFIRMED", "role": "Domain Controller"},
+    })
+    evidence = result.structured_asset_set
+    assert evidence is not None and evidence.mode == "search"
+    complete = replace(evidence, matched_total=1, truncated=False)
+    return replace(
+        result,
+        total_count=1,
+        included_count=1,
+        omitted_count=0,
+        truncated=False,
+        completeness="complete",
+        structured_asset_set=complete,
+    )
+
+
+def test_reviewer_accepts_zero_entity_search_aggregate_and_successful_empty() -> None:
+    search_query = StructuredQuerySpec.model_validate({
+        "mode": "search",
+        "filters": {"status": "CONFIRMED", "role": "Domain Controller"},
+    })
+    aggregate_query = StructuredQuerySpec.model_validate({
+        "mode": "aggregate",
+        "filters": {"role": "Domain Controller"},
+        "operation": "group_count",
+        "group_by": "status",
+        "limit": 10,
+    })
+    aggregate = _registry().execute("graph.aggregate_assets", {
+        "filters": {"role": "Domain Controller"},
+        "operation": "group_count",
+        "group_by": "status",
+        "limit": 10,
+    })
+    empty = _registry(empty=True).execute("graph.search_assets", {
+        "filters": {"status": "CONFIRMED"},
+    })
+    empty_query = StructuredQuerySpec.model_validate({
+        "mode": "search",
+        "filters": {"status": "CONFIRMED"},
+    })
+
+    assert EvidenceReviewer().review(_task(search_query), [_complete_search_result()]).outcome == "sufficient"
+    assert EvidenceReviewer().review(_task(aggregate_query), [aggregate]).outcome == "sufficient"
+    empty_review = EvidenceReviewer().review(_task(empty_query), [empty], allow_supplemental=True)
+    assert empty_review.outcome == "sufficient"
+    assert not empty_review.supplemental_allowed
+    assert _task(search_query).entities == ()
+
+
+def test_reviewer_marks_valid_truncation_partial_without_losing_answerability() -> None:
+    query = StructuredQuerySpec.model_validate({
+        "mode": "search",
+        "filters": {"status": "CONFIRMED", "role": "Domain Controller"},
+    })
+    result = _registry().execute("graph.search_assets", {
+        "filters": {"status": "CONFIRMED", "role": "Domain Controller"},
+    })
+    review = EvidenceReviewer().review(_task(query), [result])
+
+    assert review.outcome == "answer_with_limitations"
+    assert not review.missing_capabilities
+    assert any("incomplete or truncated" in item for item in review.material_limitations)
+
+
+def test_reviewer_rejects_wrong_query_identity_mode_missing_and_failed_results() -> None:
+    query = StructuredQuerySpec.model_validate({
+        "mode": "search",
+        "filters": {"status": "CONFIRMED", "role": "Domain Controller"},
+    })
+    task = _task(query)
+    result = _complete_search_result()
+    evidence = result.structured_asset_set
+    assert evidence is not None
+
+    wrong_identity = replace(
+        result,
+        structured_asset_set=replace(evidence, query_identity="wrong"),
+    )
+    wrong_mode = replace(
+        result,
+        structured_asset_set=replace(evidence, mode="aggregate"),  # type: ignore[arg-type]
+    )
+    for invalid in (wrong_identity, wrong_mode):
+        decision = EvidenceReviewer().review(task, [invalid])
+        assert decision.outcome == "missing_required_evidence"
+        assert decision.missing_capabilities == ("graph.search_assets",)
+
+    missing = EvidenceReviewer().review(task, [], allow_supplemental=True)
+    assert missing.outcome == "missing_required_evidence"
+    assert missing.next_capability == "graph.search_assets"
+    assert missing.next_arguments == {
+        "filters": {"role": "Domain Controller", "status": "CONFIRMED"},
+    }
+    failed = EvidenceReviewer().review(
+        task,
+        [replace(result, status="unavailable", structured_asset_set=None)],
+        allow_supplemental=True,
+    )
+    assert failed.outcome == "safe_failure"
+
+
+def _compose(result, task: TaskSpec, *, window: int = 32768):
+    pack = EvidenceReviewer().build_pack(task, [result])
+    package = context_package_from_evidence(
+        pack,
+        EntityResolution(status="none"),
+    )
+    settings = replace(
+        get_settings(),
+        llm_context_window_tokens=window,
+        llm_context_safety_margin_tokens=256,
+        llm_reserved_output_tokens=1024,
+    )
+    composer = ContextComposer(settings)
+    text = composer.compose(
+        package,
+        base_input_tokens=100,
+        reserved_output_tokens=1024,
+        request_id="phase4b3-context",
+    )
+    return composer, text
+
+
+def test_search_context_serializes_empty_one_and_bounded_large_results() -> None:
+    query = StructuredQuerySpec.model_validate({
+        "mode": "search",
+        "filters": {"status": "CONFIRMED"},
+        "sort": "asset_name",
+        "direction": "asc",
+    })
+    empty = _registry(empty=True).execute("graph.search_assets", {
+        "filters": {"status": "CONFIRMED"},
+        "sort": "asset_name",
+        "direction": "asc",
+    })
+    _composer, empty_text = _compose(empty, _task(query))
+    assert "SOORIN_STRUCTURED_ASSET_SET_CONTEXT_JSON" in empty_text
+    assert '"matched_total":0' in empty_text and '"assets":[]' in empty_text
+
+    one = _complete_search_result()
+    one_query = StructuredQuerySpec.model_validate({
+        "mode": "search",
+        "filters": {"status": "CONFIRMED", "role": "Domain Controller"},
+    })
+    _composer, one_text = _compose(one, _task(one_query))
+    assert "192.0.2.10" in one_text
+    assert "neo4j_active_organizational_projection" in one_text
+    assert "not live Product profile or detection truth" in one_text
+
+    evidence = one.structured_asset_set
+    assert evidence is not None and evidence.mode == "search"
+    rows = tuple(
+        {
+            **evidence.rows[0],
+            "graph_key": f"asset-{index}",
+            "ip": f"198.51.100.{index}",
+            "asset_name": "asset-" + ("x" * 1000),
+            "role": "role-" + ("y" * 1000),
+            "product": "product-" + ("z" * 1000),
+        }
+        for index in range(1, 121)
+    )
+    large_evidence = replace(
+        evidence,
+        matched_total=500,
+        returned_count=len(rows),
+        truncated=True,
+        rows=rows,
+    )
+    large = replace(
+        one,
+        total_count=500,
+        included_count=len(rows),
+        omitted_count=380,
+        truncated=True,
+        completeness="partial",
+        structured_asset_set=large_evidence,
+    )
+    composer, large_text = _compose(large, _task(one_query))
+    assert approx_tokens(composer.last_parts["graph"]) <= 1800
+    assert approx_tokens(large_text) <= composer.last_budget["max_dynamic_tokens"]
+    assert large_text.count('"graph_key"') <= 20
+    assert composer.last_inclusion[large.context_identity][0]
+    assert '"context_truncated":true' in large_text
+    assert '"rows_retrieved":120' in large_text
+    assert '"rows_omitted_from_model_context":' in large_text
+
+
+def test_aggregate_context_is_compact_and_preserves_count_and_groups() -> None:
+    query = StructuredQuerySpec.model_validate({
+        "mode": "aggregate",
+        "filters": {"role": "Domain Controller"},
+        "operation": "group_count",
+        "group_by": "status",
+    })
+    result = _registry().execute("graph.aggregate_assets", {
+        "filters": {"role": "Domain Controller"},
+        "operation": "group_count",
+        "group_by": "status",
+    })
+    _composer, text = _compose(result, _task(query))
+
+    assert '"count":12' in text
+    assert '"group_by":"status"' in text
+    assert '"value":"CONFIRMED"' in text
+    assert approx_tokens(text) < 900

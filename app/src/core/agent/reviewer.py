@@ -7,6 +7,7 @@ from typing import Any
 
 from src.core.agent.contracts import EvidencePack, ExecutionPlan, ReviewDecision, TaskSpec, ToolResult
 from src.core.agent.context_identity import identity_for_tool_result
+from src.core.agent.structured_evidence import expected_structured_query_identity
 
 
 _NO_DEDICATED_ANOMALY_EVIDENCE = (
@@ -30,6 +31,8 @@ class EvidenceReviewer:
             "graph.get_relationship": (2, 2),
             "graph.compare_assets": (2, 2),
             "graph.find_path": (2, 2),
+            "graph.search_assets": (0, 0),
+            "graph.aggregate_assets": (0, 0),
             "knowledge.search": (0, 2),
         }
         invalid_bindings = tuple(
@@ -111,6 +114,18 @@ class EvidenceReviewer:
                 limitations=material,
                 material_limitations=material,
             )
+        structured_failure = self._review_structured_results(task, required)
+        if structured_failure is not None:
+            capability, reason = structured_failure
+            return ReviewDecision(
+                outcome="missing_required_evidence",
+                reasons=(reason,),
+                missing_capabilities=(capability,),
+                supplemental_allowed=allow_supplemental,
+                next_capability=capability if allow_supplemental else None,
+                next_arguments=self._arguments(task, capability) if allow_supplemental else None,
+                material_limitations=(reason,),
+            )
         for capability in ("asset.get_profile", "asset.get_detection"):
             if capability not in task.required_capabilities:
                 continue
@@ -157,7 +172,10 @@ class EvidenceReviewer:
             for result in required
         )
         for result in required:
-            if result.status in {"partial", "empty", "not_found"}:
+            structured = result.structured_asset_set is not None
+            if result.status in {"partial", "empty", "not_found"} and not (
+                structured and result.status in {"empty", "not_found"}
+            ):
                 material_limitations.append(f"{result.source_capability} status is {result.status}.")
             if result.freshness in {"stale", "unknown"}:
                 material_limitations.append(f"{result.source_capability} freshness is {result.freshness}.")
@@ -321,5 +339,88 @@ class EvidenceReviewer:
             return None
         if capability == "knowledge.search":
             return {"query": task.request}
+        if capability in {"graph.search_assets", "graph.aggregate_assets"}:
+            query = task.structured_query
+            if query is None:
+                return None
+            arguments = query.model_dump(mode="json", exclude_none=True)
+            arguments.pop("mode", None)
+            return arguments
         minimum_entities = 2 if capability in {"graph.get_relationship", "graph.compare_assets", "graph.find_path"} else 1
         return {"entities": list(task.entities[:minimum_entities])}
+
+    @staticmethod
+    def _review_structured_results(
+        task: TaskSpec,
+        required: list[ToolResult],
+    ) -> tuple[str, str] | None:
+        structured_capabilities = {"graph.search_assets", "graph.aggregate_assets"}
+        for result in required:
+            capability = result.source_capability
+            if capability not in structured_capabilities:
+                continue
+            evidence = result.structured_asset_set
+            query = task.structured_query
+            if evidence is None or query is None:
+                return capability, f"{capability} did not provide typed structured evidence."
+            expected_mode = "search" if capability == "graph.search_assets" else "aggregate"
+            if evidence.capability != capability or evidence.mode != expected_mode or query.mode.value != expected_mode:
+                return capability, f"{capability} evidence mode did not match the validated task."
+            expected_identity = expected_structured_query_identity(query, evidence)
+            if (
+                evidence.query_identity != expected_identity
+                or result.normalized_query_hash != expected_identity
+                or result.context_identity != expected_identity
+            ):
+                return capability, f"{capability} evidence query identity did not match the validated task."
+            if not evidence.active_graph_version:
+                return capability, f"{capability} did not identify an active graph projection version."
+            if evidence.provenance != "neo4j_active_organizational_projection":
+                return capability, f"{capability} evidence provenance was not the active organizational projection."
+            if result.entities:
+                return capability, f"{capability} incorrectly attached focal entities to an Asset-set receipt."
+            if result.total_count is None or result.included_count is None or result.omitted_count is None:
+                return capability, f"{capability} did not preserve generic coverage counts."
+            if result.total_count < 0 or result.included_count < 0 or result.omitted_count < 0:
+                return capability, f"{capability} reported a negative coverage count."
+
+            if expected_mode == "search":
+                returned = evidence.returned_count
+                matched = evidence.matched_total
+                if returned != len(evidence.rows) or matched < returned:
+                    return capability, f"{capability} reported inconsistent matched and returned counts."
+                if evidence.truncated != (matched > returned):
+                    return capability, f"{capability} reported inconsistent truncation semantics."
+                if (
+                    result.total_count != matched
+                    or result.included_count != returned
+                    or result.omitted_count != matched - returned
+                    or result.truncated != evidence.truncated
+                ):
+                    return capability, f"{capability} generic and typed coverage metadata disagreed."
+                continue
+
+            if evidence.count < 0 or any(int(group.get("count", -1)) < 0 for group in evidence.groups):
+                return capability, f"{capability} reported a negative aggregate count."
+            if query.operation is None or evidence.operation != query.operation.value:
+                return capability, f"{capability} aggregate operation did not match the validated task."
+            expected_group = query.group_by.value if query.group_by else None
+            if evidence.group_by != expected_group:
+                return capability, f"{capability} aggregate grouping did not match the validated task."
+            group_total = sum(int(group.get("count") or 0) for group in evidence.groups)
+            if evidence.operation == "count" and (evidence.groups or evidence.group_by is not None):
+                return capability, f"{capability} count evidence unexpectedly contained grouped output."
+            if evidence.operation == "group_count" and (
+                evidence.group_by is None
+                or group_total > evidence.count
+                or (not evidence.truncated and group_total != evidence.count)
+            ):
+                return capability, f"{capability} reported inconsistent grouped aggregate counts."
+            expected_included = group_total if evidence.group_by else evidence.count
+            if result.total_count != evidence.count or result.included_count != expected_included:
+                return capability, f"{capability} generic and typed aggregate metadata disagreed."
+            if result.omitted_count != max(0, result.total_count - result.included_count):
+                return capability, f"{capability} reported an inconsistent omitted aggregate count."
+            if result.truncated != evidence.truncated:
+                return capability, f"{capability} generic and typed truncation metadata disagreed."
+        return None
