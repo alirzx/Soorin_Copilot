@@ -698,7 +698,7 @@ class Neo4jGraphRepository:
                 for offset in range(0, len(mutations), batch_size):
                     rows = [item.to_row() for item in mutations[offset : offset + batch_size]]
                     record = session.execute_write(
-                        lambda tx: tx.run(self._query(query), rows=rows).single()
+                        lambda tx: tx.run(query, rows=rows).single()
                     )
                     if record is not None:
                         updated += int(record["updated"] or 0)

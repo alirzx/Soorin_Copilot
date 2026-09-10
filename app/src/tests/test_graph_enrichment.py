@@ -373,6 +373,7 @@ class Transaction:
         self.session = session
 
     def run(self, query: Any, **params: Any) -> Result:
+        self.session.write_query_objects.append(query)
         text = getattr(query, "text", query)
         self.session.write_calls.append((text, params))
         rows = params.get("rows", [])
@@ -396,6 +397,7 @@ class RecordingSession:
         self.missing_keys = missing_keys or set()
         self.read_calls: list[tuple[str, dict[str, Any]]] = []
         self.write_calls: list[tuple[str, dict[str, Any]]] = []
+        self.write_query_objects: list[Any] = []
         self.transactions = 0
 
     def run(self, query: Any, **params: Any) -> Result:
@@ -470,6 +472,7 @@ def test_repository_batches_updates_and_reports_missing_without_creating_assets(
     result = repository.apply_enrichment_batch(mutations)
 
     assert session.transactions == 3
+    assert all(isinstance(query, str) for query in session.write_query_objects)
     assert [len(params["rows"]) for _, params in session.write_calls] == [2, 2, 1]
     assert result == EnrichmentWriteResult(5, 4, ("10.0.0.4",))
     query = session.write_calls[0][0]
