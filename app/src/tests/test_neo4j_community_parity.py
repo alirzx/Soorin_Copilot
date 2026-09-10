@@ -104,6 +104,27 @@ def test_community_identity_and_summary_parity(repository: Neo4jGraphRepository,
     assert repository.get_summary("10.99.99.99")["found"] is False
 
 
+def test_community_schema_contains_graph_identity_and_enrichment_indexes(
+    repository: Neo4jGraphRepository,
+) -> None:
+    with repository.driver.session() as session:
+        constraint_names = {
+            str(record["name"])
+            for record in session.run("SHOW CONSTRAINTS YIELD name RETURN name")
+        }
+        index_names = {
+            str(record["name"])
+            for record in session.run("SHOW INDEXES YIELD name RETURN name")
+        }
+
+    assert {"asset_graph_identity", "graph_metadata_id"}.issubset(
+        constraint_names
+    )
+    assert {"asset_version_ip", "asset_enrichment_schedule"}.issubset(
+        index_names
+    )
+
+
 def test_neighbors_relationship_and_path_parity(repository: Neo4jGraphRepository, oracle: _ProjectionAdjacency) -> None:
     neighbors = repository.get_neighbors("10.0.0.1", "both", limit=1000)
     assert neighbors["total"] == oracle.in_degree("10.0.0.1") + oracle.out_degree("10.0.0.1")
@@ -276,6 +297,18 @@ def test_enrichment_lkg_idempotency_and_topology_version_carry_forward(
         ).single()
     assert before_failure["properties"]["role"] == "Domain Controller"
     assert before_failure["properties"]["roles"] == ["Domain Controller", "DNS Server"]
+    assert {
+        property_name: before_failure["properties"].get(property_name)
+        for property_name in success.properties
+    } == success.properties
+    assert before_failure["properties"]["enrichment_status"] == "success"
+    assert before_failure["properties"]["enrichment_updated_at"] == success.succeeded_at
+    assert before_failure["properties"]["enrichment_last_attempt_at"] == success.attempted_at
+    assert before_failure["properties"]["enrichment_last_success_at"] == success.succeeded_at
+    assert before_failure["properties"]["enrichment_next_due_at"] == success.next_due_at
+    assert before_failure["properties"]["enrichment_source"] == success.source
+    assert before_failure["properties"]["enrichment_version"] == success.version
+    assert before_failure["properties"].get("enrichment_error") is None
     assert before_failure["properties"]["unrelated_marker"] == "keep"
     assert before_failure["outgoing"] > 0
 
@@ -327,6 +360,23 @@ def test_enrichment_lkg_idempotency_and_topology_version_carry_forward(
     assert carried["version"] == "community-enrichment-v2"
     assert carried["properties"]["role"] == "Domain Controller"
     assert carried["properties"]["roles"] == ["Domain Controller", "DNS Server"]
+    assert {
+        property_name: carried["properties"].get(property_name)
+        for property_name in success.properties
+    } == success.properties
+    for metadata_name in (
+        "enrichment_status",
+        "enrichment_updated_at",
+        "enrichment_last_attempt_at",
+        "enrichment_last_success_at",
+        "enrichment_next_due_at",
+        "enrichment_source",
+        "enrichment_version",
+        "enrichment_error",
+    ):
+        assert carried["properties"].get(metadata_name) == after_failure.get(
+            metadata_name
+        )
     assert carried["properties"]["enrichment_last_success_at"] == success.succeeded_at
     assert carried["outgoing"] == before_failure["outgoing"]
     assert old_nodes == 0
@@ -345,3 +395,42 @@ def test_enrichment_lkg_idempotency_and_topology_version_carry_forward(
     )
     assert missing.updated == 0
     assert missing.missing_graph_keys == ("10.99.99.99",)
+
+
+def test_community_keyset_paging_crosses_real_pages_without_skips_or_duplicates(
+    repository: Neo4jGraphRepository,
+) -> None:
+    records = [
+        TopologyConnectionRecord(
+            f"198.18.0.{index}",
+            f"198.18.0.{index + 1}",
+        )
+        for index in range(1, 54)
+    ]
+    repository.sync_snapshot(records, "community-enrichment-pagination")
+    expected = sorted(
+        {ip for record in records for ip in (record.src_ip, record.dst_ip)}
+    )
+    as_of = datetime(2026, 9, 10, 8, 0, tzinfo=timezone.utc)
+    cursor: str | None = None
+    collected: list[str] = []
+    page_count = 0
+
+    while True:
+        page = repository.list_due_enrichment_assets(
+            after_graph_key=cursor,
+            limit=7,
+            as_of=as_of,
+            stale_before=as_of,
+        )
+        page_count += 1
+        collected.extend(page.graph_keys)
+        if not page.has_more:
+            break
+        assert page.next_cursor is not None
+        assert page.next_cursor != cursor
+        cursor = page.next_cursor
+
+    assert page_count == 8
+    assert collected == expected
+    assert len(collected) == len(set(collected))
