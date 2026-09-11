@@ -2,14 +2,21 @@
 
 from __future__ import annotations
 
-from dataclasses import replace
+from types import SimpleNamespace
 
 import pytest
 
-from src.core.agent.contracts import ExecutionPlan, TaskSpec
+from src.core.agent.contracts import (
+    ExecutionPlan,
+    RequestConstraints,
+    StructuredAssetSearchEvidence,
+    TaskSpec,
+    ToolResult,
+)
 from src.core.agent.phase4c_nodes import Phase4CWorkflowNodes
+from src.core.agent.reviewer import EvidenceReviewer
 from src.core.agent.task_mapping import compile_direct_plan
-from src.core.graph.structured import StructuredQuerySpec
+from src.core.graph.structured import StructuredQuerySpec, structured_query_identity
 
 
 def _task(request: str, *, sort: str | None = None) -> TaskSpec:
@@ -35,6 +42,45 @@ def _rows(count: int) -> tuple[dict[str, object], ...]:
     return tuple(
         {"ip": f"192.0.2.{index}", "graph_key": f"asset-{index}"}
         for index in range(1, count + 1)
+    )
+
+
+def _search_result(task: TaskSpec) -> ToolResult:
+    assert task.structured_query is not None
+    identity = structured_query_identity(
+        task.structured_query,
+        active_graph_version="graph-v1",
+    )
+    evidence = StructuredAssetSearchEvidence(
+        capability="graph.search_assets",
+        query_identity=identity,
+        normalized_filters={"role": "Domain Controller"},
+        active_graph_version="graph-v1",
+        sort=task.structured_query.to_search_request().sort.value,
+        direction=task.structured_query.to_search_request().direction.value,
+        matched_total=1,
+        returned_count=1,
+        truncated=False,
+        rows=({"ip": "192.0.2.1", "graph_key": "asset-1"},),
+        retrieved_at="2026-09-11T10:00:00+00:00",
+    )
+    return ToolResult(
+        status="ok",
+        entities=(),
+        source_capability="graph.search_assets",
+        retrieved_at=evidence.retrieved_at,
+        freshness="current",
+        completeness="complete",
+        total_count=1,
+        included_count=1,
+        omitted_count=0,
+        source_payload_complete=True,
+        projection_usable=True,
+        normalized_query_hash=identity,
+        context_identity=identity,
+        structured_asset_set=evidence,
+        step_id="search-1",
+        provider="graph",
     )
 
 
@@ -174,3 +220,74 @@ def test_structured_set_turn_never_becomes_focal_baseline() -> None:
         None,
     )
     assert reason == "structured_asset_set_not_focal_baseline"
+
+
+@pytest.mark.parametrize("capability", ["asset.get_profile", "asset.get_detection"])
+def test_missing_product_focal_evidence_is_material_limitation(capability: str) -> None:
+    task = _task("analyze the first result")
+    search = _search_result(task)
+    failed = ToolResult(
+        status="unavailable",
+        entities=("192.0.2.1",),
+        source_capability=capability,
+        retrieved_at="2026-09-11T10:00:01+00:00",
+        freshness="unknown",
+        completeness="unknown",
+        limitations=("provider unavailable",),
+        step_id="deepening-1",
+        provider="product",
+    )
+    reviewer = EvidenceReviewer()
+    pack = reviewer.build_pack(task, [search, failed])
+    nodes = object.__new__(Phase4CWorkflowNodes)
+    nodes.settings = SimpleNamespace(agent_max_supplemental_retrievals=1)
+    nodes.service = SimpleNamespace(evidence_reviewer=reviewer)
+
+    update = nodes.review_retrieval({
+        "task": task,
+        "tool_results": [search, failed],
+        "evidence_pack": pack,
+        "request_constraints": RequestConstraints(),
+        "message": task.request,
+        "request_id": "phase4c-product-failure",
+        "supplemental_retrieval_count": 0,
+    })
+
+    assert update["review_decision"].outcome == "answer_with_limitations"
+    assert update["review_decision"].supplemental_allowed is False
+    assert any(capability in item for item in update["review_decision"].material_limitations)
+
+
+def test_optional_knowledge_failure_remains_caveat_not_operational_substitute() -> None:
+    task = _task("analyze the first result and give hardening guidance")
+    search = _search_result(task)
+    unavailable = ToolResult(
+        status="not_configured",
+        entities=(),
+        source_capability="knowledge.search",
+        retrieved_at="2026-09-11T10:00:01+00:00",
+        freshness="unknown",
+        completeness="unknown",
+        limitations=("knowledge unavailable",),
+        step_id="deepening-1",
+        provider="knowledge",
+    )
+    reviewer = EvidenceReviewer()
+    pack = reviewer.build_pack(task, [search, unavailable])
+    nodes = object.__new__(Phase4CWorkflowNodes)
+    nodes.settings = SimpleNamespace(agent_max_supplemental_retrievals=1)
+    nodes.service = SimpleNamespace(evidence_reviewer=reviewer)
+
+    update = nodes.review_retrieval({
+        "task": task,
+        "tool_results": [search, unavailable],
+        "evidence_pack": pack,
+        "request_constraints": RequestConstraints(),
+        "message": task.request,
+        "request_id": "phase4c-knowledge-failure",
+        "supplemental_retrieval_count": 0,
+    })
+
+    assert update["review_decision"].outcome == "sufficient"
+    assert not update["review_decision"].material_limitations
+    assert any("knowledge.search" in item or "knowledge unavailable" in item for item in update["review_decision"].limitations)
