@@ -1,9 +1,9 @@
 """Phase 4C bounded cross-source deepening for structured Asset discovery.
 
-The structured Asset search remains a zero-entity discovery operation.  This
+The structured Asset search remains a zero-entity discovery operation. This
 runtime extension may select at most two returned Assets *after* discovery and
 then execute existing Product/Detection/Graph/Knowledge capabilities for those
-focal Assets.  Search rows never become conversational entities merely because
+focal Assets. Search rows never become conversational entities merely because
 they were returned by Neo4j.
 """
 
@@ -14,7 +14,7 @@ import re
 from dataclasses import replace
 from typing import Any
 
-from src.core.agent.contracts import ExecutionPlan, InvestigationState, TaskSpec, ToolResult
+from src.core.agent.contracts import ExecutionPlan, InvestigationState, TaskSpec
 from src.core.agent.nodes import CopilotWorkflowNodes
 from src.core.agent.task_mapping import compile_direct_plan
 from src.core.context.models import ResolvedEntity
@@ -55,7 +55,10 @@ _KNOWLEDGE = re.compile(
     r"containment|recommendation|recommendations|best\s+practice)\b",
     re.IGNORECASE,
 )
-_BROAD = re.compile(r"\b(?:analy[sz]e|investigate|assess|comprehensive|deep(?:ly)?)\b", re.IGNORECASE)
+_BROAD = re.compile(
+    r"\b(?:analy[sz]e|investigate|assess|comprehensive|deep(?:ly)?)\b",
+    re.IGNORECASE,
+)
 
 
 class Phase4CWorkflowNodes(CopilotWorkflowNodes):
@@ -79,7 +82,12 @@ class Phase4CWorkflowNodes(CopilotWorkflowNodes):
             ),
             None,
         )
-        if search_result is None or search_result.status not in {"ok", "partial", "empty", "not_found"}:
+        if search_result is None or search_result.status not in {
+            "ok",
+            "partial",
+            "empty",
+            "not_found",
+        }:
             logger.info(
                 "event=phase4c_candidate_selection request_id=%s candidates_found=0 candidates_selected=0 "
                 "reason=search_evidence_unavailable",
@@ -133,9 +141,12 @@ class Phase4CWorkflowNodes(CopilotWorkflowNodes):
             and item.source_capability != "graph.search_assets"
             for item in deepening_results
         )
-        knowledge_calls = sum(item.source_capability == "knowledge.search" for item in deepening_results)
+        knowledge_calls = sum(
+            item.source_capability == "knowledge.search" for item in deepening_results
+        )
         partial_failures = sum(
-            item.status in {"partial", "unavailable", "not_configured", "invalid", "not_found"}
+            item.status
+            in {"partial", "unavailable", "not_configured", "invalid", "not_found"}
             for item in deepening_results
         )
         logger.info(
@@ -150,9 +161,9 @@ class Phase4CWorkflowNodes(CopilotWorkflowNodes):
             partial_failures,
         )
 
-        # The parent search result remains first-class discovery evidence.  The
-        # focal results are appended as independent ToolResults so EvidencePack,
-        # ContextComposer and Synth preserve their native provider provenance.
+        # Parent search evidence remains first-class discovery evidence. Focal
+        # results are appended as independent ToolResults, so EvidencePack,
+        # ContextComposer and Synth preserve native provider provenance.
         merged = [*results, *deepening_results]
         return {
             **base,
@@ -184,15 +195,21 @@ class Phase4CWorkflowNodes(CopilotWorkflowNodes):
         if comparison:
             if len(ips) == 2:
                 return ips[:2], "exact_two_candidates_for_comparison"
-            if _RANKED_TWO.search(request) and task.structured_query and task.structured_query.sort is not None:
+            if (
+                _RANKED_TWO.search(request)
+                and task.structured_query
+                and task.structured_query.sort is not None
+            ):
                 return ips[:2], "explicit_ranked_pair"
             return (), "ambiguous_multi_candidate_comparison"
 
         if _RANKED_ONE.search(request):
-            # "first" refers to the deterministic returned order.  Other rank
-            # wording requires the Router to have encoded an explicit sort.
+            # "first" refers to deterministic returned order. Other rank wording
+            # requires the Router to have encoded an explicit sort.
             first_word = bool(re.search(r"\bfirst\b", request, re.IGNORECASE))
-            if first_word or (task.structured_query and task.structured_query.sort is not None):
+            if first_word or (
+                task.structured_query and task.structured_query.sort is not None
+            ):
                 return (ips[0],), "explicit_ranked_single"
             return (), "rank_without_structured_sort"
 
@@ -241,7 +258,10 @@ class Phase4CWorkflowNodes(CopilotWorkflowNodes):
             response_depth=parent.response_depth,
         )
 
-        resolved = [ResolvedEntity(type="ip", value=ip, source="conversation") for ip in selected]
+        resolved = [
+            ResolvedEntity(type="ip", value=ip, source="conversation")
+            for ip in selected
+        ]
         route = replace(
             state["routing_result"],
             use_graph=use_topology,
@@ -260,7 +280,11 @@ class Phase4CWorkflowNodes(CopilotWorkflowNodes):
             materialized_entities=selected,
             target_entity=resolved[0] if len(resolved) == 1 else None,
             target_entities=resolved,
-            matched_signals=list(dict.fromkeys((*(state["routing_result"].matched_signals or []), "phase4c_focal_deepening"))),
+            matched_signals=list(
+                dict.fromkeys(
+                    (*((state["routing_result"].matched_signals or [])), "phase4c_focal_deepening")
+                )
+            ),
             graph_intent_detected=use_topology,
             asset_investigation_detected=True,
             followup_detected=False,
@@ -276,18 +300,36 @@ class Phase4CWorkflowNodes(CopilotWorkflowNodes):
         return focal_task, route
 
     @staticmethod
-    def _compile_deepening_plan(task: TaskSpec, parent_plan: ExecutionPlan) -> ExecutionPlan:
+    def _compile_deepening_plan(
+        task: TaskSpec,
+        parent_plan: ExecutionPlan,
+    ) -> ExecutionPlan:
         compiled = compile_direct_plan(
             task,
             plan_id=f"{parent_plan.plan_id}-deep"[:32],
         )
-        steps = tuple(
+        remaining_calls = max(
+            0,
+            min(parent_plan.maximum_allowed_calls, 6) - len(parent_plan.steps),
+        )
+        steps = list(compiled.steps)
+        if len(steps) > remaining_calls:
+            optional_ids = {
+                step.id for step in steps if step.requirement == "optional"
+            }
+            if optional_ids:
+                steps = [step for step in steps if step.id not in optional_ids]
+                task = replace(task, optional_capabilities=())
+                compiled = replace(compiled, task=task)
+        if len(steps) > remaining_calls:
+            raise ValueError("phase4c_deepening_call_budget_exceeded")
+        renamed = tuple(
             replace(step, id=f"deepening-{index}")
-            for index, step in enumerate(compiled.steps, start=1)
+            for index, step in enumerate(steps, start=1)
         )
         return replace(
             compiled,
-            steps=steps,
-            maximum_allowed_calls=min(parent_plan.maximum_allowed_calls, 6),
+            steps=renamed,
+            maximum_allowed_calls=remaining_calls,
             source="deterministic",
         )
