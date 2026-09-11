@@ -62,26 +62,28 @@ class AssetSearchFilters(BaseModel):
     asset_name: str | None = Field(default=None, max_length=256)
     status: str | None = Field(default=None, max_length=128)
     suggested_type: str | None = Field(default=None, max_length=256)
-    role: str | None = Field(default=None, max_length=256)
-    roles: str | None = Field(default=None, max_length=256)
-    vendor: str | None = Field(default=None, max_length=256)
-    product: str | None = Field(default=None, max_length=256)
-    tag: str | None = Field(default=None, max_length=256)
-    sub_tag: str | None = Field(default=None, max_length=256)
-    enrichment_status: str | None = Field(default=None, max_length=64)
     model_confidence_min: float | None = Field(default=None, ge=0.0, le=1.0)
     model_confidence_max: float | None = Field(default=None, ge=0.0, le=1.0)
     mapping_confidence_min: float | None = Field(default=None, ge=0.0, le=1.0)
     mapping_confidence_max: float | None = Field(default=None, ge=0.0, le=1.0)
     unknown_score_min: float | None = Field(default=None, ge=0.0, le=1.0)
     unknown_score_max: float | None = Field(default=None, ge=0.0, le=1.0)
+    classification_summary: str | None = Field(default=None, max_length=1024)
+    vendor: str | None = Field(default=None, max_length=256)
+    product: str | None = Field(default=None, max_length=256)
+    role: str | None = Field(default=None, max_length=256)
+    roles: str | None = Field(default=None, max_length=256)
+    tag: str | None = Field(default=None, max_length=256)
+    sub_tag: str | None = Field(default=None, max_length=256)
     last_detection_at_from: datetime | None = None
     last_detection_at_to: datetime | None = None
+    enrichment_status: str | None = Field(default=None, max_length=64)
 
     @field_validator(
         "asset_name",
         "status",
         "suggested_type",
+        "classification_summary",
         "role",
         "roles",
         "vendor",
