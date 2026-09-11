@@ -171,6 +171,89 @@ class Phase4CWorkflowNodes(CopilotWorkflowNodes):
             "capability_results": merged,
         }
 
+    def review_retrieval(self, state: InvestigationState) -> dict[str, Any]:
+        """Make focal verification failures visible without weakening search truth."""
+        update = super().review_retrieval(state)
+        task = state.get("task")
+        if task is None or task.intent != "asset_search":
+            return update
+        deepening = tuple(
+            item
+            for item in state.get("tool_results") or ()
+            if item.step_id.startswith("deepening-")
+        )
+        if not deepening:
+            return update
+
+        decision = update["review_decision"]
+        if decision.outcome in {"safe_failure", "missing_required_evidence"}:
+            return update
+
+        material: list[str] = []
+        caveats: list[str] = []
+        for result in deepening:
+            label = result.source_capability
+            operational = label != "knowledge.search"
+            if result.status in {"unavailable", "not_configured", "invalid", "not_found"}:
+                target = material if operational else caveats
+                target.append(f"{label} could not verify the selected focal Asset evidence.")
+            elif result.status == "partial" or result.completeness != "complete" or result.truncated:
+                target = material if operational else caveats
+                target.append(f"{label} supplied incomplete evidence for the selected focal Asset.")
+            if operational and label in {"asset.get_profile", "asset.get_detection"} and (
+                not result.source_payload_complete or not result.projection_usable
+            ):
+                material.append(f"{label} did not supply a usable Product projection for the selected focal Asset.")
+            caveats.extend(result.limitations)
+
+        material_tuple = tuple(dict.fromkeys(material))
+        caveat_tuple = tuple(dict.fromkeys(caveats))
+        if not material_tuple and not caveat_tuple:
+            return update
+        revised = replace(
+            decision,
+            outcome="answer_with_limitations" if material_tuple else decision.outcome,
+            reasons=tuple(dict.fromkeys((*decision.reasons, *material_tuple))),
+            limitations=tuple(dict.fromkeys((*decision.limitations, *material_tuple, *caveat_tuple))),
+            caveats=tuple(dict.fromkeys((*decision.caveats, *caveat_tuple))),
+            material_limitations=tuple(
+                dict.fromkeys((*decision.material_limitations, *material_tuple))
+            ),
+            supplemental_allowed=False,
+            next_capability=None,
+            next_arguments=None,
+        )
+        pack = self.service.evidence_reviewer.with_review(state["evidence_pack"], revised)
+        logger.info(
+            "event=phase4c_evidence_review request_id=%s focal_result_count=%s "
+            "material_limitation_count=%s caveat_count=%s outcome=%s",
+            state.get("request_id", ""),
+            len(deepening),
+            len(material_tuple),
+            len(caveat_tuple),
+            revised.outcome,
+        )
+        return {**update, "review_decision": revised, "evidence_pack": pack, "next_edge": "compose"}
+
+    @staticmethod
+    def _baseline_capture_rejection_reason(
+        task: Any,
+        results: tuple[Any, ...],
+        identity: Any,
+        review: Any,
+    ) -> str:
+        # The focal Assets selected during Phase 4C are execution-local. Do not
+        # attach their current evidence to the zero-entity structured-search
+        # episode baseline. StructuredQueryContext remains the continuity source.
+        if getattr(task, "intent", "") in {"asset_search", "asset_aggregate"}:
+            return "structured_asset_set_not_focal_baseline"
+        return CopilotWorkflowNodes._baseline_capture_rejection_reason(
+            task,
+            results,
+            identity,
+            review,
+        )
+
     @staticmethod
     def _select_candidates(
         task: TaskSpec,
