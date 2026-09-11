@@ -1,17 +1,25 @@
-"""Production hardening adapter for final-answer streaming."""
+"""Production hardening adapter for E2E-discovered Copilot issues."""
 
 from __future__ import annotations
 
 from collections.abc import Callable
 from typing import Any
 
+import src.core.copilot.service as base_service_module
+from src.core.agent.hardened_phase4c import Phase4CWorkflowNodes as HardenedPhase4CWorkflowNodes
 from src.core.copilot.service import CopilotService as BaseCopilotService
 from src.core.llm.errors import LLMError
 from src.core.llm.providers.base import LLMProviderResult, LLMStreamEvent
 
 
 class CopilotService(BaseCopilotService):
-    """Never expose a partial length-truncated answer to the user stream."""
+    """Use hardened Phase 4C continuity and never expose truncated final prose."""
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        # BaseCopilotService intentionally owns workflow construction. Bind the
+        # compatible Phase4C subclass at the single factory seam it already uses.
+        base_service_module.Phase4CWorkflowNodes = HardenedPhase4CWorkflowNodes
 
     def _stream_final_model(
         self,
