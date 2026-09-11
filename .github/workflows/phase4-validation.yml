@@ -52,6 +52,8 @@ jobs:
           app/src/tests/test_phase4b2_structured_capabilities.py
           app/src/tests/test_phase4b3_structured_evidence.py
           app/src/tests/test_phase4b4_structured_continuity.py
+          app/src/tests/test_phase4c_router_contract.py
+          app/src/tests/test_phase4c_exact_search_deepening.py
           app/src/tests/test_context_routing.py
           app/src/tests/test_agentic_rag_foundation.py
           -q
