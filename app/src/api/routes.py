@@ -16,7 +16,7 @@ from src.api.auth import verify_api_key
 from src.api.dependencies import get_local_persistence, get_product_api_client
 from src.api.schemas.chat import ChatResponse, HealthResponse, LLMHealthResponse
 from src.config.settings import get_settings
-from src.core.copilot.service import CopilotService
+from src.core.copilot.hardened_service import CopilotService
 from src.core.context.models import approx_tokens
 from src.core.llm.client import LLMClient
 from src.core.llm.errors import LLMError
