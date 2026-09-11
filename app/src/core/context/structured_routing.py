@@ -84,9 +84,13 @@ def validate_structured_router_payload(
 ) -> IntentDecision:
     """Validate either the established entity route or one typed Asset-set route."""
     reference = _structured_result_reference(payload.get("structured_result_reference"))
+    # This extension owns structured_result_reference. Remove it after parsing
+    # before delegating to the legacy or set-specific field allow-list. The
+    # Router prompt intentionally emits null for ordinary routes, so null must
+    # be a valid no-op rather than an unexpected-field failure.
+    clean_payload = dict(payload)
+    clean_payload.pop("structured_result_reference", None)
     if reference.kind != "none":
-        clean_payload = dict(payload)
-        clean_payload.pop("structured_result_reference", None)
         explicit = any(entity.source == "message" for entity in entities.entities)
         if explicit:
             if reference.kind == "set_query":
@@ -184,6 +188,7 @@ def validate_structured_router_payload(
         )
         return replace(decision, structured_result_reference=reference)
 
+    payload = clean_payload
     intent = str(payload.get("intent") or "")
     raw_query = payload.get("structured_query")
 
