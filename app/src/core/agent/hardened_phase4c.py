@@ -18,24 +18,22 @@ _FOCAL_CAPABILITIES = {
 }
 
 
-class Phase4CWorkflowNodes(BasePhase4CWorkflowNodes):
-    """Promote only an actually deepened structured result to focal continuity."""
+def _deepened_entities(state: InvestigationState) -> tuple[str, ...]:
+    focal: list[str] = []
+    for result in state.get("tool_results") or ():
+        if result.source_capability not in _FOCAL_CAPABILITIES:
+            continue
+        for entity in result.entities:
+            if entity not in focal:
+                focal.append(entity)
+    return tuple(focal[:2])
 
-    def join_specialist_results(self, state: InvestigationState) -> dict[str, Any]:
-        update = super().join_specialist_results(state)
-        focal: list[str] = []
-        for result in update.get("tool_results") or ():
-            if result.source_capability not in _FOCAL_CAPABILITIES:
-                continue
-            for entity in result.entities:
-                if entity not in focal:
-                    focal.append(entity)
-        if 1 <= len(focal) <= 2:
-            update["phase4c_focal_entities"] = tuple(focal)
-        return update
+
+class Phase4CWorkflowNodes(BasePhase4CWorkflowNodes):
+    """Promote only actually deepened structured results to focal continuity."""
 
     def update_memory(self, state: InvestigationState) -> dict[str, Any]:
-        focal = tuple(state.get("phase4c_focal_entities") or ())
+        focal = _deepened_entities(state)
         if not focal:
             return super().update_memory(state)
 
@@ -63,7 +61,6 @@ class Phase4CWorkflowNodes(BasePhase4CWorkflowNodes):
             use_graph=bool({"graph.get_summary", "graph.compare_assets"} & capabilities),
             use_detection="asset.get_detection" in capabilities,
             use_asset_profile="asset.get_profile" in capabilities,
-            structured_query=state["routing_result"].structured_query,
             entity_binding="active_pair" if pair else "active_single",
             resolved_entity_binding="active_pair" if pair else "active_single",
             binding_source="conversation",
