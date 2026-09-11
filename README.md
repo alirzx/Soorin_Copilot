@@ -2,14 +2,14 @@
 
 Soorin Cyber Copilot is a bounded, evidence-aware assistant for SOC, NOC, NDR, threat-intelligence, and asset-intelligence workflows in the Soorin platform.
 
-It combines current Product evidence, a Neo4j operational graph projection, approved Knowledge/RAG sources, and bounded conversation memory. LLMs route, correlate, and explain evidence; they are not the authority for live operational facts.
+It combines current Product evidence, a versioned Neo4j organizational/topology projection, approved Knowledge/RAG sources, and bounded conversation memory. LLMs route, plan when needed, correlate, and explain evidence; deterministic runtime policy remains authoritative for entity binding, tool limits, evidence validation, context budgets, and live operational truth.
 
 ## Architecture
 
 ```mermaid
 flowchart TD
     U[User / Product Frontend] --> API[Streamlit UI / Chat API]
-    API --> WF[LangGraph Workflow]
+    API --> WF[Bounded LangGraph Workflow]
 
     WF --> ENT[Entity Resolution + Request Constraints]
     ENT --> RT[Semantic Router]
@@ -23,19 +23,28 @@ flowchart TD
     EX --> GR[graph.*]
     EX --> KB[knowledge.search]
 
+    GR --> DISC[Exact Asset-set Discovery]
+    DISC --> SEL[Deterministic max 1–2 focal selection]
+    SEL --> DEEP[Bounded cross-source deepening]
+    DEEP --> AS
+    DEEP --> GR
+    DEEP -. optional .-> KB
+
     AS --> PROD[Product Backend]
     GR --> GCP[GraphContextProvider]
     GCP --> GS[GraphService]
     GS --> NEO[Neo4j Community]
-    KB --> QD[Qdrant RAG]
+    KB --> QD[Qdrant Knowledge]
 
-    PROD --> SYNC[Versioned Graph Sync]
+    PROD --> SYNC[Versioned Graph Sync + Enrichment]
     SYNC --> NEO
 
     EX --> EV[ToolResult → EvidenceReceipt → EvidencePack]
-    EV --> REV[Evidence Review + Context Composer]
-    MEM[ThreadState / Working Facts / Episodes / Product LTM] --> REV
-    REV --> SYN[Synthesizer]
+    DEEP --> EV
+    EV --> REV[Deterministic Evidence Review]
+    REV --> CTX[Bounded Context Composer]
+    MEM[ThreadState / Working Facts / Episodes / Product LTM] --> CTX
+    CTX --> SYN[Synthesizer]
     SYN --> OUT[Grounded Response / UTF-8 SSE]
     OUT --> MEM
 
@@ -44,59 +53,83 @@ flowchart TD
 
 ## Request Workflow
 
-A request moves through a bounded LangGraph workflow:
+A request moves through a bounded workflow:
 
-1. **Resolve entities** from the message, UI context, and active conversation state.
-2. **Apply request constraints** such as live/current evidence, memory-only recall, or memory writes.
-3. **Route intent** with the semantic Router.
-4. **Validate the task** and use either a deterministic direct plan or the bounded Planner for multi-step work.
-5. **Execute registered read-only capabilities** through specialized asset, graph, and knowledge paths.
-6. **Build and review evidence** before it reaches the model.
-7. **Compose bounded context** with source, freshness, completeness, limitations, and memory provenance.
-8. **Synthesize the response** and persist bounded conversation/investigation state.
+1. Resolve entities from explicit message content, UI context, and authorized conversation state.
+2. Apply deterministic request constraints such as current/live evidence, memory-only recall, or memory writes.
+3. Route semantic intent with the Router.
+4. Validate the task and use either a deterministic direct plan or one bounded Planner proposal.
+5. Execute registered read-only Product, Graph, and Knowledge capabilities.
+6. For exact Asset search, keep the result as an Asset set. If the user requested analysis and a focal choice is deterministic, select at most one or two Assets and deepen only those through existing Product/Detection/Graph capabilities.
+7. Build and deterministically review a unified EvidencePack.
+8. Compose bounded context with source, freshness, completeness, truncation, limitations, and authorized memory provenance.
+9. Synthesize the analyst-facing response and persist bounded continuity.
 
 Application validation and evidence policy remain authoritative even when Router or Planner output is incomplete.
 
+## Exact Asset Search and Phase 4C
+
+The structured Graph path supports bounded exact/range Asset discovery and count/group-count aggregation over allow-listed properties. It exposes no raw Cypher, arbitrary properties, regex, OR-expression, or operator escape hatch.
+
+The finalized investigation flow is:
+
+```text
+Exact Search
+→ bounded discovery
+→ deterministic max 1–2 focal Assets
+→ verified Product Profile / Detection
+→ bounded Graph topology when needed
+→ optional Knowledge when useful
+→ unified evidence
+→ grounded answer
+→ bounded StructuredQueryContext continuity
+```
+
+Plain list/search requests do not trigger automatic Product calls. Multi-result deepening requires deterministic selection semantics; ambiguous selection fails closed. The global capability-call limit and two-focal-entity limit remain unchanged, so a large search result can never become N-way Product fan-out.
+
+Search rows are organizational discovery evidence, not conversational entities. Product remains authoritative for current/deep Asset and Detection facts. The Synthesizer explicitly distinguishes the discovered set from deeper findings verified for selected focal Assets.
+
 ## Evidence and Authority
 
-The main evidence sources are deliberately separated:
+- **Product Backend**: authoritative current/deep Asset Profile and Detection evidence.
+- **Neo4j Community**: versioned organizational discovery projection and bounded topology.
+- **Qdrant Knowledge**: approved SOC/NOC/NDR/TI documentation and background knowledge.
+- **Memory**: conversation/investigation continuity and validated historical findings, never a replacement for required fresh operational evidence.
 
-- **Product Backend**: authoritative current asset profile, detection data, and topology source.
-- **Neo4j Community**: current operational graph projection used for graph evidence.
-- **Qdrant RAG**: approved SOC/NOC/NDR/TI knowledge and runbook retrieval.
-- **Memory**: conversation and investigation continuity, not a replacement for required fresh operational evidence.
-
-Registered graph capabilities include bounded summaries, neighbors, direct relationships, asset comparison, and directed observed paths.
-
-Product topology is synchronized into Neo4j as a versioned projection. Failed refreshes preserve the last-known-good graph. The active runtime no longer depends on NetworkX, pickle, GraphML, or GEXF artifacts.
-
-## Memory
-
-Memory is bounded and typed:
-
-- active ThreadState and entity/pair continuity,
-- working facts explicitly provided by the analyst,
-- recent-turn summaries and compact digests,
-- episodic investigation context,
-- Product-backed durable long-term memory.
-
-Pure memory recall does not intentionally refresh live evidence. Current operational evidence continues to outrank remembered conclusions when current verification is required.
-
-## Models
-
-The LLM layer has three roles:
-
-- **Router**: semantic intent and scope classification.
-- **Planner**: bounded multi-step planning when deterministic direct execution is insufficient.
-- **Synthesizer**: grounded final response from validated evidence and memory context.
-
-The CapabilityExecutor, evidence review, context budgets, and application-level guards constrain model behavior.
+Current Product evidence is not silently replaced by Graph enrichment when Product verification is unavailable. Reviewer limitations preserve that source boundary.
 
 ## Graph Runtime
 
-The graph runtime uses **Neo4j Community 2026.07.1**.
+The graph runtime uses **Neo4j Community 2026.07.1**. Product topology and enrichment are synchronized into a versioned projection; only the published active graph version is queried. Failed refreshes preserve the last-known-good version.
 
-Product topology is synchronized as a versioned directed projection, with a default refresh interval of **3600 seconds**. The API exposes bounded authenticated graph endpoints, while the UI accesses graph state only through the Copilot API.
+Structured search supports fixed exact selectors such as IP, asset name, status, suggested type, role/roles membership, vendor, product, tag/sub-tag and enrichment status; bounded confidence/time ranges; fixed sort fields; and fixed aggregation/grouping fields. Returned rows can contain additional enrichment metadata, but internal graph-version authority and scheduler metadata are not exposed as arbitrary user filters.
+
+The active runtime does not depend on NetworkX, pickle, GraphML, or GEXF artifacts.
+
+## Memory and Continuity
+
+Memory is bounded and typed:
+
+- active ThreadState and entity/pair continuity;
+- explicit analyst working facts;
+- recent-turn summaries and compact digests;
+- episodic investigation context;
+- Product-backed durable long-term memory;
+- `StructuredQueryContext` for the latest bounded structured result set.
+
+Structured search rows do not consume the two-entity budget and do not automatically become active entities. Phase 4C focal selection is execution-local; structured-search turns do not write a focal investigation baseline under an empty set-level context. Explicit current-message entities continue to outrank fallback UI/active context under the existing authority rules.
+
+Pure memory recall does not intentionally refresh live evidence. Current operational evidence continues to outrank remembered conclusions when current verification is required.
+
+## Models and Prompts
+
+The LLM layer has three roles:
+
+- **Router**: semantic intent/scope plus typed structured-query semantics.
+- **Planner**: bounded multi-step planning only when deterministic direct execution is insufficient.
+- **Synthesizer**: grounded final analysis from validated evidence and authorized memory context.
+
+Exact structured search uses deterministic direct execution. Post-search candidate selection/deepening is also deterministic and does not add another LLM call. Router and Planner prompt contracts already enforce selector-vs-entity and capability boundaries; the Synthesizer search module additionally distinguishes set discovery from verified focal analysis.
 
 ## Local Run
 
@@ -128,30 +161,49 @@ Default native endpoints:
 ## Repository Guide
 
 - `app/src/api` — FastAPI, streaming, authentication, graph, and health routes.
-- `app/src/core/agent` — workflow state, Router/Planner integration, capabilities, specialists, and evidence review.
-- `app/src/core/context` — entity resolution, evidence providers, projections, and context budgets.
-- `app/src/core/graph` — Product topology synchronization, Neo4j repository, graph policy, and graph service.
-- `app/src/core/memory` — ThreadState, working facts, episodes, retrieval, and Product LTM integration.
+- `app/src/core/agent` — workflow state, routing/planning integration, capabilities, specialists, evidence review, structured continuity, and Phase 4C bounded deepening.
+- `app/src/core/context` — entity resolution, evidence providers, projections, prompt/context construction, and token budgets.
+- `app/src/core/graph` — Product topology/enrichment synchronization, Neo4j repository, graph policy, exact structured retrieval, and graph service.
+- `app/src/core/memory` — ThreadState, structured-result continuity, working facts, episodes, retrieval, and Product LTM integration.
 - `app/src/core/rag` — embeddings, Qdrant retrieval, knowledge sources, and citations.
 - `app/src/core/observability` — logs, metrics, traces, usage reporting, and evidence diagnostics.
+
+## Phase Status
+
+```text
+Phase 1       DONE
+Phase 2       DONE
+Phase 2.5     PASS
+Phase 3       DONE
+Phase 3.5     DONE
+Phase 4A      DONE
+Phase 4A.1    DONE / VALIDATED
+Phase 4B.1    DONE
+Phase 4B.2    DONE
+Phase 4B.3    DONE
+Phase 4B.4    DONE
+Phase 4C      IMPLEMENTED; final CI gate required on current HEAD
+```
 
 ## Deployment and Documentation
 
 Primary operational references:
 
 - [Current Architecture](docs/CURRENT_ARCHITECTURE.md)
+- [Phase 4 Structured Graph Routing](docs/PHASE4_STRUCTURED_GRAPH_ROUTING.md)
+- [Phase 4C Exact Search Finalization](docs/PHASE4C_EXACT_SEARCH_FINALIZATION.md)
+- [Neo4j Enrichment / GraphRAG](docs/NEO4J_GRAPH_ENRICHMENT_GRAPHRAG.md)
 - [Deployment](docs/DEPLOYMENT.md)
 - [Environment Variables](docs/ENVIRONMENT_VARIABLES.md)
 - [Observability](docs/OBSERVABILITY.md)
 - [Frontend / Backend Integration](docs/FRONTEND_BACKEND_COPILOT_INTEGRATION.md)
 - [Evidence-to-Context Audit](docs/INTERNAL_EVIDENCE_TO_MODEL_CONTEXT_AUDIT.md)
 - [Memory and Context Design](docs/MEMORY_CONTEXT_UPGRADE_DESIGN.md)
-- [Agentic Foundation and RAG](docs/agentic-foundation-rag.md)
 
-## Offline Validation
+## Validation
 
 ```bash
 PYTHONPATH=app .venv/bin/python -m pytest -q app/src/tests
 ```
 
-The offline suite uses local fakes and fixtures and does not require live Product, LLM, Qdrant, Streamlit, or graph-refresh services.
+The Phase 4 GitHub validation workflow additionally runs targeted Router/structured-search/Phase 4C regressions, disposable Neo4j structured integration, the read-only query-plan audit, and Neo4j Community parity tests. Mutating graph tests must never target the production or main local Neo4j instance.
