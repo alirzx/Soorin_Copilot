@@ -1,6 +1,6 @@
 # Phase 4C — Exact Search Finalization
 
-Status: **IMPLEMENTED on `dev` pending final CI confirmation**
+Status: **DONE / VALIDATED on `dev`**
 
 Phase 4C turns structured Neo4j Asset discovery into a bounded investigation entry point without changing Product API contracts, frontend contracts, public chat schemas, Neo4j schema, or the two-focal-entity limit.
 
@@ -136,6 +136,6 @@ Graph search and topology continue through `GraphContextProvider → GraphServic
 
 ## Validation gate
 
-The Phase 4 validation workflow now includes Router null-contract regressions and deterministic Phase 4C candidate/fan-out tests in addition to the existing structured Neo4j integration, read-only EXPLAIN/PROFILE audit, and Neo4j Community parity suite.
+The Phase 4 validation workflow includes Router null-contract regressions and deterministic Phase 4C candidate/fan-out/reviewer tests in addition to structured Neo4j integration, the read-only EXPLAIN/PROFILE audit, and Neo4j Community parity.
 
-Phase 4C is considered complete only when this updated workflow passes on the final `dev` commit.
+Validated on commit `613dab022cb9e5f58690e0f193b034613f7cf010`: targeted Phase 4 suite `237 passed, 41 skipped, 62 subtests passed`; structured Neo4j integration `5 passed`; Neo4j Community parity `14 passed`; read-only query-plan audit completed with `writes_performed=false`.
