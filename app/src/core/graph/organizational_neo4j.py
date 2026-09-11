@@ -19,6 +19,7 @@ _TEXT_PROPERTIES = {
     "asset_name": "asset_name",
     "status": "status",
     "suggested_type": "suggested_type",
+    "classification_summary": "classification_summary",
     "role": "role",
     "vendor": "vendor",
     "product": "product",
@@ -59,7 +60,8 @@ class OrganizationalNeo4jGraphRepository(Neo4jGraphRepository):
                 "Product topology response contained no valid graph records."
             )
         nodes = sorted({str(pair["source"]) for pair in all_pairs})
-        pairs = [pair for pair in all_pairs if str(pair["target"]) in set(nodes)]
+        source_assets = set(nodes)
+        pairs = [pair for pair in all_pairs if str(pair["target"]) in source_assets]
         new_pending_assets = self._write_staging_nodes(nodes, version)
         self._write_staging_edges(pairs, version)
         self._validate_staging(version, len(nodes), len(pairs))
