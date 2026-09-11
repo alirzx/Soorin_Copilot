@@ -19,7 +19,8 @@ from src.core.memory.sqlite import (
     SQLiteThreadStateStore,
 )
 from src.core.memory.sqlite_long_term import SQLiteLongTermMemoryStore
-from src.core.memory.product import ProductLongTermMemoryStore, ProductThreadStateStore
+from src.core.memory.product import ProductThreadStateStore
+from src.core.memory.product_hardened import ProductLongTermMemoryStore
 from src.core.memory.product_chat import ProductTranscriptRepository
 from src.core.product_client import ProductApiClient
 from src.core.product_client.memory_client import ProductMemoryClient
