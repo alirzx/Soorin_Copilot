@@ -38,7 +38,7 @@ Soorin Copilot follows these implementation rules:
 - Explicit user entities outrank UI-selected entities, which outrank active session entities.
 - Detached general questions must not inherit stale asset context.
 - Provider failures are represented as unavailable, partial, stale, or safe failure; they are not converted into verified facts.
-- Graph evidence is topology evidence only. It does not prove physical routing, trust, dependency, compromise, or reachability.
+- Graph evidence covers observed communication topology and the structured organizational Asset projection. The projection is not live Product Profile/Detection truth, and topology does not prove physical routing, trust, dependency, compromise, or reachability.
 - RAG evidence is documentation evidence only. It does not override current product or graph evidence.
 
 ## 2. High-Level Runtime Flow

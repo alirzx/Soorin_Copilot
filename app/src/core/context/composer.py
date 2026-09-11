@@ -35,8 +35,8 @@ PROVIDER_SEMANTICS = {
         "limitation": "Classification evidence is not automatically authoritative inventory truth.",
     },
     "graph": {
-        "description": "Observed communication topology.",
-        "limitation": "Does not by itself prove protocol purpose, trust, service dependency, successful authentication, compromise, routing capability, or attack paths; coverage may be partial.",
+        "description": "Observed topology and structured organizational Asset projection.",
+        "limitation": "The projection is not live Product profile or detection truth. Topology does not prove protocol purpose, trust, dependency, authentication, compromise, routing, or attack paths; coverage may be partial.",
     },
     "knowledge": {
         "description": "Approved SOC documentation, runbooks, protocol knowledge, hardening guidance, and investigation procedures.",
@@ -1189,7 +1189,21 @@ class ContextComposer:
                 group_by=evidence.group_by,
             )
             selected_groups: list[dict[str, Any]] = []
-            text = ""
+            payload = {
+                **base,
+                "result": {
+                    "count": evidence.count,
+                    "groups_retrieved": len(evidence.groups),
+                    "groups_in_model_context": 0,
+                    "groups_omitted_from_model_context": len(evidence.groups),
+                    "retrieval_truncated": evidence.truncated,
+                    "context_truncated": bool(evidence.groups),
+                    "groups": [],
+                },
+            }
+            text = self._structured_asset_text(payload)
+            if approx_tokens(text) > max(0, token_budget):
+                return ""
             for group in evidence.groups:
                 candidate = [*selected_groups, self._bounded_structured_value(group)]
                 payload = {
@@ -1209,22 +1223,6 @@ class ContextComposer:
                     break
                 selected_groups = candidate
                 text = candidate_text
-            if not evidence.groups:
-                payload = {
-                    **base,
-                    "result": {
-                        "count": evidence.count,
-                        "groups_retrieved": 0,
-                        "groups_in_model_context": 0,
-                        "groups_omitted_from_model_context": 0,
-                        "retrieval_truncated": evidence.truncated,
-                        "context_truncated": False,
-                        "groups": [],
-                    },
-                }
-                text = self._structured_asset_text(payload)
-                if approx_tokens(text) > max(0, token_budget):
-                    return ""
             self._record_structured_context(
                 context,
                 text,

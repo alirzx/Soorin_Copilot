@@ -17,7 +17,7 @@ from src.core.agent.specialists import GraphAnalysisSpecialist
 from src.core.agent.structured_evidence import structured_query_identity
 from src.core.agent.task_mapping import compile_direct_plan, task_spec_from_route
 from src.core.context.models import GraphProviderResult, ProviderProvenance, RouteDecision
-from src.core.context.composer import ContextComposer
+from src.core.context.composer import ContextComposer, PROVIDER_SEMANTICS
 from src.core.context.models import EntityResolution, approx_tokens
 from src.core.context.synthesizer_prompt import SynthesizerPromptBuilder
 from src.core.graph.structured import StructuredQuerySpec
@@ -472,6 +472,49 @@ def test_aggregate_context_is_compact_and_preserves_count_and_groups() -> None:
     assert '"group_by":"status"' in text
     assert '"value":"CONFIRMED"' in text
     assert approx_tokens(text) < 900
+
+
+def test_graph_provider_semantics_include_structured_asset_projection_boundary() -> None:
+    semantics = PROVIDER_SEMANTICS["graph"]
+
+    assert "structured organizational Asset projection" in semantics["description"]
+    assert "not live Product profile or detection truth" in semantics["limitation"]
+    assert "Topology does not prove" in semantics["limitation"]
+
+
+def test_aggregate_context_falls_back_to_count_when_first_group_does_not_fit() -> None:
+    result = _registry().execute("graph.aggregate_assets", {
+        "filters": {"role": "Domain Controller"},
+        "operation": "group_count",
+        "group_by": "status",
+    })
+    evidence = result.structured_asset_set
+    assert evidence is not None and evidence.mode == "aggregate"
+    evidence = replace(
+        evidence,
+        groups=({"value": "x" * 4000, "count": evidence.count},),
+    )
+
+    text = ""
+    context: dict[str, object] = {}
+    for token_budget in range(1, 701):
+        context = {"structured_asset_set": evidence}
+        text = ContextComposer()._compose_structured_asset_set(
+            SimpleNamespace(context=context),
+            token_budget=token_budget,
+            request_id="aggregate-count-only",
+        )
+        if text:
+            break
+
+    assert text
+    assert '"count":12' in text
+    assert '"groups_in_model_context":0' in text
+    assert '"groups_omitted_from_model_context":1' in text
+    assert '"context_truncated":true' in text
+    assert '"groups":[]' in text
+    assert context["model_context_included_count"] == 0
+    assert context["model_context_omitted_count"] == 1
 
 
 def test_synthesizer_selects_asset_search_module_with_partial_set_rules() -> None:
