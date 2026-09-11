@@ -1,6 +1,6 @@
 """Deterministic hardening for structured Asset-set semantics.
 
-This module is deliberately small and allow-list based.  It never emits Cypher,
+This module is deliberately small and allow-list based. It never emits Cypher,
 never invents conversational entities, and only normalizes semantics already
 represented by StructuredQuerySpec.
 """
@@ -10,7 +10,11 @@ from __future__ import annotations
 import math
 import re
 from dataclasses import dataclass
+from typing import Any
 
+from src.core.context.entities import EntityResolver as BaseEntityResolver
+from src.core.context.models import EntityResolution, RouteDecision
+from src.core.context.router import DeterministicFallbackRouter as BaseFallbackRouter
 from src.core.graph.structured import (
     AssetAggregateOperation,
     AssetGroupField,
@@ -55,7 +59,7 @@ def _normalized_filters(filters: AssetSearchFilters) -> AssetSearchFilters:
     for name in _TEXT_FILTERS:
         value = values.get(name)
         if isinstance(value, str):
-            values[name] = value.strip().lower()
+            values[name] = value.strip().casefold()
     return AssetSearchFilters.model_validate(values)
 
 
@@ -65,11 +69,12 @@ def normalize_structured_query_for_language(
 ) -> StructuredQuerySpec:
     """Canonicalize text selectors and preserve strict/ranked user semantics.
 
-    Neo4j matching is case-insensitive for these canonicalized selectors.  For
-    strict natural-language boundaries we use the next representable float so
-    the existing inclusive typed range contract remains backward compatible.
-    Ranked single-selection requests retrieve two rows so ties can be assessed
-    while Phase 4C still selects at most one focal Asset.
+    Stored Product values keep their display casing; Neo4j comparison performs
+    case-insensitive equality for text selectors. Strict natural-language
+    boundaries use the next representable float so the existing inclusive range
+    schema remains backward compatible. Ranked single-selection requests fetch
+    two rows so the runtime can distinguish a unique top result from a tie while
+    still deepening at most one focal Asset.
     """
 
     filters = _normalized_filters(query.filters)
@@ -96,7 +101,7 @@ def normalize_structured_query_for_language(
 
     updates: dict[str, object] = {"filters": filters}
     if query.mode is StructuredQueryMode.SEARCH and query.sort is not None:
-        if (_RANKED_HIGH.search(message) or _RANKED_LOW.search(message)):
+        if _RANKED_HIGH.search(message) or _RANKED_LOW.search(message):
             updates["limit"] = max(2, int(query.limit or 0))
     return query.model_copy(update=updates)
 
@@ -104,23 +109,55 @@ def normalize_structured_query_for_language(
 def looks_like_structured_set_request(message: str) -> bool:
     """Conservatively identify self-contained set operations before UI binding.
 
-    Explicit IPs deliberately opt out so normal UI/explicit focal workflows keep
-    their existing entity precedence.
+    Explicit IPs deliberately opt out so ordinary focal-asset questions preserve
+    the established explicit > UI > active authority.
     """
 
     text = (message or "").strip()
     if not text or _EXPLICIT_IP.search(text):
         return False
-    if re.search(r"\bgroup\s+(?:all\s+)?assets?\s+by\s+(?:role|status|vendor|product|tag)\b", text, re.I):
+    if re.search(
+        r"\bgroup\s+(?:all\s+)?assets?\s+by\s+(?:role|status|vendor|product|tag|sub\s*tag|suggested\s+type|enrichment\s+status)\b",
+        text,
+        re.I,
+    ):
         return True
-    if re.search(r"\bhow\s+many\b.*\b(?:assets?|controllers?|servers?|firewalls?|workstations?)\b", text, re.I):
+    if re.search(
+        r"\bhow\s+many\b.*\b(?:assets?|controllers?|servers?|firewalls?|workstations?)\b",
+        text,
+        re.I,
+    ):
         return True
     if _SET_VERB.search(text) and (
         _SET_NOUN.search(text)
-        or re.search(r"\b(?:domain\s+controllers?|database\s+servers?|firewalls?|siem|splunk\s+indexers?|hypervisors?)\b", text, re.I)
+        or re.search(
+            r"\b(?:domain\s+controllers?|database\s+servers?|firewalls?|siem|splunk\s+indexers?|hypervisors?)\b",
+            text,
+            re.I,
+        )
     ):
         return True
     return False
+
+
+class StructuredAwareEntityResolver(BaseEntityResolver):
+    """Prevent incidental UI selection from contaminating self-contained set queries."""
+
+    def resolve(
+        self,
+        message: str,
+        ui_context: dict[str, Any] | None = None,
+        routing_state: Any = None,
+        **kwargs: Any,
+    ) -> EntityResolution:
+        if looks_like_structured_set_request(message) and not _EXPLICIT_IP.search(message or ""):
+            ui_context = None
+        return super().resolve(
+            message,
+            ui_context,
+            routing_state,
+            **kwargs,
+        )
 
 
 def deterministic_structured_fallback(message: str) -> StructuredFallbackDecision | None:
@@ -136,7 +173,7 @@ def deterministic_structured_fallback(message: str) -> StructuredFallbackDecisio
         re.I,
     )
     if group:
-        token = re.sub(r"\s+", "_", group.group(1).lower())
+        token = re.sub(r"\s+", "_", group.group(1).casefold())
         mapping = {
             "role": AssetGroupField.ROLE,
             "status": AssetGroupField.STATUS,
@@ -226,3 +263,50 @@ def deterministic_structured_fallback(message: str) -> StructuredFallbackDecisio
         normalize_structured_query_for_language(query, text),
         "deterministic_structured_search",
     )
+
+
+class StructuredAwareFallbackRouter(BaseFallbackRouter):
+    """Add a fail-closed Phase-4 set route before the legacy entity fallback."""
+
+    def route(
+        self,
+        message: str,
+        entities: EntityResolution,
+        routing_state: Any = None,
+        **kwargs: Any,
+    ) -> RouteDecision:
+        structured = deterministic_structured_fallback(message)
+        if structured is not None:
+            return RouteDecision(
+                use_graph=True,
+                reason=structured.reason,
+                structured_query=structured.query,
+                entity_binding="none",
+                requested_entity_binding="none",
+                resolved_entity_binding="none",
+                binding_source="none",
+                binding_available=True,
+                binding_normalized=True,
+                binding_normalization_reason="deterministic_structured_router_fallback",
+                materialized_entity_count=0,
+                materialized_entities=(),
+                target_entity=None,
+                target_entities=[],
+                matched_signals=[structured.intent, "structured_asset_set", "router_fallback"],
+                graph_intent_detected=True,
+                asset_investigation_detected=False,
+                followup_detected=False,
+                intent=structured.intent,  # type: ignore[arg-type]
+                scope="none",
+                direction="none",
+                depth=0,
+                requires_multiple_entities=False,
+                relationship_mode="none",
+                intent_confidence=1.0,
+                decision_source="deterministic_fallback",
+                fallback_used=True,
+                fallback_reason=str(kwargs.get("fallback_reason") or "semantic_router_unavailable"),
+                route_normalized=True,
+                route_normalization_reason="deterministic_structured_router_fallback",
+            )
+        return super().route(message, entities, routing_state, **kwargs)
