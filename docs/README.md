@@ -10,8 +10,8 @@ This directory contains living specifications and historical audit records. Hist
 |---|---|---|
 | `CURRENT_ARCHITECTURE.md` | Living architecture baseline with dated addenda | Overall bounded LangGraph, LLM roles, evidence, context, memory, Product, Neo4j and Qdrant architecture. Read with the current Phase 4 records. |
 | `NEO4J_GRAPH_ENRICHMENT_GRAPHRAG.md` | Living graph architecture record | Graph/enrichment/structured-search/GraphRAG architecture and roadmap. |
-| `PHASE4_STRUCTURED_GRAPH_ROUTING.md` | Phase 4A.1–4B.4 implementation record | Exact-search hardening, Router/capability execution, Asset-set evidence, and result continuity. |
-| `PHASE4C_EXACT_SEARCH_FINALIZATION.md` | Current Phase 4C implementation record | Bounded candidate selection, selective Product/Detection/topology deepening, reviewer/context/memory boundaries, observability and validation. |
+| `PHASE4_STRUCTURED_GRAPH_ROUTING.md` | Phase 4A.1–4C implementation record | Exact-search hardening, Router/capability execution, Asset-set evidence, continuity, and bounded cross-source deepening. |
+| `PHASE4C_EXACT_SEARCH_FINALIZATION.md` | Current Phase 4C validated implementation record | Bounded candidate selection, selective Product/Detection/topology deepening, reviewer/context/memory boundaries, observability and validation. |
 | `ENVIRONMENT_VARIABLES.md` | Living configuration reference | Current settings and deployment knobs. |
 | `DEPLOYMENT.md` | Current deployment guidance | Runtime/deployment mechanics. |
 | `OBSERVABILITY.md` | Current observability guidance | Metrics/logging boundaries. |
@@ -35,7 +35,7 @@ Phase 4B.1    DONE
 Phase 4B.2    DONE
 Phase 4B.3    DONE
 Phase 4B.4    DONE
-Phase 4C      IMPLEMENTED; final CI gate required on current HEAD
+Phase 4C      DONE / VALIDATED
 ```
 
 Phase 4A provides typed exact/range Asset filters, count/group-count aggregation, active-version-only Neo4j queries, bounded keyset pagination and fixed sort/group allow-lists. Phase 4A.1 binds cursors to normalized query identity and active graph version, hardens refresh/storage failure paths, and provides read-only `EXPLAIN/PROFILE` plus isolated Neo4j validation.
@@ -50,7 +50,7 @@ role/vendor/product/status/...  = structured selector/filter/facet
 structured retrieval output     = Asset set
 ```
 
-Phase 4C now turns an eligible exact-search result into a bounded investigation entry point:
+Phase 4C turns an eligible exact-search result into a bounded investigation entry point:
 
 ```text
 Exact Search
@@ -91,6 +91,8 @@ Asset-set rows never consume the two-focal-entity budget and never become active
 
 Mutating Neo4j integration suites must run only against a disposable database, never the main `soorin-copilot-neo4j` instance.
 
-`.github/workflows/phase4-validation.yml` uses a disposable Neo4j Community service on `dev` pushes and now covers the Router null-reference contract, Phase 4C deterministic selection/fan-out guards, the prior Phase 4 regressions, structured Neo4j integration, read-only query-plan audit, and Community parity tests.
+`.github/workflows/phase4-validation.yml` uses a disposable Neo4j Community service on `dev` pushes and covers the Router null-reference contract, Phase 4C deterministic selection/fan-out/reviewer guards, prior Phase 4 regressions, structured Neo4j integration, read-only query-plan audit, and Community parity tests.
+
+Final validated code commit `613dab022cb9e5f58690e0f193b034613f7cf010` passed `237` targeted tests (`41` skipped, `62` subtests), `5` structured Neo4j integration tests, and `14` Community parity tests. The query-plan audit reported `writes_performed=false`.
 
 `app/scripts/audit_phase4a1_query_plans.py` remains read-only. Index policy remains measurement-driven; no enriched-property index is added merely because a filter exists. `matched_total` and the existing `/graph/stats` full-IP materialization remain explicit scale items to measure before changing contracts or implementations.
