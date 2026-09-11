@@ -30,6 +30,7 @@ _TEXT_FILTERS = (
     "asset_name",
     "status",
     "suggested_type",
+    "classification_summary",
     "role",
     "roles",
     "vendor",
@@ -40,8 +41,8 @@ _TEXT_FILTERS = (
 )
 _STRICT_ABOVE = re.compile(r"\b(?:above|greater\s+than|more\s+than|over)\b", re.IGNORECASE)
 _STRICT_BELOW = re.compile(r"\b(?:below|less\s+than|under)\b", re.IGNORECASE)
-_RANKED_HIGH = re.compile(r"\b(?:highest|top(?:\s+one)?|most)\b", re.IGNORECASE)
-_RANKED_LOW = re.compile(r"\b(?:lowest|bottom(?:\s+one)?|least)\b", re.IGNORECASE)
+_RANKED_HIGH = re.compile(r"\b(?:highest|top(?:\s+one)?)\b", re.IGNORECASE)
+_RANKED_LOW = re.compile(r"\b(?:lowest|bottom(?:\s+one)?)\b", re.IGNORECASE)
 _SET_VERB = re.compile(r"\b(?:list|find|show|count|group|how\s+many)\b", re.IGNORECASE)
 _SET_NOUN = re.compile(r"\b(?:assets?|systems?|devices?)\b", re.IGNORECASE)
 _EXPLICIT_IP = re.compile(r"(?<![\d.])(?:\d{1,3}\.){3}\d{1,3}(?![\d.])")
