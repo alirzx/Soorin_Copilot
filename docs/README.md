@@ -1,46 +1,46 @@
 # Documentation map and current authority
 
-Last synchronized: 2026-09-11 (`dev`, Phase 4B.4 structured result-set continuity).
+Last synchronized: 2026-09-11 (`dev`, Phase 4C exact-search finalization).
 
-This directory contains both living specifications and historical audit records. Historical audit files are intentionally retained as snapshots of the repository state at the date written; they are not silently rewritten to look current. For implementation decisions, source code on `dev` is authoritative, followed by the living/current documents below.
+This directory contains living specifications and historical audit records. Historical audit files remain snapshots of the repository state at the date written; source on `dev` is authoritative, followed by the living/current documents below.
 
 ## Current / living documents
 
 | Document | Status | Current use |
 |---|---|---|
-| `CURRENT_ARCHITECTURE.md` | Living architecture baseline with dated addenda | Overall bounded LangGraph, LLM roles, evidence, context, memory, Product, Neo4j and Qdrant architecture. Read together with the current Phase 4 records below. |
-| `NEO4J_GRAPH_ENRICHMENT_GRAPHRAG.md` | Living graph architecture record | Authoritative graph/enrichment/structured-search/GraphRAG roadmap. |
-| `PHASE4_STRUCTURED_GRAPH_ROUTING.md` | Current Phase 4A.1–4B.4 implementation record | Exact-search hardening, Router/capability execution, bounded Asset-set evidence, and thread-scoped result continuity. |
-| `ENVIRONMENT_VARIABLES.md` | Living configuration reference | Current settings and deployment knobs. Phase 4A search limits are documented here. |
-| `DEPLOYMENT.md` | Current deployment guidance | Runtime/deployment mechanics. No Phase 4B.1 deployment-contract change. |
-| `OBSERVABILITY.md` | Current observability guidance | Metrics/logging boundaries. No Phase 4B.1 metric contract change. |
-| `FRONTEND_BACKEND_COPILOT_INTEGRATION.md` | Integration contract plus historical baseline sections | Product/Streamlit request identity, chat, persistence and ownership boundaries. Dated Git baselines are historical; current `dev` source supersedes old commit hashes. |
+| `CURRENT_ARCHITECTURE.md` | Living architecture baseline with dated addenda | Overall bounded LangGraph, LLM roles, evidence, context, memory, Product, Neo4j and Qdrant architecture. Read with the current Phase 4 records. |
+| `NEO4J_GRAPH_ENRICHMENT_GRAPHRAG.md` | Living graph architecture record | Graph/enrichment/structured-search/GraphRAG architecture and roadmap. |
+| `PHASE4_STRUCTURED_GRAPH_ROUTING.md` | Phase 4A.1–4B.4 implementation record | Exact-search hardening, Router/capability execution, Asset-set evidence, and result continuity. |
+| `PHASE4C_EXACT_SEARCH_FINALIZATION.md` | Current Phase 4C implementation record | Bounded candidate selection, selective Product/Detection/topology deepening, reviewer/context/memory boundaries, observability and validation. |
+| `ENVIRONMENT_VARIABLES.md` | Living configuration reference | Current settings and deployment knobs. |
+| `DEPLOYMENT.md` | Current deployment guidance | Runtime/deployment mechanics. |
+| `OBSERVABILITY.md` | Current observability guidance | Metrics/logging boundaries. |
+| `FRONTEND_BACKEND_COPILOT_INTEGRATION.md` | Integration contract plus historical baseline sections | Product/Streamlit request identity, chat, persistence and ownership boundaries. Current `dev` source supersedes old commit hashes. |
 
 ## Historical / design-audit documents
 
 | Document | Status | How to read it |
 |---|---|---|
-| `INTERNAL_EVIDENCE_TO_MODEL_CONTEXT_AUDIT.md` | Historical audit with later addenda | Useful evidence-flow history. Current source and `CURRENT_ARCHITECTURE.md` supersede old provider/context claims. |
+| `INTERNAL_EVIDENCE_TO_MODEL_CONTEXT_AUDIT.md` | Historical audit with later addenda | Useful evidence-flow history. Current source and architecture docs supersede old provider/context claims. |
 | `MEMORY_CONTEXT_UPGRADE_DESIGN.md` | Historical design record | Design rationale. Current memory behavior is described by source and the current-dev audit. |
 | `MEMORY_WORKFLOW_CURRENT_DEV_AUDIT.md` | Dated audit with later implementation addenda | Detailed memory/control-plane history. Treat old HEAD/status tables as historical. |
-| `agentic-foundation-rag.md` | Historical foundation/design record | Early agentic/RAG architecture rationale. Current bounded workflow and GraphRAG roadmap supersede it where they differ. |
+| `agentic-foundation-rag.md` | Historical foundation/design record | Early agentic/RAG rationale. Current bounded workflow and GraphRAG records supersede it where they differ. |
 
 ## Current Phase 4 status
 
 ```text
-Phase 4A      IMPLEMENTED
-Phase 4A.1    CODE HARDENED; isolated CI/profile validation added
-Phase 4B.1    SEMANTIC CONTRACT IMPLEMENTED
-Phase 4B.2    IMPLEMENTED: capability/execution integration
-Phase 4B.3    IMPLEMENTED: evidence/reviewer/context/synthesis integration
-Phase 4B.4    IMPLEMENTED: bounded structured result-set continuity
+Phase 4A      DONE
+Phase 4A.1    DONE / VALIDATED
+Phase 4B.1    DONE
+Phase 4B.2    DONE
+Phase 4B.3    DONE
+Phase 4B.4    DONE
+Phase 4C      IMPLEMENTED; final CI gate required on current HEAD
 ```
 
-Phase 4A contains typed exact/range Asset filters, count/group-count aggregation, active-version-only Neo4j queries, bounded keyset pagination and fixed sort/group allow-lists. Phase 4A.1 binds the service cursor to normalized query identity and active graph version, hardens refresh/storage failure paths, and provides a read-only `EXPLAIN/PROFILE` audit plus isolated CI Neo4j validation.
+Phase 4A provides typed exact/range Asset filters, count/group-count aggregation, active-version-only Neo4j queries, bounded keyset pagination and fixed sort/group allow-lists. Phase 4A.1 binds cursors to normalized query identity and active graph version, hardens refresh/storage failure paths, and provides read-only `EXPLAIN/PROFILE` plus isolated Neo4j validation.
 
-Phase 4B.1 adds a typed `StructuredQuerySpec`, Router semantic intents `asset_search` and `asset_aggregate`, deterministic validation, and structured-query fields in semantic/task contracts. Phase 4B.2 registers planner-visible, read-only `graph.search_assets` and `graph.aggregate_assets` capabilities with zero focal-entity cardinality. Simple set queries compile deterministically into one validated Graph Specialist call through `GraphService` to the active Neo4j projection. Cursor replay remains internal, configured result limits remain authoritative, and no Product fan-out or new LLM is added.
-
-Phase 4B.3 adds distinct `graph_asset_search` and `graph_asset_aggregate` evidence classes, canonical SHA-256 query identity bound to the active graph version, EvidencePack retention, deterministic zero-entity review, and dedicated bounded context serialization. Retrieval row limits remain separate from model-visible row limits. Valid empty results remain sufficient evidence; retrieval or context truncation remains answerable with explicit limitations. The Synthesizer selects small task modules for search and aggregate and preserves the Neo4j organizational-projection authority boundary.
+Phase 4B.1 introduced `StructuredQuerySpec`, Router intents `asset_search`/`asset_aggregate`, deterministic validation, and selector-vs-entity semantics. Phase 4B.2 registered read-only zero-entity `graph.search_assets` and `graph.aggregate_assets` capabilities. Phase 4B.3 added typed Asset-set evidence, query identity, EvidencePack retention, deterministic review, bounded context serialization and Synth task modules. Phase 4B.4 added owner/thread-scoped `StructuredQueryContext` with bounded ordered refs and semantic follow-up handling.
 
 The semantic rule remains fixed:
 
@@ -50,11 +50,23 @@ role/vendor/product/status/...  = structured selector/filter/facet
 structured retrieval output     = Asset set
 ```
 
-Phase 4B.4 persists one latest, owner/thread-scoped `StructuredQueryContext` inside the existing bounded ThreadState. It contains canonical query semantics and identity, active graph version, counts/truncation, a SHA-256 fingerprint of the bounded continuity snapshot, and at most eight ordered identity-only Asset refs or aggregate groups. It is continuity metadata—not current evidence, LTM, a baseline, a WorkingFact, or a Qdrant document—and is discarded independently if malformed.
+Phase 4C now turns an eligible exact-search result into a bounded investigation entry point:
 
-Natural set follow-ups are interpreted semantically by the existing Router, not an English phrase catalogue, and then validated deterministically. Set-level references produce a new canonical `StructuredQuerySpec` and current Graph call. A clear selection may materialize only one or two retained refs into the existing focal-entity workflow; explicit message entities remain authoritative, while a clear set reference can outrank incidental UI/active fallback. Historical recall uses only the retained bounded snapshot and is labelled non-current. Conservative Router fallback does not guess a structured reference.
+```text
+Exact Search
+→ bounded Asset-set discovery
+→ deterministic selection of max 1–2 focal Assets
+→ Product Profile / Detection for selected Assets only
+→ bounded Graph topology when required
+→ optional Knowledge when explicitly useful
+→ unified EvidencePack
+→ deterministic review
+→ bounded context
+→ grounded Synth response
+→ StructuredQueryContext continuity
+```
 
-Asset-set rows do not consume the two-focal-entity budget and never become active entities merely because a search ran. Phase 4C remains responsible for automatic selective cross-source deepening; Phase 4B.4 adds no Product/Detection fan-out and no model call.
+Automatic deepening is not universal. Plain list/search requests remain set-level answers. A one-result search can deepen when analysis was requested; multi-result search deepening requires deterministic selection semantics. Ambiguous multi-candidate requests fail closed. There is no `N results → N Product calls` path, and the existing six-call/global two-focal-entity bounds remain authoritative.
 
 ## Authority boundaries for GraphRAG
 
@@ -65,14 +77,20 @@ Qdrant Knowledge semantic cybersecurity documentation
 Memory            historical continuity, validated baselines and durable findings
 ```
 
-Neo4j enrichment is a discovery projection. It must not be represented as equivalent to a fresh Product Profile/Detection response.
+Neo4j enrichment is a discovery projection. It must not be represented as equivalent to a fresh Product Profile/Detection response. Phase 4C reviewer logic preserves this distinction when Product or Detection verification is missing or partial.
+
+## Exact-search property boundary
+
+Structured search exposes only fixed semantic selectors and range/sort/group allow-lists. Returned rows also contain enrichment/projection metadata. Internal graph-version authority and scheduler metadata are not turned into arbitrary user property filters. No raw property, Cypher, regex, OR-expression, or operator escape hatch exists.
+
+## Memory boundary
+
+Asset-set rows never consume the two-focal-entity budget and never become active entities merely because a search ran. `StructuredQueryContext` remains the bounded result-set continuity mechanism. Phase 4C auto-selected focal Assets are execution-local; structured-search turns do not capture a focal investigation baseline under an empty search context. Existing Working Memory/LTM schemas and explicit/active entity authority remain unchanged.
 
 ## Validation policy
 
-The mutating Neo4j integration suites must run only against a disposable database. They must never target the main `soorin-copilot-neo4j` instance.
+Mutating Neo4j integration suites must run only against a disposable database, never the main `soorin-copilot-neo4j` instance.
 
-The repository now includes `.github/workflows/phase4-validation.yml`, which uses a disposable Neo4j Community service on `dev` pushes to run Phase 4 offline tests, structured integration coverage, the read-only query-plan audit, and the existing Community parity regression.
+`.github/workflows/phase4-validation.yml` uses a disposable Neo4j Community service on `dev` pushes and now covers the Router null-reference contract, Phase 4C deterministic selection/fan-out guards, the prior Phase 4 regressions, structured Neo4j integration, read-only query-plan audit, and Community parity tests.
 
-For production-representative read-only planning evidence, `app/scripts/audit_phase4a1_query_plans.py` may be run against the configured real Neo4j instance with `SOORIN_PHASE4A1_PROFILE=1`. It performs no writes and creates no indexes.
-
-Index policy remains measurement-driven. No enriched-property index should be added merely because a filter exists. `matched_total` and the existing `/graph/stats` full-IP materialization remain explicit performance items to measure before changing their contracts or implementations.
+`app/scripts/audit_phase4a1_query_plans.py` remains read-only. Index policy remains measurement-driven; no enriched-property index is added merely because a filter exists. `matched_total` and the existing `/graph/stats` full-IP materialization remain explicit scale items to measure before changing contracts or implementations.
