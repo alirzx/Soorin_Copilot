@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ipaddress
 from typing import Any
 
 from src.core.graph.neo4j import (
@@ -15,6 +16,11 @@ from src.core.graph.structured import AssetAggregateRequest, AssetSearchRequest
 from src.core.product_client.schemas import TopologyConnectionRecord
 
 
+_RFC1918 = (
+    ipaddress.ip_network("10.0.0.0/8"),
+    ipaddress.ip_network("172.16.0.0/12"),
+    ipaddress.ip_network("192.168.0.0/16"),
+)
 _TEXT_PROPERTIES = {
     "asset_name": "asset_name",
     "status": "status",
@@ -29,22 +35,34 @@ _TEXT_PROPERTIES = {
 }
 
 
+def _internal_source(value: object) -> bool:
+    try:
+        address = ipaddress.ip_address(str(value))
+    except ValueError:
+        return False
+    return address.version == 4 and any(address in network for network in _RFC1918)
+
+
 class OrganizationalNeo4jGraphRepository(Neo4jGraphRepository):
     """Keep Asset nodes source-authoritative and text selectors case-insensitive.
 
-    Product topology source IPs are the only addresses promoted to organizational
-    Asset nodes. Destination-only peers are deliberately excluded from the Asset
-    projection until a separate peer/external-endpoint schema exists. Edges are
-    retained only when both endpoints are organizational source Assets.
+    Only RFC1918 source IPs from Product topology are promoted to organizational
+    Asset nodes. Destination-only and public/external peers are excluded until a
+    separate peer/external-endpoint schema exists. Edges remain only when both
+    endpoints are organizational source Assets.
     """
 
     @staticmethod
     def _all_pairs(records: list[TopologyConnectionRecord]) -> list[dict[str, Any]]:
-        return Neo4jGraphRepository._normalize(records)
+        return [
+            pair
+            for pair in Neo4jGraphRepository._normalize(records)
+            if _internal_source(pair["source"])
+        ]
 
     @staticmethod
     def _normalize(records: list[TopologyConnectionRecord]) -> list[dict[str, Any]]:
-        pairs = Neo4jGraphRepository._normalize(records)
+        pairs = OrganizationalNeo4jGraphRepository._all_pairs(records)
         source_assets = {str(pair["source"]) for pair in pairs}
         return [pair for pair in pairs if str(pair["target"]) in source_assets]
 
@@ -57,7 +75,7 @@ class OrganizationalNeo4jGraphRepository(Neo4jGraphRepository):
         all_pairs = self._all_pairs(records)
         if not all_pairs:
             raise GraphSyncValidationError(
-                "Product topology response contained no valid graph records."
+                "Product topology response contained no internal source Asset records."
             )
         nodes = sorted({str(pair["source"]) for pair in all_pairs})
         source_assets = set(nodes)
