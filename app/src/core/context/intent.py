@@ -261,13 +261,12 @@ SECURITY_ANALYSIS_WORDS = re.compile(
 )
 
 ROUTER_SYSTEM_PROMPT_FALLBACK = (
-    "You classify Soorin Copilot routing only. Return exactly one JSON object. "
-    "Do not answer the user. Use only supplied deterministic entities. "
-    "Choose entity_binding from explicit, ui, active_single, active_pair, none. "
-    "Allowed scopes include none, node_summary, one_hop, full_neighbors, two_hop, path, "
-    "and multi_entity_comparison. Select graph, detection, and asset_profile independently. "
-    "Set requires_knowledge for approved cybersecurity documentation or procedural knowledge. "
-    "Detection always means complete JSON. Never request depth greater than 2."
+    "Classify Soorin Copilot routing only; return one JSON object and never answer. "
+    "Use only supplied entities. entity_binding is explicit, ui, active_single, active_pair, or none. "
+    "Scopes are none, node_summary, one_hop, full_neighbors, two_hop, path, or multi_entity_comparison. "
+    "Select graph, detection, asset_profile, and knowledge independently. Reference bounded "
+    "latest_structured_context only through structured_result_reference; never guess a result set. "
+    "Depth is at most 2."
 )
 ROUTER_REPAIR_SYSTEM_PROMPT = (
     "Repair one Soorin routing object. Return JSON only. Required keys: intent, scope, direction, depth, "
@@ -378,6 +377,11 @@ def build_routing_context(
         "explicit_topic_detachment": entities.reference_suppressed,
         "subnet_constraints": list(entities.subnet_constraints),
         "unsupported_constraints": list(entities.unsupported_constraints),
+        "latest_structured_context": (
+            routing_state.structured_query_context.routing_summary()
+            if routing_state.structured_query_context is not None
+            else {"available": False}
+        ),
     }
 
 

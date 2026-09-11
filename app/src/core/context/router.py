@@ -324,6 +324,7 @@ def normalize_intent_route(decision: IntentDecision, entities: EntityResolution)
         use_detection=requires_detection,
         use_asset_profile=requires_asset_profile,
         use_knowledge=requires_knowledge,
+        structured_result_reference=decision.structured_result_reference,
         entity_binding=decision.entity_binding,
         requested_entity_binding=decision.requested_entity_binding,
         resolved_entity_binding=decision.entity_binding,

@@ -35,6 +35,7 @@ Return exactly the existing routing fields. Add `structured_query` only for Asse
   "requires_asset_profile": true,
   "requires_knowledge": false,
   "structured_query": null,
+  "structured_result_reference": null,
   "entity_binding": "explicit",
   "requires_multiple_entities": false,
   "is_followup": false,
@@ -126,6 +127,21 @@ For `mode=search`, `operation` and `group_by` must be null. `sort` may be graph_
 For `mode=aggregate`, `sort` and `direction` must be null. `operation` is count or group_count. `group_count` requires `group_by`: status, suggested_type, role, vendor, product, tag, sub_tag, or enrichment_status.
 
 Selectors are exact/range semantics only. Never emit Cypher, arbitrary property names, regex, contains/substring operators, OR expressions, traversal instructions, or invented filters. If the user's request cannot be represented by this allow-list, do not fabricate a structured query.
+
+### Latest structured result continuity
+
+The bounded `latest_structured_context` input is continuity metadata, not current evidence. Use `structured_result_reference=null` unless the request semantically depends on that prior structured query/result. Otherwise return one typed object:
+
+```json
+{"kind":"set_query|select_entities|historical_recall","ordinals":[]}
+```
+
+- `set_query`: return a complete allow-listed `structured_query` for a current rerun/refinement, inheriting prior query semantics only where the request clearly refers to that set.
+- `select_entities`: select exactly one or two retained ordered Asset refs with one-based `ordinals`; return a normal focal-entity intent and no structured query.
+- `historical_recall`: use only bounded historical continuity, with `general_knowledge`, no provider requirements, no entity binding, and no structured query.
+- Never select an ordinal outside `bounded_ref_count`; an empty or insufficient retained set is unclear.
+- Explicit message entities remain authoritative. A clear structured-set reference may outrank incidental UI/active fallback, but vague pronouns keep normal active-entity behavior.
+- Investigation-timeline ordinals and structured-result ordinals are different namespaces; use the one identified by the request's meaning.
 
 ---
 
@@ -224,7 +240,7 @@ Use `graph_followup` only when the current request depends on previously establi
 
 Entities are resolved before routing. Never extract or reinterpret them from user text. Authority is explicit, then ui, then active_pair/active_single, then none.
 
-Use active entity state only when the present request semantically depends on it. Set `is_followup=true` only when previous conversational state is required. General cybersecurity and self-contained Asset-set queries must not inherit stale active-entity context.
+Use active entity state only when the present request semantically depends on it. Set `is_followup=true` only when previous conversational state is required. General cybersecurity and self-contained Asset-set queries must not inherit stale active-entity context. A prior result-set continuation uses the typed `structured_result_reference`, not reason prose or active-pair binding.
 
 ---
 

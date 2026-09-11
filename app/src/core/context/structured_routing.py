@@ -21,7 +21,13 @@ from src.core.context.intent import (
     _extract_first_json_object,
     validate_router_payload,
 )
-from src.core.context.models import EntityResolution, IntentDecision, RouteDecision
+from src.core.context.models import (
+    EntityResolution,
+    IntentDecision,
+    ResolvedEntity,
+    RouteDecision,
+    StructuredResultReferenceDecision,
+)
 from src.core.context.router import normalize_intent_route as _base_normalize_intent_route
 from src.core.graph.structured import StructuredQueryMode, StructuredQuerySpec
 from src.core.memory.routing_state import SessionRoutingState
@@ -32,12 +38,39 @@ _SET_INTENTS = {"asset_search", "asset_aggregate"}
 _STRUCTURED_REPAIR_SYSTEM_PROMPT = (
     "Repair one Soorin routing object. Return JSON only. Required keys: intent, scope, direction, depth, "
     "requires_graph, requires_detection, requires_asset_profile, requires_knowledge, structured_query, "
+    "structured_result_reference, "
     "entity_binding, requires_multiple_entities, is_followup, classification_confidence, reason. "
     "Allowed intents: general_knowledge, asset_investigation, asset_search, asset_aggregate, graph_neighbors, "
     "graph_relationships, graph_path, graph_followup, unclear. For asset_search or asset_aggregate, preserve only "
     "allow-listed structured_query fields, use scope/direction none, depth 0, requires_graph true, entity_binding none, "
-    "and do not invent entities or Cypher. For other intents structured_query must be null."
+    "and do not invent entities or Cypher. For other intents structured_query must be null. "
+    "structured_result_reference is null or an object with kind none, set_query, select_entities, or "
+    "historical_recall and 0-2 one-based ordinals."
 )
+
+
+def _structured_result_reference(payload: Any) -> StructuredResultReferenceDecision:
+    if payload is None:
+        return StructuredResultReferenceDecision()
+    if not isinstance(payload, dict) or set(payload) != {"kind", "ordinals"}:
+        raise ValueError("structured_result_reference_schema_invalid")
+    kind = str(payload.get("kind") or "")
+    if kind not in {"none", "set_query", "select_entities", "historical_recall"}:
+        raise ValueError("structured_result_reference_kind_invalid")
+    raw_ordinals = payload.get("ordinals")
+    if not isinstance(raw_ordinals, list) or any(
+        isinstance(item, bool) or not isinstance(item, int) for item in raw_ordinals
+    ):
+        raise ValueError("structured_result_reference_ordinals_invalid")
+    ordinals = tuple(raw_ordinals)
+    if kind == "select_entities":
+        if not 1 <= len(ordinals) <= 2 or len(set(ordinals)) != len(ordinals):
+            raise ValueError("structured_result_selection_cardinality_invalid")
+        if any(item < 1 for item in ordinals):
+            raise ValueError("structured_result_selection_ordinal_invalid")
+    elif ordinals:
+        raise ValueError("structured_result_reference_unexpected_ordinals")
+    return StructuredResultReferenceDecision(kind=kind, ordinals=ordinals)  # type: ignore[arg-type]
 
 
 def validate_structured_router_payload(
@@ -50,6 +83,107 @@ def validate_structured_router_payload(
     ui_context: dict[str, Any] | None = None,
 ) -> IntentDecision:
     """Validate either the established entity route or one typed Asset-set route."""
+    reference = _structured_result_reference(payload.get("structured_result_reference"))
+    if reference.kind != "none":
+        clean_payload = dict(payload)
+        clean_payload.pop("structured_result_reference", None)
+        explicit = any(entity.source == "message" for entity in entities.entities)
+        if explicit:
+            if reference.kind == "set_query":
+                raise ValueError("structured_result_reference_cannot_override_explicit_entity")
+            decision = validate_structured_router_payload(
+                clean_payload,
+                entities,
+                min_confidence=min_confidence,
+                message=message,
+                routing_state=routing_state,
+                ui_context=ui_context,
+            )
+            return replace(decision, structured_result_reference=StructuredResultReferenceDecision())
+
+        context = routing_state.structured_query_context if routing_state is not None else None
+        if context is None:
+            raise ValueError("structured_result_reference_context_unavailable")
+        if reference.kind == "set_query":
+            decision = validate_structured_router_payload(
+                clean_payload,
+                entities,
+                min_confidence=min_confidence,
+                message=message,
+                routing_state=routing_state,
+                ui_context=None,
+            )
+            if decision.structured_query is None:
+                raise ValueError("structured_result_reference_query_required")
+            return replace(decision, structured_result_reference=reference)
+        if reference.kind == "historical_recall":
+            if (
+                clean_payload.get("intent") != "general_knowledge"
+                or clean_payload.get("structured_query") is not None
+                or any(bool(clean_payload.get(name)) for name in (
+                    "requires_graph", "requires_detection", "requires_asset_profile", "requires_knowledge"
+                ))
+            ):
+                raise ValueError("structured_result_historical_recall_route_invalid")
+            empty = EntityResolution(status="none")
+            decision = validate_structured_router_payload(
+                clean_payload,
+                empty,
+                min_confidence=min_confidence,
+                message=message,
+                routing_state=replace(
+                    routing_state,
+                    active_ip=None,
+                    active_entities=(),
+                    last_resolved_entities=(),
+                ),
+                ui_context=None,
+            )
+            return replace(decision, structured_result_reference=reference)
+
+        if context.mode != "search":
+            raise ValueError("structured_result_selection_requires_search_context")
+        if any(ordinal > len(context.result_refs) for ordinal in reference.ordinals):
+            raise ValueError("structured_result_selection_out_of_bounds")
+        selected = tuple(context.result_refs[ordinal - 1].ip for ordinal in reference.ordinals)
+        if not selected:
+            raise ValueError("structured_result_selection_empty")
+        resolved = [
+            ResolvedEntity(type="ip", value=value, source="conversation")
+            for value in selected
+        ]
+        selection_entities = EntityResolution(
+            status="resolved",
+            entities=resolved,
+            primary_entity=resolved[0] if len(resolved) == 1 else None,
+            entity_mode="single" if len(resolved) == 1 else "multiple",
+            candidate_count=len(resolved),
+            explicit_candidate_count=0,
+            valid_entity_count=len(resolved),
+            reference_detected=True,
+            reference_type="structured_result_selection",
+        )
+        clean_payload["structured_query"] = None
+        clean_payload["entity_binding"] = (
+            "active_single" if len(selected) == 1 else "active_pair"
+        )
+        clean_payload["requires_multiple_entities"] = len(selected) == 2
+        selection_state = replace(
+            routing_state,
+            active_ip=selected[0] if len(selected) == 1 else None,
+            active_entities=selected,
+            last_resolved_entities=selected,
+        )
+        decision = validate_structured_router_payload(
+            clean_payload,
+            selection_entities,
+            min_confidence=min_confidence,
+            message=message,
+            routing_state=selection_state,
+            ui_context=None,
+        )
+        return replace(decision, structured_result_reference=reference)
+
     intent = str(payload.get("intent") or "")
     raw_query = payload.get("structured_query")
 

@@ -3,10 +3,25 @@
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 
+from dataclasses import replace
+
+from src.core.agent.contracts import (
+    ReviewDecision,
+    ExecutionPlan,
+    PlanStep,
+    StructuredAssetAggregateEvidence,
+    StructuredAssetSearchEvidence,
+    TaskSpec,
+    ToolResult,
+)
+from src.core.agent.structured_continuity import structured_query_context_from_state
 from src.core.agent.structured_evidence import structured_query_identity
 from src.core.graph.structured import StructuredQuerySpec
 from src.core.identity import RequestIdentity
+from src.core.agent.nodes import CopilotWorkflowNodes
+from src.core.context.models import EntityResolution, RouteDecision
 from src.core.memory.episodes import MemoryContextKey, TurnReference, WorkingMemory
 from src.core.memory.persistence import (
     MAX_THREAD_STATE_BYTES,
@@ -14,6 +29,9 @@ from src.core.memory.persistence import (
     ThreadMemoryState,
 )
 from src.core.memory.routing_state import SessionRoutingState
+from src.core.memory.routing_state import SessionRoutingStateStore
+from src.core.memory.store import MemoryStore
+from src.config.settings import get_settings
 from src.core.memory.structured_query import (
     MAX_STRUCTURED_QUERY_RESULT_REFS,
     StructuredAggregateGroupRef,
@@ -246,3 +264,214 @@ def test_thread_size_pressure_sheds_optional_structured_context_first() -> None:
     assert len(payload["recent_turn_references"]) == 10
     retained = payload.get("structured_query_context")
     assert retained is None or len(retained["result_refs"]) < MAX_STRUCTURED_QUERY_RESULT_REFS
+
+
+def test_reviewed_search_evidence_creates_context_including_valid_empty_result() -> None:
+    query = StructuredQuerySpec.model_validate({
+        "mode": "search",
+        "filters": {"status": "CONFIRMED"},
+    })
+    identity = structured_query_identity(query, active_graph_version="graph-v1")
+    evidence = StructuredAssetSearchEvidence(
+        capability="graph.search_assets",
+        query_identity=identity,
+        normalized_filters={"status": "CONFIRMED"},
+        active_graph_version="graph-v1",
+        sort="graph_key",
+        direction="asc",
+        matched_total=0,
+        returned_count=0,
+        truncated=False,
+        rows=(),
+        retrieved_at="2026-09-11T00:00:00+00:00",
+    )
+    result = ToolResult(
+        status="not_found",
+        entities=(),
+        source_capability="graph.search_assets",
+        retrieved_at=evidence.retrieved_at,
+        freshness="current",
+        completeness="complete",
+        structured_asset_set=evidence,
+    )
+    state = {
+        "task": TaskSpec(
+            request="show confirmed assets",
+            intent="asset_search",
+            scope="none",
+            direction="none",
+            entities=(),
+            required_capabilities=("graph.search_assets",),
+            structured_query=query,
+        ),
+        "review_decision": ReviewDecision(outcome="sufficient"),
+        "tool_results": [result],
+        "request_id": "request-empty",
+    }
+
+    context = structured_query_context_from_state(state)
+
+    assert context is not None
+    assert context.matched_total == 0
+    assert context.result_refs == ()
+
+
+def test_failed_mismatched_or_rejected_evidence_cannot_replace_context() -> None:
+    query = StructuredQuerySpec.model_validate({
+        "mode": "aggregate",
+        "filters": {"role": "Domain Controller"},
+        "operation": "count",
+    })
+    identity = structured_query_identity(query, active_graph_version="graph-v1")
+    evidence = StructuredAssetAggregateEvidence(
+        capability="graph.aggregate_assets",
+        query_identity=identity,
+        normalized_filters={"role": "Domain Controller"},
+        active_graph_version="graph-v1",
+        operation="count",
+        group_by=None,
+        count=0,
+        groups=(),
+        truncated=False,
+        retrieved_at="2026-09-11T00:00:00+00:00",
+    )
+    result = ToolResult(
+        status="ok",
+        entities=(),
+        source_capability="graph.aggregate_assets",
+        retrieved_at=evidence.retrieved_at,
+        freshness="current",
+        completeness="complete",
+        structured_asset_set=evidence,
+    )
+    base = {
+        "task": TaskSpec(
+            request="count Domain Controllers",
+            intent="asset_aggregate",
+            scope="none",
+            direction="none",
+            entities=(),
+            required_capabilities=("graph.aggregate_assets",),
+            structured_query=query,
+        ),
+        "review_decision": ReviewDecision(outcome="sufficient"),
+        "tool_results": [result],
+        "request_id": "request-count",
+    }
+
+    valid = structured_query_context_from_state(base)
+    failed = structured_query_context_from_state({**base, "tool_results": [replace(result, status="unavailable")]})
+    mismatched = structured_query_context_from_state({
+        **base,
+        "tool_results": [replace(
+            result,
+            structured_asset_set=replace(evidence, query_identity="structured-asset-set:v1:" + ("0" * 64)),
+        )],
+    })
+    rejected = structured_query_context_from_state({
+        **base,
+        "review_decision": ReviewDecision(outcome="missing_required_evidence"),
+    })
+
+    assert valid is not None and valid.count == 0
+    assert failed is None
+    assert mismatched is None
+    assert rejected is None
+
+
+def test_update_memory_writes_context_without_turning_rows_into_active_entities_or_ltm() -> None:
+    identity = _identity()
+    query = StructuredQuerySpec.model_validate({
+        "mode": "search",
+        "filters": {"role": "Domain Controller"},
+    })
+    query_identity = structured_query_identity(query, active_graph_version="graph-v2")
+    evidence = StructuredAssetSearchEvidence(
+        capability="graph.search_assets",
+        query_identity=query_identity,
+        normalized_filters={"role": "Domain Controller"},
+        active_graph_version="graph-v2",
+        sort="graph_key",
+        direction="asc",
+        matched_total=2,
+        returned_count=2,
+        truncated=False,
+        rows=(
+            {"ip": "192.0.2.20", "graph_key": "asset-20", "asset_name": "dc-20"},
+            {"ip": "192.0.2.21", "graph_key": "asset-21", "asset_name": "dc-21"},
+        ),
+        retrieved_at="2026-09-11T00:00:00+00:00",
+    )
+    result = ToolResult(
+        status="ok",
+        entities=(),
+        source_capability="graph.search_assets",
+        retrieved_at=evidence.retrieved_at,
+        freshness="current",
+        completeness="complete",
+        structured_asset_set=evidence,
+    )
+    persisted: list[SessionRoutingState] = []
+
+    class _NoLTM:
+        def process_candidate(self, *_args, **_kwargs):
+            raise AssertionError("structured query continuity must not become LTM")
+
+    service = SimpleNamespace(
+        settings=replace(get_settings(), chat_store_history=False),
+        memory_store=MemoryStore(20),
+        routing_state_store=SessionRoutingStateStore(),
+        long_term_memory_coordinator=_NoLTM(),
+        persist_thread_continuity=lambda _identity, state: persisted.append(state),
+        persist_completed_local_turn=lambda *_args, **_kwargs: None,
+    )
+    task = TaskSpec(
+        request="show Domain Controllers",
+        intent="asset_search",
+        scope="none",
+        direction="none",
+        entities=(),
+        required_capabilities=("graph.search_assets",),
+        structured_query=query,
+    )
+    state = {
+        "task": task,
+        "tool_results": [result],
+        "synthesis_result": {"answer": "two results"},
+        "memory_context_key": MemoryContextKey.from_task(task),
+        "pending_working_facts": (),
+        "session_id": identity.session_id,
+        "request_id": identity.request_id,
+        "request_identity": identity,
+        "message": task.request,
+        "evidence_pack": SimpleNamespace(limitations=()),
+        "active_entity_state": SessionRoutingState(active_entities=("203.0.113.8",)),
+        "resolved_entities": EntityResolution(status="none"),
+        "routing_result": RouteDecision(
+            use_graph=True,
+            reason="structured",
+            intent="asset_search",
+            structured_query=query,
+        ),
+        "execution_plan": ExecutionPlan(
+            task=task,
+            steps=(PlanStep("search", "graph.search_assets"),),
+            plan_id="structured-plan",
+        ),
+        "review_decision": ReviewDecision(outcome="sufficient"),
+        "turn_policy": SimpleNamespace(
+            episode_transition="keep",
+            operation="follow_up",
+            operational_state_mutation_allowed=True,
+        ),
+    }
+
+    updated = CopilotWorkflowNodes(service).update_memory(state)["active_entity_state"]
+
+    assert updated.active_entities == ("203.0.113.8",)
+    assert updated.active_ip == "203.0.113.8"
+    assert updated.structured_query_context is not None
+    assert [item.ip for item in updated.structured_query_context.result_refs] == [
+        "192.0.2.20", "192.0.2.21"
+    ]
+    assert persisted == [updated]

@@ -29,6 +29,9 @@ GraphScope = Literal["none", "node_summary", "one_hop", "full_neighbors", "two_h
 GraphDirection = Literal["none", "inbound", "outbound", "both"]
 RelationshipMode = Literal["none", "direct", "compare"]
 EntityBinding = Literal["explicit", "ui", "active_single", "active_pair", "none"]
+StructuredResultReferenceKind = Literal[
+    "none", "set_query", "select_entities", "historical_recall"
+]
 
 
 def compact_preview(text: str, limit: int = 120) -> str:
@@ -68,6 +71,14 @@ class EntityResolution:
 
 
 @dataclass(frozen=True)
+class StructuredResultReferenceDecision:
+    """Semantic Router proposal for using the latest bounded result set."""
+
+    kind: StructuredResultReferenceKind = "none"
+    ordinals: tuple[int, ...] = ()
+
+
+@dataclass(frozen=True)
 class IntentDecision:
     intent: IntentName
     scope: GraphScope
@@ -78,6 +89,9 @@ class IntentDecision:
     requires_asset_profile: bool = False
     requires_knowledge: bool = False
     structured_query: StructuredQuerySpec | None = None
+    structured_result_reference: StructuredResultReferenceDecision = field(
+        default_factory=StructuredResultReferenceDecision
+    )
     entity_binding: EntityBinding = "none"
     requested_entity_binding: str = "none"
     binding_source: str = ""
@@ -133,6 +147,9 @@ class RouteDecision:
     use_asset_profile: bool = False
     use_knowledge: bool = False
     structured_query: StructuredQuerySpec | None = None
+    structured_result_reference: StructuredResultReferenceDecision = field(
+        default_factory=StructuredResultReferenceDecision
+    )
     entity_binding: EntityBinding = "none"
     requested_entity_binding: str = "none"
     resolved_entity_binding: EntityBinding = "none"

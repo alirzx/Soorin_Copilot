@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import json
 import time
 from dataclasses import replace
 from typing import Any
@@ -35,6 +36,7 @@ from src.core.agent.task_mapping import (
     task_spec_from_route,
 )
 from src.core.agent.specialists import AssetInvestigationSpecialist, GraphAnalysisSpecialist
+from src.core.agent.structured_continuity import structured_query_context_from_state
 from src.core.context import ContextComposer, normalize_intent_route
 from src.core.context.intent import (
     SECURITY_ANALYSIS_WORDS,
@@ -240,6 +242,22 @@ class CopilotWorkflowNodes:
             trace_id=state["trace_id"],
             request_id=state["request_id"],
         )
+        if decision.fallback_used and str(decision.error_reason or "").startswith(
+            "structured_result_"
+        ):
+            logger.info(
+                "event=structured_result_reference_rejected request_id=%s drop_reason=%s",
+                state["request_id"],
+                str(decision.error_reason)[:120],
+            )
+            return {
+                "routing_fallback_used": True,
+                **self._clarification(
+                    "That structured result does not retain the requested Asset reference. "
+                    "Please rerun or refine the search, or choose one of the retained results.",
+                    "structured_result_reference_unavailable",
+                ),
+            }
         if decision.fallback_used:
             route_entities = entities
             route = self.service.fallback_router.route(
@@ -336,6 +354,72 @@ class CopilotWorkflowNodes:
                     state["request_id"],
                     ",".join(active_pair),
                 )
+        reference = decision.structured_result_reference
+        if not decision.fallback_used and reference.kind == "select_entities":
+            turn_policy = derive_turn_policy(
+                state["message"], constraints, route_entities, routing_state
+            )
+            task_envelope = derive_task_envelope(
+                route_entities, constraints, turn_policy, routing_state
+            )
+            logger.info(
+                "event=structured_result_reference_resolved request_id=%s "
+                "reference_kind=select_entities selected_count=%s",
+                state["request_id"],
+                len(reference.ordinals),
+            )
+        elif not decision.fallback_used and reference.kind == "set_query":
+            turn_policy = replace(
+                turn_policy,
+                operation="follow_up",
+                target="none",
+                target_entities=(),
+                episode_transition="keep",
+                reason_codes=tuple(
+                    dict.fromkeys((*turn_policy.reason_codes, "structured_set_continuation"))
+                ),
+            )
+            task_envelope = derive_task_envelope(
+                route_entities, constraints, turn_policy, routing_state
+            )
+            logger.info(
+                "event=structured_result_reference_resolved request_id=%s "
+                "reference_kind=set_query selected_count=0",
+                state["request_id"],
+            )
+        elif not decision.fallback_used and reference.kind == "historical_recall":
+            constraints = replace(
+                constraints,
+                allow_live=False,
+                require_current=False,
+                memory_only=True,
+                reason_codes=tuple(
+                    dict.fromkeys(
+                        (*constraints.reason_codes, "historical_structured_result_recall")
+                    )
+                ),
+            )
+            turn_policy = replace(
+                turn_policy,
+                operation="memory_recall",
+                target="conversation",
+                target_entities=(),
+                episode_transition="keep",
+                operational_state_mutation_allowed=False,
+                reason_codes=tuple(
+                    dict.fromkeys(
+                        (*turn_policy.reason_codes, "historical_structured_result_recall")
+                    )
+                ),
+            )
+            task_envelope = derive_task_envelope(
+                route_entities, constraints, turn_policy, routing_state
+            )
+            logger.info(
+                "event=structured_result_reference_resolved request_id=%s "
+                "reference_kind=historical_recall selected_count=0",
+                state["request_id"],
+            )
         evidence_mode = evidence_mode_from_request(state["message"])
         if (
             evidence_mode in {"memory_only", "no_live_refresh"}
@@ -375,6 +459,7 @@ class CopilotWorkflowNodes:
             "resolved_entities": route_entities,
             "turn_policy": turn_policy,
             "task_envelope": task_envelope,
+            "request_constraints": constraints,
             "routing_fallback_used": bool(decision.fallback_used),
             "next_edge": "validate_task",
         }
@@ -957,6 +1042,36 @@ class CopilotWorkflowNodes:
             current_projections=current_projections,
             historical_baselines=historical_baselines,
         )
+        structured_reference = getattr(
+            state["routing_result"], "structured_result_reference", None
+        )
+        if getattr(structured_reference, "kind", "none") == "historical_recall":
+            structured_context = getattr(
+                state["active_entity_state"], "structured_query_context", None
+            )
+            if structured_context is not None:
+                historical_text = (
+                    "[SOORIN_HISTORICAL_STRUCTURED_QUERY_CONTINUITY_JSON]\n"
+                    + json.dumps(
+                        structured_context.historical_context_payload(),
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                        sort_keys=True,
+                    )
+                    + "\n[/SOORIN_HISTORICAL_STRUCTURED_QUERY_CONTINUITY_JSON]"
+                )
+                maximum = self.context_composer.last_budget.get("max_dynamic_tokens", 0)
+                combined = "\n\n".join(part for part in (dynamic_context, historical_text) if part)
+                if approx_tokens(combined) <= maximum:
+                    dynamic_context = combined
+                    logger.info(
+                        "event=structured_result_history_context_included request_id=%s "
+                        "mode=%s ref_count=%s graph_version_present=%s",
+                        state["request_id"],
+                        structured_context.mode,
+                        len(structured_context.result_refs),
+                        bool(structured_context.active_graph_version),
+                    )
         results = apply_context_inclusion(
             list(state.get("tool_results") or []),
             self.context_composer.last_inclusion,
@@ -1378,6 +1493,20 @@ class CopilotWorkflowNodes:
                 baseline_rejection_reason,
             )
         previous = state["active_entity_state"]
+        structured_query_context = (
+            structured_query_context_from_state(state)
+            or getattr(previous, "structured_query_context", None)
+        )
+        if structured_query_context is not getattr(previous, "structured_query_context", None):
+            logger.info(
+                "event=structured_query_context_written request_id=%s mode=%s "
+                "ref_count=%s graph_version_present=%s continuity_truncated=%s",
+                state["request_id"],
+                structured_query_context.mode,
+                len(structured_query_context.result_refs),
+                bool(structured_query_context.active_graph_version),
+                structured_query_context.continuity_truncated,
+            )
         resolved = state["resolved_entities"]
         route = state["routing_result"]
         active_entities = previous.active_entities
@@ -1474,6 +1603,7 @@ class CopilotWorkflowNodes:
             last_evidence_ids=tuple(item.step_id for item in results if item.step_id),
             last_capability_statuses=tuple(f"{item.source_capability}:{item.status}" for item in results),
             entity_timeline=timeline,
+            structured_query_context=structured_query_context,
         )
         logger.info(
             "event=operational_state_update request_id=%s "
@@ -1549,6 +1679,8 @@ class CopilotWorkflowNodes:
             return 0
         created = 0
         for result in state.get("tool_results") or ():
+            if result.structured_asset_set is not None:
+                continue
             refs = evidence_refs_from_validated_result(
                 requirements,
                 result,

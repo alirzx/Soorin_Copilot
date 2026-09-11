@@ -278,6 +278,37 @@ class StructuredQueryContext:
             "created_at": self.created_at,
         }
 
+    def routing_summary(self) -> dict[str, Any]:
+        """Return only the bounded semantics exposed to the semantic Router."""
+        return {
+            "available": True,
+            "mode": self.mode,
+            "query": self.query.model_dump(mode="json", exclude_none=True),
+            "matched_total": self.matched_total,
+            "returned_count": self.returned_count,
+            "count": self.count,
+            "retrieval_truncated": self.retrieval_truncated,
+            "continuity_truncated": self.continuity_truncated,
+            "bounded_ref_count": len(self.result_refs),
+            "ordered_refs": [item.to_payload() for item in self.result_refs],
+            "bounded_groups": [item.to_payload() for item in self.aggregate_groups],
+            "active_graph_version": self.active_graph_version,
+            "retrieved_at": self.retrieved_at,
+        }
+
+    def historical_context_payload(self) -> dict[str, Any]:
+        """Bounded model context explicitly labelled as historical continuity."""
+        return {
+            "authority": (
+                "Historical structured-query continuity only; not current operational "
+                "evidence. Omitted refs cannot be reconstructed."
+            ),
+            "query_identity": self.query_identity,
+            "result_fingerprint": self.result_fingerprint,
+            "source_request_id": self.source_request_id,
+            **self.routing_summary(),
+        }
+
     @classmethod
     def from_payload(cls, payload: Any) -> "StructuredQueryContext":
         allowed = {
