@@ -38,7 +38,7 @@ requires_multiple_entities = false
 
 Profile and Detection remain off during semantic set routing because no focal Asset exists yet. Phase 4C may later select at most one or two returned Assets deterministically and deepen only those.
 
-The Router extension now also accepts its own prompt-compliant `structured_result_reference: null` field on ordinary routes. The extension field is parsed and removed before the legacy/set allow-list validator runs, so normal, structured, and repair routes share one consistent contract.
+The Router extension also accepts its own prompt-compliant `structured_result_reference: null` field on ordinary routes. The extension field is parsed and removed before the legacy/set allow-list validator runs, so normal, structured, and repair routes share one consistent contract.
 
 ## Phase 4B.2 execution contract
 
@@ -99,7 +99,7 @@ Set-level follow-ups rerun a typed current query. Entity-selection follow-ups ma
 
 ## Phase 4C exact-search finalization
 
-Eligible analytical searches now use a bounded two-stage flow:
+Eligible analytical searches use a bounded two-stage flow:
 
 ```text
 Exact Graph Search
@@ -136,7 +136,7 @@ The existing global capability-call budget remains authoritative across both sta
 
 Stage-1 discovery and Stage-2 Product/Detection/Graph/Knowledge results remain separate first-class ToolResults and merge only in EvidencePack. Product/Detection failures on selected focal Assets produce material limitations. Neo4j projection is never treated as a substitute for missing Product truth. Optional Knowledge failure is a background-evidence caveat rather than proof about the environment.
 
-The Synthesizer `asset_search` module now distinguishes **discovery result** from **verified focal-Asset analysis** and applies deeper Product/Detection/topology facts only to the selected focal Assets.
+The Synthesizer `asset_search` module distinguishes **discovery result** from **verified focal-Asset analysis** and applies deeper Product/Detection/topology facts only to the selected focal Assets.
 
 ### Memory boundary
 
@@ -156,7 +156,7 @@ Prompt changes remain intentionally small:
 
 - Router already distinguishes Asset selectors from focal entities and keeps Product/Detection off until later focal selection; no extra Router verbosity was needed beyond the null-contract validator fix.
 - Structured set tasks still use deterministic direct planning; the Planner does not own post-search candidate selection and no new Planner behavior/model call was added.
-- Synth `asset_search` instructions now distinguish set discovery from verified selected-Asset analysis.
+- Synth `asset_search` instructions distinguish set discovery from verified selected-Asset analysis.
 - The static Synth system core already contains Product/Graph/Knowledge/memory authority and temporal rules and was not enlarged.
 
 ## Observability
@@ -176,15 +176,17 @@ Index changes remain measurement-driven. `matched_total` and `/graph/stats` full
 
 ## CI gate
 
-`.github/workflows/phase4-validation.yml` uses a disposable Neo4j Community service on `dev` pushes and now runs:
+`.github/workflows/phase4-validation.yml` uses a disposable Neo4j Community service on `dev` pushes and runs:
 
 1. compileall;
-2. Phase 4A–4C routing/contracts/regressions, including Router null-reference and candidate/fan-out guards;
+2. Phase 4A–4C routing/contracts/regressions, including Router null-reference and candidate/fan-out/reviewer guards;
 3. structured Neo4j integration regression;
 4. read-only EXPLAIN/PROFILE audit;
 5. Neo4j Community regression.
 
 Mutating graph tests must never target the main runtime database.
+
+Final validated code commit `613dab022cb9e5f58690e0f193b034613f7cf010` passed `237` targeted tests (`41` skipped, `62` subtests), `5` structured Neo4j integration tests, and `14` Community parity tests; the read-only query-plan audit reported `writes_performed=false`.
 
 ## Current status
 
@@ -195,7 +197,7 @@ Phase 4B.1    DONE
 Phase 4B.2    DONE
 Phase 4B.3    DONE
 Phase 4B.4    DONE
-Phase 4C      IMPLEMENTED; final CI gate required on current HEAD
+Phase 4C      DONE / VALIDATED
 ```
 
 Detailed Phase 4C design and production boundaries are recorded in `PHASE4C_EXACT_SEARCH_FINALIZATION.md`.
