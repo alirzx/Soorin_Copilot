@@ -156,7 +156,7 @@ def test_product_thread_state_baseline_uses_v3_wire_and_current_internal_schema(
     )
 
     body = fake.calls[0][2]["json_body"]
-    assert state.schema_version == THREAD_STATE_SCHEMA_VERSION == 4
+    assert state.schema_version == THREAD_STATE_SCHEMA_VERSION == 5
     assert body["schemaVersion"] == PRODUCT_THREAD_STATE_SCHEMA_VERSION == 3
     assert body["stateJson"]["working_memory"]["baseline"]["source_request_id"] == (
         baseline.source_request_id

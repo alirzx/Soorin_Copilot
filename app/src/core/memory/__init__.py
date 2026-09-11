@@ -10,6 +10,13 @@ from src.core.memory.episodes import (
     WorkingMemory,
 )
 from src.core.memory.persistence import ThreadMemoryState
+from src.core.memory.structured_query import (
+    MAX_STRUCTURED_QUERY_GROUP_REFS,
+    MAX_STRUCTURED_QUERY_RESULT_REFS,
+    StructuredAggregateGroupRef,
+    StructuredAssetRef,
+    StructuredQueryContext,
+)
 from src.core.memory.long_term import (
     LongTermMemoryRecord,
     MemoryPromotionPolicy,
@@ -52,4 +59,9 @@ __all__ = [
     "RelevantTurn",
     "TurnReference",
     "ThreadMemoryState",
+    "StructuredQueryContext",
+    "StructuredAssetRef",
+    "StructuredAggregateGroupRef",
+    "MAX_STRUCTURED_QUERY_RESULT_REFS",
+    "MAX_STRUCTURED_QUERY_GROUP_REFS",
 ]

@@ -6,6 +6,7 @@ from dataclasses import dataclass
 import ipaddress
 
 from src.core.memory.episodes import EntityVisit
+from src.core.memory.structured_query import StructuredQueryContext
 
 
 def _valid_ipv4(value: str | None) -> str | None:
@@ -40,6 +41,7 @@ class SessionRoutingState:
     last_evidence_ids: tuple[str, ...] = ()
     last_capability_statuses: tuple[str, ...] = ()
     entity_timeline: tuple[EntityVisit, ...] = ()
+    structured_query_context: StructuredQueryContext | None = None
 
     def __post_init__(self) -> None:
         active_entities = tuple(
@@ -61,6 +63,10 @@ class SessionRoutingState:
             if isinstance(item, EntityVisit) and item.ordered_entity_ids
         )[-24:]
         object.__setattr__(self, "entity_timeline", timeline)
+        if self.structured_query_context is not None and not isinstance(
+            self.structured_query_context, StructuredQueryContext
+        ):
+            raise ValueError("structured_query_context must be typed")
 
     @property
     def active_entity_count(self) -> int:

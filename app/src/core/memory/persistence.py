@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import ipaddress
 import json
+import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
@@ -26,16 +27,20 @@ from src.core.memory.episodes import (
     WorkingMemory,
 )
 from src.core.memory.routing_state import SessionRoutingState
+from src.core.memory.structured_query import StructuredQueryContext
 
 
 LOCAL_SCHEMA_VERSION = 7
-THREAD_STATE_SCHEMA_VERSION = 4
-_COMPATIBLE_THREAD_STATE_SCHEMA_VERSIONS = frozenset({3, 4})
+THREAD_STATE_SCHEMA_VERSION = 5
+_COMPATIBLE_THREAD_STATE_SCHEMA_VERSIONS = frozenset({3, 4, 5})
 MAX_THREAD_STATE_BYTES = 16_384
 MAX_CHAT_CONTENT_CHARS = 100_000
 MAX_CONVERSATION_TITLE_CHARS = 256
 MAX_CHAT_READ_LIMIT = 200
 MAX_ENTITY_TIMELINE_VISITS = 24
+
+
+logger = logging.getLogger(__name__)
 
 
 def utc_now() -> str:
@@ -550,6 +555,7 @@ class ThreadMemoryState:
     recent_turn_references: tuple[TurnReference, ...] = ()
     recent_episodes: tuple[EpisodeRecord, ...] = ()
     entity_timeline: tuple[EntityVisit, ...] = ()
+    structured_query_context: StructuredQueryContext | None = None
     summary_updated_at: str = ""
     summary_source_request_id: str = ""
     summary_size_tokens: int = 0
@@ -595,6 +601,7 @@ class ThreadMemoryState:
             entity_timeline=(
                 state.entity_timeline if entity_timeline is None else entity_timeline
             ),
+            structured_query_context=state.structured_query_context,
             summary_updated_at=summary_updated_at,
             summary_source_request_id=summary_source_request_id,
             summary_size_tokens=summary_size_tokens,
@@ -617,6 +624,7 @@ class ThreadMemoryState:
             previous_requires_detection=self.previous_requires_detection,
             previous_requires_asset_profile=self.previous_requires_asset_profile,
             entity_timeline=self.entity_timeline,
+            structured_query_context=self.structured_query_context,
         )
 
     def to_payload(self) -> dict[str, Any]:
@@ -650,6 +658,8 @@ class ThreadMemoryState:
             "summary_source_request_id": self.summary_source_request_id,
             "summary_size_tokens": self.summary_size_tokens,
         }
+        if self.structured_query_context is not None:
+            payload["structured_query_context"] = self.structured_query_context.to_payload()
         if self.working_memory is not None:
             payload["working_memory"] = {
                 "context_key": _context_key_payload(self.working_memory.context_key),
@@ -672,6 +682,18 @@ class ThreadMemoryState:
             return len(json.dumps(
                 payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
             ).encode("utf-8"))
+
+        if payload_size() > MAX_THREAD_STATE_BYTES and self.structured_query_context is not None:
+            maximum_items = max(
+                len(self.structured_query_context.result_refs),
+                len(self.structured_query_context.aggregate_groups),
+            )
+            for retained in range(maximum_items - 1, -1, -1):
+                payload["structured_query_context"] = self.structured_query_context.bounded(retained).to_payload()
+                if payload_size() <= MAX_THREAD_STATE_BYTES:
+                    break
+            if payload_size() > MAX_THREAD_STATE_BYTES:
+                payload.pop("structured_query_context", None)
 
         for episode in payload["recent_episodes"]:
             if payload_size() <= MAX_THREAD_STATE_BYTES:
@@ -717,6 +739,7 @@ class ThreadMemoryState:
             "recent_turn_references",
             "recent_episodes",
             "entity_timeline",
+            "structured_query_context",
             "summary_updated_at",
             "summary_source_request_id",
             "summary_size_tokens",
@@ -753,6 +776,16 @@ class ThreadMemoryState:
             payload.get("recent_episodes", []), session_id, normalized_owner
         )
         timeline = _entity_visits_from_payload(payload.get("entity_timeline", []))
+        structured_query_context = None
+        if payload.get("structured_query_context") is not None:
+            try:
+                structured_query_context = StructuredQueryContext.from_payload(
+                    payload.get("structured_query_context")
+                )
+            except (TypeError, ValueError):
+                logger.warning(
+                    "event=structured_query_context_restore_dropped reason=invalid_optional_context"
+                )
         summary_size = payload.get("summary_size_tokens", 0)
         if not isinstance(summary_size, int) or not 0 <= summary_size <= 16_384:
             raise LocalPersistenceSchemaError("Invalid persisted summary_size_tokens.")
@@ -809,6 +842,7 @@ class ThreadMemoryState:
             recent_turn_references=turn_references,
             recent_episodes=episodes,
             entity_timeline=timeline,
+            structured_query_context=structured_query_context,
             summary_updated_at=str(payload.get("summary_updated_at") or "")[:64],
             summary_source_request_id=str(payload.get("summary_source_request_id") or "")[:128],
             summary_size_tokens=summary_size,
