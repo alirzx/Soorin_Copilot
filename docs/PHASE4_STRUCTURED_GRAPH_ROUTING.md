@@ -1,12 +1,12 @@
 # Phase 4 Structured Graph Routing
 
-Status: current `dev` implementation record for Phase 4A.1 through Phase 4B.3.
+Status: current `dev` implementation record for Phase 4A.1 through Phase 4B.4.
 
 ## Current boundary
 
-Phase 4A provides typed, bounded, active-version-only Neo4j Asset search and aggregation. Phase 4A.1 adds external cursor request/version binding plus a read-only query-plan audit. Phase 4B.1 adds the semantic contract for structured Asset-set requests. Phase 4B.2 connects that contract to bounded agent execution. Phase 4B.3 carries those results through typed evidence, deterministic review, bounded context, and task-specific synthesis.
+Phase 4A provides typed, bounded, active-version-only Neo4j Asset search and aggregation. Phase 4A.1 adds external cursor request/version binding plus a read-only query-plan audit. Phase 4B.1 adds the semantic contract for structured Asset-set requests. Phase 4B.2 connects that contract to bounded agent execution. Phase 4B.3 carries those results through typed evidence, deterministic review, bounded context, and task-specific synthesis. Phase 4B.4 adds bounded, thread-scoped continuity for a later semantic reference to that query/result.
 
-No Product backend, frontend, public API, PostgreSQL schema, Qdrant schema, Neo4j schema, or Memory schema is changed by 4B.3.
+No Product backend, frontend, public API, PostgreSQL schema, Qdrant schema, or Neo4j schema is changed. Phase 4B.4 bumps only the internal ThreadState JSON contract from 4 to 5 while retaining version 3/4 readers; Product continues storing the same bounded `stateJson`.
 
 ## Semantic contract
 
@@ -86,7 +86,35 @@ The Reviewer accepts zero focal entities and treats one capability result as one
 
 Context composition uses a dedicated structured serializer. Search retrieval may retain up to the configured retrieval limit, while model context includes at most 20 rows and may include fewer under the existing token budget and output reservation. Identity, requested selector fields, sort field, and a stable allow-listed analyst projection are retained; individual strings and list values are bounded. Aggregate evidence uses a smaller context cap and preserves the total even when grouped output is context-bounded. The model receives explicit retrieval-versus-context counts, truncation state, limitations, and projection authority.
 
-Synthesizer module selection adds no model call. `asset_search` and `asset_aggregate` modules require direct grounded answers, explicit subset caveats, valid-zero handling, and no invented Product truth. Result-set continuity remains deferred to Phase 4B.4 and selective cross-source deepening remains deferred to Phase 4C.
+Synthesizer module selection adds no model call. `asset_search` and `asset_aggregate` modules require direct grounded answers, explicit subset caveats, valid-zero handling, and no invented Product truth. Selective cross-source deepening remains deferred to Phase 4C.
+
+## Phase 4B.4 structured continuity contract
+
+```text
+reviewed structured ToolResult
+→ update_memory
+→ bounded StructuredQueryContext
+→ SessionRoutingState / ThreadMemoryState v5
+→ existing owner-scoped ThreadStateStore
+→ next request Router summary
+→ typed semantic reference
+→ deterministic materialization
+```
+
+`StructuredQueryContext` retains the canonical query and query identity, active graph version, result counts, retrieval truncation, source/timestamps, and no more than eight ordered `ip`/optional `graph_key`/short-name refs for search or eight label/count groups for aggregation. Eight is independent of the 50/200 retrieval bounds and leaves room inside the established 16,384-byte total ThreadState envelope. It never stores complete Asset rows, classification summaries, provider payloads, or assistant prose.
+
+Its `structured-query-context:v1` SHA-256 fingerprint binds the mode, canonical query identity, graph version, ordered bounded refs or groups, counts, and retrieval/continuity truncation. Restore recomputes both query identity and result fingerprint. Malformed optional continuity is dropped without invalidating established thread state; under total-size pressure refs are reduced and then the context is removed before working memory, turn references, episodes, active entities, or explicit facts are harmed.
+
+There are two current-follow-up families:
+
+- Set-level continuity: the Router emits a full allow-listed `StructuredQuerySpec` inheriting the intended prior selectors and applying a count/group/sort/filter refinement. The normal direct Graph capability reruns against the current active projection; retained counts/refs never substitute for current evidence.
+- Entity-selection continuity: a typed one-based selection chooses at most one or two retained ordered search refs. Deterministic code validates the selection and then feeds those IPs into the existing focal-entity or comparison workflow. No search row becomes active before that later selection.
+
+Historical result recall reuses the existing memory-only answer path with an explicit “historical structured-query continuity, not current operational evidence” label. It exposes only retained refs/groups and discloses bounded/truncated state. A graph-version change does not destroy an IP referent, but any current claim still requires current Graph/Product/Detection evidence. Gate 8 does not treat the context as evidence, and it is never promoted to Working Facts, baselines, Product LTM, or Qdrant.
+
+Natural references are classified by the existing Semantic Router using a small bounded summary. There is no fixed English phrase catalogue and no extra model call. The Router emits only `none`, `set_query`, `select_entities`, or `historical_recall`; deterministic validation owns context availability, explicit-message precedence, maximum-two cardinality, canonical IPs, ordinals, query schema, identity, and fingerprint. Repair accepts the same schema. Unavailable/invalid selections clarify rather than falling through to UI or active entities; ordinary vague pronouns and EntityVisit ordinals keep their established namespaces.
+
+Unrelated and DETACH turns neither bind this context implicitly nor erase the latest bounded thread-scoped reference. A clear set reference can outrank stale UI/active fallback, but an explicit message IP or pair remains authoritative. No automatic Product fan-out or Phase 4C candidate selection is performed.
 
 ## Router prompt policy
 
@@ -137,4 +165,4 @@ Two measured decisions remain intentionally separate from semantic routing:
 
 ## Next phases
 
-Phase 4B.3 set-aware EvidencePack/Reviewer/ContextComposer/Synthesizer handling is implemented. Phase 4B.4 adds bounded short-term result-set continuity. Phase 4C adds selective cross-source Product/Detection/topology deepening; Phase 4B.3 performs no such fan-out.
+Phase 4B.3 set-aware EvidencePack/Reviewer/ContextComposer/Synthesizer handling and Phase 4B.4 bounded result-set continuity are implemented. Phase 4C adds automatic selective cross-source Product/Detection/topology deepening; Phase 4B.4 performs no such fan-out.

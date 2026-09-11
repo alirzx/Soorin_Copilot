@@ -2,7 +2,7 @@
 
 Status: living architecture record. Update whenever graph schema, topology synchronization, enrichment, scheduling, structured retrieval, graph capabilities, GraphRAG retrieval, or Copilot evidence integration changes.
 
-Last synchronized: 2026-09-10.
+Last synchronized: 2026-09-11.
 
 ```text
 Phase 1       DONE
@@ -15,6 +15,7 @@ Phase 4A.1    CODE COMPLETE; CI/PROFILE VALIDATION GATE
 Phase 4B.1    IMPLEMENTED
 Phase 4B.2    IMPLEMENTED
 Phase 4B.3    IMPLEMENTED
+Phase 4B.4    IMPLEMENTED
 ```
 
 ## 1. Purpose and authority
@@ -260,20 +261,20 @@ This validation path prevents developers from having to point mutating integrati
 
 ## 13. External boundaries unchanged
 
-Phase 4A/4A.1/4B.1/4B.2/4B.3 do not change Product backend endpoints, Product PostgreSQL schema, Streamlit/Product frontend request contracts, public graph API routes, Qdrant collections, or memory schema. Phase 4B.3 changes only internal evidence, review, context, and Synthesizer task-module contracts.
+Phase 4A/4A.1/4B.1/4B.2/4B.3/4B.4 do not change Product backend endpoints, Product PostgreSQL schema, Streamlit/Product frontend request contracts, public graph API routes, Qdrant collections, or Neo4j schema. Phase 4B.4 changes only the internal bounded ThreadState JSON version, using the existing Product/local `stateJson` persistence boundary.
 
 Current chat identity fields remain `conversation_id`, `session_id`, `request_id`, `message`, and optional `ui_context.selected_ip`.
 
 ## 14. Next phases
 
-Phase 4B.3 implements set-aware evidence classes, EvidencePack/Reviewer semantics, bounded model-context projection, and task-aware synthesis. Phase 4B.4 owns short-term result-set continuity such as “those assets” without turning result rows into focal entities. Phase 4C owns bounded candidate selection and cross-source deepening.
+Phase 4B.3 implements set-aware evidence classes, EvidencePack/Reviewer semantics, bounded model-context projection, and task-aware synthesis. Phase 4B.4 implements one latest thread-scoped `StructuredQueryContext`: canonical query identity and graph version, bounded counts/truncation, and up to eight ordered identity refs or aggregate groups with a deterministic snapshot fingerprint. It is referential metadata, never Graph evidence or LTM. The existing semantic Router classifies set reuse, one/two-result selection, or historical recall; deterministic code validates and materializes the decision. Set reuse reruns current Neo4j evidence, and selected refs enter only the existing focal workflow. Phase 4C owns automatic bounded candidate selection and cross-source deepening.
 
 ## 15. Near-future GraphRAG roadmap
 
 ```text
 Phase 4B.2 capability/execution integration (implemented)
-Phase 4B.3 evidence/context integration
-Phase 4B.4 bounded result-set continuity
+Phase 4B.3 evidence/context integration (implemented)
+Phase 4B.4 bounded result-set continuity (implemented)
 Phase 4C   cross-source exact search → selective Product/Detection/topology deepening
 Phase 5    measured Neo4j full-text retrieval
 Phase 6    semantic Asset search with controlled Asset text + vector index

@@ -388,6 +388,8 @@ URLs, disable freshness checks, or force unvalidated full payloads.
 
 Phase 4B.3 adds first-class `graph_asset_search` and `graph_asset_aggregate` evidence. Each structured receipt carries normalized query semantics, active graph version, canonical SHA-256 query identity, Neo4j organizational-projection provenance, counts, bounded rows/groups, truncation, retrieval time, and limitations. These receipts remain zero-focal-entity evidence and are retained by EvidencePack without turning returned Assets into task entities or memory objects.
 
+Phase 4B.4 derives one bounded `StructuredQueryContext` from reviewed typed structured evidence at `update_memory`. The context records canonical `StructuredQuerySpec` semantics, query identity, graph version, counts and truncation, request/timestamps, and at most eight ordered identity-only Asset refs or eight aggregate groups. A second SHA-256 digest fingerprints exactly that bounded continuity snapshot: query identity, graph version, mode, ordered retained refs or groups, counts, and retrieval/continuity truncation. It is stored only through the existing owner-scoped ThreadState `stateJson`; ThreadState schema version 5 still accepts versions 3 and 4 with a missing context interpreted as `None`. Invalid optional context is dropped without losing core route, working-memory, episode, or timeline state, and size pressure trims/drops it before established memory.
+
 ### Supplemental validation
 
 The only allowed sequence is implemented:
@@ -727,6 +729,10 @@ Typed long-term memory (Gate 6/7, disabled by default):
 Routing state:
 
 - Stores active IP, active entity pair, previous intent, previous scope, previous direction, previous depth, and previous operational provider state.
+- Stores one latest bounded `StructuredQueryContext` for referential continuity. It is not a `MemoryContextKey` entity set, current evidence, WorkingFact, baseline, LTM record, or Qdrant projection; Gate 8 never consumes it as evidence.
+- Exposes only a bounded summary to the existing Semantic Router. Natural follow-ups are semantic typed decisions, not phrase-list matching. Deterministic validation checks context presence, canonical identities/fingerprint, cardinality, ordinals, and IPs before either rerunning a current set query or materializing at most two focal Assets.
+- Preserves explicit-message entity authority. Clear structured-set references may outrank incidental UI/active fallback, while ordinary vague active-single/pair and EntityVisit timeline references retain their existing namespace and behavior.
+- A detached/unrelated turn does not use structured context implicitly and does not erase the one bounded latest context; a later explicit semantic reference may reuse it within the same owner/thread boundary.
 - Successful single-IP graph requests preserve active IP and node-summary route state.
 - General or unclear detached turns do not erase active IP.
 - Knowledge-only routes can be selected and included in trace/provider status, but current persisted `last_provider`/`last_providers` are operational-provider oriented and do not persist `knowledge` as a last provider.

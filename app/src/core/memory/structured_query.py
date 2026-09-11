@@ -9,7 +9,11 @@ import re
 from dataclasses import dataclass
 from typing import Any, Literal
 
-from src.core.graph.structured import StructuredQueryMode, StructuredQuerySpec
+from src.core.graph.structured import (
+    StructuredQueryMode,
+    StructuredQuerySpec,
+    structured_query_identity,
+)
 
 
 STRUCTURED_QUERY_CONTEXT_SCHEMA_VERSION = "structured-query-context-v1"
@@ -126,6 +130,11 @@ class StructuredQueryContext:
             "active_graph_version",
             _bounded_optional(self.active_graph_version, maximum=128),
         )
+        if self.query_identity != structured_query_identity(
+            self.query,
+            active_graph_version=self.active_graph_version,
+        ):
+            raise ValueError("structured query identity mismatch")
         for name in ("matched_total", "returned_count", "count"):
             value = getattr(self, name)
             if value is not None and (

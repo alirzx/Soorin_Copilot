@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from types import SimpleNamespace
+
+import pytest
 
 from dataclasses import replace
 
@@ -21,6 +24,7 @@ from src.core.agent.structured_evidence import structured_query_identity
 from src.core.graph.structured import StructuredQuerySpec
 from src.core.identity import RequestIdentity
 from src.core.agent.nodes import CopilotWorkflowNodes
+from src.core.agent.evidence_policy import EvidenceRequirementPolicy, MemorySufficiencyGate, build_gap_plan
 from src.core.context.models import EntityResolution, RouteDecision
 from src.core.memory.episodes import MemoryContextKey, TurnReference, WorkingMemory
 from src.core.memory.persistence import (
@@ -28,9 +32,11 @@ from src.core.memory.persistence import (
     THREAD_STATE_SCHEMA_VERSION,
     ThreadMemoryState,
 )
+from src.core.memory.persistence import LocalPersistenceOwnershipError
 from src.core.memory.routing_state import SessionRoutingState
 from src.core.memory.routing_state import SessionRoutingStateStore
 from src.core.memory.store import MemoryStore
+from src.core.memory.sqlite import LocalSQLiteDatabase, SQLiteThreadStateStore
 from src.config.settings import get_settings
 from src.core.memory.structured_query import (
     MAX_STRUCTURED_QUERY_RESULT_REFS,
@@ -110,6 +116,28 @@ def test_result_fingerprint_is_stable_and_binds_bounded_snapshot() -> None:
     changed_version = _search_context(version="graph-v8")
     changed_count = _search_context(matched_total=13)
     changed_truncation = _search_context(retrieval_truncated=False)
+    changed_query = StructuredQuerySpec.model_validate({
+        "mode": "search",
+        "filters": {"role": "Domain Controller", "status": "CONFIRMED"},
+        "sort": "asset_name",
+        "direction": "asc",
+        "limit": 50,
+    })
+    changed_identity = StructuredQueryContext.create(
+        query_identity=structured_query_identity(
+            changed_query,
+            active_graph_version=original.active_graph_version,
+        ),
+        active_graph_version=original.active_graph_version,
+        query=changed_query,
+        matched_total=original.matched_total,
+        returned_count=original.returned_count,
+        retrieval_truncated=original.retrieval_truncated,
+        result_refs=original.result_refs,
+        source_request_id=original.source_request_id,
+        retrieved_at=original.retrieved_at,
+        created_at=original.created_at,
+    )
 
     assert replay.result_fingerprint == original.result_fingerprint
     assert len({
@@ -118,7 +146,8 @@ def test_result_fingerprint_is_stable_and_binds_bounded_snapshot() -> None:
         changed_version.result_fingerprint,
         changed_count.result_fingerprint,
         changed_truncation.result_fingerprint,
-    }) == 5
+        changed_identity.result_fingerprint,
+    }) == 6
 
 
 def test_aggregate_context_roundtrips_without_entity_refs() -> None:
@@ -204,6 +233,33 @@ def test_bad_optional_fingerprint_is_dropped_without_losing_core_state() -> None
     payload["structured_query_context"]["result_fingerprint"] = (
         "structured-query-context:v1:" + ("0" * 64)
     )
+
+    restored = ThreadMemoryState.from_payload(
+        payload,
+        thread_key=identity.thread_key,
+        user_id=identity.user_id,
+        conversation_id=identity.conversation_id,
+        session_id=identity.session_id,
+        updated_at=state.updated_at,
+        revision=1,
+        schema_version=THREAD_STATE_SCHEMA_VERSION,
+    )
+
+    assert restored.active_entities == ("203.0.113.8",)
+    assert restored.structured_query_context is None
+
+
+def test_mismatched_optional_query_identity_is_dropped_without_losing_core_state() -> None:
+    identity = _identity()
+    state = ThreadMemoryState.from_routing_state(
+        identity,
+        SessionRoutingState(
+            active_entities=("203.0.113.8",),
+            structured_query_context=_search_context(),
+        ),
+    )
+    payload = state.to_payload()
+    payload["structured_query_context"]["query"]["filters"]["status"] = "CONFIRMED"
 
     restored = ThreadMemoryState.from_payload(
         payload,
@@ -475,3 +531,151 @@ def test_update_memory_writes_context_without_turning_rows_into_active_entities_
         "192.0.2.20", "192.0.2.21"
     ]
     assert persisted == [updated]
+
+
+def test_structured_context_survives_owned_sqlite_restore_and_is_cross_thread_isolated(
+    tmp_path: Path,
+) -> None:
+    identity = _identity()
+    database = LocalSQLiteDatabase(tmp_path / "structured-continuity.sqlite3")
+    database.initialize()
+    store = SQLiteThreadStateStore(database)
+    state = ThreadMemoryState.from_routing_state(
+        identity,
+        SessionRoutingState(structured_query_context=_search_context()),
+    )
+    store.save(identity=identity, state=state, expected_revision=0)
+
+    restored = store.load(identity=identity)
+    other_thread = RequestIdentity.resolve(
+        user_id="user-a",
+        conversation_id="conversation-b",
+        session_id="session-b",
+        request_id="request-b",
+    )
+    wrong_owner = RequestIdentity.resolve(
+        user_id="user-b",
+        conversation_id="conversation-a",
+        session_id="session-a",
+        request_id="request-c",
+    )
+
+    assert restored is not None and restored.structured_query_context is not None
+    assert store.load(identity=other_thread) is None
+    with pytest.raises(LocalPersistenceOwnershipError):
+        store.load(identity=wrong_owner)
+
+
+def test_corrupted_persisted_ref_drops_only_optional_context() -> None:
+    identity = _identity()
+    state = ThreadMemoryState.from_routing_state(
+        identity,
+        SessionRoutingState(
+            active_entities=("203.0.113.8",),
+            structured_query_context=_search_context(),
+        ),
+    )
+    payload = state.to_payload()
+    payload["structured_query_context"]["result_refs"][0]["ip"] = "not-an-ip"
+
+    restored = ThreadMemoryState.from_payload(
+        payload,
+        thread_key=identity.thread_key,
+        user_id=identity.user_id,
+        conversation_id=identity.conversation_id,
+        session_id=identity.session_id,
+        updated_at=state.updated_at,
+        revision=1,
+        schema_version=THREAD_STATE_SCHEMA_VERSION,
+    )
+
+    assert restored.active_entities == ("203.0.113.8",)
+    assert restored.structured_query_context is None
+
+
+def test_structured_context_never_satisfies_gate8_or_skips_current_capabilities() -> None:
+    context = _search_context()
+    tasks = (
+        TaskSpec(
+            request="rerun the set",
+            intent="asset_search",
+            scope="none",
+            direction="none",
+            entities=(),
+            required_capabilities=("graph.search_assets",),
+            structured_query=context.query,
+        ),
+        TaskSpec(
+            request="inspect selected Asset",
+            intent="asset_investigation",
+            scope="node_summary",
+            direction="both",
+            entities=(context.result_refs[0].ip,),
+            required_capabilities=("asset.get_profile", "asset.get_detection"),
+        ),
+    )
+
+    for task in tasks:
+        requirements = EvidenceRequirementPolicy().derive(task)
+        decisions = MemorySufficiencyGate().evaluate(requirements, ())
+        gap = build_gap_plan(requirements, decisions)
+        assert gap.skipped_capabilities == ()
+        assert {item.requirement.capability for item in gap.gaps} == set(
+            task.required_capabilities
+        )
+
+
+def test_old_graph_version_ref_can_identify_asset_but_current_set_remains_live_direct() -> None:
+    context = _search_context(version="graph-v1")
+    selected = context.result_refs[0]
+    current_query = StructuredQuerySpec.model_validate({
+        "mode": "search",
+        "filters": {"role": "Domain Controller"},
+    })
+    current_task = TaskSpec(
+        request="show the current matching set",
+        intent="asset_search",
+        scope="none",
+        direction="none",
+        entities=(),
+        required_capabilities=("graph.search_assets",),
+        structured_query=current_query,
+        workflow_mode="direct",
+    )
+
+    assert selected.ip == "192.0.2.1"
+    assert context.active_graph_version == "graph-v1"
+    requirements = EvidenceRequirementPolicy().derive(current_task)
+    gap = build_gap_plan(requirements, MemorySufficiencyGate().evaluate(requirements, ()))
+    assert tuple(item.requirement.capability for item in gap.gaps) == ("graph.search_assets",)
+    assert current_task.workflow_mode == "direct"
+
+
+def test_aggregate_group_continuity_is_bounded_and_historical_payload_is_explicit() -> None:
+    query = StructuredQuerySpec.model_validate({
+        "mode": "aggregate",
+        "filters": {"role": "Domain Controller"},
+        "operation": "group_count",
+        "group_by": "status",
+    })
+    groups = tuple(
+        StructuredAggregateGroupRef(value=f"group-{index}", count=index)
+        for index in range(20)
+    )
+    context = StructuredQueryContext.create(
+        query_identity=structured_query_identity(query, active_graph_version="graph-v1"),
+        active_graph_version="graph-v1",
+        query=query,
+        count=190,
+        aggregate_groups=groups,
+        source_request_id="aggregate-groups",
+        retrieved_at="2026-09-11T00:00:00+00:00",
+        created_at="2026-09-11T00:00:01+00:00",
+    )
+    historical = context.historical_context_payload()
+
+    assert len(context.aggregate_groups) == 8
+    assert context.continuity_truncated
+    assert context.result_refs == ()
+    assert "Historical structured-query continuity only" in historical["authority"]
+    assert "not current operational evidence" in historical["authority"]

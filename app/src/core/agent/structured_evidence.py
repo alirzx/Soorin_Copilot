@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
-import json
 from typing import Any
 
 from src.core.agent.contracts import (
@@ -11,44 +9,7 @@ from src.core.agent.contracts import (
     StructuredAssetSearchEvidence,
     StructuredAssetSetEvidence,
 )
-from src.core.graph.structured import StructuredQuerySpec
-
-
-def structured_query_identity(
-    query: StructuredQuerySpec | dict[str, Any],
-    *,
-    active_graph_version: str | None,
-) -> str:
-    """Hash only normalized semantic query fields and projection version."""
-    if isinstance(query, StructuredQuerySpec):
-        serialized = query.model_dump(mode="json", exclude_none=True)
-    else:
-        serialized = {key: value for key, value in query.items() if value is not None}
-    mode = str(serialized.get("mode") or "")
-    payload = {
-        "mode": mode,
-        "filters": dict(serialized.get("filters") or {}),
-    }
-    if mode == "search":
-        payload.update(
-            sort=str(serialized.get("sort") or "graph_key"),
-            direction=str(serialized.get("direction") or "asc"),
-        )
-    elif mode == "aggregate":
-        payload.update(
-            operation=str(serialized.get("operation") or "count"),
-            group_by=serialized.get("group_by"),
-        )
-    canonical = json.dumps(
-        {
-            "active_graph_version": active_graph_version,
-            "query": payload,
-        },
-        ensure_ascii=False,
-        separators=(",", ":"),
-        sort_keys=True,
-    ).encode("utf-8")
-    return "structured-asset-set:v1:" + hashlib.sha256(canonical).hexdigest()
+from src.core.graph.structured import StructuredQuerySpec, structured_query_identity
 
 
 def structured_evidence_from_context(

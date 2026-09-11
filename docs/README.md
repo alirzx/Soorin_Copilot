@@ -1,6 +1,6 @@
 # Documentation map and current authority
 
-Last synchronized: 2026-09-11 (`dev`, Phase 4B.3 evidence/context integration).
+Last synchronized: 2026-09-11 (`dev`, Phase 4B.4 structured result-set continuity).
 
 This directory contains both living specifications and historical audit records. Historical audit files are intentionally retained as snapshots of the repository state at the date written; they are not silently rewritten to look current. For implementation decisions, source code on `dev` is authoritative, followed by the living/current documents below.
 
@@ -10,7 +10,7 @@ This directory contains both living specifications and historical audit records.
 |---|---|---|
 | `CURRENT_ARCHITECTURE.md` | Living architecture baseline with dated addenda | Overall bounded LangGraph, LLM roles, evidence, context, memory, Product, Neo4j and Qdrant architecture. Read together with the current Phase 4 records below. |
 | `NEO4J_GRAPH_ENRICHMENT_GRAPHRAG.md` | Living graph architecture record | Authoritative graph/enrichment/structured-search/GraphRAG roadmap. |
-| `PHASE4_STRUCTURED_GRAPH_ROUTING.md` | Current Phase 4A.1–4B.3 implementation record | Exact-search hardening, Router/capability execution, and bounded Asset-set evidence-to-answer flow. |
+| `PHASE4_STRUCTURED_GRAPH_ROUTING.md` | Current Phase 4A.1–4B.4 implementation record | Exact-search hardening, Router/capability execution, bounded Asset-set evidence, and thread-scoped result continuity. |
 | `ENVIRONMENT_VARIABLES.md` | Living configuration reference | Current settings and deployment knobs. Phase 4A search limits are documented here. |
 | `DEPLOYMENT.md` | Current deployment guidance | Runtime/deployment mechanics. No Phase 4B.1 deployment-contract change. |
 | `OBSERVABILITY.md` | Current observability guidance | Metrics/logging boundaries. No Phase 4B.1 metric contract change. |
@@ -33,6 +33,7 @@ Phase 4A.1    CODE HARDENED; isolated CI/profile validation added
 Phase 4B.1    SEMANTIC CONTRACT IMPLEMENTED
 Phase 4B.2    IMPLEMENTED: capability/execution integration
 Phase 4B.3    IMPLEMENTED: evidence/reviewer/context/synthesis integration
+Phase 4B.4    IMPLEMENTED: bounded structured result-set continuity
 ```
 
 Phase 4A contains typed exact/range Asset filters, count/group-count aggregation, active-version-only Neo4j queries, bounded keyset pagination and fixed sort/group allow-lists. Phase 4A.1 binds the service cursor to normalized query identity and active graph version, hardens refresh/storage failure paths, and provides a read-only `EXPLAIN/PROFILE` audit plus isolated CI Neo4j validation.
@@ -49,9 +50,11 @@ role/vendor/product/status/...  = structured selector/filter/facet
 structured retrieval output     = Asset set
 ```
 
-Asset-set rows do not consume the two-focal-entity budget. A later bounded result-set continuity object may reference a set, while only selected Assets become focal entities for Product/Detection/topology deepening.
+Phase 4B.4 persists one latest, owner/thread-scoped `StructuredQueryContext` inside the existing bounded ThreadState. It contains canonical query semantics and identity, active graph version, counts/truncation, a SHA-256 fingerprint of the bounded continuity snapshot, and at most eight ordered identity-only Asset refs or aggregate groups. It is continuity metadata—not current evidence, LTM, a baseline, a WorkingFact, or a Qdrant document—and is discarded independently if malformed.
 
-Phase 4B.4 remains responsible for short-term result-set continuity, and Phase 4C for selective cross-source deepening. Phase 4B.3 does not persist result sets, reinterpret selectors as focal entities, or fan out to Product/Detection.
+Natural set follow-ups are interpreted semantically by the existing Router, not an English phrase catalogue, and then validated deterministically. Set-level references produce a new canonical `StructuredQuerySpec` and current Graph call. A clear selection may materialize only one or two retained refs into the existing focal-entity workflow; explicit message entities remain authoritative, while a clear set reference can outrank incidental UI/active fallback. Historical recall uses only the retained bounded snapshot and is labelled non-current. Conservative Router fallback does not guess a structured reference.
+
+Asset-set rows do not consume the two-focal-entity budget and never become active entities merely because a search ran. Phase 4C remains responsible for automatic selective cross-source deepening; Phase 4B.4 adds no Product/Detection fan-out and no model call.
 
 ## Authority boundaries for GraphRAG
 

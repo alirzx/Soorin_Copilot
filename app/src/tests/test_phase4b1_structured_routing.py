@@ -396,6 +396,66 @@ def test_set_continuation_accepts_full_typed_query_and_ignores_incidental_ui() -
     assert decision.structured_result_reference.kind == "set_query"
 
 
+@pytest.mark.parametrize(
+    ("intent", "query", "expected"),
+    [
+        (
+            "asset_aggregate",
+            {
+                "mode": "aggregate",
+                "filters": {"role": "Domain Controller"},
+                "operation": "count",
+            },
+            ("count", None, None, None),
+        ),
+        (
+            "asset_search",
+            {
+                "mode": "search",
+                "filters": {"role": "Domain Controller"},
+                "sort": "model_confidence",
+                "direction": "asc",
+            },
+            (None, None, "model_confidence", "asc"),
+        ),
+        (
+            "asset_aggregate",
+            {
+                "mode": "aggregate",
+                "filters": {"role": "Domain Controller"},
+                "operation": "group_count",
+                "group_by": "status",
+            },
+            ("group_count", "status", None, None),
+        ),
+    ],
+)
+def test_typed_set_followups_keep_prior_filters_for_count_sort_and_grouping(
+    intent: str,
+    query: dict[str, object],
+    expected: tuple[str | None, str | None, str | None, str | None],
+) -> None:
+    payload = _base_payload(intent, query)
+    payload["structured_result_reference"] = {"kind": "set_query", "ordinals": []}
+    payload["is_followup"] = True
+
+    decision = validate_structured_router_payload(
+        payload,
+        _empty_entities(),
+        min_confidence=0.5,
+        routing_state=SessionRoutingState(structured_query_context=_continuity()),
+    )
+
+    assert decision.structured_query is not None
+    assert decision.structured_query.filters.role == "Domain Controller"
+    assert (
+        decision.structured_query.operation.value if decision.structured_query.operation else None,
+        decision.structured_query.group_by.value if decision.structured_query.group_by else None,
+        decision.structured_query.sort.value if decision.structured_query.sort else None,
+        decision.structured_query.direction.value if decision.structured_query.direction else None,
+    ) == expected
+
+
 def test_empty_out_of_bounds_and_aggregate_selection_fail_validation() -> None:
     for context, pattern in (
         (_continuity(refs=0), "out_of_bounds"),
@@ -414,6 +474,75 @@ def test_empty_out_of_bounds_and_aggregate_selection_fail_validation() -> None:
                 min_confidence=0.5,
                 routing_state=SessionRoutingState(structured_query_context=context),
             )
+
+
+def test_vague_active_single_remains_in_existing_namespace_when_context_exists() -> None:
+    active = ResolvedEntity(type="ip", value="198.51.100.10", source="conversation")
+    entities = EntityResolution(
+        status="resolved",
+        entities=[active],
+        primary_entity=active,
+        entity_mode="single",
+        candidate_count=1,
+        valid_entity_count=1,
+        reference_detected=True,
+        reference_type="active_single",
+    )
+    payload = {
+        "intent": "asset_investigation",
+        "scope": "node_summary",
+        "direction": "both",
+        "depth": 0,
+        "requires_graph": True,
+        "requires_detection": False,
+        "requires_asset_profile": True,
+        "requires_knowledge": False,
+        "structured_query": None,
+        "entity_binding": "active_single",
+        "requires_multiple_entities": False,
+        "is_followup": True,
+        "classification_confidence": 0.98,
+        "reason": "Continue with the active focal Asset.",
+    }
+
+    decision = validate_structured_router_payload(
+        payload,
+        entities,
+        min_confidence=0.5,
+        routing_state=SessionRoutingState(
+            active_entities=(active.value,),
+            structured_query_context=_continuity(),
+        ),
+    )
+
+    assert decision.materialized_entities == (active.value,)
+    assert decision.structured_result_reference.kind == "none"
+
+
+def test_explicit_pair_outranks_structured_result_selection() -> None:
+    explicit = EntityResolution(
+        status="resolved",
+        entities=[
+            ResolvedEntity(type="ip", value="203.0.113.4", source="message"),
+            ResolvedEntity(type="ip", value="203.0.113.5", source="message"),
+        ],
+        entity_mode="multiple",
+        candidate_count=2,
+        explicit_candidate_count=2,
+        valid_entity_count=2,
+    )
+    payload = _entity_payload(pair=True)
+    payload["entity_binding"] = "explicit"
+
+    decision = validate_structured_router_payload(
+        payload,
+        explicit,
+        min_confidence=0.5,
+        routing_state=SessionRoutingState(structured_query_context=_continuity()),
+    )
+
+    assert decision.materialized_entities == ("203.0.113.4", "203.0.113.5")
+    assert decision.structured_result_reference.kind == "none"
 
 
 class _RepairLLM:
@@ -454,6 +583,50 @@ def test_router_repair_path_preserves_typed_result_selection() -> None:
     assert decision.decision_source == "semantic_router_repair"
     assert decision.materialized_entities == ("192.0.2.1", "192.0.2.2")
     assert decision.structured_result_reference.kind == "select_entities"
+
+
+def test_empty_result_selection_repair_failure_routes_to_clarification_not_active_or_ui() -> None:
+    invalid = _entity_payload()
+    settings = replace(
+        get_settings(),
+        intent_router_enabled=True,
+        intent_router_retry_enabled=True,
+        intent_router_min_confidence=0.5,
+    )
+    router = SemanticIntentRouter(
+        settings,
+        _RepairLLM([json.dumps(invalid), json.dumps(invalid)]),
+    )
+    active = ResolvedEntity(type="ip", value="198.51.100.10", source="conversation")
+    entities = EntityResolution(
+        status="resolved",
+        entities=[active],
+        primary_entity=active,
+        entity_mode="single",
+        candidate_count=1,
+        valid_entity_count=1,
+        reference_detected=True,
+        reference_type="active_single",
+    )
+    routing_state = SessionRoutingState(
+        active_entities=(active.value,),
+        structured_query_context=_continuity(refs=0),
+    )
+    service = SimpleNamespace(settings=settings, intent_router=router)
+
+    routed = CopilotWorkflowNodes(service).route({
+        "message": "inspect the selected retained result",
+        "resolved_entities": entities,
+        "active_entity_state": routing_state,
+        "recent_messages": [],
+        "ui_context": {"selected_ip": "203.0.113.99"},
+        "request_id": "empty-result-selection",
+        "trace_id": "trace-empty-result-selection",
+    })
+
+    assert routed["workflow_status"] == "clarification_required"
+    assert routed["clarification"]["code"] == "structured_result_reference_unavailable"
+    assert "routing_result" not in routed
 
 
 def test_route_node_recomputes_pair_authority_for_structured_result_selection() -> None:

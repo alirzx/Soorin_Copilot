@@ -1345,3 +1345,33 @@ external contract:
 compatibility, but no runtime code consumes them. Conversation compaction is
 deterministic and performs no summary-model call. They remain intentionally
 dormant in this compatibility-preserving change.
+
+## 20. 2026-09-11 Phase 4B.4 structured-result continuity addendum
+
+Phase 4B.4 extends the existing state path rather than adding a memory system.
+Reviewed structured search/aggregate evidence may create one latest
+`StructuredQueryContext` during `update_memory`; `SessionRoutingState` carries it
+into `ThreadMemoryState` schema version 5 and the existing owner-scoped local or
+Product `stateJson` store. Versions 3 and 4 remain readable with no structured
+context. Invalid optional context is dropped independently, and the 16,384-byte
+total-state pressure policy trims/drops it before established continuity.
+
+The context retains canonical query identity, graph-version provenance,
+count/truncation metadata, and at most eight ordered identity-only Asset refs or
+eight aggregate label/count groups. A SHA-256 result fingerprint binds that
+bounded snapshot; it is not a claim about the complete Neo4j result. It is
+ThreadState referential metadata, not current evidence, a WorkingFact,
+InvestigationBaseline, Product LTM record, or Qdrant document. Gate 8 therefore
+cannot use it to skip current Graph, Product Profile, or Detection requirements.
+
+Natural follow-ups use the existing semantic Router and a typed bounded summary,
+not fixed English phrases and not another LLM call. Deterministic code validates
+the query/reference and either reruns a canonical current set query, selects at
+most one or two retained IPs into the existing focal workflow, or exposes the
+bounded snapshot through the existing historical recall path. Explicit message
+entities remain highest authority; clear result-set semantics may outrank stale
+UI/active fallback, while vague single/pair and EntityVisit timeline references
+retain their established behavior. KEEP/SWITCH/DETACH episode semantics are
+unchanged: DETACH does not implicitly use the context, though the latest bounded
+thread reference remains available for a later clear reference. No result row is
+automatically activated and no Product/Detection fan-out occurs.
