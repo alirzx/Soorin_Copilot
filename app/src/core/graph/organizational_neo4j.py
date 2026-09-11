@@ -16,6 +16,7 @@ from src.core.graph.structured import AssetAggregateRequest, AssetSearchRequest
 from src.core.product_client.schemas import TopologyConnectionRecord
 
 
+ORGANIZATIONAL_PROJECTION_SCHEMA_VERSION = 2
 _RFC1918 = (
     ipaddress.ip_network("10.0.0.0/8"),
     ipaddress.ip_network("172.16.0.0/12"),
@@ -92,6 +93,35 @@ class OrganizationalNeo4jGraphRepository(Neo4jGraphRepository):
             _utc_now(),
             int(new_pending_assets or 0),
         )
+
+    def projection_schema_version(self) -> int:
+        row = self._single(
+            "MATCH (m:GraphMetadata {id: 'active'}) RETURN m.schema_version AS schema_version"
+        )
+        if row is None:
+            return 0
+        try:
+            return int(row.get("schema_version") or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    def _publish(self, version: str) -> None:
+        query = """
+        MERGE (m:GraphMetadata {id: 'active'})
+        SET m.active_graph_version = $version,
+            m.last_successful_sync = $now,
+            m.sync_status = 'published',
+            m.schema_version = $schema_version
+        """
+        with self.driver.session() as session:
+            session.execute_write(
+                lambda tx: tx.run(
+                    query,
+                    version=version,
+                    now=_utc_now(),
+                    schema_version=ORGANIZATIONAL_PROJECTION_SCHEMA_VERSION,
+                ).consume()
+            )
 
     @staticmethod
     def _structured_filter_clauses(
