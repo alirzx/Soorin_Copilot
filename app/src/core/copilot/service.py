@@ -20,7 +20,7 @@ from src.core.agent.planner import BoundedPlanner
 from src.core.agent.registry import build_capability_registry
 from src.core.agent.reviewer import EvidenceReviewer
 from src.core.agent.workflow import BoundedCopilotWorkflow
-from src.core.agent.nodes import CopilotWorkflowNodes
+from src.core.agent.phase4c_nodes import Phase4CWorkflowNodes
 from src.core.context import ContextComposer, DeterministicFallbackRouter, EntityResolver, SemanticIntentRouter
 from src.core.copilot.input_guard import prompt_injection_refusal
 from src.core.context.providers import AssetProfileContextProvider, DetectionContextProvider, GraphContextProvider
@@ -1034,7 +1034,7 @@ class CopilotService:
                 trace_id=workflow_trace_id,
                 request_identity=identity,
                 stream_sink=stream_sink,
-                node_runtime=CopilotWorkflowNodes(self, stream_sink=stream_sink),
+                node_runtime=Phase4CWorkflowNodes(self, stream_sink=stream_sink),
             )
             request_success = True
             return result
