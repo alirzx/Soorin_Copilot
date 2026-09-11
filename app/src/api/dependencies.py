@@ -9,8 +9,8 @@ from src.core.graph.enrichment import AssetEnrichmentService
 from src.core.graph.enrichment_runtime import GraphEnrichmentRuntimeService
 from src.core.graph.neo4j import Neo4jDriver
 from src.core.graph.organizational_neo4j import OrganizationalNeo4jGraphRepository
+from src.core.graph.organizational_refresh import GraphRefreshService
 from src.core.graph.organizational_service import OrganizationalGraphService
-from src.core.graph.refresh import GraphRefreshService
 from src.core.memory.factory import LocalPersistenceAdapters, build_local_persistence
 from src.core.product_client import ProductApiClient
 from src.core.product_client.memory_client import ProductMemoryClient
