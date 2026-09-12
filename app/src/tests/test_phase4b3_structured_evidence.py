@@ -532,10 +532,12 @@ def test_synthesizer_selects_asset_search_module_with_partial_set_rules() -> Non
 
     assert context.task_category == "asset_search"
     assert "task.asset_search" in modules
-    assert "State the matched total" in prompt
-    assert "displayed list partial" in prompt
+    assert "Lead with what was found" in prompt
+    assert "only part of the current results was returned" in prompt
     assert "not conversational focal entities" in prompt
-    assert "rather than live Product truth" in prompt
+    assert "Current Product evidence remains authoritative" in prompt
+    assert "Never expose query syntax or implementation vocabulary" in prompt
+    assert "Do not describe retrieval/context machinery" in prompt
     assert context.graph.truncated
 
 
@@ -561,8 +563,10 @@ def test_synthesizer_selects_compact_asset_aggregate_module_without_llm_call() -
 
     assert context.task_category == "asset_aggregate"
     assert "task.asset_aggregate" in rendered.selected_module_names
-    assert "Treat zero as a valid observed aggregate" in rendered.dynamic_prompt
-    assert "bounded groups" in rendered.dynamic_prompt
+    assert "Treat zero as a valid observed count" in rendered.dynamic_prompt
+    assert "additional groups were not shown" in rendered.dynamic_prompt
+    assert "without echoing backend query syntax" in rendered.dynamic_prompt
+    assert "retrieval mechanics" in rendered.dynamic_prompt
     assert any('"count":12' in message["content"] for message in rendered.messages)
 
 

@@ -7,7 +7,7 @@ from src.core.agent.contracts import (
     TaskSpec,
     ToolResult,
 )
-from src.core.agent.hardened_phase4c import Phase4CWorkflowNodes
+from src.core.agent.hardened_phase4c import Phase4CWorkflowNodes, _deepened_entities
 from src.core.agent.hardened_reviewer import EvidenceReviewer
 from src.core.agent.phase4c_nodes import Phase4CWorkflowNodes as BasePhase4CWorkflowNodes
 from src.core.context.models import RouteDecision
@@ -19,6 +19,7 @@ from src.core.graph.structured import (
     SortDirection,
     StructuredQueryMode,
     StructuredQuerySpec,
+    structured_query_identity,
 )
 from src.core.llm.providers.base import LLMProviderResult, LLMStreamEvent
 
@@ -34,6 +35,8 @@ def _ranked_query() -> StructuredQuerySpec:
 
 
 def test_ranked_two_row_tie_check_is_not_materially_incomplete():
+    query = _ranked_query()
+    query_identity = structured_query_identity(query, active_graph_version="v1")
     task = TaskSpec(
         request="Find the Firewall with the highest model confidence.",
         intent="asset_search",
@@ -41,11 +44,11 @@ def test_ranked_two_row_tie_check_is_not_materially_incomplete():
         direction="none",
         entities=(),
         required_capabilities=("graph.search_assets",),
-        structured_query=_ranked_query(),
+        structured_query=query,
     )
     evidence = StructuredAssetSearchEvidence(
         capability="graph.search_assets",
-        query_identity="q",
+        query_identity=query_identity,
         normalized_filters={"role": "firewall"},
         active_graph_version="v1",
         sort="model_confidence",
@@ -66,7 +69,12 @@ def test_ranked_two_row_tie_check_is_not_materially_incomplete():
         retrieved_at="now",
         freshness="current",
         completeness="partial",
+        total_count=9,
+        included_count=2,
+        omitted_count=7,
         truncated=True,
+        normalized_query_hash=query_identity,
+        context_identity=query_identity,
         structured_asset_set=evidence,
     )
     decision = EvidenceReviewer().review(task, [result])
@@ -74,7 +82,7 @@ def test_ranked_two_row_tie_check_is_not_materially_incomplete():
     assert not decision.material_limitations
 
 
-def test_phase4c_marks_only_deepened_asset_as_focal(monkeypatch):
+def test_phase4c_derives_only_actually_deepened_assets_as_focal():
     focal_result = ToolResult(
         status="ok",
         entities=("192.168.8.1",),
@@ -83,17 +91,20 @@ def test_phase4c_marks_only_deepened_asset_as_focal(monkeypatch):
         freshness="current",
         completeness="complete",
     )
-    monkeypatch.setattr(
-        BasePhase4CWorkflowNodes,
-        "join_specialist_results",
-        lambda self, state: {"tool_results": [focal_result]},
+    search_result = ToolResult(
+        status="ok",
+        entities=(),
+        source_capability="graph.search_assets",
+        retrieved_at="now",
+        freshness="current",
+        completeness="complete",
     )
-    node = object.__new__(Phase4CWorkflowNodes)
-    update = node.join_specialist_results({})
-    assert update["phase4c_focal_entities"] == ("192.168.8.1",)
+
+    state = {"tool_results": [search_result, focal_result]}
+    assert _deepened_entities(state) == ("192.168.8.1",)
 
 
-def test_phase4c_focal_marker_becomes_active_in_memory_transition(monkeypatch):
+def test_phase4c_deepened_asset_becomes_active_in_memory_transition(monkeypatch):
     profile = ToolResult(
         status="ok",
         entities=("192.168.8.1",),
@@ -111,8 +122,8 @@ def test_phase4c_focal_marker_becomes_active_in_memory_transition(monkeypatch):
 
     monkeypatch.setattr(BasePhase4CWorkflowNodes, "update_memory", capture)
     node = object.__new__(Phase4CWorkflowNodes)
+
     state = {
-        "phase4c_focal_entities": ("192.168.8.1",),
         "tool_results": [profile],
         "routing_result": RouteDecision(
             use_graph=True,
@@ -121,7 +132,9 @@ def test_phase4c_focal_marker_becomes_active_in_memory_transition(monkeypatch):
             structured_query=_ranked_query(),
         ),
     }
+
     update = node.update_memory(state)
+
     assert update["entities"].primary_entity.value == "192.168.8.1"
     assert update["route"].intent == "asset_investigation"
     assert update["route"].materialized_entities == ("192.168.8.1",)
