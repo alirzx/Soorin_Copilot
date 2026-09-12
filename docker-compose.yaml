@@ -119,7 +119,7 @@ services:
           create_host_path: false
 
       - type: bind
-        source: ./huggingface
+        source: ${SOORIN_HF_CACHE_HOST_PATH:-./huggingface}
         target: /home/soorin/.cache/huggingface
         read_only: true
         bind:
