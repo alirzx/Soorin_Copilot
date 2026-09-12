@@ -1,9 +1,12 @@
 name: soorin-copilot
 
-x-app-image: &app-image soorin-copilot:${SOORIN_IMAGE_TAG:-copilot_release_3.1}
+x-app-image: &app-image soorin-copilot:${SOORIN_IMAGE_TAG:-copilot_release_3.5.1}
 
 x-common-service: &common-service
   image: *app-image
+  build:
+    context: .
+    dockerfile: Dockerfile
   pull_policy: never
   restart: "${SOORIN_RESTART_POLICY:-unless-stopped}"
   init: true
@@ -91,6 +94,23 @@ services:
       - "${SOORIN_API_BIND_IP:-0.0.0.0}:${SOORIN_API_HOST_PORT:-6998}:6998"
 
     volumes:
+      # Runtime source is bind-mounted so host/server code fixes are visible
+      # immediately without rebuilding the image. Restart/recreate the service
+      # when API_RELOAD is disabled.
+      - type: bind
+        source: ./app
+        target: /workspace/app
+        read_only: true
+        bind:
+          create_host_path: false
+
+      - type: bind
+        source: ./lib
+        target: /workspace/lib
+        read_only: true
+        bind:
+          create_host_path: false
+
       - type: bind
         source: ./data
         target: /workspace/data
@@ -165,6 +185,21 @@ services:
 
     ports:
       - "${SOORIN_UI_BIND_IP:-0.0.0.0}:${SOORIN_UI_HOST_PORT:-8503}:8501"
+
+    volumes:
+      - type: bind
+        source: ./app
+        target: /workspace/app
+        read_only: true
+        bind:
+          create_host_path: false
+
+      - type: bind
+        source: ./lib
+        target: /workspace/lib
+        read_only: true
+        bind:
+          create_host_path: false
 
     depends_on:
       api:
