@@ -55,7 +55,12 @@ def structured_evidence_from_context(
             "operation": str(context.get("operation") or "count"),
             "group_by": context.get("group_by"),
         }
-        groups = tuple(dict(group) for group in (context.get("groups") or ()) if isinstance(group, dict))
+        total = int(context.get("count") or 0)
+        groups = tuple(
+            _aggregate_group_with_arithmetic(group, total=total)
+            for group in (context.get("groups") or ())
+            if isinstance(group, dict)
+        )
         return StructuredAssetAggregateEvidence(
             capability="graph.aggregate_assets",
             query_identity=structured_query_identity(query, active_graph_version=active_graph_version),
@@ -63,7 +68,7 @@ def structured_evidence_from_context(
             active_graph_version=active_graph_version,
             operation=query["operation"],
             group_by=_optional_string(query.get("group_by")),
-            count=int(context.get("count") or 0),
+            count=total,
             groups=groups,
             truncated=bool(context.get("truncated", False)),
             retrieved_at=retrieved_at,
@@ -85,3 +90,17 @@ def expected_structured_query_identity(
 
 def _optional_string(value: Any) -> str | None:
     return str(value) if value is not None else None
+
+
+def _aggregate_group_with_arithmetic(
+    group: dict[str, Any],
+    *,
+    total: int,
+) -> dict[str, Any]:
+    """Attach deterministic arithmetic so synthesis never estimates percentages."""
+    normalized = dict(group)
+    count = int(normalized.get("count") or 0)
+    normalized["percentage_of_total"] = (
+        round((count * 100.0) / total, 2) if total > 0 else None
+    )
+    return normalized

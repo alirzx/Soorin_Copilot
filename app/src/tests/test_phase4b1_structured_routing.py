@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 import json
+import math
 from types import SimpleNamespace
 
 import pytest
@@ -22,6 +23,7 @@ from src.core.context.structured_routing import (
 )
 from src.core.graph.structured import StructuredQuerySpec
 from src.core.memory.routing_state import SessionRoutingState
+from src.core.memory.retrieval import LongTermMemorySelection
 from src.core.memory.structured_query import StructuredAssetRef, StructuredQueryContext
 from src.core.llm.providers.base import LLMProviderResult
 
@@ -585,6 +587,78 @@ def test_router_repair_path_preserves_typed_result_selection() -> None:
     assert decision.structured_result_reference.kind == "select_entities"
 
 
+@pytest.mark.parametrize(
+    ("message", "raw_score", "expected"),
+    [
+        ("List assets with model confidence above 90", 90, math.nextafter(0.9, math.inf)),
+        ("List assets with model confidence above 90%", 90, math.nextafter(0.9, math.inf)),
+        ("List assets with model confidence above 0.90", 0.9, math.nextafter(0.9, math.inf)),
+    ],
+)
+def test_semantic_router_normalizes_natural_score_before_typed_validation(
+    message: str,
+    raw_score: float,
+    expected: float,
+) -> None:
+    payload = _base_payload(
+        "asset_search",
+        {
+            "mode": "search",
+            "filters": {"model_confidence_min": raw_score},
+        },
+    )
+    payload["structured_result_reference"] = {"kind": "none", "ordinals": []}
+    settings = replace(
+        get_settings(),
+        intent_router_enabled=True,
+        intent_router_retry_enabled=False,
+        intent_router_min_confidence=0.5,
+    )
+    router = SemanticIntentRouter(settings, _RepairLLM([json.dumps(payload)]))
+
+    decision = router.classify(
+        message,
+        _empty_entities(),
+        SessionRoutingState(),
+        request_id="natural-score",
+    )
+
+    assert decision.structured_query is not None
+    assert decision.structured_query.filters.model_confidence_min == expected
+
+
+def test_semantic_router_scopes_percent_units_to_the_matching_score_field() -> None:
+    payload = _base_payload(
+        "asset_search",
+        {
+            "mode": "search",
+            "filters": {
+                "model_confidence_min": 0.9,
+                "mapping_confidence_min": 90,
+            },
+        },
+    )
+    payload["structured_result_reference"] = {"kind": "none", "ordinals": []}
+    settings = replace(
+        get_settings(),
+        intent_router_enabled=True,
+        intent_router_retry_enabled=False,
+        intent_router_min_confidence=0.5,
+    )
+    router = SemanticIntentRouter(settings, _RepairLLM([json.dumps(payload)]))
+
+    decision = router.classify(
+        "List assets with model confidence at least 0.9 and mapping confidence at least 90%.",
+        _empty_entities(),
+        SessionRoutingState(),
+        request_id="mixed-score-units",
+    )
+
+    assert decision.structured_query is not None
+    assert decision.structured_query.filters.model_confidence_min == 0.9
+    assert decision.structured_query.filters.mapping_confidence_min == 0.9
+
+
 def test_empty_result_selection_repair_failure_routes_to_clarification_not_active_or_ui() -> None:
     invalid = _entity_payload()
     settings = replace(
@@ -710,12 +784,22 @@ def test_route_node_set_continuation_discards_incidental_pair_envelope() -> None
         settings=get_settings(),
         intent_router=SimpleNamespace(classify=lambda *_args, **_kwargs: decision),
     )
+    entity_scoped_memory = SimpleNamespace(
+        memory=SimpleNamespace(entity_ids=("198.51.100.10",)),
+        estimated_tokens=12,
+    )
 
     routed = CopilotWorkflowNodes(service).route({
         "message": "how many of those are there?",
         "resolved_entities": old_pair,
         "active_entity_state": routing_state,
         "recent_messages": [],
+        "long_term_memory_selection": LongTermMemorySelection(
+            status="ok",
+            memories=(entity_scoped_memory,),
+            selected_count=1,
+            estimated_tokens=12,
+        ),
         "request_id": "route-result-count",
         "trace_id": "trace-result-count",
     })
@@ -725,6 +809,11 @@ def test_route_node_set_continuation_discards_incidental_pair_envelope() -> None
     assert route.materialized_entities == ()
     assert routed["task_envelope"].ordered_entities == ()
     assert routed["task_envelope"].comparison_required is False
+    assert routed["long_term_memory_selection"].memories == ()
+    assert routed["long_term_memory_selection"].selected_count == 0
+    assert "entity_scoped_ltm_excluded_for_global_query" in (
+        routed["long_term_memory_selection"].limitations
+    )
 
 
 def test_historical_result_recall_is_no_live_and_does_not_bind_active_or_ui_entities() -> None:

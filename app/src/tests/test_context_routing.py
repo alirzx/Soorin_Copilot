@@ -1134,13 +1134,37 @@ class LLMPrimaryRouterTests(unittest.TestCase):
     def test_provider_error_and_low_confidence_fall_back(self) -> None:
         llm = FakeLLMClient([LLMError("boom", reason="timeout")])
         router = GLMIntentRouter(self.settings, llm)  # type: ignore[arg-type]
-        self.assertTrue(router.classify("x", self.entities, SessionRoutingState()).fallback_used)
+        failed = router.classify("x", self.entities, SessionRoutingState())
+        self.assertTrue(failed.fallback_used)
+        self.assertEqual(failed.fallback_reason, "timeout")
+        self.assertFalse(failed.content_present)
+        self.assertIsNone(failed.finish_reason)
         self.assertEqual(len(llm.calls), 1)
         low = GLMIntentRouter(
             make_settings(intent_router_retry_enabled=False),
             FakeLLMClient([fake_result('{"intent":"asset_investigation","scope":"node_summary","direction":"both","depth":0,"requires_graph":true,"requires_detection":false,"requires_asset_profile":false,"requires_multiple_entities":false,"is_followup":false,"classification_confidence":0.2,"reason":"low"}')]),  # type: ignore[arg-type]
         )
         self.assertTrue(low.classify("x", self.entities, SessionRoutingState()).fallback_used)
+
+    def test_repair_transport_failure_has_distinct_failure_reason(self) -> None:
+        llm = FakeLLMClient(
+            [
+                fake_result("not json"),
+                LLMError("repair timed out", reason="provider_transport_error"),
+            ]
+        )
+        router = GLMIntentRouter(self.settings, llm)  # type: ignore[arg-type]
+
+        decision = router.classify("x", self.entities, SessionRoutingState())
+
+        self.assertTrue(decision.fallback_used)
+        self.assertEqual(
+            decision.fallback_reason,
+            "repair_provider_transport_error",
+        )
+        self.assertEqual(decision.retry_count, 1)
+        self.assertTrue(decision.content_present)
+        self.assertEqual(len(llm.calls), 2)
 
     def test_router_uses_router_specific_generation_settings_and_retry_budget(self) -> None:
         settings = make_settings(

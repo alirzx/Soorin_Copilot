@@ -119,6 +119,7 @@ BROAD_CONVERSATION_RECALL_REQUEST = re.compile(
     r"\b(?:this|our)\s+conversation\b|"
     r"\bwhat\s+(?:investigations?|analyses)\s+have\s+we\s+(?:done|performed)\b|"
     r"\bwhat\s+did\s+we\s+talk\s+about(?:\s+earlier)?\b|"
+    r"\bwhat\s+(?:(?:did|do)\s+)?we\s+diss?cuss(?:ed)?\b|"
     r"\bsummari[sz]e\s+what\s+we\s+have\s+done\s+so\s+far\b",
     re.IGNORECASE,
 )

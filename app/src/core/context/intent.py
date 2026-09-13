@@ -776,13 +776,15 @@ class SemanticIntentRouter:
                 trace_id=trace_id,
             )
         except LLMError as exc:
+            failure_reason = str(getattr(exc, "reason", "") or "provider_error")
             logger.warning(
-                "event=intent_router_transport_failure request_id=%s error_type=%s repair_attempted=false",
+                "event=intent_router_transport_failure request_id=%s reason=%s error_type=%s repair_attempted=false",
                 request_id,
+                failure_reason,
                 type(exc).__name__,
             )
             return self._failure(
-                "provider_error",
+                failure_reason,
                 int((time.perf_counter() - started) * 1000),
                 0,
                 None,
@@ -863,13 +865,15 @@ class SemanticIntentRouter:
                 trace_id=trace_id,
             )
         except LLMError as exc:
+            failure_reason = str(getattr(exc, "reason", "") or "provider_error")
             logger.warning(
-                "event=intent_router_repair_failed request_id=%s reason=transport_failure error_type=%s",
+                "event=intent_router_repair_failed request_id=%s reason=%s error_type=%s",
                 request_id,
+                failure_reason,
                 type(exc).__name__,
             )
             return self._failure(
-                "provider_error",
+                f"repair_{failure_reason}",
                 int((time.perf_counter() - started) * 1000),
                 1,
                 finish_reason,

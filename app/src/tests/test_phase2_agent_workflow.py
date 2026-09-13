@@ -690,6 +690,7 @@ class TestWorkflowAndLogging:
                 step_id="s1",
                 status="ok",
                 latency_ms=3,
+                routing_fallback_used=True,
                 api_key="must-not-appear",
                 raw_payload={"secret": "must-not-appear"},
             )
@@ -697,6 +698,7 @@ class TestWorkflowAndLogging:
         assert "request_id=r1" in output
         assert "trace_id=t1" in output
         assert "plan_id=p1" in output
+        assert "routing_fallback_used=true" in output
         assert "must-not-appear" not in output
 
     def test_evidence_snapshot_is_bounded_private_and_redacted(self):

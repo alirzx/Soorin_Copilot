@@ -13,7 +13,7 @@ SAFE_EVENT_FIELDS = {
     "deployment", "model", "status", "latency_ms", "retry_count", "cache_status",
     "freshness", "completeness", "total_items", "included_items", "omitted_items",
     "truncated", "review_outcome", "supplemental_retrieval_count", "tool_call_count",
-    "planner_called", "fallback_used", "error_class", "safe_error_code", "reason",
+    "planner_called", "fallback_used", "routing_fallback_used", "error_class", "safe_error_code", "reason",
     "max_concurrency", "max_calls", "max_graph_depth", "runtime", "bounded",
     "phase", "purpose", "normalized_query_hash", "views", "detail",
     "raw_estimate", "calibrated_estimate", "output_reservation",

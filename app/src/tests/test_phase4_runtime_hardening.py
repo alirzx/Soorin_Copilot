@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from types import MethodType
+from types import MethodType, SimpleNamespace
 
 from src.core.agent.contracts import (
     StructuredAssetSearchEvidence,
@@ -22,6 +22,7 @@ from src.core.graph.structured import (
     structured_query_identity,
 )
 from src.core.llm.providers.base import LLMProviderResult, LLMStreamEvent
+from src.core.memory.routing_state import SessionRoutingState
 
 
 def _ranked_query() -> StructuredQuerySpec:
@@ -113,18 +114,59 @@ def test_phase4c_deepened_asset_becomes_active_in_memory_transition(monkeypatch)
         freshness="current",
         completeness="complete",
     )
+    query = _ranked_query()
+    query_identity = structured_query_identity(query, active_graph_version="v1")
+    search_evidence = StructuredAssetSearchEvidence(
+        capability="graph.search_assets",
+        query_identity=query_identity,
+        normalized_filters={"role": "firewall"},
+        active_graph_version="v1",
+        sort="model_confidence",
+        direction="desc",
+        matched_total=1,
+        returned_count=1,
+        truncated=False,
+        rows=({"ip": "192.168.8.1", "graph_key": "192.168.8.1"},),
+        retrieved_at="now",
+    )
+    search = ToolResult(
+        status="ok",
+        entities=(),
+        source_capability="graph.search_assets",
+        retrieved_at="now",
+        freshness="current",
+        completeness="complete",
+        structured_asset_set=search_evidence,
+        normalized_query_hash=query_identity,
+        context_identity=query_identity,
+    )
 
     def capture(_self, state):
         return {
             "entities": state["resolved_entities"],
             "route": state["routing_result"],
+            "task": state["task"],
+            "context_key": state["memory_context_key"],
+            "active_state": state["active_entity_state"],
         }
 
     monkeypatch.setattr(BasePhase4CWorkflowNodes, "update_memory", capture)
     node = object.__new__(Phase4CWorkflowNodes)
 
     state = {
-        "tool_results": [profile],
+        "tool_results": [search, profile],
+        "task": TaskSpec(
+            request="Find the Firewall with the highest model confidence and analyze it.",
+            intent="asset_search",
+            scope="none",
+            direction="none",
+            entities=(),
+            required_capabilities=("graph.search_assets",),
+            structured_query=query,
+        ),
+        "active_entity_state": SessionRoutingState(active_ip="192.168.30.1"),
+        "review_decision": SimpleNamespace(outcome="sufficient"),
+        "request_id": "phase4c-baseline",
         "routing_result": RouteDecision(
             use_graph=True,
             reason="ranked search",
@@ -138,6 +180,14 @@ def test_phase4c_deepened_asset_becomes_active_in_memory_transition(monkeypatch)
     assert update["entities"].primary_entity.value == "192.168.8.1"
     assert update["route"].intent == "asset_investigation"
     assert update["route"].materialized_entities == ("192.168.8.1",)
+    assert update["route"].structured_query is None
+    assert update["task"].intent == "asset_investigation"
+    assert update["task"].entities == ("192.168.8.1",)
+    assert update["task"].structured_query is None
+    assert update["task"].required_capabilities == ("asset.get_profile",)
+    assert update["context_key"].entities == ("192.168.8.1",)
+    assert update["active_state"].structured_query_context is not None
+    assert update["active_state"].structured_query_context.query == query
 
 
 def test_length_truncated_stream_is_not_emitted_before_recovery(monkeypatch):

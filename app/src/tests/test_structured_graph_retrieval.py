@@ -14,6 +14,7 @@ from src.config.settings import get_settings
 from src.core.graph.neo4j import Neo4jGraphRepository
 from src.core.graph.service import GraphService
 from src.core.graph.structured import (
+    AssetAggregateGroup,
     AssetAggregateRequest,
     AssetSearchFilters,
     AssetSearchRequest,
@@ -45,7 +46,13 @@ class _Session:
         if "RETURN count(a) AS count" in cypher:
             return _Result([{"count": 1}])
         if "WITH a.status AS value" in cypher:
-            return _Result([{"value": "CONFIRMED", "count": 1}])
+            return _Result([
+                {
+                    "value": "CONFIRMED",
+                    "count": 2,
+                    "member_ips": ["192.0.2.10", "192.0.2.11"],
+                }
+            ])
         return _Result(
             [
                 {
@@ -196,11 +203,39 @@ def test_aggregate_contract_counts_in_cypher_and_bounds_group_count() -> None:
     )
     assert count.count == 1
     assert grouped.count == 1
-    assert [(group.value, group.count) for group in grouped.groups] == [("CONFIRMED", 1)]
+    assert [(group.value, group.count) for group in grouped.groups] == [("CONFIRMED", 2)]
+    assert grouped.groups[0].member_ips == ("192.0.2.10", "192.0.2.11")
+    assert grouped.groups[0].member_ips_truncated is False
     queries = [query for query, _ in repository.driver.session_instance.calls]  # type: ignore[attr-defined]
     assert any("RETURN count(a) AS count" in query for query in queries)
-    assert any("WITH a.status AS value, count(a) AS count" in query for query in queries)
+    assert any("collect(member_ip)[0..$member_limit] AS member_ips" in query for query in queries)
+    aggregate_call = next(
+        params
+        for query, params in repository.driver.session_instance.calls  # type: ignore[attr-defined]
+        if "collect(member_ip)" in query
+    )
+    assert aggregate_call["member_limit"] == 20
     with pytest.raises(ValidationError):
         AssetAggregateRequest(operation="group_count")
     with pytest.raises(ValidationError):
         AssetAggregateRequest(operation="count", group_by="vendor")
+
+
+def test_aggregate_member_identity_contract_is_canonical_and_strictly_bounded() -> None:
+    group = AssetAggregateGroup(
+        value="server",
+        count=30,
+        member_ips=[" 192.0.2.2 ", "192.0.2.1"],
+        member_ips_truncated=True,
+    )
+    assert group.member_ips == ("192.0.2.2", "192.0.2.1")
+    assert group.member_ips_truncated is True
+
+    with pytest.raises(ValidationError, match="bounded cap"):
+        AssetAggregateGroup(
+            value="server",
+            count=21,
+            member_ips=[f"192.0.2.{index}" for index in range(1, 22)],
+        )
+    with pytest.raises(ValidationError, match="invalid"):
+        AssetAggregateGroup(value="server", count=1, member_ips=["not-an-ip"])

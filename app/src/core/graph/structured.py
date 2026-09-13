@@ -16,6 +16,9 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
+MAX_AGGREGATE_GROUP_MEMBER_IPS = 20
+
+
 class AssetSortField(str, Enum):
     GRAPH_KEY = "graph_key"
     IP = "ip"
@@ -266,7 +269,23 @@ class AssetAggregateGroup(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     value: str | None
-    count: int
+    count: int = Field(ge=0)
+    member_ips: tuple[str, ...] = ()
+    member_ips_truncated: bool = False
+
+    @field_validator("member_ips", mode="before")
+    @classmethod
+    def normalize_member_ips(cls, value: Any) -> tuple[str, ...]:
+        raw = tuple(value or ())
+        if len(raw) > MAX_AGGREGATE_GROUP_MEMBER_IPS:
+            raise ValueError("aggregate group member IPs exceed the bounded cap")
+        normalized: list[str] = []
+        for item in raw:
+            try:
+                normalized.append(str(ipaddress.ip_address(str(item).strip())))
+            except ValueError as exc:
+                raise ValueError("aggregate group member IP is invalid") from exc
+        return tuple(normalized)
 
 
 class AssetAggregateResult(BaseModel):

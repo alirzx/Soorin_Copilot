@@ -83,7 +83,20 @@ class _StructuredGraphProvider:
     def aggregate_assets(self, request):
         self.aggregate_calls += 1
         groups = (
-            [{"value": "CONFIRMED", "count": 9}, {"value": "REVIEW", "count": 3}]
+            [
+                {
+                    "value": "CONFIRMED",
+                    "count": 9,
+                    "member_ips": ["192.0.2.10", "192.0.2.11"],
+                    "member_ips_truncated": True,
+                },
+                {
+                    "value": "REVIEW",
+                    "count": 3,
+                    "member_ips": ["192.0.2.12"],
+                    "member_ips_truncated": True,
+                },
+            ]
             if request.group_by
             else []
         )
@@ -188,6 +201,9 @@ def test_aggregate_tool_result_and_evidence_pack_preserve_typed_groups() -> None
     assert evidence is not None and evidence.mode == "aggregate"
     assert evidence.operation == "group_count" and evidence.group_by == "status"
     assert evidence.count == 12 and sum(group["count"] for group in evidence.groups) == 12
+    assert evidence.groups[0]["member_ips"] == ["192.0.2.10", "192.0.2.11"]
+    assert evidence.groups[0]["member_ips_truncated"] is True
+    assert evidence.groups[0]["percentage_of_total"] == 75.0
     assert evidence.active_graph_version == "graph-v7"
     assert pack.structured_asset_sets == (evidence,)
     assert pack.tool_results[0].structured_asset_set is evidence
@@ -471,7 +487,9 @@ def test_aggregate_context_is_compact_and_preserves_count_and_groups() -> None:
     assert '"count":12' in text
     assert '"group_by":"status"' in text
     assert '"value":"CONFIRMED"' in text
-    assert approx_tokens(text) < 900
+    assert '"member_ips":["192.0.2.10","192.0.2.11"]' in text
+    assert '"percentage_of_total":75.0' in text
+    assert approx_tokens(text) < 950
 
 
 def test_graph_provider_semantics_include_structured_asset_projection_boundary() -> None:
@@ -567,6 +585,9 @@ def test_synthesizer_selects_compact_asset_aggregate_module_without_llm_call() -
     assert "additional groups were not shown" in rendered.dynamic_prompt
     assert "without echoing backend query syntax" in rendered.dynamic_prompt
     assert "retrieval mechanics" in rendered.dynamic_prompt
+    assert "precomputed percentages exactly" in rendered.dynamic_prompt
+    assert "bounded member sample" in rendered.dynamic_prompt
+    assert "Observed, Inferred, Hypothesis, or Unknown" in rendered.dynamic_prompt
     assert any('"count":12' in message["content"] for message in rendered.messages)
 
 

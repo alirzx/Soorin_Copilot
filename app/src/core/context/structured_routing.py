@@ -29,6 +29,12 @@ from src.core.context.models import (
     StructuredResultReferenceDecision,
 )
 from src.core.context.router import normalize_intent_route as _base_normalize_intent_route
+from src.core.context.structured_hardening import (
+    looks_like_structured_set_reference,
+    merge_structured_query_for_followup,
+    normalize_structured_query_for_language,
+    normalize_structured_query_payload_for_language,
+)
 from src.core.graph.structured import StructuredQueryMode, StructuredQuerySpec
 from src.core.memory.routing_state import SessionRoutingState
 
@@ -119,7 +125,14 @@ def validate_structured_router_payload(
             )
             if decision.structured_query is None:
                 raise ValueError("structured_result_reference_query_required")
-            return replace(decision, structured_result_reference=reference)
+            return replace(
+                decision,
+                structured_query=merge_structured_query_for_followup(
+                    context.query,
+                    decision.structured_query,
+                ),
+                structured_result_reference=reference,
+            )
         if reference.kind == "historical_recall":
             if (
                 clean_payload.get("intent") != "general_knowledge"
@@ -336,14 +349,50 @@ class SemanticIntentRouter(_BaseSemanticIntentRouter):
             raise
         if not isinstance(payload, dict):
             raise ValueError("malformed_json:not_object")
-        return validate_structured_router_payload(
+        message = str(routing_context.get("message") or "")
+        payload = dict(payload)
+        if "structured_query" in payload:
+            payload["structured_query"] = normalize_structured_query_payload_for_language(
+                payload.get("structured_query"),
+                message,
+            )
+        raw_reference = payload.get("structured_result_reference")
+        reference_kind = (
+            str(raw_reference.get("kind") or "none")
+            if isinstance(raw_reference, dict)
+            else "none"
+        )
+        explicit_message_entity = any(
+            entity.source == "message" for entity in entities.entities
+        )
+        if (
+            reference_kind == "none"
+            and not explicit_message_entity
+            and routing_state is not None
+            and routing_state.structured_query_context is not None
+            and looks_like_structured_set_reference(message)
+        ):
+            payload["structured_result_reference"] = {
+                "kind": "set_query",
+                "ordinals": [],
+            }
+        decision = validate_structured_router_payload(
             payload,
             entities,
             min_confidence=self.settings.intent_router_min_confidence,
-            message=str(routing_context.get("message") or ""),
+            message=message,
             routing_state=routing_state,
             ui_context=ui_context,
         )
+        if decision.structured_query is not None:
+            decision = replace(
+                decision,
+                structured_query=normalize_structured_query_for_language(
+                    decision.structured_query,
+                    message,
+                ),
+            )
+        return decision
 
 
 def normalize_intent_route(

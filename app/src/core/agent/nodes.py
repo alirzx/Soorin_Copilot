@@ -43,6 +43,7 @@ from src.core.context.intent import (
     resolution_from_materialized_decision,
 )
 from src.core.context.models import EntityResolution, ResolvedEntity, RouteDecision, approx_tokens
+from src.core.context.structured_hardening import looks_like_structured_set_request
 from src.core.context.compaction import (
     current_evidence_projections,
     episodic_baseline_projections,
@@ -133,6 +134,10 @@ class CopilotWorkflowNodes:
             len(constraints.reason_codes),
         )
         retrieve_long_term = getattr(self.service, "retrieve_long_term_memory", None)
+        structured_set_request = looks_like_structured_set_request(
+            state["message"],
+            structured_context_available=bool(routing_state.structured_query_context),
+        )
         long_term_selection = (
             retrieve_long_term(
                 identity=state["request_identity"],
@@ -147,9 +152,14 @@ class CopilotWorkflowNodes:
                     state["message"]
                 ),
             )
-            if retrieve_long_term is not None
+            if retrieve_long_term is not None and not structured_set_request
             else None
         )
+        if structured_set_request and retrieve_long_term is not None:
+            logger.info(
+                "event=long_term_memory_bypassed request_id=%s reason=structured_asset_set_authority",
+                state["request_id"],
+            )
         update: dict[str, Any] = {
             "resolved_entities": resolution,
             "active_entity_state": routing_state,
@@ -280,6 +290,16 @@ class CopilotWorkflowNodes:
                 fallback_used=True,
                 fallback_reason=decision.fallback_reason or decision.error_reason,
             )
+            if route.reason == "deterministic_structured_parse_unavailable":
+                return {
+                    "routing_fallback_used": True,
+                    **self._clarification(
+                        "I recognized this as a structured Asset-set request, but its selectors or thresholds are not safely representable. Please restate it with an allow-listed field and an unambiguous value.",
+                        "structured_query_clarification_required",
+                    ),
+                }
+            if route.structured_query is not None:
+                route_entities = EntityResolution(status="none")
         else:
             route_entities = resolution_from_materialized_decision(decision, entities)
             route = normalize_intent_route(decision, route_entities)
@@ -354,8 +374,8 @@ class CopilotWorkflowNodes:
                     state["request_id"],
                     ",".join(active_pair),
                 )
-        reference = decision.structured_result_reference
-        if not decision.fallback_used and reference.kind == "select_entities":
+        reference = route.structured_result_reference
+        if reference.kind == "select_entities":
             turn_policy = derive_turn_policy(
                 state["message"], constraints, route_entities, routing_state
             )
@@ -368,7 +388,7 @@ class CopilotWorkflowNodes:
                 state["request_id"],
                 len(reference.ordinals),
             )
-        elif not decision.fallback_used and reference.kind == "set_query":
+        elif reference.kind == "set_query":
             turn_policy = replace(
                 turn_policy,
                 operation="follow_up",
@@ -387,7 +407,7 @@ class CopilotWorkflowNodes:
                 "reference_kind=set_query selected_count=0",
                 state["request_id"],
             )
-        elif not decision.fallback_used and reference.kind == "historical_recall":
+        elif reference.kind == "historical_recall":
             constraints = replace(
                 constraints,
                 allow_live=False,
@@ -454,13 +474,20 @@ class CopilotWorkflowNodes:
         if SECURITY_ANALYSIS_WORDS.search(state["message"]) and "security_or_anomaly" not in route.matched_signals:
             route = replace(route, matched_signals=[*route.matched_signals, "security_or_anomaly"])
         route = enforce_task_envelope(route, task_envelope)
+        long_term_selection = state.get("long_term_memory_selection")
+        if route.structured_query is not None:
+            long_term_selection = self._without_entity_scoped_ltm(
+                long_term_selection,
+                request_id=state["request_id"],
+            )
         return {
             "routing_result": route,
             "resolved_entities": route_entities,
             "turn_policy": turn_policy,
             "task_envelope": task_envelope,
             "request_constraints": constraints,
-            "routing_fallback_used": bool(decision.fallback_used),
+            "long_term_memory_selection": long_term_selection,
+            "routing_fallback_used": bool(route.fallback_used),
             "next_edge": "validate_task",
         }
 
@@ -547,6 +574,46 @@ class CopilotWorkflowNodes:
             "clarification": {"answer": answer, "code": code},
             "next_edge": "clarification",
         }
+
+    @staticmethod
+    def _without_entity_scoped_ltm(selection: Any, *, request_id: str) -> Any:
+        """Re-scope preliminary LTM after a zero-entity structured route is authoritative."""
+        if selection is None:
+            return None
+        memories = tuple(
+            item
+            for item in tuple(getattr(selection, "memories", ()) or ())
+            if not tuple(getattr(getattr(item, "memory", None), "entity_ids", ()) or ())
+        )
+        baselines = tuple(
+            item
+            for item in tuple(getattr(selection, "baseline_memories", ()) or ())
+            if not tuple(getattr(getattr(item, "memory", None), "entity_ids", ()) or ())
+        )
+        removed = (
+            len(tuple(getattr(selection, "memories", ()) or ())) - len(memories)
+            + len(tuple(getattr(selection, "baseline_memories", ()) or ())) - len(baselines)
+        )
+        if not removed:
+            return selection
+        logger.info(
+            "event=long_term_memory_rescoped request_id=%s scope=global_structured_set removed_entity_scoped=%s retained=%s",
+            request_id,
+            removed,
+            len(memories),
+        )
+        return replace(
+            selection,
+            memories=memories,
+            baseline_memories=baselines,
+            selected_count=len(memories),
+            estimated_tokens=sum(item.estimated_tokens for item in memories),
+            limitations=tuple(
+                dict.fromkeys(
+                    (*tuple(getattr(selection, "limitations", ()) or ()), "entity_scoped_ltm_excluded_for_global_query")
+                )
+            ),
+        )
 
     def _authorized_memory_context_key(self, state: InvestigationState, task: Any) -> MemoryContextKey:
         candidate = MemoryContextKey.from_task(task)

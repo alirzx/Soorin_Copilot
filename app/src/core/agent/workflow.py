@@ -647,6 +647,7 @@ class BoundedCopilotWorkflow:
             tool_call_count=len(final.get("tool_results") or ()),
             planner_called=bool(final.get("planner_called")),
             fallback_used=bool(final.get("fallback_used")),
+            routing_fallback_used=bool(final.get("routing_fallback_used")),
             reason=final.get("limitation_reasons") or (),
         )
         self._render_workflow_trace(final)

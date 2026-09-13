@@ -15,10 +15,12 @@ from src.core.agent.contracts import (
     ExecutionPlan,
     PlanStep,
     ReviewDecision,
+    StructuredAssetSearchEvidence,
     TaskSpec,
     ToolResult,
 )
 from src.core.agent.nodes import CopilotWorkflowNodes
+from src.core.agent.hardened_phase4c import Phase4CWorkflowNodes
 from src.core.agent.reviewer import EvidenceReviewer
 from src.core.agent.evidence_policy import (
     EvidenceRequirementPolicy,
@@ -44,7 +46,7 @@ from src.core.context.compaction import (
 )
 from src.core.context.composer import ContextComposer
 from src.core.context.entities import EntityResolver
-from src.core.context.models import CopilotContextPackage, EntityResolution
+from src.core.context.models import CopilotContextPackage, EntityResolution, RouteDecision
 from src.core.context.product_views import build_product_view, payload_inventory, select_product_views
 from src.core.copilot.service import CopilotService
 from src.core.memory.episodes import BaselineProjection, InvestigationBaseline, MemoryContextKey
@@ -55,6 +57,7 @@ from src.core.memory.retrieval import LongTermMemorySelection
 from src.core.memory.routing_state import SessionRoutingState, SessionRoutingStateStore
 from src.core.memory.store import MemoryStore
 from src.core.identity import RequestIdentity
+from src.core.graph.structured import StructuredQuerySpec, structured_query_identity
 from src.core.product_client import ProductApiClient
 
 
@@ -1373,6 +1376,128 @@ def test_update_memory_captures_baseline_from_tool_results_not_assistant_prose()
     assert baseline.source_request_id == identity.request_id
     assert baseline.projections[0].payload == {"role": "server", "risk": 7}
     assert "assistant prose" not in str(baseline.projections[0].payload)
+
+
+def test_phase4c_deepened_focal_evidence_gets_its_own_baseline_and_keeps_set_context() -> None:
+    query = StructuredQuerySpec.model_validate({
+        "mode": "search",
+        "filters": {"role": "Firewall"},
+        "sort": "model_confidence",
+        "direction": "desc",
+        "limit": 2,
+    })
+    query_identity = structured_query_identity(
+        query,
+        active_graph_version="graph-v1",
+    )
+    search_evidence = StructuredAssetSearchEvidence(
+        capability="graph.search_assets",
+        query_identity=query_identity,
+        normalized_filters={"role": "Firewall"},
+        active_graph_version="graph-v1",
+        sort="model_confidence",
+        direction="desc",
+        matched_total=1,
+        returned_count=1,
+        truncated=False,
+        rows=({"ip": IP, "graph_key": IP},),
+        retrieved_at="2026-08-20T00:00:00+00:00",
+    )
+    search_result = ToolResult(
+        status="ok",
+        entities=(),
+        source_capability="graph.search_assets",
+        retrieved_at=search_evidence.retrieved_at,
+        freshness="current",
+        completeness="complete",
+        context_included=True,
+        projection_usable=True,
+        source_payload_complete=True,
+        structured_asset_set=search_evidence,
+        normalized_query_hash=query_identity,
+        context_identity=query_identity,
+    )
+    original_task = TaskSpec(
+        request="Find the highest-confidence Firewall and analyze it.",
+        intent="asset_search",
+        scope="none",
+        direction="none",
+        entities=(),
+        required_capabilities=("graph.search_assets",),
+        structured_query=query,
+    )
+    results = (
+        search_result,
+        _complete_product_result(),
+        _complete_product_result(
+            "asset.get_detection",
+            payload={"classification": "firewall", "confidence": 0.95},
+        ),
+        _complete_graph_result(),
+    )
+    memory = MemoryStore(20)
+    service = SimpleNamespace(
+        settings=get_settings(),
+        memory_store=memory,
+        routing_state_store=SessionRoutingStateStore(),
+        long_term_memory_coordinator=None,
+        persist_thread_continuity=lambda *_args, **_kwargs: None,
+        persist_completed_local_turn=lambda *_args, **_kwargs: None,
+    )
+    identity = RequestIdentity.resolve(
+        user_id="user_test",
+        conversation_id="conversation-phase4c",
+        session_id="session-phase4c",
+        request_id="request-phase4c",
+    )
+    state = {
+        "task": original_task,
+        "tool_results": list(results),
+        "synthesis_result": {"answer": "Grounded focal analysis."},
+        "pending_working_facts": (),
+        "session_id": identity.session_id,
+        "request_id": identity.request_id,
+        "request_identity": identity,
+        "message": original_task.request,
+        "evidence_pack": SimpleNamespace(limitations=()),
+        "active_entity_state": SessionRoutingState(
+            active_ip="192.0.2.99",
+            active_entities=("192.0.2.99",),
+        ),
+        "resolved_entities": EntityResolution(status="none"),
+        "routing_result": RouteDecision(
+            use_graph=True,
+            reason="ranked structured search",
+            intent="asset_search",
+            structured_query=query,
+        ),
+        "execution_plan": ExecutionPlan(
+            task=original_task,
+            steps=(),
+            plan_id="phase4c-plan",
+        ),
+        "review_decision": ReviewDecision(outcome="sufficient"),
+        "turn_policy": SimpleNamespace(
+            episode_transition="switch",
+            operational_state_mutation_allowed=True,
+            operation="follow_up",
+        ),
+    }
+
+    update = Phase4CWorkflowNodes(service).update_memory(state)
+    working = memory.repository.get_working(identity.session_id)
+
+    assert update["memory_update_result"]["investigation_baseline_write_count"] == 1
+    assert update["active_entity_state"].active_ip == IP
+    assert update["active_entity_state"].structured_query_context is not None
+    assert update["active_entity_state"].structured_query_context.query == query
+    assert working is not None and working.context_key.entities == (IP,)
+    assert working.baseline is not None
+    assert {item.capability for item in working.baseline.projections} == {
+        "asset.get_profile",
+        "asset.get_detection",
+        "graph.get_summary",
+    }
 
 
 def _run_baseline_update(

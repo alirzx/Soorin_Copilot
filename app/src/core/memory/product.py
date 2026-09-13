@@ -30,6 +30,17 @@ logger = logging.getLogger(__name__)
 class ProductMemoryContractError(RuntimeError):
     """A successful Product response violated the canonical memory contract."""
 
+    def __init__(
+        self,
+        message: str,
+        *,
+        reason_code: str = "contract_invalid",
+        phase: str = "canonical_validation",
+    ) -> None:
+        super().__init__(message)
+        self.reason_code = reason_code
+        self.phase = phase
+
 
 def _object(value: Any, *keys: str) -> dict[str, Any]:
     if not isinstance(value, dict):
@@ -104,8 +115,12 @@ def _normalize_memory_wire(value: Any) -> dict[str, Any]:
 def _memory_from_wire(value: Any) -> LongTermMemoryRecord:
     item = _normalize_memory_wire(value)
     required = ("memoryId", "memoryType", "userId", "statement", "epistemicStatus", "confidence", "sourceRequestId", "sourceConversationId", "evidenceRefs", "validFrom", "revision", "status", "indexStatus", "idempotencyFingerprint", "logicalMemoryKey")
-    if any(key not in item for key in required):
-        raise ProductMemoryContractError("Product memory canonical response was incomplete.")
+    missing = tuple(key for key in required if key not in item)
+    if missing:
+        raise ProductMemoryContractError(
+            "Product memory canonical response was incomplete.",
+            reason_code=f"missing_fields:{','.join(missing)}",
+        )
     try:
         return LongTermMemoryRecord(
             memory_id=item["memoryId"], memory_type=item["memoryType"], user_id=item["userId"],
@@ -118,7 +133,10 @@ def _memory_from_wire(value: Any) -> LongTermMemoryRecord:
             has_unresolved_conflict=bool(item.get("hasUnresolvedConflict", False)), policy_version=item.get("policyVersion", "ltm-promotion-v1"),
         )
     except (TypeError, ValueError) as exc:
-        raise ProductMemoryContractError("Product memory canonical response was invalid.") from exc
+        raise ProductMemoryContractError(
+            "Product memory canonical response was invalid.",
+            reason_code="invalid_field_type_or_value",
+        ) from exc
 
 
 class ProductThreadStateStore:
@@ -222,6 +240,15 @@ class ProductLongTermMemoryStore:
                 purpose or "canonical_get",
             )
             return None
+        except ProductMemoryContractError as exc:
+            logger.error(
+                "event=product_ltm_contract_failed request_id=%s operation=get purpose=%s phase=%s reason=%s payload_logged=false",
+                request_id,
+                purpose or "canonical_get",
+                exc.phase,
+                exc.reason_code,
+            )
+            raise
         logger.info(
             "event=product_ltm_read_completed request_id=%s operation=get purpose=%s status=ok",
             request_id,

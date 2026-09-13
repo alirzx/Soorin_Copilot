@@ -129,7 +129,9 @@ class LLMTransientRetryTests(unittest.TestCase):
         )
 
         self.assertTrue(decision.fallback_used)
-        self.assertEqual(decision.fallback_reason, "provider_error")
+        self.assertEqual(decision.fallback_reason, "provider_transport_error")
+        self.assertFalse(decision.content_present)
+        self.assertIsNone(decision.finish_reason)
         self.assertEqual(post.call_count, 1)
 
     @patch("src.core.llm.providers.arvan.requests.post")

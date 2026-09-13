@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+from src.core.identity import normalize_identifier
 from src.core.memory.persistence import LocalPersistenceOwnershipError
 from src.core.memory.product import (
     ProductLongTermMemoryStore as BaseProductLongTermMemoryStore,
@@ -15,6 +16,30 @@ from src.core.memory.product import (
 
 
 logger = logging.getLogger(__name__)
+
+
+def _log_contract_failure(
+    *,
+    request_id: str,
+    purpose: str,
+    phase: str,
+    reason: str,
+    memory_id: str = "",
+) -> None:
+    try:
+        safe_memory_id = normalize_identifier(memory_id or None, field_name="memory_id") or ""
+    except ValueError:
+        safe_memory_id = "invalid_identifier"
+    logger.error(
+        "event=product_ltm_contract_failed request_id=%s operation=search purpose=%s phase=%s reason=%s memory_id=%s memory_id_present=%s hydration_attempted=%s payload_logged=false",
+        request_id,
+        purpose or "inventory",
+        phase,
+        reason,
+        safe_memory_id,
+        str(bool(safe_memory_id)).lower(),
+        str(phase == "canonical_hydration").lower(),
+    )
 
 
 class ProductLongTermMemoryStore(BaseProductLongTermMemoryStore):
@@ -56,11 +81,30 @@ class ProductLongTermMemoryStore(BaseProductLongTermMemoryStore):
             None,
         )
         if not isinstance(records, list):
-            raise ProductMemoryContractError("Product memory search response was invalid.")
+            _log_contract_failure(
+                request_id=request_id,
+                purpose=purpose,
+                phase="search_envelope",
+                reason="records_not_list",
+            )
+            raise ProductMemoryContractError(
+                "Product memory search response was invalid.",
+                reason_code="records_not_list",
+                phase="search_envelope",
+            )
 
         hydrated = []
         for record in records:
-            summary = _normalize_memory_wire(record)
+            try:
+                summary = _normalize_memory_wire(record)
+            except ProductMemoryContractError as exc:
+                _log_contract_failure(
+                    request_id=request_id,
+                    purpose=purpose,
+                    phase="search_summary",
+                    reason=exc.reason_code,
+                )
+                raise
             summary_owner = summary.get("userId")
             if summary_owner is not None and summary_owner != owner:
                 raise LocalPersistenceOwnershipError(
@@ -74,17 +118,35 @@ class ProductLongTermMemoryStore(BaseProductLongTermMemoryStore):
                     raise
                 memory_id = summary.get("memoryId")
                 if not isinstance(memory_id, str) or not memory_id:
-                    raise ProductMemoryContractError(
-                        "Product memory search summary omitted memoryId."
+                    _log_contract_failure(
+                        request_id=request_id,
+                        purpose=purpose,
+                        phase="search_summary",
+                        reason="missing_fields:memoryId",
                     )
-            hydrated.append(
-                self._hydrate(
-                    user_id,
-                    memory_id,
-                    request_id=request_id,
-                    purpose=f"{purpose}_canonical_hydration",
+                    raise ProductMemoryContractError(
+                        "Product memory search summary omitted memoryId.",
+                        reason_code="missing_fields:memoryId",
+                        phase="search_summary",
+                    )
+            try:
+                hydrated.append(
+                    self._hydrate(
+                        user_id,
+                        memory_id,
+                        request_id=request_id,
+                        purpose=f"{purpose}_canonical_hydration",
+                    )
                 )
-            )
+            except ProductMemoryContractError as exc:
+                _log_contract_failure(
+                    request_id=request_id,
+                    purpose=purpose,
+                    phase="canonical_hydration",
+                    reason=exc.reason_code,
+                    memory_id=memory_id,
+                )
+                raise
         logger.info(
             "event=product_ltm_read_completed request_id=%s operation=search purpose=%s status=ok record_count=%s canonical_hydration=true",
             request_id,

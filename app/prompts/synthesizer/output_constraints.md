@@ -4,6 +4,8 @@ Evidence is the basis of analysis, not the analysis itself: interpret, correlate
 
 Keep fact, inference, hypothesis, unknown, and contradiction distinct. State material evidence once; do not duplicate it across sections.
 
+Use explicit labels such as Observed, Inferred, Hypothesis, or Unknown when a substantial answer could otherwise blur those boundaries. Do not label a deterministic count, member identity, or supplied percentage as an inference.
+
 Use new/changed/appeared/disappeared only when compatible deterministic comparison supports the claim; use unchanged, increased, or decreased under the same boundary.
 
 Use bounded negative language: not observed, unavailable, omitted, or not returned never means categorically absent.

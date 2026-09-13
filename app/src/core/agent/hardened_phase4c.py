@@ -7,7 +7,13 @@ from typing import Any
 
 from src.core.agent.contracts import InvestigationState
 from src.core.agent.phase4c_nodes import Phase4CWorkflowNodes as BasePhase4CWorkflowNodes
-from src.core.context.models import EntityResolution, ResolvedEntity
+from src.core.agent.structured_continuity import structured_query_context_from_state
+from src.core.context.models import (
+    EntityResolution,
+    ResolvedEntity,
+    StructuredResultReferenceDecision,
+)
+from src.core.memory.episodes import MemoryContextKey
 
 
 _FOCAL_CAPABILITIES = {
@@ -16,6 +22,12 @@ _FOCAL_CAPABILITIES = {
     "graph.get_summary",
     "graph.compare_assets",
 }
+_FOCAL_CAPABILITY_ORDER = (
+    "asset.get_profile",
+    "asset.get_detection",
+    "graph.get_summary",
+    "graph.compare_assets",
+)
 
 
 def _deepened_entities(state: InvestigationState) -> tuple[str, ...]:
@@ -74,15 +86,54 @@ class Phase4CWorkflowNodes(BasePhase4CWorkflowNodes):
             asset_investigation_detected=True,
             followup_detected=True,
             intent="asset_investigation",
+            structured_query=None,
+            structured_result_reference=StructuredResultReferenceDecision(),
             scope="multi_entity_comparison" if pair else "node_summary",
-            direction="both" if bool({"graph.get_summary", "graph.compare_assets"} & capabilities) else "none",
+            direction=(
+                "both"
+                if bool({"graph.get_summary", "graph.compare_assets"} & capabilities)
+                else "none"
+            ),
             depth=1 if pair else 0,
             requires_multiple_entities=pair,
             relationship_mode="compare" if pair else "none",
             route_normalized=True,
             route_normalization_reason="phase4c_focal_deepening_persisted",
         )
+        original_task = state["task"]
+        required_capabilities = tuple(
+            capability
+            for capability in _FOCAL_CAPABILITY_ORDER
+            if capability in capabilities
+        )
+        focal_task = replace(
+            original_task,
+            intent="asset_investigation",
+            scope="multi_entity_comparison" if pair else "node_summary",
+            direction=(
+                "both"
+                if bool({"graph.get_summary", "graph.compare_assets"} & capabilities)
+                else "none"
+            ),
+            entities=focal,
+            required_capabilities=required_capabilities,
+            optional_capabilities=(),
+            structured_query=None,
+            requires_multiple_entities=pair,
+            is_followup=True,
+            graph_depth=1 if pair else 0,
+            relationship_mode="compare" if pair else "none",
+        )
         patched: InvestigationState = dict(state)  # type: ignore[assignment]
         patched["resolved_entities"] = resolution
         patched["routing_result"] = route
+        patched["task"] = focal_task
+        patched["memory_context_key"] = MemoryContextKey.from_task(focal_task)
+        structured_context = structured_query_context_from_state(state)
+        previous = state.get("active_entity_state")
+        if structured_context is not None and previous is not None:
+            patched["active_entity_state"] = replace(
+                previous,
+                structured_query_context=structured_context,
+            )
         return super().update_memory(patched)

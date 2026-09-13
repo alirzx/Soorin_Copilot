@@ -131,6 +131,7 @@ def test_historical_identity_and_classification_request_has_complementary_classe
     "message",
     (
         "What did we discuss about our assets?",
+        "What did we disscuss?",
         "What do you remember from our network analysis?",
         "Tell me about all the assets we analyzed.",
     ),

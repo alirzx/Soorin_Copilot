@@ -40,6 +40,7 @@ from src.core.graph.structured import (
     AssetAggregateRequest,
     AssetAggregateResult,
     AssetGroupField,
+    MAX_AGGREGATE_GROUP_MEMBER_IPS,
     AssetSearchRequest,
     AssetSearchResult,
     AssetSortField,
@@ -798,25 +799,39 @@ class Neo4jGraphRepository:
         query = f"""
         MATCH (a:Asset)
         WHERE {where}
-        WITH a.{group_property} AS value, count(a) AS count
-        RETURN value, count
+        WITH a.{group_property} AS value, a.ip AS member_ip
+        ORDER BY value ASC, member_ip ASC
+        WITH value, count(*) AS count,
+             collect(member_ip)[0..$member_limit] AS member_ips
+        RETURN value, count, member_ips
         ORDER BY count DESC, value ASC
         LIMIT $fetch_limit
         """
         params["fetch_limit"] = limit + 1
+        params["member_limit"] = MAX_AGGREGATE_GROUP_MEMBER_IPS
         count_query = f"MATCH (a:Asset) WHERE {where} RETURN count(a) AS count"
         try:
             with self.driver.session() as session:
                 records = list(session.run(self._query(query), **params))
                 count_record = session.run(
                     self._query(count_query),
-                    **{key: value for key, value in params.items() if key != "fetch_limit"},
+                    **{
+                        key: value
+                        for key, value in params.items()
+                        if key not in {"fetch_limit", "member_limit"}
+                    },
                 ).single()
         except Exception as exc:
             raise Neo4jUnavailable("Neo4j structured Asset aggregation failed.") from exc
         selected = records[:limit]
         groups = tuple(
-            AssetAggregateGroup(value=record["value"], count=int(record["count"] or 0))
+            AssetAggregateGroup(
+                value=record["value"],
+                count=int(record["count"] or 0),
+                member_ips=tuple(record.get("member_ips") or ()),
+                member_ips_truncated=int(record["count"] or 0)
+                > len(tuple(record.get("member_ips") or ())),
+            )
             for record in selected
         )
         return AssetAggregateResult(
