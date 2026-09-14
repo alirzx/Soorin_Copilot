@@ -5,9 +5,10 @@ from __future__ import annotations
 from dataclasses import replace
 from typing import Any
 
+from src.core.context.intent import SemanticIntentRouter as LLMPrimarySemanticIntentRouter
 from src.core.context.models import EntityResolution, IntentDecision
 from src.core.context.structured_hardening import normalize_structured_query_for_language
-from src.core.context.structured_routing import SemanticIntentRouter as BaseSemanticIntentRouter
+from src.core.context.structured_routing import SemanticIntentRouter as StructuredSemanticIntentRouter
 from src.core.memory.routing_state import SessionRoutingState
 
 
@@ -23,12 +24,45 @@ Natural score thresholds may be fractions or percentages: 0.90, 90, 90%, and 90 
 """.strip()
 
 
-class SemanticIntentRouter(BaseSemanticIntentRouter):
-    """Normalize validated Phase-4 queries without changing legacy routes."""
+class SemanticIntentRouter(StructuredSemanticIntentRouter):
+    """LLM-primary Router with deterministic structured validation and fallback."""
 
     def __init__(self, settings: Any, llm_client: Any) -> None:
         super().__init__(settings, llm_client)
         self.system_prompt = f"{self.system_prompt}\n\n{_STRUCTURED_HARDENING_PROMPT}"
+
+    def classify(
+        self,
+        message: str,
+        entities: EntityResolution,
+        routing_state: SessionRoutingState,
+        *,
+        ui_context: dict[str, Any] | None = None,
+        recent_messages: list[dict[str, str]] | None = None,
+        trace_id: str = "",
+        request_id: str = "",
+    ) -> IntentDecision:
+        """Always call the semantic Router for enabled routing.
+
+        The structured layer remains responsible for validating and normalizing
+        the model output through ``self._decision_from_content``. If the Router
+        transport or schema/repair path fails, the established workflow returns
+        ``fallback_used=True`` and ``StructuredAwareFallbackRouter`` performs the
+        bounded deterministic structured parse. In other words, deterministic
+        parsing is a safety/fallback mechanism, never the primary semantic
+        authority.
+        """
+
+        return LLMPrimarySemanticIntentRouter.classify(
+            self,
+            message,
+            entities,
+            routing_state,
+            ui_context=ui_context,
+            recent_messages=recent_messages,
+            trace_id=trace_id,
+            request_id=request_id,
+        )
 
     def _decision_from_content(
         self,
