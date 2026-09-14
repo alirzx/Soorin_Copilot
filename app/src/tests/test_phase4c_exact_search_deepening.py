@@ -13,6 +13,7 @@ from src.core.agent.contracts import (
     TaskSpec,
     ToolResult,
 )
+from src.core.agent.hardened_phase4c import _deepened_entities
 from src.core.agent.phase4c_nodes import Phase4CWorkflowNodes
 from src.core.agent.reviewer import EvidenceReviewer
 from src.core.agent.task_mapping import compile_direct_plan
@@ -224,6 +225,32 @@ def test_structured_set_turn_never_becomes_focal_baseline() -> None:
         None,
     )
     assert reason == "structured_asset_set_not_focal_baseline"
+
+
+def test_only_explicit_phase4c_deepening_steps_become_focal_continuity() -> None:
+    normal = ToolResult(
+        status="ok",
+        entities=("192.0.2.1",),
+        source_capability="asset.get_profile",
+        retrieved_at="2026-09-11T10:00:01+00:00",
+        freshness="current",
+        completeness="complete",
+        step_id="profile-1",
+        provider="product",
+    )
+    deepening = ToolResult(
+        status="ok",
+        entities=("192.0.2.2",),
+        source_capability="asset.get_profile",
+        retrieved_at="2026-09-11T10:00:02+00:00",
+        freshness="current",
+        completeness="complete",
+        step_id="deepening-1",
+        provider="product",
+    )
+
+    assert _deepened_entities({"tool_results": [normal]}) == ()
+    assert _deepened_entities({"tool_results": [normal, deepening]}) == ("192.0.2.2",)
 
 
 @pytest.mark.parametrize("capability", ["asset.get_profile", "asset.get_detection"])

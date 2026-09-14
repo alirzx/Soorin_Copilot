@@ -181,6 +181,7 @@ def _synthesis_state(review: ReviewDecision) -> dict:
         "request_id": "status-request",
         "session_id": "status-session",
         "trace_id": "status-trace",
+        "task": task,
         "review_decision": review,
         "context_review": {"decision": "synthesize", "required_context_missing": False},
         "tool_results": [],

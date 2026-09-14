@@ -30,11 +30,19 @@ _FOCAL_CAPABILITY_ORDER = (
 )
 
 
+def _phase4c_deepening_results(state: InvestigationState) -> tuple[Any, ...]:
+    """Return only focal evidence produced by the deterministic Phase 4C fan-out."""
+    return tuple(
+        result
+        for result in state.get("tool_results") or ()
+        if str(getattr(result, "step_id", "") or "").startswith("deepening-")
+        and result.source_capability in _FOCAL_CAPABILITIES
+    )
+
+
 def _deepened_entities(state: InvestigationState) -> tuple[str, ...]:
     focal: list[str] = []
-    for result in state.get("tool_results") or ():
-        if result.source_capability not in _FOCAL_CAPABILITIES:
-            continue
+    for result in _phase4c_deepening_results(state):
         for entity in result.entities:
             if entity not in focal:
                 focal.append(entity)
@@ -45,6 +53,7 @@ class Phase4CWorkflowNodes(BasePhase4CWorkflowNodes):
     """Promote only actually deepened structured results to focal continuity."""
 
     def update_memory(self, state: InvestigationState) -> dict[str, Any]:
+        deepening_results = _phase4c_deepening_results(state)
         focal = _deepened_entities(state)
         if not focal:
             return super().update_memory(state)
@@ -65,7 +74,7 @@ class Phase4CWorkflowNodes(BasePhase4CWorkflowNodes):
             reference_type="phase4c_focal_deepening",
         )
         capabilities = {
-            result.source_capability for result in state.get("tool_results") or ()
+            result.source_capability for result in deepening_results
         }
         pair = len(focal) == 2
         route = replace(
@@ -131,9 +140,8 @@ class Phase4CWorkflowNodes(BasePhase4CWorkflowNodes):
         patched["memory_context_key"] = MemoryContextKey.from_task(focal_task)
         patched["baseline_results"] = [
             result
-            for result in state.get("tool_results") or ()
-            if result.source_capability in _FOCAL_CAPABILITIES
-            and bool(set(result.entities).intersection(focal))
+            for result in deepening_results
+            if bool(set(result.entities).intersection(focal))
         ]
         patched["require_baseline_for_operational_mutation"] = True
         structured_context = structured_query_context_from_state(state)

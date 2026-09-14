@@ -276,4 +276,5 @@ def test_agent_capability_path_reaches_active_structured_projection(
     assert "SOORIN_STRUCTURED_ASSET_SET_CONTEXT_JSON" in dynamic_context
     assert '"matched_total":2' in dynamic_context
     assert "task.asset_search" in modules
-    assert "enrichment-derived organizational projection" in prompt
+    assert "current asset data" in prompt
+    assert "search criteria as selectors" in prompt
