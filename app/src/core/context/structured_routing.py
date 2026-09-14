@@ -30,10 +30,14 @@ from src.core.context.models import (
 )
 from src.core.context.router import normalize_intent_route as _base_normalize_intent_route
 from src.core.context.structured_hardening import (
+    deterministic_structured_fallback,
     looks_like_structured_set_reference,
     merge_structured_query_for_followup,
     normalize_structured_query_for_language,
     normalize_structured_query_payload_for_language,
+    select_structured_query_context,
+    structured_material_gap_reason,
+    structured_reference_scope,
 )
 from src.core.graph.structured import StructuredQueryMode, StructuredQuerySpec
 from src.core.memory.routing_state import SessionRoutingState
@@ -49,7 +53,10 @@ _STRUCTURED_REPAIR_SYSTEM_PROMPT = (
     "Allowed intents: general_knowledge, asset_investigation, asset_search, asset_aggregate, graph_neighbors, "
     "graph_relationships, graph_path, graph_followup, unclear. For asset_search or asset_aggregate, preserve only "
     "allow-listed structured_query fields, use scope/direction none, depth 0, requires_graph true, entity_binding none, "
-    "and do not invent entities or Cypher. For other intents structured_query must be null. "
+    "and do not invent entities, fields, thresholds, dates, or Cypher. The typed filters support bounded all/any "
+    "predicate trees and aggregate group_by_fields supports 1-3 unique allow-listed dimensions; preserve legacy "
+    "group_by for one dimension. Same-turn them/their belongs to the current query, while set_query is only for "
+    "actual previous-result references. For other intents structured_query must be null. "
     "structured_result_reference is null or an object with kind none, set_query, select_entities, or "
     "historical_recall and 0-2 one-based ordinals."
 )
@@ -90,6 +97,8 @@ def validate_structured_router_payload(
 ) -> IntentDecision:
     """Validate either the established entity route or one typed Asset-set route."""
     reference = _structured_result_reference(payload.get("structured_result_reference"))
+    if reference.kind == "set_query" and structured_reference_scope(message) == "same_turn":
+        reference = StructuredResultReferenceDecision()
     # This extension owns structured_result_reference. Remove it after parsing
     # before delegating to the legacy or set-specific field allow-list. The
     # Router prompt intentionally emits null for ordinary routes, so null must
@@ -111,7 +120,10 @@ def validate_structured_router_payload(
             )
             return replace(decision, structured_result_reference=StructuredResultReferenceDecision())
 
-        context = routing_state.structured_query_context if routing_state is not None else None
+        context = (
+            select_structured_query_context(routing_state, message)
+            if routing_state is not None else None
+        )
         if context is None:
             raise ValueError("structured_result_reference_context_unavailable")
         if reference.kind == "set_query":
@@ -226,6 +238,9 @@ def validate_structured_router_payload(
     except ValidationError as exc:
         raise ValueError("schema_validation_failed:structured_query") from exc
 
+    if material_gap := structured_material_gap_reason(message):
+        raise ValueError(f"schema_validation_failed:{material_gap}")
+
     expected_mode = (
         StructuredQueryMode.SEARCH
         if intent == "asset_search"
@@ -325,6 +340,66 @@ class SemanticIntentRouter(_BaseSemanticIntentRouter):
         # its module. Keep that existing path but make its contract 4B.1-aware.
         _intent_module.ROUTER_REPAIR_SYSTEM_PROMPT = _STRUCTURED_REPAIR_SYSTEM_PROMPT
 
+    def classify(
+        self,
+        message: str,
+        entities: EntityResolution,
+        routing_state: SessionRoutingState,
+        *,
+        ui_context: dict[str, Any] | None = None,
+        recent_messages: list[dict[str, str]] | None = None,
+        trace_id: str = "",
+        request_id: str = "",
+    ) -> IntentDecision:
+        context = select_structured_query_context(routing_state, message)
+        compiled = deterministic_structured_fallback(
+            message,
+            prior_query=getattr(context, "query", None),
+            prior_group_values=tuple(
+                str(group.value)
+                for group in tuple(getattr(context, "aggregate_groups", ()) or ())
+                if group.value is not None
+            ),
+        )
+        if compiled is not None:
+            logger.info(
+                "event=intent_router_deterministic_compiler request_id=%s status=matched "
+                "intent=%s reference_kind=%s router_called=false",
+                request_id,
+                compiled.intent,
+                compiled.reference.kind,
+            )
+            return IntentDecision(
+                intent=compiled.intent,  # type: ignore[arg-type]
+                scope="none",
+                direction="none",
+                depth=0,
+                requires_graph=True,
+                structured_query=compiled.query,
+                structured_result_reference=compiled.reference,
+                entity_binding="none",
+                requested_entity_binding="none",
+                binding_source="none",
+                binding_available=True,
+                materialized_entity_count=0,
+                materialized_entities=(),
+                classification_confidence=1.0,
+                reason=compiled.reason,
+                decision_source="deterministic_fallback",
+                router_called=False,
+                content_present=False,
+                fallback_used=False,
+            )
+        return super().classify(
+            message,
+            entities,
+            routing_state,
+            ui_context=ui_context,
+            recent_messages=recent_messages,
+            trace_id=trace_id,
+            request_id=request_id,
+        )
+
     def _decision_from_content(
         self,
         content: str,
@@ -365,12 +440,21 @@ class SemanticIntentRouter(_BaseSemanticIntentRouter):
         explicit_message_entity = any(
             entity.source == "message" for entity in entities.entities
         )
+        reference_scope = structured_reference_scope(message)
+        if reference_scope == "same_turn" and reference_kind == "set_query":
+            payload["structured_result_reference"] = {"kind": "none", "ordinals": []}
+            reference_kind = "none"
+            logger.info(
+                "event=structured_result_reference_normalized request_id=%s "
+                "from_kind=set_query to_kind=none reason=same_turn_antecedent",
+                request_id,
+            )
         if (
             reference_kind == "none"
             and not explicit_message_entity
             and routing_state is not None
             and routing_state.structured_query_context is not None
-            and looks_like_structured_set_reference(message)
+            and reference_scope == "previous"
         ):
             payload["structured_result_reference"] = {
                 "kind": "set_query",

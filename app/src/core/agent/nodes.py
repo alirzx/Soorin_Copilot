@@ -37,6 +37,10 @@ from src.core.agent.task_mapping import (
 )
 from src.core.agent.specialists import AssetInvestigationSpecialist, GraphAnalysisSpecialist
 from src.core.agent.structured_continuity import structured_query_context_from_state
+from src.core.agent.structured_presentation import (
+    is_structured_presentation_only,
+    render_structured_presentation,
+)
 from src.core.context import ContextComposer, normalize_intent_route
 from src.core.context.intent import (
     SECURITY_ANALYSIS_WORDS,
@@ -1054,6 +1058,20 @@ class CopilotWorkflowNodes:
             else None
         )
         history = list(snapshot.messages if snapshot else [])
+        active_state = state["active_entity_state"]
+        structured_reference_kind = getattr(
+            getattr(state["routing_result"], "structured_result_reference", None),
+            "kind",
+            "none",
+        )
+        continuity_arguments = {
+            "structured_context": getattr(active_state, "structured_query_context", None),
+            "structured_lineage": tuple(
+                getattr(active_state, "structured_query_lineage", ()) or ()
+            ),
+            "structured_reference_kind": structured_reference_kind,
+            "active_focal_entities": tuple(getattr(active_state, "active_entities", ()) or ()),
+        }
         preliminary_task_context = self.synthesizer_prompt_builder.build_context(
             task,
             tuple(state.get("tool_results") or ()),
@@ -1062,6 +1080,7 @@ class CopilotWorkflowNodes:
             review=state.get("review_decision"),
             request_constraints=state.get("request_constraints"),
             accepted_working_fact_count=len(state.get("pending_working_facts") or ()),
+            **continuity_arguments,
         )
         preliminary_prompt = self.synthesizer_prompt_builder.render_messages(
             static_core=self.service.system_prompt,
@@ -1166,6 +1185,23 @@ class CopilotWorkflowNodes:
             baseline_status=self.context_composer.last_baseline_status,
             baseline_present=self.context_composer.last_baseline_present,
             baseline_compatible=self.context_composer.last_baseline_compatible,
+            **continuity_arguments,
+        )
+        logger.info(
+            "event=synth_continuity_facts request_id=%s previous_set_available=%s "
+            "previous_set_used=%s reference_kind=%s base_set_available=%s "
+            "current_result_count=%s previous_result_count=%s results_truncated=%s "
+            "active_focal_count=%s focal_baseline_available=%s",
+            state["request_id"],
+            task_context.continuity.previous_structured_set_available,
+            task_context.continuity.previous_structured_set_used,
+            task_context.continuity.structured_reference_kind,
+            task_context.continuity.base_structured_set_available,
+            task_context.continuity.current_result_count,
+            task_context.continuity.previous_result_count,
+            task_context.continuity.structured_results_truncated,
+            len(task_context.continuity.active_focal_entities),
+            task_context.continuity.focal_baseline_available,
         )
         rendered_prompt = self.synthesizer_prompt_builder.render_messages(
             static_core=self.service.system_prompt,
@@ -1320,9 +1356,28 @@ class CopilotWorkflowNodes:
                 limitation_reasons.extend(
                     review.reasons or ("missing_required_evidence",)
                 )
+            deterministic_presentation = (
+                render_structured_presentation(tuple(state.get("tool_results") or ()))
+                if review.outcome in {"sufficient", "answer_with_limitations"}
+                and is_structured_presentation_only(
+                    state["task"].request,
+                    tuple(state.get("tool_results") or ()),
+                )
+                else None
+            )
             request = state["synthesis_request"]
             try:
-                if self.stream_sink is not None:
+                if deterministic_presentation is not None:
+                    result = self._deterministic(
+                        deterministic_presentation,
+                        "structured-presentation",
+                    )
+                    logger.info(
+                        "event=synthesis_response_path request_id=%s "
+                        "path=deterministic_structured_presentation",
+                        state["request_id"],
+                    )
+                elif self.stream_sink is not None:
                     metrics = {
                         "streaming_requested": True,
                         "streaming_used": False,
@@ -1346,6 +1401,10 @@ class CopilotWorkflowNodes:
                         trace_id=state["trace_id"],
                     )
                 else:
+                    logger.info(
+                        "event=synthesis_response_path request_id=%s path=normal_synth",
+                        state["request_id"],
+                    )
                     result = self.service.llm_client.chat(
                         state["model_messages"],
                         request_id=state["request_id"],
@@ -1494,6 +1553,7 @@ class CopilotWorkflowNodes:
             return {"next_edge": "terminal"}
         task = state["task"]
         results = state.get("tool_results") or []
+        baseline_results = state.get("baseline_results") or results
         synthesis = state["synthesis_result"]
         context_key = state.get("memory_context_key") or MemoryContextKey.from_task(task)
         pending_facts = tuple(state.get("pending_working_facts") or ())
@@ -1501,7 +1561,7 @@ class CopilotWorkflowNodes:
         baseline_written = False
         baseline_rejection_reason = self._baseline_capture_rejection_reason(
             task,
-            tuple(results),
+            tuple(baseline_results),
             identity,
             state.get("review_decision"),
         )
@@ -1535,7 +1595,7 @@ class CopilotWorkflowNodes:
             )
             if not baseline_rejection_reason:
                 baseline = investigation_baseline_from_results(
-                    tuple(results),
+                    tuple(baseline_results),
                     owner_id=str(identity.user_id),
                     source_request_id=state["request_id"],
                     scope=task.scope,
@@ -1560,10 +1620,35 @@ class CopilotWorkflowNodes:
                 baseline_rejection_reason,
             )
         previous = state["active_entity_state"]
+        derived_structured_context = structured_query_context_from_state(state)
         structured_query_context = (
-            structured_query_context_from_state(state)
+            derived_structured_context
             or getattr(previous, "structured_query_context", None)
         )
+        structured_query_lineage = tuple(
+            getattr(previous, "structured_query_lineage", ()) or ()
+        )
+        if derived_structured_context is not None:
+            reference_kind = getattr(
+                getattr(state.get("routing_result"), "structured_result_reference", None),
+                "kind",
+                "none",
+            )
+            if reference_kind == "set_query" and structured_query_context is not None:
+                candidates = [*structured_query_lineage]
+                prior_context = getattr(previous, "structured_query_context", None)
+                if prior_context is not None and not any(
+                    item.result_fingerprint == prior_context.result_fingerprint
+                    for item in candidates
+                ):
+                    candidates.append(prior_context)
+                candidates.append(derived_structured_context)
+                unique = list({item.result_fingerprint: item for item in candidates}.values())
+                structured_query_lineage = tuple(
+                    unique if len(unique) <= 3 else (unique[0], unique[-2], unique[-1])
+                )
+            else:
+                structured_query_lineage = (derived_structured_context,)
         if structured_query_context is not getattr(previous, "structured_query_context", None):
             logger.info(
                 "event=structured_query_context_written request_id=%s mode=%s "
@@ -1598,6 +1683,10 @@ class CopilotWorkflowNodes:
             last_resolved = ()
         can_update = (
             operational_state_mutation_allowed
+            and (
+                not state.get("require_baseline_for_operational_mutation", False)
+                or baseline_written
+            )
             and
             resolved.status == "resolved"
             and bool(resolved.entities)
@@ -1671,6 +1760,7 @@ class CopilotWorkflowNodes:
             last_capability_statuses=tuple(f"{item.source_capability}:{item.status}" for item in results),
             entity_timeline=timeline,
             structured_query_context=structured_query_context,
+            structured_query_lineage=structured_query_lineage,
         )
         logger.info(
             "event=operational_state_update request_id=%s "
@@ -1685,6 +1775,13 @@ class CopilotWorkflowNodes:
             ",".join(new_state.active_entities) if len(new_state.active_entities) == 2 else "none",
             bool(getattr(state.get("conversation_snapshot"), "episode_transition", False)),
         )
+        if state.get("require_baseline_for_operational_mutation", False) and not baseline_written:
+            logger.info(
+                "event=operational_state_update_deferred request_id=%s "
+                "reason=focal_baseline_unavailable active_entities_preserved=%s",
+                state["request_id"],
+                ",".join(previous.active_entities) or "none",
+            )
         if self.settings.chat_store_history and operational_state_mutation_allowed:
             self.service.memory_store.compact_if_needed(
                 state["session_id"],

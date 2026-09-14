@@ -22,6 +22,9 @@ from src.core.context.router import DeterministicFallbackRouter as BaseFallbackR
 from src.core.graph.structured import (
     AssetAggregateOperation,
     AssetGroupField,
+    AssetPredicate,
+    AssetPredicateField,
+    AssetPredicateOperator,
     AssetSearchFilters,
     AssetSortField,
     SortDirection,
@@ -56,6 +59,18 @@ _STRUCTURED_SET_REFERENCE = re.compile(
     r"(?:which|list|show)\s+(?:member\s+)?ips?\s+(?:are\s+)?(?:in|from|belong(?:ing)?\s+to))\b",
     re.IGNORECASE,
 )
+_EXPLICIT_PREVIOUS_SET_REFERENCE = re.compile(
+    r"\b(?:previous|prior|earlier|original|base|latest|refined)\s+(?:structured\s+)?"
+    r"(?:set|list|results?)\b|\b(?:those|these)\s+results?\b|"
+    r"\b(?:the\s+)?results?\s+(?:above|you\s+just\s+returned)\b|"
+    r"\bwhich\s+of\s+(?:them|those)\b|\bfrom\s+(?:that|the)\s+list\b",
+    re.IGNORECASE,
+)
+_SAME_TURN_SET_ANTECEDENT = re.compile(
+    r"\b(?:find|list|show|select)\b[\s\S]{1,260}?\b(?:assets?|systems?|devices?|servers?|"
+    r"controllers?|firewalls?)\b[\s\S]{0,180}?\b(?:them|their|those|these|one)\b",
+    re.IGNORECASE,
+)
 _SCORE_ALIASES: dict[str, str] = {
     "model_confidence": (
         r"(?:model|classification|classifier)\s+(?:confidence|certainty)|"
@@ -85,6 +100,16 @@ _COMPARATOR_PATTERN = "|".join(
     re.escape(item) for item in sorted(_COMPARATORS, key=len, reverse=True)
 )
 
+_AMBIGUOUS_SCORE_QUALIFIER = re.compile(
+    r"\b(?:high|low)\s+(?:(?:model|mapping|classification)\s+)?(?:confidence|certainty)\b",
+    re.IGNORECASE,
+)
+_UNSUPPORTED_MATERIAL_SELECTOR = re.compile(
+    r"\b(?:owned\s+by|owner(?:\s+is)?|department(?:\s+is)?|business\s+unit(?:\s+is)?|"
+    r"location(?:\s+is)?|operating\s+system(?:\s+is)?|os\s+is)\b",
+    re.IGNORECASE,
+)
+
 
 @dataclass(frozen=True)
 class StructuredFallbackDecision:
@@ -92,6 +117,16 @@ class StructuredFallbackDecision:
     query: StructuredQuerySpec
     reason: str
     reference: StructuredResultReferenceDecision = StructuredResultReferenceDecision()
+
+
+def structured_material_gap_reason(message: str) -> str | None:
+    """Identify material selector language that the allow-list cannot encode exactly."""
+    text = message or ""
+    if _AMBIGUOUS_SCORE_QUALIFIER.search(text):
+        return "ambiguous_confidence_threshold"
+    if _UNSUPPORTED_MATERIAL_SELECTOR.search(text):
+        return "unsupported_structured_property"
+    return None
 
 
 def normalize_natural_score(value: Any, *, percent_explicit: bool = False) -> float:
@@ -159,6 +194,42 @@ def normalize_structured_query_payload_for_language(
                 percent_explicit=percent_explicit,
             )
     normalized["filters"] = filters
+    if isinstance(filters.get("predicate"), dict):
+        filters["predicate"] = _normalize_predicate_payload_scores(
+            filters["predicate"],
+            message,
+        )
+    return normalized
+
+
+def _normalize_predicate_payload_scores(payload: dict[str, Any], message: str) -> dict[str, Any]:
+    normalized = dict(payload)
+    for key in ("all", "any"):
+        if isinstance(normalized.get(key), list):
+            normalized[key] = [
+                _normalize_predicate_payload_scores(item, message)
+                if isinstance(item, dict) else item
+                for item in normalized[key]
+            ]
+    if isinstance(normalized.get("not"), dict):
+        normalized["not"] = _normalize_predicate_payload_scores(normalized["not"], message)
+    field = str(normalized.get("field") or "")
+    if field not in _SCORE_ALIASES:
+        return normalized
+    if "value" in normalized:
+        normalized["value"] = normalize_natural_score(normalized["value"])
+    if isinstance(normalized.get("values"), list):
+        normalized["values"] = [normalize_natural_score(item) for item in normalized["values"]]
+    operator = str(normalized.get("operator") or "")
+    alias = _SCORE_ALIASES[field]
+    if operator == "gte" and re.search(
+        rf"\b(?:{alias})\s+(?:above|greater\s+than|more\s+than|over)\b", message, re.I
+    ):
+        normalized["operator"] = "gt"
+    elif operator == "lte" and re.search(
+        rf"\b(?:{alias})\s+(?:below|less\s+than|under)\b", message, re.I
+    ):
+        normalized["operator"] = "lt"
     return normalized
 
 
@@ -169,6 +240,10 @@ def merge_structured_query_for_followup(
     """Apply current selectors to the retained query; refs remain identity-only."""
     merged_filters = previous.filters.model_dump(exclude_none=True)
     merged_filters.update(current.filters.model_dump(exclude_none=True))
+    previous_predicate = previous.filters.predicate
+    current_predicate = current.filters.predicate
+    if previous_predicate is not None and current_predicate is not None:
+        merged_filters["predicate"] = AssetPredicate(all=(previous_predicate, current_predicate))
     updates: dict[str, Any] = {
         "filters": AssetSearchFilters.model_validate(merged_filters),
     }
@@ -181,7 +256,38 @@ def merge_structured_query_for_followup(
 
 
 def looks_like_structured_set_reference(message: str) -> bool:
-    return bool(_STRUCTURED_SET_REFERENCE.search(message or ""))
+    return structured_reference_scope(message) == "previous"
+
+
+def structured_reference_scope(message: str) -> str:
+    """Distinguish same-turn antecedents from actual prior-result references."""
+    text = message or ""
+    if _EXPLICIT_PREVIOUS_SET_REFERENCE.search(text):
+        return "previous"
+    if _SAME_TURN_SET_ANTECEDENT.search(text):
+        return "same_turn"
+    return "previous" if _STRUCTURED_SET_REFERENCE.search(text) else "none"
+
+
+def select_structured_query_context(routing_state: Any, message: str) -> Any:
+    """Resolve explicit base/latest language against the bounded lineage."""
+    current = getattr(routing_state, "structured_query_context", None)
+    lineage = tuple(getattr(routing_state, "structured_query_lineage", ()) or ())
+    if not lineage:
+        lineage = (current,) if current is not None else ()
+    text = message or ""
+    if re.search(r"\b(?:original|base)\s+(?:structured\s+)?(?:set|list|results?)\b", text, re.I):
+        return lineage[0] if lineage else current
+    if re.search(r"\b(?:latest|refined)\s+(?:structured\s+)?(?:set|list|results?)\b", text, re.I):
+        return lineage[-1] if lineage else current
+    named_same = re.search(r"\b(?:the\s+)?same\s+(?P<label>[\w -]+?)\s+set\b", text, re.I)
+    if named_same and len(lineage) > 1:
+        label = " ".join(named_same.group("label").casefold().split())
+        for context in lineage:
+            role = str(getattr(getattr(context.query, "filters", None), "role", "") or "")
+            if role.casefold() == label:
+                return context
+    return current
 
 
 def _normalized_filters(filters: AssetSearchFilters) -> AssetSearchFilters:
@@ -190,7 +296,40 @@ def _normalized_filters(filters: AssetSearchFilters) -> AssetSearchFilters:
         value = values.get(name)
         if isinstance(value, str):
             values[name] = value.strip().casefold()
+    predicate = filters.predicate
+    if predicate is not None:
+        values["predicate"] = _normalized_predicate(predicate)
     return AssetSearchFilters.model_validate(values)
+
+
+def _normalized_predicate(predicate: AssetPredicate) -> AssetPredicate:
+    if predicate.all:
+        return AssetPredicate(all=tuple(_normalized_predicate(item) for item in predicate.all))
+    if predicate.any:
+        return AssetPredicate(any=tuple(_normalized_predicate(item) for item in predicate.any))
+    if predicate.not_ is not None:
+        return AssetPredicate.model_validate({"not": _normalized_predicate(predicate.not_)})
+    assert predicate.field is not None and predicate.operator is not None
+    text_fields = {
+        AssetPredicateField.ASSET_NAME,
+        AssetPredicateField.STATUS,
+        AssetPredicateField.SUGGESTED_TYPE,
+        AssetPredicateField.CLASSIFICATION_SUMMARY,
+        AssetPredicateField.VENDOR,
+        AssetPredicateField.PRODUCT,
+        AssetPredicateField.ROLE,
+        AssetPredicateField.ROLES,
+        AssetPredicateField.TAG,
+        AssetPredicateField.SUB_TAG,
+        AssetPredicateField.ENRICHMENT_STATUS,
+    }
+    payload = predicate.model_dump(by_alias=True)
+    if predicate.field in text_fields:
+        if payload.get("value") is not None:
+            payload["value"] = str(payload["value"]).strip().casefold()
+        if payload.get("values"):
+            payload["values"] = [str(item).strip().casefold() for item in payload["values"]]
+    return AssetPredicate.model_validate(payload)
 
 
 def normalize_structured_query_for_language(
@@ -203,8 +342,8 @@ def normalize_structured_query_for_language(
     case-insensitive equality for text selectors. Strict natural-language
     boundaries use the next representable float so the existing inclusive range
     schema remains backward compatible. Ranked single-selection requests fetch
-    two rows so the runtime can distinguish a unique top result from a tie while
-    still deepening at most one focal Asset.
+    three rows so the runtime can distinguish a unique result, an exact top-two
+    tie, and a larger tie without inventing a winner.
     """
 
     filters = _normalized_filters(query.filters)
@@ -229,7 +368,7 @@ def normalize_structured_query_for_language(
     updates: dict[str, object] = {"filters": filters}
     if query.mode is StructuredQueryMode.SEARCH and query.sort is not None:
         if _RANKED_HIGH.search(message) or _RANKED_LOW.search(message):
-            updates["limit"] = max(2, int(query.limit or 0))
+            updates["limit"] = max(3, int(query.limit or 0))
     return query.model_copy(update=updates)
 
 
@@ -403,6 +542,125 @@ def _natural_filter_values(message: str) -> tuple[dict[str, object], bool]:
     return values, invalid_score
 
 
+def _natural_boolean_predicate(
+    message: str,
+    values: dict[str, object],
+) -> AssetPredicate | None:
+    """Compile only explicit, bounded OR constructions the grammar can prove."""
+
+    cross_field = re.search(
+        r"\brole(?:\s+is|\s*=)?\s+(?P<role>[\w][\w .&/-]*?)\s+or\s+"
+        r"suggested\s+type(?:\s+is|\s*=)?\s+(?P<suggested>[\w][\w .&/-]*?)"
+        r"(?=\s+(?:and|with|having|where|whose)\b|[?.!,]|$)",
+        message,
+        re.I,
+    )
+    if cross_field:
+        values.pop("role", None)
+        values.pop("suggested_type", None)
+        return AssetPredicate(any=(
+            AssetPredicate(
+                field=AssetPredicateField.ROLE,
+                operator=AssetPredicateOperator.EQ,
+                value=cross_field.group("role"),
+            ),
+            AssetPredicate(
+                field=AssetPredicateField.SUGGESTED_TYPE,
+                operator=AssetPredicateOperator.EQ,
+                value=cross_field.group("suggested"),
+            ),
+        ))
+
+    vendor = re.search(
+        r"\b(?:either\s+)?vendor(?:\s+is|\s*=)?\s+(?P<first>[\w.&-]+)\s+or\s+"
+        r"(?:vendor(?:\s+is|\s*=)?\s+)?(?P<second>[\w.&-]+)\b",
+        message,
+        re.I,
+    )
+    if vendor:
+        values.pop("vendor", None)
+        return AssetPredicate(
+            field=AssetPredicateField.VENDOR,
+            operator=AssetPredicateOperator.IN,
+            values=(vendor.group("first"), vendor.group("second")),
+        )
+
+    role_choice = re.search(
+        r"\b(?P<first>database\s+server|domain\s+controller|linux\s+server|"
+        r"windows\s+workstation|firewall|siem|splunk\s+indexer|hypervisor)\s+or\s+"
+        r"(?P<second>database\s+server|domain\s+controller|linux\s+server|"
+        r"windows\s+workstation|firewall|siem|splunk\s+indexer|hypervisor)\b",
+        message,
+        re.I,
+    )
+    if role_choice:
+        values.pop("role", None)
+        return AssetPredicate(
+            field=AssetPredicateField.ROLE,
+            operator=AssetPredicateOperator.IN,
+            values=(role_choice.group("first"), role_choice.group("second")),
+        )
+
+    timestamp = re.search(
+        r"\b(?:last\s+(?:detection|detected|classified)|classification\s+time|"
+        r"detection\s+timestamp|seen\s+by\s+detection)\s+"
+        r"(?P<operator>after|before)\s+(?P<value>\d{4}-\d{2}-\d{2}(?:T[^\s,;]+)?)",
+        message,
+        re.I,
+    )
+    if timestamp:
+        return AssetPredicate(
+            field=AssetPredicateField.LAST_DETECTION_AT,
+            operator=(
+                AssetPredicateOperator.GT
+                if timestamp.group("operator").casefold() == "after"
+                else AssetPredicateOperator.LT
+            ),
+            value=timestamp.group("value").rstrip(".,;?!"),
+        )
+    return None
+
+
+def _group_fields_from_message(message: str) -> tuple[AssetGroupField, ...] | None:
+    match = re.search(
+        r"\bgroup\s+(?:(?:all\s+)?assets?|them|those|these)\s+by\s+"
+        r"(?P<fields>[^?.!;]+)",
+        message,
+        re.I,
+    )
+    if match is None:
+        return None
+    field_text = re.split(
+        r"\s+and\s+(?:show|display|give|list|return)\b|\s+for\s+each\b",
+        match.group("fields"),
+        maxsplit=1,
+        flags=re.I,
+    )[0]
+    raw_tokens = re.split(r"\s*(?:,|\band\b)\s*", field_text, flags=re.I)
+    mapping = {
+        "role": AssetGroupField.ROLE,
+        "status": AssetGroupField.STATUS,
+        "vendor": AssetGroupField.VENDOR,
+        "product": AssetGroupField.PRODUCT,
+        "tag": AssetGroupField.TAG,
+        "sub tag": AssetGroupField.SUB_TAG,
+        "sub-tag": AssetGroupField.SUB_TAG,
+        "suggested type": AssetGroupField.SUGGESTED_TYPE,
+        "enrichment status": AssetGroupField.ENRICHMENT_STATUS,
+    }
+    fields: list[AssetGroupField] = []
+    for raw in raw_tokens:
+        token = re.sub(r"\s+", " ", raw.strip().casefold())
+        token = re.sub(r"^(?:their\s+|the\s+)?(?:primary\s+)?", "", token)
+        field = mapping.get(token)
+        if field is None:
+            return None
+        fields.append(field)
+    if not 1 <= len(fields) <= 3 or len(set(fields)) != len(fields):
+        return None
+    return tuple(fields)
+
+
 def _merge_referenced_query(
     prior_query: StructuredQuerySpec | None,
     current: StructuredQuerySpec,
@@ -425,7 +683,10 @@ def deterministic_structured_fallback(
     """Parse only unambiguous common set requests when the semantic Router fails."""
 
     text = " ".join((message or "").strip().split())
-    reference = bool(prior_query is not None and looks_like_structured_set_reference(text))
+    if structured_material_gap_reason(text) is not None:
+        return None
+    reference_scope = structured_reference_scope(text)
+    reference = bool(prior_query is not None and reference_scope == "previous")
     if not looks_like_structured_set_request(
         text,
         structured_context_available=prior_query is not None,
@@ -471,33 +732,36 @@ def deterministic_structured_fallback(
             StructuredResultReferenceDecision(kind="set_query"),
         )
 
-    group = re.search(
-        r"\bgroup\s+(?:(?:all\s+)?assets?|them|those|these)\s+by\s+(role|status|vendor|product|tag|sub\s*tag|suggested\s+type|enrichment\s+status)\b",
-        text,
-        re.I,
-    )
-    if group:
-        token = re.sub(r"\s+", "_", group.group(1).casefold())
-        mapping = {
-            "role": AssetGroupField.ROLE,
-            "status": AssetGroupField.STATUS,
-            "vendor": AssetGroupField.VENDOR,
-            "product": AssetGroupField.PRODUCT,
-            "tag": AssetGroupField.TAG,
-            "sub_tag": AssetGroupField.SUB_TAG,
-            "suggested_type": AssetGroupField.SUGGESTED_TYPE,
-            "enrichment_status": AssetGroupField.ENRICHMENT_STATUS,
-        }
-        field = mapping.get(token)
-        if field is None:
-            return None
+    group_fields = _group_fields_from_message(text)
+    values, invalid_score = _natural_filter_values(text)
+    if invalid_score:
+        return None
+    # The exact-selector grammar must not reinterpret the aggregation phrase
+    # "by (their primary) role and status" as a role value of "and status".
+    if (
+        group_fields
+        and AssetGroupField.ROLE in group_fields
+        and str(values.get("role") or "").casefold().startswith("and ")
+    ):
+        values.pop("role", None)
+    predicate = _natural_boolean_predicate(text, values)
+    if predicate is not None:
+        values["predicate"] = predicate
+    try:
+        filters = AssetSearchFilters.model_validate(values)
+    except ValueError:
+        return None
+
+    if group_fields:
         try:
             query = _merge_referenced_query(
                 prior_query,
                 StructuredQuerySpec(
                     mode=StructuredQueryMode.AGGREGATE,
+                    filters=filters,
                     operation=AssetAggregateOperation.GROUP_COUNT,
-                    group_by=field,
+                    group_by=group_fields[0] if len(group_fields) == 1 else None,
+                    group_by_fields=group_fields,
                 ),
                 reference=reference,
             )
@@ -510,14 +774,6 @@ def deterministic_structured_fallback(
             StructuredResultReferenceDecision(kind="set_query") if reference else StructuredResultReferenceDecision(),
         )
 
-    values, invalid_score = _natural_filter_values(text)
-    if invalid_score:
-        return None
-
-    try:
-        filters = AssetSearchFilters.model_validate(values)
-    except ValueError:
-        return None
     if re.search(r"\bhow\s+many\b|\bcount\b", text, re.I) and (values or reference):
         query = StructuredQuerySpec(
             mode=StructuredQueryMode.AGGREGATE,
@@ -547,9 +803,9 @@ def deterministic_structured_fallback(
     direction = None
     limit = None
     if re.search(r"\bhighest\s+model\s+confidence\b", text, re.I):
-        sort, direction, limit = AssetSortField.MODEL_CONFIDENCE, SortDirection.DESC, 2
+        sort, direction, limit = AssetSortField.MODEL_CONFIDENCE, SortDirection.DESC, 3
     elif re.search(r"\blowest\s+model\s+confidence\b", text, re.I):
-        sort, direction, limit = AssetSortField.MODEL_CONFIDENCE, SortDirection.ASC, 2
+        sort, direction, limit = AssetSortField.MODEL_CONFIDENCE, SortDirection.ASC, 3
     query = StructuredQuerySpec(
         mode=StructuredQueryMode.SEARCH,
         filters=filters,
@@ -584,7 +840,7 @@ class StructuredAwareFallbackRouter(BaseFallbackRouter):
         routing_state: Any = None,
         **kwargs: Any,
     ) -> RouteDecision:
-        context = getattr(routing_state, "structured_query_context", None)
+        context = select_structured_query_context(routing_state, message)
         structured = deterministic_structured_fallback(
             message,
             prior_query=getattr(context, "query", None),

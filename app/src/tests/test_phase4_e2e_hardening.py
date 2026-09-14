@@ -76,7 +76,7 @@ def test_multiple_score_comparators_each_preserve_their_strict_boundary():
     assert normalized.filters.mapping_confidence_min == math.nextafter(0.8, math.inf)
 
 
-def test_ranked_search_retains_two_rows_for_tie_check():
+def test_ranked_search_retains_three_rows_to_prove_tie_boundary():
     query = StructuredQuerySpec(
         mode=StructuredQueryMode.SEARCH,
         filters=AssetSearchFilters(role="Firewall"),
@@ -88,7 +88,7 @@ def test_ranked_search_retains_two_rows_for_tie_check():
         query,
         "Find the Firewall with the highest model confidence and analyze it.",
     )
-    assert normalized.limit == 2
+    assert normalized.limit == 3
 
 
 def test_structured_set_request_ignores_incidental_ui_selected_ip():
@@ -634,12 +634,17 @@ def test_product_summary_hydration_failure_logs_safe_contract_stage(caplog):
 
     store = ProductLongTermMemoryStore(Client())
     with caplog.at_level(logging.ERROR):
-        with pytest.raises(ProductMemoryContractError):
-            store.list(
-                user_id="user-1",
-                request_id="safe-diagnostics",
-                purpose="active_inventory",
-            )
+        records = store.list(
+            user_id="user-1",
+            request_id="safe-diagnostics",
+            purpose="active_inventory",
+        )
+
+    assert records == ()
+    assert "malformed_product_memory_skipped" in store.consume_read_limitations(
+        request_id="safe-diagnostics",
+        purpose="active_inventory",
+    )
 
     text = caplog.text
     assert "event=product_ltm_contract_failed" in text

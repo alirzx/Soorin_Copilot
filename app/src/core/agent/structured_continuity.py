@@ -80,6 +80,10 @@ def structured_query_context_from_state(state: dict[str, Any]) -> StructuredQuer
                     StructuredAggregateGroupRef(
                         value=group.get("value"),
                         count=group.get("count"),
+                        group_values=tuple(
+                            (str(key), value)
+                            for key, value in dict(group.get("group_values") or {}).items()
+                        ),
                     )
                     for group in evidence.groups
                 )

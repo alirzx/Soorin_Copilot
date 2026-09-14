@@ -1384,7 +1384,7 @@ def test_phase4c_deepened_focal_evidence_gets_its_own_baseline_and_keeps_set_con
         "filters": {"role": "Firewall"},
         "sort": "model_confidence",
         "direction": "desc",
-        "limit": 2,
+        "limit": 3,
     })
     query_identity = structured_query_identity(
         query,
@@ -1397,10 +1397,14 @@ def test_phase4c_deepened_focal_evidence_gets_its_own_baseline_and_keeps_set_con
         active_graph_version="graph-v1",
         sort="model_confidence",
         direction="desc",
-        matched_total=1,
-        returned_count=1,
-        truncated=False,
-        rows=({"ip": IP, "graph_key": IP},),
+        matched_total=9,
+        returned_count=3,
+        truncated=True,
+        rows=(
+            {"ip": IP, "graph_key": IP, "model_confidence": 0.99},
+            {"ip": "192.0.2.21", "graph_key": "192.0.2.21", "model_confidence": 0.97},
+            {"ip": "192.0.2.22", "graph_key": "192.0.2.22", "model_confidence": 0.96},
+        ),
         retrieved_at="2026-08-20T00:00:00+00:00",
     )
     search_result = ToolResult(
@@ -1491,6 +1495,7 @@ def test_phase4c_deepened_focal_evidence_gets_its_own_baseline_and_keeps_set_con
     assert update["active_entity_state"].active_ip == IP
     assert update["active_entity_state"].structured_query_context is not None
     assert update["active_entity_state"].structured_query_context.query == query
+    assert update["active_entity_state"].structured_query_context.retrieval_truncated is True
     assert working is not None and working.context_key.entities == (IP,)
     assert working.baseline is not None
     assert {item.capability for item in working.baseline.projections} == {

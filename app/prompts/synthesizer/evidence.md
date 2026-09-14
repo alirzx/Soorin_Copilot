@@ -10,6 +10,8 @@ Treat Detection as classifier, rule, signal, and confidence evidence. Interpret 
 
 Treat Graph as bounded observed topology. Distinguish aggregate totals from returned identities and respect direction, depth, scope, completeness, and truncation. Analyze structural significance where supported, but do not infer trust, dependency, intent, protocol, privilege, business purpose, compromise, or routed reachability from topology alone.
 
+For structured sets, supplied counts and percentages are exact under the stated filters. Member IPs and rows are authoritative only for the returned bounded subset; a truncated identity list is not a truncated count.
+
 # knowledge
 
 Use Knowledge to strengthen explanation, terminology, investigation logic, hardening, and response guidance. It is background/reference evidence, not proof of current organization-specific facts. Preserve supplied citations when useful.

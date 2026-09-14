@@ -77,20 +77,49 @@ class StructuredAggregateGroupRef:
 
     value: str | None
     count: int
+    group_values: tuple[tuple[str, str | None], ...] = ()
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "value", _bounded_optional(self.value, maximum=128))
         if not isinstance(self.count, int) or not 0 <= self.count <= 1_000_000_000_000:
             raise ValueError("invalid structured aggregate group count")
+        allowed = {
+            "status", "suggested_type", "role", "vendor", "product", "tag",
+            "sub_tag", "enrichment_status",
+        }
+        normalized: list[tuple[str, str | None]] = []
+        for key, value in self.group_values:
+            if key not in allowed or any(existing == key for existing, _ in normalized):
+                raise ValueError("invalid structured aggregate group dimension")
+            normalized.append((key, _bounded_optional(value, maximum=128)))
+        if len(normalized) > 3:
+            raise ValueError("too many structured aggregate group dimensions")
+        if len(normalized) == 1:
+            only = normalized[0][1]
+            if self.value is not None and self.value != only:
+                raise ValueError("structured aggregate legacy value mismatch")
+            if self.value is None:
+                object.__setattr__(self, "value", only)
+        object.__setattr__(self, "group_values", tuple(normalized))
 
     def to_payload(self) -> dict[str, Any]:
-        return {"value": self.value, "count": self.count}
+        payload = {"value": self.value, "count": self.count}
+        if self.group_values:
+            payload["group_values"] = dict(self.group_values)
+        return payload
 
     @classmethod
     def from_payload(cls, payload: Any) -> "StructuredAggregateGroupRef":
-        if not isinstance(payload, dict) or set(payload) - {"value", "count"}:
+        if not isinstance(payload, dict) or set(payload) - {"value", "count", "group_values"}:
             raise ValueError("invalid structured aggregate group ref")
-        return cls(value=payload.get("value"), count=payload.get("count"))
+        group_values = payload.get("group_values") or {}
+        if not isinstance(group_values, dict):
+            raise ValueError("invalid structured aggregate group values")
+        return cls(
+            value=payload.get("value"),
+            count=payload.get("count"),
+            group_values=tuple((str(key), value) for key, value in group_values.items()),
+        )
 
 
 @dataclass(frozen=True)

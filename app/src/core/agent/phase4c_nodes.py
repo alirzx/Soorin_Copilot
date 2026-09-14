@@ -97,7 +97,12 @@ class Phase4CWorkflowNodes(CopilotWorkflowNodes):
 
         evidence = search_result.structured_asset_set
         rows = tuple(getattr(evidence, "rows", ()) or ())
-        selected, reason = self._select_candidates(task, rows)
+        selected, reason = self._select_candidates(
+            task,
+            rows,
+            retrieval_truncated=bool(getattr(evidence, "truncated", False)),
+            matched_total=int(getattr(evidence, "matched_total", len(rows)) or 0),
+        )
         logger.info(
             "event=phase4c_candidate_selection request_id=%s candidates_found=%s candidates_selected=%s "
             "selection_reason=%s retrieval_truncated=%s",
@@ -258,6 +263,9 @@ class Phase4CWorkflowNodes(CopilotWorkflowNodes):
     def _select_candidates(
         task: TaskSpec,
         rows: tuple[dict[str, Any], ...],
+        *,
+        retrieval_truncated: bool = True,
+        matched_total: int | None = None,
     ) -> tuple[tuple[str, ...], str]:
         if not rows:
             return (), "zero_candidates"
@@ -290,10 +298,33 @@ class Phase4CWorkflowNodes(CopilotWorkflowNodes):
             # "first" refers to deterministic returned order. Other rank wording
             # requires the Router to have encoded an explicit sort.
             first_word = bool(re.search(r"\bfirst\b", request, re.IGNORECASE))
-            if first_word or (
-                task.structured_query and task.structured_query.sort is not None
-            ):
+            if first_word:
                 return (ips[0],), "explicit_ranked_single"
+            query = task.structured_query
+            if query is not None and query.sort is not None:
+                sort_field = query.sort.value
+                ranked_rows = tuple(
+                    row for row in rows
+                    if str(row.get("ip") or "").strip() in ips
+                )
+                if not ranked_rows or ranked_rows[0].get(sort_field) is None:
+                    return (), "ranked_value_unavailable"
+                top_value = ranked_rows[0].get(sort_field)
+                tied = tuple(
+                    str(row.get("ip") or "").strip()
+                    for row in ranked_rows
+                    if row.get(sort_field) == top_value
+                )
+                if len(tied) == 1:
+                    return (tied[0],), "unique_ranked_single"
+                complete_tie_boundary = (
+                    len(tied) < len(ranked_rows)
+                    or (matched_total is not None and matched_total == len(ranked_rows))
+                    or not retrieval_truncated
+                )
+                if len(tied) == 2 and complete_tie_boundary:
+                    return tied, "exact_top_two_tie"
+                return (), "ranked_top_tie_requires_secondary_criterion"
             return (), "rank_without_structured_sort"
 
         return (), "ambiguous_multi_candidate_selection"

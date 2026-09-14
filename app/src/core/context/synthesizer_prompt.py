@@ -68,6 +68,19 @@ class SynthesizerExecutionState:
 
 
 @dataclass(frozen=True)
+class SynthesizerContinuityState:
+    previous_structured_set_available: bool = False
+    previous_structured_set_used: bool = False
+    structured_reference_kind: str = "none"
+    base_structured_set_available: bool = False
+    current_result_count: int | None = None
+    previous_result_count: int | None = None
+    structured_results_truncated: bool = False
+    active_focal_entities: tuple[str, ...] = ()
+    focal_baseline_available: bool = False
+
+
+@dataclass(frozen=True)
 class SynthesizerTaskContext:
     task_category: str
     intent: str
@@ -76,6 +89,7 @@ class SynthesizerTaskContext:
     evidence_mode: EvidenceMode
     response_depth: ResponseDepth
     execution: SynthesizerExecutionState
+    continuity: SynthesizerContinuityState
     memory: SynthesizerMemoryState
     profile: SynthesizerProviderState
     detection: SynthesizerProviderState
@@ -205,6 +219,10 @@ class SynthesizerPromptBuilder:
         baseline_status: str = "absent",
         baseline_present: bool = False,
         baseline_compatible: bool = False,
+        structured_context: Any = None,
+        structured_lineage: tuple[Any, ...] = (),
+        structured_reference_kind: str = "none",
+        active_focal_entities: tuple[str, ...] = (),
     ) -> SynthesizerTaskContext:
         memory_package = getattr(snapshot, "memory_context", None)
         selected_count = max(
@@ -275,6 +293,41 @@ class SynthesizerPromptBuilder:
             )
         )[:20]
         contradiction_count = sum(len(result.contradictions) for result in results)
+        current_structured = next(
+            (
+                item.structured_asset_set
+                for item in results
+                if item.structured_asset_set is not None
+            ),
+            None,
+        )
+        current_count = None
+        if current_structured is not None:
+            current_count = int(
+                getattr(current_structured, "matched_total", None)
+                if getattr(current_structured, "mode", "") == "search"
+                else getattr(current_structured, "count", 0)
+            )
+        previous_count = None
+        if structured_context is not None:
+            previous_count = (
+                getattr(structured_context, "matched_total", None)
+                if getattr(structured_context, "mode", "") == "search"
+                else getattr(structured_context, "count", None)
+            )
+        continuity = SynthesizerContinuityState(
+            previous_structured_set_available=structured_context is not None,
+            previous_structured_set_used=structured_reference_kind == "set_query",
+            structured_reference_kind=structured_reference_kind,
+            base_structured_set_available=len(structured_lineage) > 1,
+            current_result_count=current_count,
+            previous_result_count=previous_count,
+            structured_results_truncated=bool(
+                getattr(current_structured, "truncated", False)
+            ),
+            active_focal_entities=tuple(active_focal_entities[:2]),
+            focal_baseline_available=baseline_compatible,
+        )
         return SynthesizerTaskContext(
             task_category=self._task_category(task),
             intent=task.intent,
@@ -283,6 +336,7 @@ class SynthesizerPromptBuilder:
             evidence_mode=task.evidence_mode,
             response_depth=self._response_depth(task),
             execution=execution,
+            continuity=continuity,
             memory=memory,
             profile=provider_states["profile"],
             detection=provider_states["detection"],
@@ -357,6 +411,7 @@ class SynthesizerPromptBuilder:
             "evidence_mode": context.evidence_mode,
             "response_depth": context.response_depth,
             "execution": context.execution.__dict__,
+            "continuity": context.continuity.__dict__,
             "memory": context.memory.__dict__,
             "providers": {
                 "profile": context.profile.__dict__,

@@ -345,6 +345,8 @@ class EvidenceReviewer:
                 return None
             arguments = query.model_dump(mode="json", exclude_none=True)
             arguments.pop("mode", None)
+            if not arguments.get("group_by_fields"):
+                arguments.pop("group_by_fields", None)
             return arguments
         minimum_entities = 2 if capability in {"graph.get_relationship", "graph.compare_assets", "graph.find_path"} else 1
         return {"entities": list(task.entities[:minimum_entities])}
@@ -404,19 +406,30 @@ class EvidenceReviewer:
                 return capability, f"{capability} reported a negative aggregate count."
             if query.operation is None or evidence.operation != query.operation.value:
                 return capability, f"{capability} aggregate operation did not match the validated task."
-            expected_group = query.group_by.value if query.group_by else None
-            if evidence.group_by != expected_group:
+            expected_groups = tuple(
+                item.value for item in (
+                    query.group_by_fields
+                    or ((query.group_by,) if query.group_by is not None else ())
+                )
+            )
+            evidence_groups = evidence.group_by_fields or (
+                (evidence.group_by,) if evidence.group_by is not None else ()
+            )
+            if evidence_groups != expected_groups:
                 return capability, f"{capability} aggregate grouping did not match the validated task."
+            expected_group = expected_groups[0] if len(expected_groups) == 1 else None
+            if evidence.group_by != expected_group:
+                return capability, f"{capability} legacy aggregate grouping did not match the validated task."
             group_total = sum(int(group.get("count") or 0) for group in evidence.groups)
-            if evidence.operation == "count" and (evidence.groups or evidence.group_by is not None):
+            if evidence.operation == "count" and (evidence.groups or evidence.group_by_fields):
                 return capability, f"{capability} count evidence unexpectedly contained grouped output."
             if evidence.operation == "group_count" and (
-                evidence.group_by is None
+                not evidence_groups
                 or group_total > evidence.count
                 or (not evidence.truncated and group_total != evidence.count)
             ):
                 return capability, f"{capability} reported inconsistent grouped aggregate counts."
-            expected_included = group_total if evidence.group_by else evidence.count
+            expected_included = group_total if evidence_groups else evidence.count
             if result.total_count != evidence.count or result.included_count != expected_included:
                 return capability, f"{capability} generic and typed aggregate metadata disagreed."
             if result.omitted_count != max(0, result.total_count - result.included_count):

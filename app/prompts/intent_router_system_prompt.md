@@ -112,21 +112,27 @@ For these two intents:
     "unknown_score_min": null,
     "unknown_score_max": null,
     "last_detection_at_from": null,
-    "last_detection_at_to": null
+    "last_detection_at_to": null,
+    "predicate": null
   },
   "sort": null,
   "direction": null,
   "limit": null,
   "operation": null,
-  "group_by": null
+  "group_by": null,
+  "group_by_fields": []
 }
 ```
 
+For bounded Boolean selection, `filters.predicate` is a typed tree: `{"all":[...]}`, `{"any":[...]}`, or one leaf `{"field":"vendor","operator":"eq","value":"VMware"}`. Allow-listed leaf fields are the filter fields without `_min/_max`; operators are `eq`, bounded `in`, `member_eq` for `roles`, and `gt|gte|lt|lte|between` for scores/timestamps. Nesting is at most 3 levels and at most 24 leaves. Never emit arbitrary fields/operators or raw query text.
+
 For `mode=search`, `operation` and `group_by` must be null. `sort` may be graph_key, ip, asset_name, model_confidence, mapping_confidence, unknown_score, last_detection_at, or enrichment_next_due_at. `direction` may be asc or desc.
 
-For `mode=aggregate`, `sort` and `direction` must be null. `operation` is count or group_count. `group_count` requires `group_by`: status, suggested_type, role, vendor, product, tag, sub_tag, or enrichment_status.
+For `mode=aggregate`, `sort` and `direction` must be null. `operation` is count or group_count. `group_count` uses one to three unique dimensions in `group_by_fields`; keep legacy `group_by` for a single dimension only. Dimensions are status, suggested_type, role, vendor, product, tag, sub_tag, or enrichment_status.
 
-Selectors are exact/range semantics only. Never emit Cypher, arbitrary property names, regex, contains/substring operators, OR expressions, traversal instructions, or invented filters. If the user's request cannot be represented by this allow-list, do not fabricate a structured query.
+Selectors are exact/range semantics only. Use the typed Boolean tree for supported AND/OR combinations and do not fall back merely because several supported filters appear. Never emit Cypher, arbitrary property names, regex, contains/substring operators, traversal instructions, invented thresholds/dates, or substituted properties. If material semantics are ambiguous or unsupported, choose `unclear` rather than dropping them.
+
+Same-turn antecedents belong to the current query: “Find X and group them by role” must not inherit a previous set. Use `structured_result_reference=set_query` only for actual prior-result language such as “which of them”, “those results”, or an explicit previous/base/latest set. Explicit current-turn semantics outrank active/UI state. Always include a valid `structured_query` for representable `asset_search` and `asset_aggregate` requests. Return JSON only.
 
 ### Latest structured result continuity
 
@@ -202,6 +208,9 @@ Examples that belong to structured routing when exactly representable by the all
 - “Show low-confidence VMware assets.” → `asset_search`, vendor + confidence range.
 - “How many Domain Controllers do we have?” → `asset_aggregate`, count + role filter.
 - “Count assets by status.” → `asset_aggregate`, group_count by status.
+- “List confirmed Linux Servers above 90% model confidence.” → flat role/status plus a strict score predicate or faithfully normalized strict bound.
+- “Find Linux Servers where vendor is VMware or Microsoft.” → role plus a bounded vendor `in`/`any` predicate.
+- “Find assets after the supplied timestamp and group them by role and status.” → current timestamp predicate plus two `group_by_fields`; `them` is same-turn.
 
 Properties are selectors, not entities. The returned Asset set is not a replacement for active entity state.
 

@@ -9,6 +9,9 @@ from src.core.memory.episodes import EntityVisit
 from src.core.memory.structured_query import StructuredQueryContext
 
 
+MAX_STRUCTURED_QUERY_LINEAGE = 3
+
+
 def _valid_ipv4(value: str | None) -> str | None:
     if not value:
         return None
@@ -42,6 +45,7 @@ class SessionRoutingState:
     last_capability_statuses: tuple[str, ...] = ()
     entity_timeline: tuple[EntityVisit, ...] = ()
     structured_query_context: StructuredQueryContext | None = None
+    structured_query_lineage: tuple[StructuredQueryContext, ...] = ()
 
     def __post_init__(self) -> None:
         active_entities = tuple(
@@ -67,6 +71,21 @@ class SessionRoutingState:
             self.structured_query_context, StructuredQueryContext
         ):
             raise ValueError("structured_query_context must be typed")
+        lineage = tuple(
+            item for item in self.structured_query_lineage
+            if isinstance(item, StructuredQueryContext)
+        )[-MAX_STRUCTURED_QUERY_LINEAGE:]
+        if len(lineage) != len(self.structured_query_lineage):
+            raise ValueError("structured_query_lineage must be typed")
+        current = self.structured_query_context
+        if current is not None and (
+            not lineage or lineage[-1].result_fingerprint != current.result_fingerprint
+        ):
+            lineage = (*lineage, current)[-MAX_STRUCTURED_QUERY_LINEAGE:]
+        if current is None and lineage:
+            current = lineage[-1]
+            object.__setattr__(self, "structured_query_context", current)
+        object.__setattr__(self, "structured_query_lineage", lineage)
 
     @property
     def active_entity_count(self) -> int:

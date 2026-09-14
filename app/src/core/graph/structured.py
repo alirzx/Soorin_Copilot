@@ -17,6 +17,10 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 
 MAX_AGGREGATE_GROUP_MEMBER_IPS = 20
+MAX_STRUCTURED_PREDICATE_DEPTH = 3
+MAX_STRUCTURED_PREDICATE_LEAVES = 24
+MAX_STRUCTURED_PREDICATE_VALUES = 20
+MAX_AGGREGATE_GROUP_FIELDS = 3
 
 
 class AssetSortField(str, Enum):
@@ -56,6 +60,189 @@ class StructuredQueryMode(str, Enum):
     AGGREGATE = "aggregate"
 
 
+class AssetPredicateField(str, Enum):
+    IP = "ip"
+    ASSET_NAME = "asset_name"
+    STATUS = "status"
+    SUGGESTED_TYPE = "suggested_type"
+    CLASSIFICATION_SUMMARY = "classification_summary"
+    VENDOR = "vendor"
+    PRODUCT = "product"
+    ROLE = "role"
+    ROLES = "roles"
+    TAG = "tag"
+    SUB_TAG = "sub_tag"
+    MODEL_CONFIDENCE = "model_confidence"
+    MAPPING_CONFIDENCE = "mapping_confidence"
+    UNKNOWN_SCORE = "unknown_score"
+    LAST_DETECTION_AT = "last_detection_at"
+    ENRICHMENT_STATUS = "enrichment_status"
+
+
+class AssetPredicateOperator(str, Enum):
+    EQ = "eq"
+    IN = "in"
+    MEMBER_EQ = "member_eq"
+    GT = "gt"
+    GTE = "gte"
+    LT = "lt"
+    LTE = "lte"
+    BETWEEN = "between"
+
+
+_PREDICATE_TEXT_FIELDS = frozenset({
+    AssetPredicateField.ASSET_NAME,
+    AssetPredicateField.STATUS,
+    AssetPredicateField.SUGGESTED_TYPE,
+    AssetPredicateField.CLASSIFICATION_SUMMARY,
+    AssetPredicateField.VENDOR,
+    AssetPredicateField.PRODUCT,
+    AssetPredicateField.ROLE,
+    AssetPredicateField.TAG,
+    AssetPredicateField.SUB_TAG,
+    AssetPredicateField.ENRICHMENT_STATUS,
+})
+_PREDICATE_SCORE_FIELDS = frozenset({
+    AssetPredicateField.MODEL_CONFIDENCE,
+    AssetPredicateField.MAPPING_CONFIDENCE,
+    AssetPredicateField.UNKNOWN_SCORE,
+})
+_PREDICATE_RANGE_OPERATORS = frozenset({
+    AssetPredicateOperator.GT,
+    AssetPredicateOperator.GTE,
+    AssetPredicateOperator.LT,
+    AssetPredicateOperator.LTE,
+    AssetPredicateOperator.BETWEEN,
+})
+
+
+class AssetPredicate(BaseModel):
+    """One bounded Boolean node or one allow-listed Asset-property predicate."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, populate_by_name=True)
+
+    field: AssetPredicateField | None = None
+    operator: AssetPredicateOperator | None = None
+    value: Any = None
+    values: tuple[Any, ...] = ()
+    all: tuple["AssetPredicate", ...] = ()
+    any: tuple["AssetPredicate", ...] = ()
+    not_: "AssetPredicate | None" = Field(default=None, alias="not")
+
+    @model_validator(mode="after")
+    def validate_node(self) -> "AssetPredicate":
+        boolean_kinds = sum(bool(item) for item in (self.all, self.any)) + int(
+            self.not_ is not None
+        )
+        leaf = self.field is not None or self.operator is not None
+        if boolean_kinds + int(leaf) != 1:
+            raise ValueError("predicate must be exactly one leaf, all, any, or not node")
+        if self.all or self.any:
+            children = self.all or self.any
+            if not 2 <= len(children) <= MAX_STRUCTURED_PREDICATE_LEAVES:
+                raise ValueError("Boolean predicate nodes require 2..24 children")
+            if self.value is not None or self.values:
+                raise ValueError("Boolean predicate nodes do not accept values")
+            return self
+        if self.not_ is not None:
+            if self.value is not None or self.values:
+                raise ValueError("not predicate nodes do not accept values")
+            if self.not_.all or self.not_.any or self.not_.not_ is not None:
+                raise ValueError("not is limited to one leaf predicate")
+            return self
+        if self.field is None or self.operator is None:
+            raise ValueError("predicate leaves require field and operator")
+        normalized_value, normalized_values = self._normalize_leaf_values()
+        object.__setattr__(self, "value", normalized_value)
+        object.__setattr__(self, "values", normalized_values)
+        return self
+
+    def _normalize_leaf_values(self) -> tuple[Any, tuple[Any, ...]]:
+        assert self.field is not None and self.operator is not None
+        if self.operator in {AssetPredicateOperator.IN, AssetPredicateOperator.BETWEEN}:
+            if self.value is not None:
+                raise ValueError("in/between predicates use values")
+            required = 2 if self.operator is AssetPredicateOperator.BETWEEN else None
+            if required is not None and len(self.values) != required:
+                raise ValueError("between requires exactly two values")
+            if self.operator is AssetPredicateOperator.IN and not (
+                1 <= len(self.values) <= MAX_STRUCTURED_PREDICATE_VALUES
+            ):
+                raise ValueError("in requires 1..20 values")
+            values = tuple(self._normalize_scalar(item) for item in self.values)
+            if self.operator is AssetPredicateOperator.BETWEEN and values[0] > values[1]:
+                raise ValueError("between lower bound cannot exceed upper bound")
+            return None, tuple(dict.fromkeys(values))
+        if self.values:
+            raise ValueError("this predicate operator does not accept values")
+        if self.value is None:
+            raise ValueError("predicate value is required")
+        return self._normalize_scalar(self.value), ()
+
+    def _normalize_scalar(self, value: Any) -> Any:
+        assert self.field is not None and self.operator is not None
+        if self.field is AssetPredicateField.ROLES:
+            if self.operator not in {AssetPredicateOperator.MEMBER_EQ, AssetPredicateOperator.IN}:
+                raise ValueError("roles supports member_eq or in membership only")
+            return self._normalized_text(value)
+        if self.operator is AssetPredicateOperator.MEMBER_EQ:
+            raise ValueError("member_eq is reserved for roles")
+        if self.field is AssetPredicateField.IP:
+            if self.operator not in {AssetPredicateOperator.EQ, AssetPredicateOperator.IN}:
+                raise ValueError("ip supports eq or in only")
+            try:
+                return str(ipaddress.ip_address(str(value).strip()))
+            except ValueError as exc:
+                raise ValueError("predicate IP is invalid") from exc
+        if self.field in _PREDICATE_TEXT_FIELDS:
+            if self.operator not in {AssetPredicateOperator.EQ, AssetPredicateOperator.IN}:
+                raise ValueError("text predicates support eq or in only")
+            return self._normalized_text(value)
+        if self.field in _PREDICATE_SCORE_FIELDS:
+            if self.operator not in _PREDICATE_RANGE_OPERATORS | {AssetPredicateOperator.EQ}:
+                raise ValueError("score predicate operator is invalid")
+            if isinstance(value, bool):
+                raise ValueError("score predicate must be numeric")
+            try:
+                score = float(value)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("score predicate must be numeric") from exc
+            if not 0.0 <= score <= 1.0:
+                raise ValueError("score predicate must be between zero and one")
+            return score
+        if self.field is AssetPredicateField.LAST_DETECTION_AT:
+            if self.operator not in _PREDICATE_RANGE_OPERATORS | {AssetPredicateOperator.EQ}:
+                raise ValueError("timestamp predicate operator is invalid")
+            try:
+                parsed = value if isinstance(value, datetime) else datetime.fromisoformat(
+                    str(value).replace("Z", "+00:00")
+                )
+            except (TypeError, ValueError) as exc:
+                raise ValueError("timestamp predicate must be ISO-8601") from exc
+            if parsed.tzinfo is None or parsed.utcoffset() is None:
+                raise ValueError("timestamp predicate must include a timezone")
+            return parsed.astimezone(timezone.utc).isoformat()
+        raise ValueError("predicate field is unsupported")
+
+    @staticmethod
+    def _normalized_text(value: Any) -> str:
+        text = str(value).strip()
+        if not text or len(text) > 1024:
+            raise ValueError("predicate text is blank or oversized")
+        return text
+
+    def shape(self) -> tuple[int, int]:
+        """Return (depth, leaf count) for the validated bounded tree."""
+        children = self.all or self.any
+        if children:
+            shapes = tuple(child.shape() for child in children)
+            return 1 + max(item[0] for item in shapes), sum(item[1] for item in shapes)
+        if self.not_ is not None:
+            depth, leaves = self.not_.shape()
+            return depth + 1, leaves
+        return 1, 1
+
+
 class AssetSearchFilters(BaseModel):
     """Allow-listed AND selectors over authoritative Asset properties."""
 
@@ -81,6 +268,7 @@ class AssetSearchFilters(BaseModel):
     last_detection_at_from: datetime | None = None
     last_detection_at_to: datetime | None = None
     enrichment_status: str | None = Field(default=None, max_length=64)
+    predicate: AssetPredicate | None = None
 
     @field_validator(
         "asset_name",
@@ -135,6 +323,12 @@ class AssetSearchFilters(BaseModel):
             upper = getattr(self, upper_name)
             if lower is not None and upper is not None and lower > upper:
                 raise ValueError(f"{lower_name} cannot exceed {upper_name}")
+        if self.predicate is not None:
+            depth, leaves = self.predicate.shape()
+            if depth > MAX_STRUCTURED_PREDICATE_DEPTH:
+                raise ValueError("structured predicate nesting is too deep")
+            if leaves > MAX_STRUCTURED_PREDICATE_LEAVES:
+                raise ValueError("structured predicate has too many leaves")
         return self
 
     def query_values(self) -> dict[str, Any]:
@@ -230,15 +424,27 @@ class AssetAggregateRequest(BaseModel):
     filters: AssetSearchFilters = Field(default_factory=AssetSearchFilters)
     operation: AssetAggregateOperation = AssetAggregateOperation.COUNT
     group_by: AssetGroupField | None = None
+    group_by_fields: tuple[AssetGroupField, ...] = ()
     limit: int | None = Field(default=None, ge=1)
 
     @model_validator(mode="after")
     def validate_grouping(self) -> "AssetAggregateRequest":
-        if self.operation is AssetAggregateOperation.GROUP_COUNT and self.group_by is None:
+        fields = self.group_fields
+        if self.operation is AssetAggregateOperation.GROUP_COUNT and not fields:
             raise ValueError("group_count requires group_by")
-        if self.operation is AssetAggregateOperation.COUNT and self.group_by is not None:
+        if self.operation is AssetAggregateOperation.COUNT and fields:
             raise ValueError("count does not accept group_by")
+        if len(fields) > MAX_AGGREGATE_GROUP_FIELDS:
+            raise ValueError("group_count supports at most three dimensions")
+        if len(set(fields)) != len(fields):
+            raise ValueError("aggregate grouping dimensions must be unique")
+        if self.group_by is not None and self.group_by_fields and self.group_by != self.group_by_fields[0]:
+            raise ValueError("group_by must match the first group_by_fields dimension")
         return self
+
+    @property
+    def group_fields(self) -> tuple[AssetGroupField, ...]:
+        return self.group_by_fields or ((self.group_by,) if self.group_by is not None else ())
 
 
 class AssetAggregateCapabilityInput(BaseModel):
@@ -249,6 +455,7 @@ class AssetAggregateCapabilityInput(BaseModel):
     filters: AssetSearchFilters = Field(default_factory=AssetSearchFilters)
     operation: AssetAggregateOperation = AssetAggregateOperation.COUNT
     group_by: AssetGroupField | None = None
+    group_by_fields: tuple[AssetGroupField, ...] = ()
     limit: int | None = Field(default=None, ge=1)
 
     @model_validator(mode="after")
@@ -261,6 +468,7 @@ class AssetAggregateCapabilityInput(BaseModel):
             filters=self.filters,
             operation=self.operation,
             group_by=self.group_by,
+            group_by_fields=self.group_by_fields,
             limit=self.limit,
         )
 
@@ -268,7 +476,8 @@ class AssetAggregateCapabilityInput(BaseModel):
 class AssetAggregateGroup(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    value: str | None
+    value: str | None = None
+    group_values: dict[str, str | None] = Field(default_factory=dict)
     count: int = Field(ge=0)
     member_ips: tuple[str, ...] = ()
     member_ips_truncated: bool = False
@@ -287,6 +496,33 @@ class AssetAggregateGroup(BaseModel):
                 raise ValueError("aggregate group member IP is invalid") from exc
         return tuple(normalized)
 
+    @field_validator("group_values", mode="before")
+    @classmethod
+    def normalize_group_values(cls, value: Any) -> dict[str, str | None]:
+        if value is None:
+            return {}
+        if not isinstance(value, dict) or not 1 <= len(value) <= MAX_AGGREGATE_GROUP_FIELDS:
+            raise ValueError("aggregate group_values must contain 1..3 dimensions")
+        allowed = {item.value for item in AssetGroupField}
+        normalized: dict[str, str | None] = {}
+        for key, raw in value.items():
+            if key not in allowed or key in normalized:
+                raise ValueError("aggregate group_values contains an invalid dimension")
+            normalized[key] = None if raw is None else str(raw)[:1024]
+        return normalized
+
+    @model_validator(mode="after")
+    def validate_legacy_value(self) -> "AssetAggregateGroup":
+        if len(self.group_values) == 1:
+            only = next(iter(self.group_values.values()))
+            if self.value is not None and self.value != only:
+                raise ValueError("aggregate legacy value disagrees with group_values")
+            if self.value is None:
+                object.__setattr__(self, "value", only)
+        elif len(self.group_values) > 1 and self.value is not None:
+            raise ValueError("multi-dimensional aggregate groups do not expose legacy value")
+        return self
+
 
 class AssetAggregateResult(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
@@ -296,10 +532,15 @@ class AssetAggregateResult(BaseModel):
     operation: AssetAggregateOperation
     count: int
     group_by: AssetGroupField | None = None
+    group_by_fields: tuple[AssetGroupField, ...] = ()
     groups: tuple[AssetAggregateGroup, ...] = ()
     truncated: bool = False
     retrieved_at: str
     limitations: tuple[str, ...] = ()
+
+    @property
+    def group_fields(self) -> tuple[AssetGroupField, ...]:
+        return self.group_by_fields or ((self.group_by,) if self.group_by is not None else ())
 
 
 class StructuredQuerySpec(BaseModel):
@@ -319,21 +560,30 @@ class StructuredQuerySpec(BaseModel):
     limit: int | None = Field(default=None, ge=1)
     operation: AssetAggregateOperation | None = None
     group_by: AssetGroupField | None = None
+    group_by_fields: tuple[AssetGroupField, ...] = ()
 
     @model_validator(mode="after")
     def validate_mode_contract(self) -> "StructuredQuerySpec":
         if self.mode is StructuredQueryMode.SEARCH:
-            if self.operation is not None or self.group_by is not None:
+            if self.operation is not None or self.group_by is not None or self.group_by_fields:
                 raise ValueError("search structured queries do not accept aggregate fields")
             return self
         if self.sort is not None or self.direction is not None:
             raise ValueError("aggregate structured queries do not accept sort or direction")
         if self.operation is None:
             raise ValueError("aggregate structured queries require operation")
-        if self.operation is AssetAggregateOperation.GROUP_COUNT and self.group_by is None:
+        fields = self.group_by_fields or ((self.group_by,) if self.group_by is not None else ())
+        if self.operation is AssetAggregateOperation.GROUP_COUNT and not fields:
             raise ValueError("group_count requires group_by")
-        if self.operation is AssetAggregateOperation.COUNT and self.group_by is not None:
+        if self.operation is AssetAggregateOperation.COUNT and fields:
             raise ValueError("count does not accept group_by")
+        AssetAggregateRequest(
+            filters=self.filters,
+            operation=self.operation,
+            group_by=self.group_by,
+            group_by_fields=self.group_by_fields,
+            limit=self.limit,
+        )
         return self
 
     def to_search_request(self) -> AssetSearchRequest:
@@ -353,6 +603,7 @@ class StructuredQuerySpec(BaseModel):
             filters=self.filters,
             operation=self.operation,
             group_by=self.group_by,
+            group_by_fields=self.group_by_fields,
             limit=self.limit,
         )
 
@@ -378,9 +629,13 @@ def structured_query_identity(
             direction=str(serialized.get("direction") or "asc"),
         )
     elif mode == "aggregate":
+        group_fields = list(serialized.get("group_by_fields") or ())
+        if not group_fields and serialized.get("group_by") is not None:
+            group_fields = [serialized["group_by"]]
         payload.update(
             operation=str(serialized.get("operation") or "count"),
-            group_by=serialized.get("group_by"),
+            group_by=(group_fields[0] if len(group_fields) == 1 else None),
+            group_by_fields=group_fields,
         )
     canonical = json.dumps(
         {"active_graph_version": active_graph_version, "query": payload},
@@ -389,3 +644,6 @@ def structured_query_identity(
         sort_keys=True,
     ).encode("utf-8")
     return "structured-asset-set:v1:" + hashlib.sha256(canonical).hexdigest()
+
+
+AssetPredicate.model_rebuild()

@@ -54,6 +54,7 @@ def structured_evidence_from_context(
             "filters": filters,
             "operation": str(context.get("operation") or "count"),
             "group_by": context.get("group_by"),
+            "group_by_fields": list(context.get("group_by_fields") or ()),
         }
         total = int(context.get("count") or 0)
         groups = tuple(
@@ -68,6 +69,7 @@ def structured_evidence_from_context(
             active_graph_version=active_graph_version,
             operation=query["operation"],
             group_by=_optional_string(query.get("group_by")),
+            group_by_fields=tuple(str(item) for item in query["group_by_fields"]),
             count=total,
             groups=groups,
             truncated=bool(context.get("truncated", False)),

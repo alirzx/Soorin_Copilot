@@ -123,6 +123,7 @@ class StructuredAssetAggregateEvidence:
     groups: tuple[dict[str, Any], ...]
     truncated: bool
     retrieved_at: str
+    group_by_fields: tuple[str, ...] = ()
     limitations: tuple[str, ...] = ()
     mode: Literal["aggregate"] = "aggregate"
     provenance: str = "neo4j_active_organizational_projection"
@@ -462,6 +463,8 @@ class InvestigationState(TypedDict, total=False):
     task: TaskSpec
     execution_plan: ExecutionPlan
     tool_results: list[ToolResult]
+    baseline_results: list[ToolResult]
+    require_baseline_for_operational_mutation: bool
     asset_specialist_result: AssetInvestigationResult
     graph_specialist_result: GraphAnalysisResult
     specialist_tool_results: list[ToolResult]

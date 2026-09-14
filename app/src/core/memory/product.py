@@ -3,11 +3,21 @@
 from __future__ import annotations
 
 import logging
+import base64
+import binascii
+import hashlib
+import json
 from dataclasses import replace
 from typing import Any
 
 from src.core.identity import RequestIdentity
-from src.core.memory.long_term import LongTermMemoryRecord, MemoryLifecycleAuditEvent, MemoryLifecycleResult, PromotionDecision
+from src.core.memory.long_term import (
+    LongTermMemoryRecord,
+    MemoryLifecycleAuditEvent,
+    MemoryLifecycleResult,
+    PromotionDecision,
+    logical_memory_key_for,
+)
 from src.core.memory.persistence import (
     THREAD_STATE_SCHEMA_VERSION,
     LocalPersistenceConflictError,
@@ -25,6 +35,9 @@ PRODUCT_THREAD_STATE_SCHEMA_VERSION = 3
 
 
 logger = logging.getLogger(__name__)
+
+_BACKEND_TYPED_EVIDENCE_REF_TYPES = frozenset({"chat", "asset"})
+_TYPED_EVIDENCE_REF_PREFIX = "product_ref:"
 
 
 class ProductMemoryContractError(RuntimeError):
@@ -65,14 +78,67 @@ def _refs_from_wire(refs: Any) -> tuple[str, ...]:
         if isinstance(ref, dict):
             ref_type = ref.get("type", ref.get("referenceType", ref.get("refType")))
             ref_id = ref.get("id", ref.get("referenceId", ref.get("refId")))
-            if ref_type not in {"canonical_ref", "canonical"} or not isinstance(ref_id, str):
-                raise ProductMemoryContractError("Product memory evidence reference is not lossless.")
-            values.append(ref_id)
+            if not isinstance(ref_type, str) or not isinstance(ref_id, str) or not ref_id.strip():
+                raise ProductMemoryContractError(
+                    "Product memory evidence reference was invalid.",
+                    reason_code="evidence_ref_shape_invalid",
+                )
+            if ref_type in {"canonical_ref", "canonical"}:
+                values.append(ref_id)
+            elif ref_type in _BACKEND_TYPED_EVIDENCE_REF_TYPES:
+                encoded = base64.urlsafe_b64encode(ref_id.encode("utf-8")).decode("ascii").rstrip("=")
+                value = f"{_TYPED_EVIDENCE_REF_PREFIX}{ref_type}:{encoded}"
+                if len(value) > 128:
+                    raise ProductMemoryContractError(
+                        "Product memory evidence reference was oversized.",
+                        reason_code="evidence_ref_oversized",
+                    )
+                values.append(value)
+            else:
+                raise ProductMemoryContractError(
+                    "Product memory evidence reference type was unsupported.",
+                    reason_code="evidence_ref_type_unsupported",
+                )
         elif isinstance(ref, str):
             values.append(ref)
         else:
             raise ProductMemoryContractError("Product memory evidence reference was invalid.")
     return tuple(values)
+
+
+def _ref_to_wire(ref: str) -> dict[str, str]:
+    if not ref.startswith(_TYPED_EVIDENCE_REF_PREFIX):
+        return {"type": "canonical_ref", "id": ref}
+    try:
+        _prefix, ref_type, encoded = ref.split(":", 2)
+        if ref_type not in _BACKEND_TYPED_EVIDENCE_REF_TYPES:
+            raise ValueError("unsupported evidence reference type")
+        padding = "=" * (-len(encoded) % 4)
+        ref_id = base64.urlsafe_b64decode(encoded + padding).decode("utf-8")
+    except (ValueError, UnicodeDecodeError, binascii.Error) as exc:
+        raise ProductMemoryContractError(
+            "Product memory evidence reference codec was invalid.",
+            reason_code="evidence_ref_codec_invalid",
+        ) from exc
+    if not ref_id:
+        raise ProductMemoryContractError(
+            "Product memory evidence reference codec was invalid.",
+            reason_code="evidence_ref_codec_invalid",
+        )
+    return {"type": ref_type, "id": ref_id}
+
+
+def _fingerprint_for_refs(item: dict[str, Any], refs: tuple[str, ...]) -> str:
+    payload = {
+        "user_id": item["userId"],
+        "memory_type": item["memoryType"],
+        "entity_ids": sorted(tuple(item.get("entityIds") or ())),
+        "statement": str(item["statement"]).strip(),
+        "evidence_refs": sorted(refs),
+    }
+    return hashlib.sha256(
+        json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
 
 
 _MEMORY_WIRE_ALIASES = {
@@ -122,20 +188,78 @@ def _memory_from_wire(value: Any) -> LongTermMemoryRecord:
             reason_code=f"missing_fields:{','.join(missing)}",
         )
     try:
+        refs = _refs_from_wire(item["evidenceRefs"])
+        supplied_fingerprint = str(item["idempotencyFingerprint"] or "").strip().lower()
+        fingerprint = supplied_fingerprint
+        supplied_logical_key = str(item["logicalMemoryKey"] or "").strip().lower()
+        logical_key = supplied_logical_key
+        expected = _fingerprint_for_refs(item, refs)
+        expected_logical_key = logical_memory_key_for(
+            user_id=item["userId"],
+            entity_ids=tuple(item.get("entityIds") or ()),
+            memory_type=item["memoryType"],
+            statement=str(item["statement"]).strip(),
+            evidence_refs=refs,
+        )
+        if supplied_fingerprint and supplied_fingerprint != expected:
+            legacy_refs = tuple(
+                str(ref.get("id", ref.get("referenceId", ref.get("refId"))))
+                if isinstance(ref, dict) else str(ref)
+                for ref in item["evidenceRefs"]
+            )
+            if supplied_fingerprint == _fingerprint_for_refs(item, legacy_refs):
+                fingerprint = ""
+                logger.info(
+                    "event=product_ltm_legacy_ref_fingerprint_accepted memory_id_present=true "
+                    "migration_needed=true payload_logged=false"
+                )
+                legacy_logical_key = logical_memory_key_for(
+                    user_id=item["userId"],
+                    entity_ids=tuple(item.get("entityIds") or ()),
+                    memory_type=item["memoryType"],
+                    statement=str(item["statement"]).strip(),
+                    evidence_refs=legacy_refs,
+                )
+                if supplied_logical_key == legacy_logical_key:
+                    logical_key = ""
+        elif supplied_logical_key and supplied_logical_key != expected_logical_key:
+            legacy_refs = tuple(
+                str(ref.get("id", ref.get("referenceId", ref.get("refId"))))
+                if isinstance(ref, dict) else str(ref)
+                for ref in item["evidenceRefs"]
+            )
+            if supplied_logical_key == logical_memory_key_for(
+                user_id=item["userId"],
+                entity_ids=tuple(item.get("entityIds") or ()),
+                memory_type=item["memoryType"],
+                statement=str(item["statement"]).strip(),
+                evidence_refs=legacy_refs,
+            ):
+                logical_key = ""
         return LongTermMemoryRecord(
             memory_id=item["memoryId"], memory_type=item["memoryType"], user_id=item["userId"],
             entity_ids=tuple(item.get("entityIds") or ()), statement=item["statement"], epistemic_status=item["epistemicStatus"],
             confidence=item["confidence"], source_request_id=item["sourceRequestId"], source_conversation_id=item["sourceConversationId"],
-            evidence_refs=_refs_from_wire(item["evidenceRefs"]), provenance_category=item.get("provenanceCategory", "investigation"),
+            evidence_refs=refs, provenance_category=item.get("provenanceCategory", "investigation"),
             valid_from=item["validFrom"], valid_until=item.get("validUntil"), created_at=item.get("createdAt", ""), updated_at=item.get("updatedAt", ""),
             revision=int(item["revision"]), status=item["status"], index_status=item["indexStatus"], supersedes_memory_id=item.get("supersedesMemoryId"),
-            idempotency_fingerprint=item["idempotencyFingerprint"], logical_memory_key=item["logicalMemoryKey"],
+            idempotency_fingerprint=fingerprint, logical_memory_key=logical_key,
             has_unresolved_conflict=bool(item.get("hasUnresolvedConflict", False)), policy_version=item.get("policyVersion", "ltm-promotion-v1"),
         )
+    except ProductMemoryContractError:
+        raise
     except (TypeError, ValueError) as exc:
+        message = str(exc)
+        reason = (
+            "idempotency_fingerprint_mismatch" if "idempotency fingerprint" in message
+            else "logical_memory_key_mismatch" if "logical key" in message
+            else "invalid_revision" if "revision" in message
+            else "invalid_status" if "status" in message
+            else "invalid_field_type_or_value"
+        )
         raise ProductMemoryContractError(
             "Product memory canonical response was invalid.",
-            reason_code="invalid_field_type_or_value",
+            reason_code=reason,
         ) from exc
 
 
@@ -212,7 +336,7 @@ class ProductLongTermMemoryStore:
         return _memory_from_wire({**item, "userId": domain_user_id})
 
     @staticmethod
-    def _refs(refs: tuple[str, ...]) -> list[dict[str, str]]: return [{"type": "canonical_ref", "id": ref} for ref in refs]
+    def _refs(refs: tuple[str, ...]) -> list[dict[str, str]]: return [_ref_to_wire(ref) for ref in refs]
     @classmethod
     def _wire(cls, memory: LongTermMemoryRecord) -> dict[str, Any]:
         return {"memoryType": memory.memory_type, "statement": memory.statement, "epistemicStatus": memory.epistemic_status, "confidence": memory.confidence, "sourceRequestId": memory.source_request_id, "sourceConversationId": memory.source_conversation_id, "evidenceRefs": cls._refs(memory.evidence_refs), "provenanceCategory": memory.provenance_category, "validFrom": memory.valid_from, "validUntil": memory.valid_until, "entityIds": list(memory.entity_ids), "idempotencyFingerprint": memory.idempotency_fingerprint, "logicalMemoryKey": memory.logical_memory_key, "policyVersion": memory.policy_version}

@@ -221,6 +221,7 @@ class LongTermMemoryRetriever:
         exact_started = time.perf_counter()
         exact: tuple[LongTermMemoryRecord, ...] = ()
         exact_error: str | None = None
+        exact_limitations: tuple[str, ...] = ()
         if entity_ids:
             try:
                 exact = self.store.list(
@@ -231,6 +232,11 @@ class LongTermMemoryRetriever:
                     request_id=request_id,
                     purpose="exact_active_retrieval",
                 )
+                consume_limitations = getattr(self.store, "consume_read_limitations", None)
+                if consume_limitations is not None:
+                    exact_limitations = tuple(
+                        consume_limitations(request_id, "exact_active_retrieval") or ()
+                    )
                 logger.info(
                     "event=memory_exact_search_completed request_id=%s status=ok candidate_count=%s",
                     request_id,
@@ -255,6 +261,7 @@ class LongTermMemoryRetriever:
         candidates: dict[str, RetrievedLongTermMemory] = {}
         rejected_reasons: list[str] = []
         limitations: list[str] = []
+        limitations.extend(exact_limitations)
         if exact_error:
             limitations.append("exact_memory_unavailable")
         for memory in exact:

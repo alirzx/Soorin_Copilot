@@ -147,7 +147,9 @@ def test_registry_and_planner_catalog_expose_only_safe_zero_entity_contracts() -
 
     expected_arguments = {
         "graph.search_assets": ["filters", "sort", "direction", "limit"],
-        "graph.aggregate_assets": ["filters", "operation", "group_by", "limit"],
+        "graph.aggregate_assets": [
+            "filters", "operation", "group_by", "group_by_fields", "limit"
+        ],
     }
     for name, allowed in expected_arguments.items():
         spec = registry.get(name)

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import threading
 from typing import Any
 
 from src.core.identity import normalize_identifier
@@ -13,6 +14,7 @@ from src.core.memory.product import (
     _normalize_memory_wire,
     _object,
 )
+from src.core.observability.metrics import get_metrics
 
 
 logger = logging.getLogger(__name__)
@@ -44,6 +46,37 @@ def _log_contract_failure(
 
 class ProductLongTermMemoryStore(BaseProductLongTermMemoryStore):
     """Keep strict canonical validation while accepting bounded search summaries."""
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._limitation_lock = threading.Lock()
+        self._read_limitations: dict[tuple[str, str], tuple[str, ...]] = {}
+
+    def _remember_read_limitations(
+        self,
+        request_id: str,
+        purpose: str,
+        limitations: list[str],
+    ) -> None:
+        if not request_id or not limitations:
+            return
+        with self._limitation_lock:
+            self._read_limitations[(request_id, purpose)] = tuple(dict.fromkeys(limitations))
+
+    def consume_read_limitations(
+        self,
+        request_id: str,
+        purpose: str | None = None,
+    ) -> tuple[str, ...]:
+        with self._limitation_lock:
+            keys = tuple(
+                key for key in self._read_limitations
+                if key[0] == request_id and (purpose is None or key[1] == purpose)
+            )
+            values = tuple(
+                item for key in keys for item in self._read_limitations.pop(key, ())
+            )
+        return tuple(dict.fromkeys(values))
 
     def list(
         self,
@@ -94,6 +127,8 @@ class ProductLongTermMemoryStore(BaseProductLongTermMemoryStore):
             )
 
         hydrated = []
+        limitations: list[str] = []
+        skipped_count = 0
         for record in records:
             try:
                 summary = _normalize_memory_wire(record)
@@ -104,16 +139,23 @@ class ProductLongTermMemoryStore(BaseProductLongTermMemoryStore):
                     phase="search_summary",
                     reason=exc.reason_code,
                 )
-                raise
+                limitations.append("malformed_product_memory_skipped")
+                skipped_count += 1
+                get_metrics().observe_memory_canonical_record("malformed_skipped")
+                continue
             summary_owner = summary.get("userId")
             if summary_owner is not None and summary_owner != owner:
+                get_metrics().observe_memory_canonical_record("security_rejected")
                 raise LocalPersistenceOwnershipError(
                     "Product long-term memory owner did not match the transport owner."
                 )
             try:
                 hydrated.append(self._domain_record(record, domain_user_id=user_id))
                 continue
-            except (ProductMemoryContractError, LocalPersistenceOwnershipError):
+            except LocalPersistenceOwnershipError:
+                get_metrics().observe_memory_canonical_record("security_rejected")
+                raise
+            except ProductMemoryContractError:
                 if summary_owner is not None and summary_owner != owner:
                     raise
                 memory_id = summary.get("memoryId")
@@ -124,11 +166,10 @@ class ProductLongTermMemoryStore(BaseProductLongTermMemoryStore):
                         phase="search_summary",
                         reason="missing_fields:memoryId",
                     )
-                    raise ProductMemoryContractError(
-                        "Product memory search summary omitted memoryId.",
-                        reason_code="missing_fields:memoryId",
-                        phase="search_summary",
-                    )
+                    limitations.append("malformed_product_memory_skipped")
+                    skipped_count += 1
+                    get_metrics().observe_memory_canonical_record("malformed_skipped")
+                    continue
             try:
                 hydrated.append(
                     self._hydrate(
@@ -146,11 +187,22 @@ class ProductLongTermMemoryStore(BaseProductLongTermMemoryStore):
                     reason=exc.reason_code,
                     memory_id=memory_id,
                 )
-                raise
+                limitations.append("malformed_product_memory_skipped")
+                skipped_count += 1
+                get_metrics().observe_memory_canonical_record("malformed_skipped")
+                continue
+        self._remember_read_limitations(request_id, purpose, limitations)
+        for _record in hydrated:
+            get_metrics().observe_memory_canonical_record("valid")
         logger.info(
-            "event=product_ltm_read_completed request_id=%s operation=search purpose=%s status=ok record_count=%s canonical_hydration=true",
+            "event=product_ltm_read_completed request_id=%s operation=search purpose=%s "
+            "status=ok record_count=%s valid_record_count=%s skipped_record_count=%s "
+            "canonical_hydration=true limitation_count=%s",
             request_id,
             purpose or "inventory",
+            len(records),
             len(hydrated),
+            skipped_count,
+            len(set(limitations)),
         )
         return tuple(hydrated)

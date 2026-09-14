@@ -606,9 +606,8 @@ class MemoryStore:
                 or bool(current_entities.intersection(item.context_key.entities))
             ]
 
-        # Keep exactly one newest complete turn verbatim. Older turns use the
-        # same bounded durable digest shape, preventing transcript/digest
-        # duplication and keeping broad recall useful without becoming a dump.
+        # The setting is an exact raw-message target, not a completed-turn count.
+        # Non-target messages remain eligible through bounded digests.
         deduplicated: dict[str, RelevantTurn] = {}
         for item in candidates:
             key = item.request_id or hashlib.sha256(
@@ -618,27 +617,35 @@ class MemoryStore:
             if existing is None or item.created_at >= existing.created_at:
                 deduplicated[key] = item
         candidates = list(deduplicated.values())
-        latest_key = max(
-            candidates,
-            key=lambda item: item.created_at,
-            default=None,
+        raw_message_target = max(
+            0,
+            int(getattr(settings, "conversation_recent_raw_messages", 0)),
         )
+        ordered_candidates = sorted(candidates, key=lambda item: item.created_at)
+        raw_eligible: list[tuple[str, str]] = []
+        for item in ordered_candidates:
+            if item.source_representation != "raw":
+                continue
+            raw_eligible.extend(((item.request_id, "user"), (item.request_id, "assistant")))
+        raw_targets = set(raw_eligible[-raw_message_target:]) if raw_message_target else set()
         layered_candidates: list[RelevantTurn] = []
         for item in candidates:
-            keep_raw = item is latest_key and item.source_representation == "raw"
-            user_content = item.user_content if keep_raw else compact_preview(item.user_content, limit=360)
-            assistant_content = (
-                item.assistant_content
-                if keep_raw
-                else compact_preview(item.assistant_content, limit=560)
+            user_raw = (item.request_id, "user") in raw_targets
+            assistant_raw = (item.request_id, "assistant") in raw_targets
+            user_content = item.user_content if user_raw else compact_preview(item.user_content, limit=360)
+            assistant_content = item.assistant_content if assistant_raw else compact_preview(
+                item.assistant_content, limit=560
             )
+            representation = "raw" if user_raw and assistant_raw else "digest" if not user_raw and not assistant_raw else "mixed"
             layered_candidates.append(
                 replace(
                     item,
                     user_content=user_content,
                     assistant_content=assistant_content,
                     estimated_tokens=approx_tokens(user_content) + approx_tokens(assistant_content),
-                    source_representation="raw" if keep_raw else "digest",
+                    source_representation=representation,
+                    user_source_representation="raw" if user_raw else "digest",
+                    assistant_source_representation="raw" if assistant_raw else "digest",
                 )
             )
         candidates = layered_candidates
@@ -652,9 +659,28 @@ class MemoryStore:
         ranked = sorted(candidates, key=priority, reverse=True)
         selected: list[RelevantTurn] = []
         used_turn_tokens = 0
+        downgraded_raw_messages = 0
         for candidate in ranked:
             if len(selected) >= max_turns:
                 break
+            if used_turn_tokens + candidate.estimated_tokens > turn_budget:
+                downgraded_raw_messages += sum(
+                    source == "raw" for source in (
+                        candidate.user_source_representation,
+                        candidate.assistant_source_representation,
+                    )
+                )
+                user_digest = compact_preview(candidate.user_content, limit=180)
+                assistant_digest = compact_preview(candidate.assistant_content, limit=260)
+                candidate = replace(
+                    candidate,
+                    user_content=user_digest,
+                    assistant_content=assistant_digest,
+                    estimated_tokens=approx_tokens(user_digest) + approx_tokens(assistant_digest),
+                    source_representation="digest",
+                    user_source_representation="digest",
+                    assistant_source_representation="digest",
+                )
             if used_turn_tokens + candidate.estimated_tokens > turn_budget:
                 continue
             reason = (
@@ -809,10 +835,31 @@ class MemoryStore:
         )
         latency_ms = int((datetime.now(timezone.utc) - started).total_seconds() * 1000)
         logger.info(
-            "event=recent_turns_selected request_id=%s candidate_count=%s selected_count=%s estimated_tokens=%s latency_ms=%s",
+            "event=recent_turns_selected request_id=%s candidate_count=%s selected_count=%s "
+            "configured_raw_message_target=%s raw_messages_selected=%s "
+            "raw_messages_downgraded=%s digest_messages_selected=%s "
+            "estimated_tokens=%s latency_ms=%s",
             request_id,
             len(candidates),
             len(selected),
+            raw_message_target,
+            sum(
+                source == "raw"
+                for item in selected
+                for source in (
+                    item.user_source_representation,
+                    item.assistant_source_representation,
+                )
+            ),
+            downgraded_raw_messages,
+            sum(
+                source == "digest"
+                for item in selected
+                for source in (
+                    item.user_source_representation,
+                    item.assistant_source_representation,
+                )
+            ),
             used_turn_tokens,
             latency_ms,
         )
@@ -820,8 +867,16 @@ class MemoryStore:
             "event=memory_context_composed request_id=%s selected_turns=%s raw_turn_count=%s digest_turn_count=%s summary_tokens=%s working_fact_count=%s episode_count=%s long_term_count=%s thread_recall=%s thread_recall_complete=%s memory_context_truncated=%s estimated_tokens=%s omitted_count=%s",
             request_id,
             len(selected),
-            sum(item.source_representation == "raw" for item in selected),
-            sum(item.source_representation == "digest" for item in selected),
+            sum(
+                source == "raw"
+                for item in selected
+                for source in (item.user_source_representation, item.assistant_source_representation)
+            ),
+            sum(
+                source == "digest"
+                for item in selected
+                for source in (item.user_source_representation, item.assistant_source_representation)
+            ),
             summary_tokens,
             len(package.working_facts),
             len(selected_episodes),
@@ -1172,12 +1227,11 @@ class MemoryStore:
         if tokens <= settings.conversation_summary_trigger_tokens and not retention_pressure:
             return False
 
-        # This setting is a message count. Round it up to complete user/assistant pairs.
-        recent_count = max(2, int(settings.conversation_recent_raw_messages))
-        if recent_count % 2:
-            recent_count += 1
-        older = history[:-recent_count]
-        recent = history[-recent_count:]
+        # This setting is exactly a raw-message count. Pair continuity that no
+        # longer fits remains available through durable bounded turn digests.
+        recent_count = max(0, int(settings.conversation_recent_raw_messages))
+        older = history[:-recent_count] if recent_count else history
+        recent = history[-recent_count:] if recent_count else []
         existing = self._summaries.get(session_id)
         source_messages = older or history
         if not older and existing and int(existing.get("summary_source_message_count", 0)) >= len(history):

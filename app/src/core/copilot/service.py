@@ -265,6 +265,14 @@ class CopilotService:
                     request_id=identity.request_id,
                     purpose="active_inventory",
                 )
+                consume_limitations = getattr(
+                    self.long_term_memory_store,
+                    "consume_read_limitations",
+                    None,
+                )
+                inventory_limitations = tuple(
+                    consume_limitations(identity.request_id) or ()
+                ) if consume_limitations is not None else ()
             except Exception as exc:
                 error_category = (
                     "product_memory_contract"
@@ -315,6 +323,10 @@ class CopilotService:
                 active_record_count=len(active),
                 selected_count=len(selection.memories),
                 inventory_available=True,
+                limitations=tuple(dict.fromkeys((
+                    *selection.limitations,
+                    *inventory_limitations,
+                ))),
             )
         except Exception as exc:
             logger.warning(

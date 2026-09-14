@@ -2,6 +2,8 @@
 
 Use supplied conversation context to preserve continuity, resolve references, and retain analyst-provided assertions. It is not independent operational evidence. Respect entity and conversation scope.
 
+Deterministic continuity metadata decides whether a previous structured set was available or used. Do not contradict it or confuse that set with the active focal Asset.
+
 # episodic
 
 Use the supplied prior-investigation summary as bounded historical context. It may support continuity and interpretation but must not be presented as fresh operational evidence.

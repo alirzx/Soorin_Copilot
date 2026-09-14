@@ -53,6 +53,13 @@ class _Session:
                     "member_ips": ["192.0.2.10", "192.0.2.11"],
                 }
             ])
+        if "a.role AS group_0" in cypher and "a.status AS group_1" in cypher:
+            return _Result([{
+                "group_0": "Linux Server",
+                "group_1": "CONFIRMED",
+                "count": 1,
+                "member_ips": ["192.0.2.10"],
+            }])
         return _Result(
             [
                 {
@@ -219,6 +226,31 @@ def test_aggregate_contract_counts_in_cypher_and_bounds_group_count() -> None:
         AssetAggregateRequest(operation="group_count")
     with pytest.raises(ValidationError):
         AssetAggregateRequest(operation="count", group_by="vendor")
+
+
+def test_multi_group_aggregation_compiles_allowlisted_dimensions_and_typed_values() -> None:
+    repository = _repository()
+
+    result = repository.aggregate_assets(AssetAggregateRequest(
+        filters=AssetSearchFilters(status="CONFIRMED"),
+        operation="group_count",
+        group_by_fields=("role", "status"),
+        limit=2,
+    ))
+
+    assert result.group_by is None
+    assert [field.value for field in result.group_by_fields] == ["role", "status"]
+    assert result.groups[0].group_values == {
+        "role": "Linux Server", "status": "CONFIRMED"
+    }
+    query, params = next(
+        (query, params)
+        for query, params in repository.driver.session_instance.calls  # type: ignore[attr-defined]
+        if "a.role AS group_0" in query
+    )
+    assert "a.status AS group_1" in query
+    assert "RETURN group_0, group_1, count, member_ips" in query
+    assert params["status"] == "CONFIRMED"
 
 
 def test_aggregate_member_identity_contract_is_canonical_and_strictly_bounded() -> None:

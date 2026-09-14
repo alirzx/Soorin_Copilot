@@ -21,8 +21,13 @@ from src.core.memory.persistence import (
 )
 from src.core.memory.product import (
     PRODUCT_THREAD_STATE_SCHEMA_VERSION,
+    ProductMemoryContractError,
     ProductLongTermMemoryStore,
     ProductThreadStateStore,
+    _memory_from_wire,
+)
+from src.core.memory.product_hardened import (
+    ProductLongTermMemoryStore as HardenedProductLongTermMemoryStore,
 )
 from src.core.memory.routing_state import SessionRoutingState
 from src.core.product_client.memory_client import (
@@ -433,6 +438,62 @@ def _candidate():
         source_request_id="request-1", source_conversation_id="chat-1",
         evidence_refs=("evidence_class_asset_identity",),
     )
+
+
+@pytest.mark.parametrize("ref_type", ("chat", "asset"))
+def test_documented_typed_evidence_ref_hydrates_and_reemits_losslessly(ref_type):
+    record = _candidate()
+    wire = _canonical_wire(record)
+    wire["evidenceRefs"] = [{"type": ref_type, "id": record.evidence_refs[0]}]
+
+    hydrated = _memory_from_wire(wire)
+
+    assert ProductLongTermMemoryStore._refs(hydrated.evidence_refs) == wire["evidenceRefs"]
+    assert hydrated.idempotency_fingerprint
+
+
+def test_hardened_inventory_keeps_valid_records_when_one_record_is_malformed():
+    record = _candidate()
+    def payload(_method, path, _kwargs):
+        if path.endswith("/legacy-broken"):
+            return {"memory": {"memoryId": "legacy-broken", "userId": record.user_id}}
+        return {
+            "records": [
+                _canonical_wire(record),
+                {"memoryId": "legacy-broken", "userId": record.user_id},
+            ]
+        }
+
+    fake = FakeProductClient(payload)
+    store = HardenedProductLongTermMemoryStore(ProductMemoryClient(fake))
+
+    records = store.list(
+        user_id=record.user_id,
+        request_id="mixed-inventory",
+        purpose="active_inventory",
+    )
+
+    assert records == (record,)
+    assert store.consume_read_limitations(
+        "mixed-inventory", "active_inventory"
+    ) == ("malformed_product_memory_skipped",)
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "reason"),
+    (
+        ("idempotencyFingerprint", "0" * 64, "idempotency_fingerprint_mismatch"),
+        ("logicalMemoryKey", "not-the-canonical-key", "logical_memory_key_mismatch"),
+    ),
+)
+def test_invalid_product_identity_fields_fail_with_explicit_reason(field, value, reason):
+    wire = _canonical_wire(_candidate())
+    wire[field] = value
+
+    with pytest.raises(ProductMemoryContractError) as captured:
+        _memory_from_wire(wire)
+
+    assert captured.value.reason_code == reason
 
 
 @pytest.mark.parametrize(

@@ -556,6 +556,7 @@ class ThreadMemoryState:
     recent_episodes: tuple[EpisodeRecord, ...] = ()
     entity_timeline: tuple[EntityVisit, ...] = ()
     structured_query_context: StructuredQueryContext | None = None
+    structured_query_lineage: tuple[StructuredQueryContext, ...] = ()
     summary_updated_at: str = ""
     summary_source_request_id: str = ""
     summary_size_tokens: int = 0
@@ -602,6 +603,7 @@ class ThreadMemoryState:
                 state.entity_timeline if entity_timeline is None else entity_timeline
             ),
             structured_query_context=state.structured_query_context,
+            structured_query_lineage=state.structured_query_lineage,
             summary_updated_at=summary_updated_at,
             summary_source_request_id=summary_source_request_id,
             summary_size_tokens=summary_size_tokens,
@@ -625,6 +627,7 @@ class ThreadMemoryState:
             previous_requires_asset_profile=self.previous_requires_asset_profile,
             entity_timeline=self.entity_timeline,
             structured_query_context=self.structured_query_context,
+            structured_query_lineage=self.structured_query_lineage,
         )
 
     def to_payload(self) -> dict[str, Any]:
@@ -660,6 +663,10 @@ class ThreadMemoryState:
         }
         if self.structured_query_context is not None:
             payload["structured_query_context"] = self.structured_query_context.to_payload()
+        if self.structured_query_lineage:
+            payload["structured_query_lineage"] = [
+                item.to_payload() for item in self.structured_query_lineage
+            ]
         if self.working_memory is not None:
             payload["working_memory"] = {
                 "context_key": _context_key_payload(self.working_memory.context_key),
@@ -694,6 +701,15 @@ class ThreadMemoryState:
                     break
             if payload_size() > MAX_THREAD_STATE_BYTES:
                 payload.pop("structured_query_context", None)
+
+        if payload_size() > MAX_THREAD_STATE_BYTES and payload.get("structured_query_lineage"):
+            payload["structured_query_lineage"] = [
+                item.bounded(0).to_payload() for item in self.structured_query_lineage
+            ]
+            while payload_size() > MAX_THREAD_STATE_BYTES and len(payload["structured_query_lineage"]) > 1:
+                payload["structured_query_lineage"].pop(1 if len(payload["structured_query_lineage"]) > 2 else 0)
+            if payload_size() > MAX_THREAD_STATE_BYTES:
+                payload.pop("structured_query_lineage", None)
 
         for episode in payload["recent_episodes"]:
             if payload_size() <= MAX_THREAD_STATE_BYTES:
@@ -740,6 +756,7 @@ class ThreadMemoryState:
             "recent_episodes",
             "entity_timeline",
             "structured_query_context",
+            "structured_query_lineage",
             "summary_updated_at",
             "summary_source_request_id",
             "summary_size_tokens",
@@ -786,6 +803,20 @@ class ThreadMemoryState:
                 logger.warning(
                     "event=structured_query_context_restore_dropped reason=invalid_optional_context"
                 )
+        structured_query_lineage: tuple[StructuredQueryContext, ...] = ()
+        raw_lineage = payload.get("structured_query_lineage")
+        if raw_lineage is not None:
+            try:
+                if not isinstance(raw_lineage, list) or len(raw_lineage) > 3:
+                    raise ValueError("invalid structured lineage")
+                structured_query_lineage = tuple(
+                    StructuredQueryContext.from_payload(item) for item in raw_lineage
+                )
+            except (TypeError, ValueError):
+                logger.warning(
+                    "event=structured_query_lineage_restore_dropped reason=invalid_optional_context"
+                )
+                structured_query_lineage = ()
         summary_size = payload.get("summary_size_tokens", 0)
         if not isinstance(summary_size, int) or not 0 <= summary_size <= 16_384:
             raise LocalPersistenceSchemaError("Invalid persisted summary_size_tokens.")
@@ -843,6 +874,7 @@ class ThreadMemoryState:
             recent_episodes=episodes,
             entity_timeline=timeline,
             structured_query_context=structured_query_context,
+            structured_query_lineage=structured_query_lineage,
             summary_updated_at=str(payload.get("summary_updated_at") or "")[:64],
             summary_source_request_id=str(payload.get("summary_source_request_id") or "")[:128],
             summary_size_tokens=summary_size,

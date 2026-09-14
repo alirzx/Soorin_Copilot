@@ -129,11 +129,34 @@ class Phase4CWorkflowNodes(BasePhase4CWorkflowNodes):
         patched["routing_result"] = route
         patched["task"] = focal_task
         patched["memory_context_key"] = MemoryContextKey.from_task(focal_task)
+        patched["baseline_results"] = [
+            result
+            for result in state.get("tool_results") or ()
+            if result.source_capability in _FOCAL_CAPABILITIES
+            and bool(set(result.entities).intersection(focal))
+        ]
+        patched["require_baseline_for_operational_mutation"] = True
         structured_context = structured_query_context_from_state(state)
         previous = state.get("active_entity_state")
         if structured_context is not None and previous is not None:
+            reference_kind = getattr(
+                getattr(state.get("routing_result"), "structured_result_reference", None),
+                "kind",
+                "none",
+            )
+            previous_lineage = tuple(
+                getattr(previous, "structured_query_lineage", ()) or ()
+            )
+            lineage = (
+                (*previous_lineage, structured_context)
+                if reference_kind == "set_query"
+                else (structured_context,)
+            )
+            if len(lineage) > 3:
+                lineage = (lineage[0], lineage[-2], lineage[-1])
             patched["active_entity_state"] = replace(
                 previous,
                 structured_query_context=structured_context,
+                structured_query_lineage=lineage,
             )
         return super().update_memory(patched)

@@ -382,6 +382,17 @@ def build_routing_context(
             if routing_state.structured_query_context is not None
             else {"available": False}
         ),
+        "structured_lineage": [
+            {
+                "position": (
+                    "base" if index == 0 else
+                    "latest" if index == len(routing_state.structured_query_lineage) - 1 else
+                    "parent"
+                ),
+                **item.routing_summary(),
+            }
+            for index, item in enumerate(routing_state.structured_query_lineage)
+        ],
     }
 
 

@@ -230,7 +230,7 @@ class GraphContextProvider:
             )
         included_count = (
             sum(group.count for group in result.groups)
-            if result.group_by
+            if result.group_by or result.group_by_fields
             else result.count
         )
         context = result.model_dump(mode="json")

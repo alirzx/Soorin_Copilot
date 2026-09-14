@@ -40,6 +40,9 @@ from src.core.graph.structured import (
     AssetAggregateRequest,
     AssetAggregateResult,
     AssetGroupField,
+    AssetPredicate,
+    AssetPredicateField,
+    AssetPredicateOperator,
     MAX_AGGREGATE_GROUP_MEMBER_IPS,
     AssetSearchRequest,
     AssetSearchResult,
@@ -52,6 +55,110 @@ from src.core.product_client.schemas import TopologyConnectionRecord
 logger = logging.getLogger(__name__)
 
 _GRAPH_MUTATION_LOCK = threading.RLock()
+
+_STRUCTURED_PREDICATE_PROPERTIES = {
+    AssetPredicateField.IP: "ip",
+    AssetPredicateField.ASSET_NAME: "asset_name",
+    AssetPredicateField.STATUS: "status",
+    AssetPredicateField.SUGGESTED_TYPE: "suggested_type",
+    AssetPredicateField.CLASSIFICATION_SUMMARY: "classification_summary",
+    AssetPredicateField.VENDOR: "vendor",
+    AssetPredicateField.PRODUCT: "product",
+    AssetPredicateField.ROLE: "role",
+    AssetPredicateField.ROLES: "roles",
+    AssetPredicateField.TAG: "tag",
+    AssetPredicateField.SUB_TAG: "sub_tag",
+    AssetPredicateField.MODEL_CONFIDENCE: "model_confidence",
+    AssetPredicateField.MAPPING_CONFIDENCE: "mapping_confidence",
+    AssetPredicateField.UNKNOWN_SCORE: "unknown_score",
+    AssetPredicateField.LAST_DETECTION_AT: "last_detection_at",
+    AssetPredicateField.ENRICHMENT_STATUS: "enrichment_status",
+}
+_STRUCTURED_TEXT_PREDICATE_FIELDS = frozenset({
+    AssetPredicateField.ASSET_NAME,
+    AssetPredicateField.STATUS,
+    AssetPredicateField.SUGGESTED_TYPE,
+    AssetPredicateField.CLASSIFICATION_SUMMARY,
+    AssetPredicateField.VENDOR,
+    AssetPredicateField.PRODUCT,
+    AssetPredicateField.ROLE,
+    AssetPredicateField.TAG,
+    AssetPredicateField.SUB_TAG,
+    AssetPredicateField.ENRICHMENT_STATUS,
+})
+
+
+def _compile_structured_predicate(
+    predicate: AssetPredicate,
+    *,
+    case_insensitive_text: bool,
+) -> tuple[str, dict[str, object]]:
+    """Compile one validated predicate tree using only server-owned syntax."""
+
+    parameters: dict[str, object] = {}
+    counter = [0]
+
+    def parameter(value: object) -> str:
+        name = f"predicate_{counter[0]}"
+        counter[0] += 1
+        parameters[name] = value
+        return f"${name}"
+
+    def compile_node(node: AssetPredicate) -> str:
+        if node.all:
+            return "(" + " AND ".join(compile_node(child) for child in node.all) + ")"
+        if node.any:
+            return "(" + " OR ".join(compile_node(child) for child in node.any) + ")"
+        if node.not_ is not None:
+            return f"(NOT {compile_node(node.not_)})"
+
+        assert node.field is not None and node.operator is not None
+        property_name = _STRUCTURED_PREDICATE_PROPERTIES[node.field]
+        property_expression = f"a.{property_name}"
+        text_field = node.field in _STRUCTURED_TEXT_PREDICATE_FIELDS
+        if text_field and case_insensitive_text:
+            property_expression = f"toLower(coalesce(a.{property_name}, ''))"
+
+        if node.field is AssetPredicateField.ROLES:
+            raw_values = node.values if node.operator is AssetPredicateOperator.IN else (node.value,)
+            values = [str(value).casefold() for value in raw_values]
+            placeholder = parameter(values if node.operator is AssetPredicateOperator.IN else values[0])
+            comparison = (
+                f"toLower(role_value) IN {placeholder}"
+                if node.operator is AssetPredicateOperator.IN
+                else f"toLower(role_value) = {placeholder}"
+            ) if case_insensitive_text else (
+                f"role_value IN {placeholder}"
+                if node.operator is AssetPredicateOperator.IN
+                else f"role_value = {placeholder}"
+            )
+            return f"any(role_value IN coalesce(a.roles, []) WHERE {comparison})"
+
+        if node.operator is AssetPredicateOperator.IN:
+            values = list(node.values)
+            if text_field and case_insensitive_text:
+                values = [str(value).casefold() for value in values]
+            return f"{property_expression} IN {parameter(values)}"
+        if node.operator is AssetPredicateOperator.BETWEEN:
+            lower, upper = node.values
+            return (
+                f"({property_expression} >= {parameter(lower)} AND "
+                f"{property_expression} <= {parameter(upper)})"
+            )
+
+        value = node.value
+        if text_field and case_insensitive_text:
+            value = str(value).casefold()
+        operator = {
+            AssetPredicateOperator.EQ: "=",
+            AssetPredicateOperator.GT: ">",
+            AssetPredicateOperator.GTE: ">=",
+            AssetPredicateOperator.LT: "<",
+            AssetPredicateOperator.LTE: "<=",
+        }[node.operator]
+        return f"{property_expression} {operator} {parameter(value)}"
+
+    return compile_node(predicate), parameters
 
 
 def _serialized_graph_mutation(method: Any) -> Any:
@@ -773,6 +880,7 @@ class Neo4jGraphRepository:
                 operation=request.operation,
                 count=0,
                 group_by=request.group_by,
+                group_by_fields=request.group_fields,
                 retrieved_at=_utc_now(),
                 limitations=self._structured_limitations(),
             )
@@ -793,18 +901,30 @@ class Neo4jGraphRepository:
                 limitations=self._structured_limitations(),
             )
 
-        assert request.group_by is not None
+        group_fields = request.group_fields
+        assert group_fields
         limit = self.policy.structured_limit(request.limit)
-        group_property = self._asset_group_property(request.group_by)
+        group_properties = tuple(self._asset_group_property(field) for field in group_fields)
+        group_aliases = (
+            ("value",)
+            if len(group_fields) == 1
+            else tuple(f"group_{index}" for index in range(len(group_fields)))
+        )
+        projection = ", ".join(
+            f"a.{property_name} AS {alias}"
+            for property_name, alias in zip(group_properties, group_aliases)
+        )
+        aliases = ", ".join(group_aliases)
+        group_order = ", ".join(f"{alias} ASC" for alias in group_aliases)
         query = f"""
         MATCH (a:Asset)
         WHERE {where}
-        WITH a.{group_property} AS value, a.ip AS member_ip
-        ORDER BY value ASC, member_ip ASC
-        WITH value, count(*) AS count,
+        WITH {projection}, a.ip AS member_ip
+        ORDER BY {group_order}, member_ip ASC
+        WITH {aliases}, count(*) AS count,
              collect(member_ip)[0..$member_limit] AS member_ips
-        RETURN value, count, member_ips
-        ORDER BY count DESC, value ASC
+        RETURN {aliases}, count, member_ips
+        ORDER BY count DESC, {group_order}
         LIMIT $fetch_limit
         """
         params["fetch_limit"] = limit + 1
@@ -826,7 +946,11 @@ class Neo4jGraphRepository:
         selected = records[:limit]
         groups = tuple(
             AssetAggregateGroup(
-                value=record["value"],
+                value=record[group_aliases[0]] if len(group_aliases) == 1 else None,
+                group_values={
+                    field.value: record[alias]
+                    for field, alias in zip(group_fields, group_aliases)
+                },
                 count=int(record["count"] or 0),
                 member_ips=tuple(record.get("member_ips") or ()),
                 member_ips_truncated=int(record["count"] or 0)
@@ -840,6 +964,7 @@ class Neo4jGraphRepository:
             operation=request.operation,
             count=int(count_record["count"] or 0) if count_record else 0,
             group_by=request.group_by,
+            group_by_fields=group_fields,
             groups=groups,
             truncated=len(records) > limit,
             retrieved_at=_utc_now(),
@@ -857,6 +982,7 @@ class Neo4jGraphRepository:
         request: AssetSearchRequest | AssetAggregateRequest,
     ) -> tuple[list[str], dict[str, object]]:
         values = request.filters.query_values()
+        values.pop("predicate", None)
         clauses: list[str] = []
         exact_properties = {
             "ip": "ip",
@@ -888,6 +1014,13 @@ class Neo4jGraphRepository:
         for parameter, (property_name, operator) in range_properties.items():
             if parameter in values:
                 clauses.append(f"a.{property_name} {operator} ${parameter}")
+        if request.filters.predicate is not None:
+            predicate_clause, predicate_values = _compile_structured_predicate(
+                request.filters.predicate,
+                case_insensitive_text=False,
+            )
+            clauses.append(predicate_clause)
+            values.update(predicate_values)
         return clauses, values
 
     @staticmethod

@@ -168,6 +168,8 @@ class RelevantTurn:
     retrieval_reason: str
     estimated_tokens: int
     source_representation: str = "raw"
+    user_source_representation: str = ""
+    assistant_source_representation: str = ""
 
 
 @dataclass(frozen=True)
@@ -286,21 +288,22 @@ class MemoryContextPackage:
                 }
             )
         for turn in self.relevant_turns:
+            user_source = turn.user_source_representation or turn.source_representation
+            assistant_source = turn.assistant_source_representation or turn.source_representation
             messages.append({
                 "role": "system",
                 "content": (
                     "[SOORIN RELEVANT TURN PROVENANCE]\n"
                     f"request_id={turn.request_id}; entities={','.join(turn.context_key.entities) or 'conversation'}; "
-                    f"topic={turn.context_key.topic_family}; source={turn.source_representation}; temporal=historical; "
+                    f"topic={turn.context_key.topic_family}; source={turn.source_representation}; "
+                    f"user_source={user_source}; assistant_source={assistant_source}; temporal=historical; "
                     "user text is analyst-supplied and assistant text is a prior conclusion, not fresh evidence."
                 ),
             })
-            messages.extend(
-                (
-                    {"role": "user", "content": turn.user_content},
-                    {"role": "assistant", "content": turn.assistant_content},
-                )
-            )
+            if turn.user_content:
+                messages.append({"role": "user", "content": turn.user_content})
+            if turn.assistant_content:
+                messages.append({"role": "assistant", "content": turn.assistant_content})
         return messages
 
 

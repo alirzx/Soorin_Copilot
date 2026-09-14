@@ -40,7 +40,11 @@ def _task(request: str, *, sort: str | None = None) -> TaskSpec:
 
 def _rows(count: int) -> tuple[dict[str, object], ...]:
     return tuple(
-        {"ip": f"192.0.2.{index}", "graph_key": f"asset-{index}"}
+        {
+            "ip": f"192.0.2.{index}",
+            "graph_key": f"asset-{index}",
+            "model_confidence": 1.0 - (index / 100),
+        }
         for index in range(1, count + 1)
     )
 
@@ -133,7 +137,7 @@ def test_rank_semantics_require_structured_sort() -> None:
         _rows(5),
     )
     assert selected == ("192.0.2.1",)
-    assert reason == "explicit_ranked_single"
+    assert reason == "unique_ranked_single"
 
 
 def test_exact_two_candidates_can_be_compared_without_n_way_fanout() -> None:

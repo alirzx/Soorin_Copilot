@@ -520,6 +520,8 @@ def compile_direct_plan(task: TaskSpec, *, plan_id: str | None = None) -> Execut
             mode="json",
             exclude_none=True,
         )
+        if not arguments.get("group_by_fields"):
+            arguments.pop("group_by_fields", None)
         steps.append(PlanStep(
             id="step-1",
             capability=expected_capability,

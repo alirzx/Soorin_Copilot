@@ -105,7 +105,7 @@ def test_uncorrelated_product_pairs_restore_references_and_ignore_current_dangli
     assert working.latest_assistant_turn == "T11 conclusion"
 
 
-def test_retention_pressure_summarizes_before_discard_and_preserves_complete_pair():
+def test_retention_pressure_honors_exact_one_message_retention():
     session = "session-retention"
     key = MemoryContextKey(("192.0.2.20",), "asset_investigation", "none", "asset")
     memory = MemoryStore(4, relevant_turn_limit=4)
@@ -115,7 +115,6 @@ def test_retention_pressure_summarizes_before_discard_and_preserves_complete_pai
         session, summary_settings(), SessionRoutingState(active_entities=key.entities), request_id="r2"
     )
     assert memory.get(session) == [
-        {"role": "user", "content": "short question 2"},
         {"role": "assistant", "content": "short conclusion 2"},
     ]
     working = memory.repository.get_working(session)

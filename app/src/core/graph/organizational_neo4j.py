@@ -9,6 +9,7 @@ from src.core.graph.neo4j import (
     GraphProjectionStatus,
     GraphSyncValidationError,
     Neo4jGraphRepository,
+    _compile_structured_predicate,
     _serialized_graph_mutation,
     _utc_now,
 )
@@ -128,6 +129,7 @@ class OrganizationalNeo4jGraphRepository(Neo4jGraphRepository):
         request: AssetSearchRequest | AssetAggregateRequest,
     ) -> tuple[list[str], dict[str, object]]:
         values = request.filters.query_values()
+        values.pop("predicate", None)
         clauses: list[str] = []
 
         if "ip" in values:
@@ -160,4 +162,11 @@ class OrganizationalNeo4jGraphRepository(Neo4jGraphRepository):
         for parameter, (property_name, operator) in range_properties.items():
             if parameter in values:
                 clauses.append(f"a.{property_name} {operator} ${parameter}")
+        if request.filters.predicate is not None:
+            predicate_clause, predicate_values = _compile_structured_predicate(
+                request.filters.predicate,
+                case_insensitive_text=True,
+            )
+            clauses.append(predicate_clause)
+            values.update(predicate_values)
         return clauses, values

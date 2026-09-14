@@ -99,6 +99,7 @@ MEMORY_LIFECYCLE_ACTIONS = frozenset(
 OBSERVATION_RESULTS = frozenset({"success", "failure"})
 MEMORY_REVISION_OPERATIONS = frozenset({"thread_save", "memory_transition", "index_status", "other"})
 MEMORY_CANONICAL_SOURCES = frozenset({"product", "local", "other"})
+MEMORY_CANONICAL_RECORD_RESULTS = frozenset({"valid", "malformed_skipped", "security_rejected"})
 MEMORY_VECTOR_OPERATIONS = frozenset({"search", "index", "delete", "reconcile", "other"})
 WORKFLOW_FALLBACK_KINDS = frozenset({"routing", "plan"})
 
@@ -344,6 +345,12 @@ class SoorinMetrics:
             ("source", "result"),
             registry=self.registry,
         )
+        self.memory_canonical_records = Counter(
+            "soorin_memory_canonical_records_total",
+            "Per-record canonical Product memory validation outcomes.",
+            ("result",),
+            registry=self.registry,
+        )
         self.memory_vector_operations = Counter(
             "soorin_memory_vector_operations_total",
             "Semantic memory vector operation outcomes.",
@@ -577,6 +584,12 @@ class SoorinMetrics:
             self.memory_canonical_reload.labels(
                 _bounded(source, MEMORY_CANONICAL_SOURCES),
                 _bounded(result, OBSERVATION_RESULTS, "failure"),
+            ).inc()
+
+    def observe_memory_canonical_record(self, result: str) -> None:
+        if self.enabled:
+            self.memory_canonical_records.labels(
+                _bounded(result, MEMORY_CANONICAL_RECORD_RESULTS, "security_rejected")
             ).inc()
 
     def observe_memory_vector(self, operation: str, result: str) -> None:

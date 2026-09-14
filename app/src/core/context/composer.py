@@ -1187,6 +1187,7 @@ class ContextComposer:
             base["query"].update(
                 operation=evidence.operation,
                 group_by=evidence.group_by,
+                group_by_fields=list(evidence.group_by_fields),
             )
             selected_groups: list[dict[str, Any]] = []
             payload = {
