@@ -40,13 +40,29 @@ class SortDirection(str, Enum):
 
 
 class AssetGroupField(str, Enum):
+    """Allow-listed grouping dimensions over the enriched Asset projection.
+
+    The 15 Product-derived Exact Search properties are all groupable. The
+    Graph-owned enrichment status remains available as one additional metadata
+    dimension. Because this is an enum, group values can never become arbitrary
+    Cypher/property syntax.
+    """
+
+    IP = "ip"
+    ASSET_NAME = "asset_name"
     STATUS = "status"
     SUGGESTED_TYPE = "suggested_type"
-    ROLE = "role"
+    MODEL_CONFIDENCE = "model_confidence"
+    MAPPING_CONFIDENCE = "mapping_confidence"
+    UNKNOWN_SCORE = "unknown_score"
+    CLASSIFICATION_SUMMARY = "classification_summary"
     VENDOR = "vendor"
     PRODUCT = "product"
+    ROLE = "role"
+    ROLES = "roles"
     TAG = "tag"
     SUB_TAG = "sub_tag"
+    LAST_DETECTION_AT = "last_detection_at"
     ENRICHMENT_STATUS = "enrichment_status"
 
 
@@ -473,6 +489,14 @@ class AssetAggregateCapabilityInput(BaseModel):
         )
 
 
+def _normalized_group_value(value: Any) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, (list, tuple)):
+        return json.dumps(list(value), ensure_ascii=False, separators=(",", ":"))[:1024]
+    return str(value)[:1024]
+
+
 class AssetAggregateGroup(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -481,6 +505,11 @@ class AssetAggregateGroup(BaseModel):
     count: int = Field(ge=0)
     member_ips: tuple[str, ...] = ()
     member_ips_truncated: bool = False
+
+    @field_validator("value", mode="before")
+    @classmethod
+    def normalize_value(cls, value: Any) -> str | None:
+        return _normalized_group_value(value)
 
     @field_validator("member_ips", mode="before")
     @classmethod
@@ -508,7 +537,7 @@ class AssetAggregateGroup(BaseModel):
         for key, raw in value.items():
             if key not in allowed or key in normalized:
                 raise ValueError("aggregate group_values contains an invalid dimension")
-            normalized[key] = None if raw is None else str(raw)[:1024]
+            normalized[key] = _normalized_group_value(raw)
         return normalized
 
     @model_validator(mode="after")

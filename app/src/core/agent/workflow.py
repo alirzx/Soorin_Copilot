@@ -398,7 +398,15 @@ class BoundedCopilotWorkflow:
             self._after_clarification_interrupt,
             {"resume": "resolve_entities", "respond": "clarification"},
         )
-        graph.add_edge("route", "validate_task")
+        graph.add_conditional_edges(
+            "route",
+            self._after_route,
+            {
+                "validate_task": "validate_task",
+                "clarification": "clarification",
+                "safe_failure": "safe_failure",
+            },
+        )
         graph.add_conditional_edges(
             "validate_task",
             self._after_task,
@@ -482,6 +490,17 @@ class BoundedCopilotWorkflow:
     @staticmethod
     def _after_clarification_interrupt(state: InvestigationState) -> str:
         return "resume" if state.get("workflow_status") == "running" else "respond"
+
+    @staticmethod
+    def _after_route(state: InvestigationState) -> str:
+        """Never let a terminal/clarification Router outcome reach task validation."""
+        if state.get("workflow_status") == "clarification_required":
+            return "clarification"
+        if state.get("workflow_status") in {"failed", "cancelled"}:
+            return "safe_failure"
+        if state.get("routing_result") is None:
+            return "safe_failure"
+        return "validate_task"
 
     @staticmethod
     def _after_task(state: InvestigationState) -> str:
@@ -693,8 +712,12 @@ class BoundedCopilotWorkflow:
         if self._after_resolution(current) == "clarification":
             current.update(runtime.clarification_response(current) or {})
             return current  # type: ignore[return-value]
-        for name in ("route", "validate_task"):
-            current.update(getattr(runtime, name)(current) or {})
+        current.update(runtime.route(current) or {})
+        route_edge = self._after_route(current)
+        if route_edge in {"clarification", "safe_failure"}:
+            current.update(getattr(runtime, f"{route_edge}_response")(current) or {})
+            return current  # type: ignore[return-value]
+        current.update(runtime.validate_task(current) or {})
         edge = self._after_task(current)
         if edge in {"clarification", "safe_failure"}:
             current.update(getattr(runtime, f"{edge}_response")(current) or {})

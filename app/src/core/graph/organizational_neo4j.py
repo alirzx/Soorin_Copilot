@@ -13,7 +13,7 @@ from src.core.graph.neo4j import (
     _serialized_graph_mutation,
     _utc_now,
 )
-from src.core.graph.structured import AssetAggregateRequest, AssetSearchRequest
+from src.core.graph.structured import AssetAggregateRequest, AssetGroupField, AssetSearchRequest
 from src.core.product_client.schemas import TopologyConnectionRecord
 
 
@@ -170,3 +170,25 @@ class OrganizationalNeo4jGraphRepository(Neo4jGraphRepository):
             clauses.append(predicate_clause)
             values.update(predicate_values)
         return clauses, values
+
+    @staticmethod
+    def _asset_group_property(group: AssetGroupField) -> str:
+        """Map every Product-derived Exact Search property to its stored key."""
+        return {
+            AssetGroupField.IP: "ip",
+            AssetGroupField.ASSET_NAME: "asset_name",
+            AssetGroupField.STATUS: "status",
+            AssetGroupField.SUGGESTED_TYPE: "suggested_type",
+            AssetGroupField.MODEL_CONFIDENCE: "model_confidence",
+            AssetGroupField.MAPPING_CONFIDENCE: "mapping_confidence",
+            AssetGroupField.UNKNOWN_SCORE: "unknown_score",
+            AssetGroupField.CLASSIFICATION_SUMMARY: "classification_summary",
+            AssetGroupField.VENDOR: "vendor",
+            AssetGroupField.PRODUCT: "product",
+            AssetGroupField.ROLE: "role",
+            AssetGroupField.ROLES: "roles",
+            AssetGroupField.TAG: "tag",
+            AssetGroupField.SUB_TAG: "sub_tag",
+            AssetGroupField.LAST_DETECTION_AT: "last_detection_at",
+            AssetGroupField.ENRICHMENT_STATUS: "enrichment_status",
+        }[group]

@@ -109,6 +109,33 @@ _UNSUPPORTED_MATERIAL_SELECTOR = re.compile(
     r"location(?:\s+is)?|operating\s+system(?:\s+is)?|os\s+is)\b",
     re.IGNORECASE,
 )
+_GROUP_FIELD_ALIASES: dict[str, AssetGroupField] = {
+    "ip": AssetGroupField.IP,
+    "ip address": AssetGroupField.IP,
+    "asset name": AssetGroupField.ASSET_NAME,
+    "name": AssetGroupField.ASSET_NAME,
+    "status": AssetGroupField.STATUS,
+    "suggested type": AssetGroupField.SUGGESTED_TYPE,
+    "asset type": AssetGroupField.SUGGESTED_TYPE,
+    "model confidence": AssetGroupField.MODEL_CONFIDENCE,
+    "classification confidence": AssetGroupField.MODEL_CONFIDENCE,
+    "mapping confidence": AssetGroupField.MAPPING_CONFIDENCE,
+    "unknown score": AssetGroupField.UNKNOWN_SCORE,
+    "classification summary": AssetGroupField.CLASSIFICATION_SUMMARY,
+    "classifcation summary": AssetGroupField.CLASSIFICATION_SUMMARY,
+    "classifier summary": AssetGroupField.CLASSIFICATION_SUMMARY,
+    "vendor": AssetGroupField.VENDOR,
+    "product": AssetGroupField.PRODUCT,
+    "role": AssetGroupField.ROLE,
+    "roles": AssetGroupField.ROLES,
+    "tag": AssetGroupField.TAG,
+    "sub tag": AssetGroupField.SUB_TAG,
+    "sub-tag": AssetGroupField.SUB_TAG,
+    "last detection": AssetGroupField.LAST_DETECTION_AT,
+    "last detection time": AssetGroupField.LAST_DETECTION_AT,
+    "last detection timestamp": AssetGroupField.LAST_DETECTION_AT,
+    "enrichment status": AssetGroupField.ENRICHMENT_STATUS,
+}
 
 
 @dataclass(frozen=True)
@@ -395,7 +422,7 @@ def looks_like_structured_set_request(
     ):
         return False
     if re.search(
-        r"\bgroup\s+(?:(?:all\s+)?assets?|them|those|these)\s+by\s+(?:role|status|vendor|product|tag|sub\s*tag|suggested\s+type|enrichment\s+status)\b",
+        r"\bgroup\s+(?:(?:all\s+)?assets?|them|those|these)\s+by\s+(?:ip(?:\s+address)?|asset\s+name|name|status|suggested\s+type|asset\s+type|model\s+confidence|classification\s+confidence|mapping\s+confidence|unknown\s+score|classif(?:i)?cation\s+summary|classifier\s+summary|vendor|product|role|roles|tag|sub[-\s]?tag|last\s+detection(?:\s+(?:time|timestamp))?|enrichment\s+status)\b",
         text,
         re.I,
     ):
@@ -491,7 +518,7 @@ def _natural_filter_values(message: str) -> tuple[dict[str, object], bool]:
         "tag": r"\b(?:tag|asset\s+label)(?:\s+is)?\s+(?P<value>[\w][\w .&/-]*?)(?=[?.!,]|$)",
         "sub_tag": r"\b(?:sub[-\s]?tag|secondary\s+tag|subclassification\s+label)(?:\s+is)?\s+(?P<value>[\w][\w .&/-]*?)(?=[?.!,]|$)",
         "asset_name": r"\b(?:asset\s+name(?:\s+is)?|hostname/name(?:\s+is)?|name\s+is|named)\s+(?P<value>[\w][\w.-]*)(?=[?.!,]|$)",
-        "classification_summary": r"\b(?:classification\s+(?:summary|description)|classifier\s+summary)(?:\s+is)?\s+(?P<value>.+?)(?=[?.!,]|$)",
+        "classification_summary": r"\b(?:classif(?:i)?cation\s+(?:summary|description)|classifier\s+summary)(?:\s+is)?\s+(?P<value>.+?)(?=[?.!,]|$)",
         "enrichment_status": r"\b(?:enrichment\s+status)(?:\s+is)?\s+(?P<value>[\w-]+)(?=[?.!,]|$)",
     }
     for field, pattern in exact_patterns.items():
@@ -501,6 +528,8 @@ def _natural_filter_values(message: str) -> tuple[dict[str, object], bool]:
     status = re.search(r"\b(unconfirmed|confirmed)\b", text, re.I)
     if status:
         values["status"] = status.group(1)
+    elif re.search(r"\bconfirm\s+(?:assets?|devices?|systems?)\b", text, re.I):
+        values["status"] = "confirmed"
     ip_match = re.search(r"\bip(?:\s+(?:is|address))?\s+(?P<value>(?:\d{1,3}\.){3}\d{1,3})\b", text, re.I)
     if value := _captured_value(ip_match):
         values["ip"] = value
@@ -635,24 +664,15 @@ def _group_fields_from_message(message: str) -> tuple[AssetGroupField, ...] | No
         match.group("fields"),
         maxsplit=1,
         flags=re.I,
-    )[0]
+    )[0].strip(" ,")
     raw_tokens = re.split(r"\s*(?:,|\band\b)\s*", field_text, flags=re.I)
-    mapping = {
-        "role": AssetGroupField.ROLE,
-        "status": AssetGroupField.STATUS,
-        "vendor": AssetGroupField.VENDOR,
-        "product": AssetGroupField.PRODUCT,
-        "tag": AssetGroupField.TAG,
-        "sub tag": AssetGroupField.SUB_TAG,
-        "sub-tag": AssetGroupField.SUB_TAG,
-        "suggested type": AssetGroupField.SUGGESTED_TYPE,
-        "enrichment status": AssetGroupField.ENRICHMENT_STATUS,
-    }
     fields: list[AssetGroupField] = []
     for raw in raw_tokens:
         token = re.sub(r"\s+", " ", raw.strip().casefold())
+        if not token:
+            continue
         token = re.sub(r"^(?:their\s+|the\s+)?(?:primary\s+)?", "", token)
-        field = mapping.get(token)
+        field = _GROUP_FIELD_ALIASES.get(token)
         if field is None:
             return None
         fields.append(field)

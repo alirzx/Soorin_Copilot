@@ -98,6 +98,7 @@ For these two intents:
     "asset_name": null,
     "status": null,
     "suggested_type": null,
+    "classification_summary": null,
     "role": null,
     "roles": null,
     "vendor": null,
@@ -128,7 +129,7 @@ For bounded Boolean selection, `filters.predicate` is a typed tree: `{"all":[...
 
 For `mode=search`, `operation` and `group_by` must be null. `sort` may be graph_key, ip, asset_name, model_confidence, mapping_confidence, unknown_score, last_detection_at, or enrichment_next_due_at. `direction` may be asc or desc.
 
-For `mode=aggregate`, `sort` and `direction` must be null. `operation` is count or group_count. `group_count` uses one to three unique dimensions in `group_by_fields`; keep legacy `group_by` for a single dimension only. Dimensions are status, suggested_type, role, vendor, product, tag, sub_tag, or enrichment_status.
+For `mode=aggregate`, `sort` and `direction` must be null. `operation` is count or group_count. `group_count` uses one to three unique dimensions in `group_by_fields`; keep legacy `group_by` for a single dimension only. The 15 Product-derived Asset dimensions are `ip`, `asset_name`, `status`, `suggested_type`, `model_confidence`, `mapping_confidence`, `unknown_score`, `classification_summary`, `vendor`, `product`, `role`, `roles`, `tag`, `sub_tag`, and `last_detection_at`. `enrichment_status` is additionally available as Graph-owned metadata. Grouping by `roles` uses the complete stored roles array as one group key; filtering by `roles` remains membership-based.
 
 Selectors are exact/range semantics only. Use the typed Boolean tree for supported AND/OR combinations and do not fall back merely because several supported filters appear. Never emit Cypher, arbitrary property names, regex, contains/substring operators, traversal instructions, invented thresholds/dates, or substituted properties. If material semantics are ambiguous or unsupported, choose `unclear` rather than dropping them.
 
@@ -208,6 +209,7 @@ Examples that belong to structured routing when exactly representable by the all
 - “Show low-confidence VMware assets.” → `asset_search`, vendor + confidence range.
 - “How many Domain Controllers do we have?” → `asset_aggregate`, count + role filter.
 - “Count assets by status.” → `asset_aggregate`, group_count by status.
+- “Group confirmed assets by classification summary and show member IPs and percentages.” → `asset_aggregate`, status filter + group_count by classification_summary.
 - “List confirmed Linux Servers above 90% model confidence.” → flat role/status plus a strict score predicate or faithfully normalized strict bound.
 - “Find Linux Servers where vendor is VMware or Microsoft.” → role plus a bounded vendor `in`/`any` predicate.
 - “Find assets after the supplied timestamp and group them by role and status.” → current timestamp predicate plus two `group_by_fields`; `them` is same-turn.
