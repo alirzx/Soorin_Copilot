@@ -101,6 +101,7 @@ class SynthesizerTaskContext:
     selected_analytical_lenses: tuple[str, ...]
     limitations: tuple[str, ...]
     output_constraints: tuple[str, ...]
+    structured_query_scope: dict[str, Any]
 
 
 @dataclass(frozen=True)
@@ -328,6 +329,24 @@ class SynthesizerPromptBuilder:
             active_focal_entities=tuple(active_focal_entities[:2]),
             focal_baseline_available=baseline_compatible,
         )
+        structured_query_scope: dict[str, Any] = {}
+        if task.structured_query is not None:
+            query = task.structured_query
+            structured_query_scope = {
+                "mode": query.mode.value,
+                "filters": query.filters.model_dump(
+                    mode="json",
+                    by_alias=True,
+                    exclude_none=True,
+                    exclude_defaults=True,
+                ),
+                "requested_output_fields": [
+                    item.value for item in query.requested_output_fields
+                ],
+                "semantic_class": query.semantic_class,
+                "class_mapping_mode": query.class_mapping_mode,
+                "exact_zero_scope_only": True,
+            }
         return SynthesizerTaskContext(
             task_category=self._task_category(task),
             intent=task.intent,
@@ -352,6 +371,7 @@ class SynthesizerPromptBuilder:
             selected_analytical_lenses=self._analytical_lenses(task),
             limitations=limitations,
             output_constraints=(),
+            structured_query_scope=structured_query_scope,
         )
 
     def render_contract(self, context: SynthesizerTaskContext) -> tuple[str, tuple[str, ...]]:
@@ -423,6 +443,7 @@ class SynthesizerPromptBuilder:
             "current_vs_historical_relationship": context.current_vs_historical_relationship,
             "deterministic_delta_available": context.deterministic_delta_available,
             "limitations": list(context.limitations),
+            "structured_query_scope": context.structured_query_scope,
         }
         text = (
             "[SOORIN SYNTHESIZER TASK CONTRACT]\n"

@@ -7,7 +7,10 @@ from typing import Any
 
 from src.core.agent.contracts import EvidencePack, ExecutionPlan, ReviewDecision, TaskSpec, ToolResult
 from src.core.agent.context_identity import identity_for_tool_result
-from src.core.agent.structured_evidence import expected_structured_query_identity
+from src.core.agent.structured_evidence import (
+    expected_semantic_query_identity,
+    expected_structured_query_identity,
+)
 
 
 _NO_DEDICATED_ANOMALY_EVIDENCE = (
@@ -343,8 +346,17 @@ class EvidenceReviewer:
             query = task.structured_query
             if query is None:
                 return None
-            arguments = query.model_dump(mode="json", exclude_none=True)
-            arguments.pop("mode", None)
+            request = (
+                query.to_search_request()
+                if capability == "graph.search_assets"
+                else query.to_aggregate_request()
+            )
+            arguments = request.model_dump(
+                mode="json",
+                exclude={"cursor"},
+                exclude_none=True,
+            )
+            arguments["semantic_query_id"] = expected_semantic_query_identity(query)
             if not arguments.get("group_by_fields"):
                 arguments.pop("group_by_fields", None)
             return arguments
@@ -369,10 +381,19 @@ class EvidenceReviewer:
             if evidence.capability != capability or evidence.mode != expected_mode or query.mode.value != expected_mode:
                 return capability, f"{capability} evidence mode did not match the validated task."
             expected_identity = expected_structured_query_identity(query, evidence)
+            expected_semantic_identity = expected_semantic_query_identity(query)
+            provider_context = getattr(result.provider_result, "context", {})
             if (
                 evidence.query_identity != expected_identity
                 or result.normalized_query_hash != expected_identity
                 or result.context_identity != expected_identity
+                or evidence.semantic_query_id != expected_semantic_identity
+                or result.semantic_query_id not in {"", expected_semantic_identity}
+                or (
+                    isinstance(provider_context, dict)
+                    and provider_context.get("semantic_query_id") is not None
+                    and provider_context.get("semantic_query_id") != expected_semantic_identity
+                )
             ):
                 return capability, f"{capability} evidence query identity did not match the validated task."
             if not evidence.active_graph_version:

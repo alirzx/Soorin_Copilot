@@ -9,7 +9,7 @@ from src.core.agent.registry import CapabilityRegistry
 from src.core.agent.task_mapping import compile_direct_plan, enforce_task_envelope, task_spec_from_route
 from src.core.agent.contracts import RequestConstraints, TaskEnvelope, TurnPolicy
 from src.core.context.models import RouteDecision
-from src.core.graph.structured import StructuredQuerySpec
+from src.core.graph.structured import StructuredQuerySpec, semantic_query_identity
 
 
 def _route(query: StructuredQuerySpec) -> RouteDecision:
@@ -89,6 +89,7 @@ def test_structured_direct_plan_compiles_typed_arguments_and_unknown_registry_fa
         "filters": {"vendor": "VMware"},
         "sort": "graph_key",
         "direction": "asc",
+        "semantic_query_id": semantic_query_identity(query),
     }
 
     with pytest.raises(PlanValidationError) as exc:

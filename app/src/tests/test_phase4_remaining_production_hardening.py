@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import json
 
 import pytest
 from pydantic import ValidationError
@@ -34,6 +35,7 @@ from src.core.graph.structured import (
     structured_query_identity,
 )
 from src.core.identity import RequestIdentity
+from src.core.llm.providers.base import LLMProviderResult
 from src.core.memory.episodes import MemoryContextKey
 from src.core.memory.persistence import THREAD_STATE_SCHEMA_VERSION, ThreadMemoryState
 from src.core.memory.product import _ref_to_wire, _refs_from_wire
@@ -161,9 +163,15 @@ def test_deterministic_compiler_handles_complex_and_multi_group_requests() -> No
         "either vendor VMware or vendor Microsoft."
     )
     assert complex_result is not None
-    assert complex_result.query.filters.role == "linux server"
+    assert complex_result.query.filters.role is None
+    assert complex_result.query.semantic_class == "Linux Server"
     assert complex_result.query.filters.predicate is not None
-    assert complex_result.query.filters.predicate.operator.value == "in"
+    predicate = complex_result.query.filters.predicate
+    assert predicate.all
+    assert any(
+        child.operator is not None and child.operator.value == "in"
+        for child in predicate.all
+    )
 
     grouped = deterministic_structured_fallback(
         "Group all assets by role and status. For each group show the exact count."
@@ -192,19 +200,72 @@ def test_deterministic_compiler_does_not_drop_or_invent_material_selectors(messa
         "Group all assets by role and status.",
     ),
 )
-def test_supported_structured_prompts_skip_semantic_router_and_repair(message: str) -> None:
-    class NoModelCalls:
-        def __getattr__(self, name):
-            raise AssertionError(f"LLM must not be called through {name}")
+def test_supported_structured_prompts_use_semantic_router_as_primary(message: str) -> None:
+    aggregate = message.startswith("Group")
+    payload = {
+        "intent": "asset_aggregate" if aggregate else "asset_search",
+        "scope": "none",
+        "direction": "none",
+        "depth": 0,
+        "requires_graph": True,
+        "requires_detection": False,
+        "requires_asset_profile": False,
+        "requires_knowledge": False,
+        "structured_query": (
+            {
+                "mode": "aggregate",
+                "filters": {},
+                "operation": "group_count",
+                "group_by_fields": ["role", "status"],
+            }
+            if aggregate
+            else {
+                "mode": "search",
+                "filters": {
+                    "status": "confirmed",
+                    "role": "Linux Server",
+                    "model_confidence_min": 0.9,
+                    "predicate": {
+                        "field": "vendor",
+                        "operator": "in",
+                        "values": ["VMware", "Microsoft"],
+                    },
+                },
+            }
+        ),
+        "structured_result_reference": None,
+        "entity_binding": "none",
+        "requires_multiple_entities": False,
+        "is_followup": False,
+        "classification_confidence": 0.98,
+        "reason": "Bounded structured Asset query.",
+    }
+
+    class RecordingModel:
+        calls = 0
+
+        def chat(self, *_args, **_kwargs):
+            self.calls += 1
+            return LLMProviderResult(
+                text=json.dumps(payload),
+                provider="fake",
+                model="fake",
+                finish_reason="stop",
+                usage={},
+                status_code=200,
+            )
 
     settings = replace(get_settings(), intent_router_enabled=True)
-    decision = SemanticIntentRouter(settings, NoModelCalls()).classify(
+    model = RecordingModel()
+    decision = SemanticIntentRouter(settings, model).classify(
         message,
         EntityResolution(status="none", entity_mode="none"),
         SessionRoutingState(),
         request_id="deterministic-router-test",
     )
-    assert decision.router_called is False
+    assert model.calls == 1
+    assert decision.router_called is True
+    assert decision.decision_source == "semantic_router"
     assert decision.fallback_used is False
     assert decision.structured_query is not None
 

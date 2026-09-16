@@ -7,7 +7,7 @@ import json
 from typing import Annotated, Any, Literal, TypeAlias, TypedDict
 import operator
 
-from src.core.graph.structured import StructuredQuerySpec
+from src.core.graph.structured import StructuredQuerySpec, semantic_query_identity
 from src.core.identity import RequestIdentity
 
 
@@ -108,6 +108,15 @@ class StructuredAssetSearchEvidence:
     provenance: str = "neo4j_active_organizational_projection"
     schema_version: str = "structured-asset-search-evidence-v1"
 
+    @property
+    def semantic_query_id(self) -> str:
+        return semantic_query_identity({
+            "mode": "search",
+            "filters": self.normalized_filters,
+            "sort": self.sort,
+            "direction": self.direction,
+        })
+
 
 @dataclass(frozen=True)
 class StructuredAssetAggregateEvidence:
@@ -128,6 +137,16 @@ class StructuredAssetAggregateEvidence:
     mode: Literal["aggregate"] = "aggregate"
     provenance: str = "neo4j_active_organizational_projection"
     schema_version: str = "structured-asset-aggregate-evidence-v1"
+
+    @property
+    def semantic_query_id(self) -> str:
+        return semantic_query_identity({
+            "mode": "aggregate",
+            "filters": self.normalized_filters,
+            "operation": self.operation,
+            "group_by": self.group_by,
+            "group_by_fields": list(self.group_by_fields),
+        })
 
 
 StructuredAssetSetEvidence: TypeAlias = (
@@ -185,6 +204,7 @@ class ToolResult:
     projection_schema_version: str = ""
     evidence_receipt: EvidenceReceipt | None = None
     structured_asset_set: StructuredAssetSetEvidence | None = None
+    semantic_query_id: str = ""
 
 
 @dataclass(frozen=True)

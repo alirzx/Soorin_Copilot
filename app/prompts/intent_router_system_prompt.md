@@ -121,9 +121,24 @@ For these two intents:
   "limit": null,
   "operation": null,
   "group_by": null,
-  "group_by_fields": []
+  "group_by_fields": [],
+  "requested_output_fields": []
 }
 ```
+
+The Product Detection Overview semantic dictionary is authoritative:
+- `asset_name` is the hostname/name; `ip` is the exact address; `status` is workflow confirmation state.
+- `suggested_type` is the model's canonical proposed asset class. It is not `role`, `roles`, or the narrative `classification_summary`.
+- `model_confidence` is classification confidence; `mapping_confidence` is role-mapping confidence; `unknown_score` is classification uncertainty. Never substitute one for another.
+- `classification_summary` is the complete human-readable classifier sentence. Do not use it as a canonical asset-class label.
+- `vendor` is manufacturer/vendor and `product` is product/family/platform.
+- `role` is the scalar primary function. `roles` is the multi-valued role set and must use membership semantics.
+- `tag` and `sub_tag` are distinct classification labels. `last_detection_at` is the timestamp of the latest detection/classification.
+- `enrichment_status` is Graph-owned metadata, not one of the 15 Product-derived Detection Overview fields.
+
+Generic asset-class/function wording without an explicit field, such as “Domain Controllers”, means the typed OR of `suggested_type eq`, `role eq`, and `roles member_eq` for the canonical class. It never means `classification_summary`. This applies to other supported canonical classes/functions too. Explicit wording overrides the generic mapping: “primary role is” means only `role`; “roles include” means only `roles` membership; “suggested type is” means only `suggested_type`; “classification summary exactly” means only the full summary field.
+
+`requested_output_fields` is a unique bounded presentation list and never a selector. It may contain the Product/Graph fields above plus `count`, `percentage`, and `member_ips`. Words after “show/display/return/include” that ask which columns or arithmetic to present belong here, not in `filters`, and must never alter the matched population.
 
 For bounded Boolean selection, `filters.predicate` is a typed tree: `{"all":[...]}`, `{"any":[...]}`, or one leaf `{"field":"vendor","operator":"eq","value":"VMware"}`. Allow-listed leaf fields are the filter fields without `_min/_max`; operators are `eq`, bounded `in`, `member_eq` for `roles`, and `gt|gte|lt|lte|between` for scores/timestamps. Nesting is at most 3 levels and at most 24 leaves. Never emit arbitrary fields/operators or raw query text.
 
@@ -133,7 +148,11 @@ For `mode=aggregate`, `sort` and `direction` must be null. `operation` is count 
 
 Selectors are exact/range semantics only. Use the typed Boolean tree for supported AND/OR combinations and do not fall back merely because several supported filters appear. Never emit Cypher, arbitrary property names, regex, contains/substring operators, traversal instructions, invented thresholds/dates, or substituted properties. If material semantics are ambiguous or unsupported, choose `unclear` rather than dropping them.
 
+`limit` is semantic only when the user explicitly requests cardinality such as “top 3”, “first 10”, “show 5”, “only 20”, or “return the first 7”. Otherwise it must be null; runtime owns default and maximum bounds. A singular highest/lowest ranked request may use the bounded tie-check behavior supplied by the application.
+
 Same-turn antecedents belong to the current query: “Find X and group them by role” must not inherit a previous set. Use `structured_result_reference=set_query` only for actual prior-result language such as “which of them”, “those results”, or an explicit previous/base/latest set. Explicit current-turn semantics outrank active/UI state. Always include a valid `structured_query` for representable `asset_search` and `asset_aggregate` requests. Return JSON only.
+
+“again”, “rerun”, “search again”, and “find again” request a fresh current execution. They are not previous-result references and must not make prior rows or an empty prior population authoritative.
 
 ### Latest structured result continuity
 
@@ -205,9 +224,9 @@ For a genuinely open-ended assessment of one known Asset, normally use `asset_in
 
 ### Asset-set discovery and aggregate
 Examples that belong to structured routing when exactly representable by the allow-list:
-- “List confirmed Domain Controllers.” → `asset_search`, filters status + role.
+- “List confirmed Domain Controllers.” → `asset_search`, status plus the generic canonical-class OR over suggested type, primary role, and roles membership.
 - “Show low-confidence VMware assets.” → `asset_search`, vendor + confidence range.
-- “How many Domain Controllers do we have?” → `asset_aggregate`, count + role filter.
+- “How many Domain Controllers do we have?” → `asset_aggregate`, count plus the generic canonical-class OR.
 - “Count assets by status.” → `asset_aggregate`, group_count by status.
 - “Group confirmed assets by classification summary and show member IPs and percentages.” → `asset_aggregate`, status filter + group_count by classification_summary.
 - “List confirmed Linux Servers above 90% model confidence.” → flat role/status plus a strict score predicate or faithfully normalized strict bound.

@@ -11,7 +11,15 @@ import sys
 from pathlib import Path
 from types import SimpleNamespace
 
-from src.core.copilot.trace import CopilotRequestTrace, render_human_copilot_trace
+from src.core.agent.contracts import TaskSpec, ToolResult
+from src.core.agent.structured_evidence import structured_evidence_from_context
+from src.core.context.structured_hardening import normalize_structured_query_for_language
+from src.core.copilot.trace import (
+    CopilotRequestTrace,
+    render_human_copilot_trace,
+    trace_from_investigation_state,
+)
+from src.core.graph.structured import StructuredQuerySpec
 from src.core.observability.logging import JsonLogFormatter, configure_application_logging
 from src.core.observability.snapshots import EvidenceSnapshotWriter
 
@@ -392,3 +400,87 @@ def test_snapshot_cleanup_and_write_failures_do_not_escape(tmp_path, monkeypatch
     monkeypatch.setattr(write_writer, "_atomic_write", fail_write)
     assert write_writer.write("write-failure", _snapshot_artifacts()) is None
     assert write_writer.last_result["status"] == "failed"
+
+
+def test_detailed_trace_exposes_sanitized_structured_query_authority_and_identity() -> None:
+    query = normalize_structured_query_for_language(
+        StructuredQuerySpec.model_validate({
+            "mode": "search",
+            "filters": {"role": "Domain Controller"},
+            "limit": 3,
+        }),
+        "find all Domain Controller assets, show with their vendor and IP",
+    )
+    context = {
+        "active_graph_version": "graph-v1",
+        "filters": query.filters.model_dump(mode="json"),
+        "rows": [],
+        "returned_count": 0,
+        "matched_total": 0,
+        "truncated": False,
+        "sort": "graph_key",
+        "direction": "asc",
+        "retrieved_at": "2026-09-16T00:00:00Z",
+        "runtime_effective_limit": 50,
+        "runtime_max_limit": 200,
+    }
+    evidence = structured_evidence_from_context("graph.search_assets", context)
+    assert evidence is not None
+    result = ToolResult(
+        status="not_found",
+        entities=(),
+        source_capability="graph.search_assets",
+        retrieved_at="2026-09-16T00:00:00Z",
+        freshness="current",
+        completeness="complete",
+        normalized_query_hash=evidence.query_identity,
+        context_identity=evidence.query_identity,
+        structured_asset_set=evidence,
+        semantic_query_id=evidence.semantic_query_id,
+        provider_result=SimpleNamespace(context=context),
+    )
+    task = TaskSpec(
+        request="find all Domain Controller assets, show with their vendor and IP",
+        intent="asset_search",
+        scope="none",
+        direction="none",
+        entities=(),
+        required_capabilities=("graph.search_assets",),
+        structured_query=query,
+    )
+    route = SimpleNamespace(
+        intent="asset_search",
+        scope="none",
+        direction="none",
+        depth=0,
+        decision_source="semantic_router",
+        fallback_used=False,
+        semantic_router_latency_ms=12,
+        semantic_router_called=True,
+        semantic_router_retry_count=0,
+        structured_result_reference=SimpleNamespace(kind="none"),
+    )
+    trace = trace_from_investigation_state({
+        "request_id": "structured-trace",
+        "session_id": "session-1",
+        "message": task.request,
+        "workflow_status": "completed",
+        "routing_result": route,
+        "task": task,
+        "tool_results": [result],
+        "final_response": {"raw_payload": "must-not-leak"},
+        "full_prompt": "must-not-leak",
+    })
+    rendered = render_human_copilot_trace(
+        trace,
+        settings=_trace_settings(detail="detailed"),
+        emit=False,
+    )
+    assert "STRUCTURED QUERY" in rendered
+    for expected in (
+        "router supplied limit", "user explicit limit", "runtime effective limit",
+        "runtime max limit", "requested output fields", "semantic query id",
+        "evidence query identity", "identity match", "generic_asset_class",
+    ):
+        assert expected in rendered
+    assert "must-not-leak" not in rendered

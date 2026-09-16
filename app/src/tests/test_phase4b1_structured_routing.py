@@ -21,7 +21,15 @@ from src.core.context.structured_routing import (
     normalize_intent_route,
     validate_structured_router_payload,
 )
-from src.core.graph.structured import StructuredQuerySpec
+from src.core.context.structured_hardening import (
+    deterministic_structured_fallback,
+    normalize_structured_query_for_language,
+)
+from src.core.graph.structured import (
+    AssetPredicateField,
+    AssetPredicateOperator,
+    StructuredQuerySpec,
+)
 from src.core.memory.routing_state import SessionRoutingState
 from src.core.memory.retrieval import LongTermMemorySelection
 from src.core.memory.structured_query import StructuredAssetRef, StructuredQueryContext
@@ -388,6 +396,7 @@ def test_set_continuation_accepts_full_typed_query_and_ignores_incidental_ui() -
         payload,
         _empty_entities(),
         min_confidence=0.5,
+        message="how many of those are there?",
         routing_state=SessionRoutingState(structured_query_context=_continuity()),
         ui_context={"selected_ip": "203.0.113.99"},
     )
@@ -550,8 +559,10 @@ def test_explicit_pair_outranks_structured_result_selection() -> None:
 class _RepairLLM:
     def __init__(self, responses: list[str]) -> None:
         self.responses = responses
+        self.calls = 0
 
     def chat(self, *_args, **_kwargs) -> LLMProviderResult:
+        self.calls += 1
         return LLMProviderResult(
             text=self.responses.pop(0),
             provider="fake",
@@ -778,6 +789,7 @@ def test_route_node_set_continuation_discards_incidental_pair_envelope() -> None
         payload,
         old_pair,
         min_confidence=0.5,
+        message="how many of those are there?",
         routing_state=routing_state,
     )
     service = SimpleNamespace(
@@ -865,3 +877,136 @@ def test_historical_result_recall_is_no_live_and_does_not_bind_active_or_ui_enti
     assert routed["request_constraints"].memory_only is True
     assert routed["turn_policy"].operation == "memory_recall"
     assert routed["turn_policy"].operational_state_mutation_allowed is False
+
+
+@pytest.mark.parametrize(
+    ("message", "mapping", "fields"),
+    [
+        (
+            "find domain controllers",
+            "generic_asset_class",
+            ("suggested_type", "role", "roles"),
+        ),
+        ("show all DC assets", "generic_asset_class", ("suggested_type", "role", "roles")),
+        ("find machines acting as domain controllers", "generic_asset_class", ("suggested_type", "role", "roles")),
+        ("primary role is Domain Controller", "explicit_role", ("role",)),
+        ("roles include Domain Controller", "explicit_roles_membership", ("roles",)),
+        ("suggested type is Domain Controller", "explicit_suggested_type", ("suggested_type",)),
+        (
+            "classification summary exactly Domain Controller",
+            "explicit_classification_summary",
+            ("classification_summary",),
+        ),
+    ],
+)
+def test_asset_class_language_normalizes_to_the_typed_canonical_predicate(
+    message: str,
+    mapping: str,
+    fields: tuple[str, ...],
+) -> None:
+    query = normalize_structured_query_for_language(
+        StructuredQuerySpec.model_validate({
+            "mode": "search",
+            "filters": {"role": "Domain Controller"},
+        }),
+        message,
+    )
+    predicate = query.filters.predicate
+    leaves = (predicate.any or (predicate,)) if predicate is not None else ()
+    actual_fields = (
+        tuple(item.field.value for item in leaves if item.field is not None)
+        if leaves
+        else tuple(
+            name for name in fields if getattr(query.filters, name) is not None
+        )
+    )
+    assert actual_fields == fields
+    assert query.class_mapping_mode == mapping
+    assert not leaves or all(
+        item.operator
+        is (AssetPredicateOperator.MEMBER_EQ if item.field is AssetPredicateField.ROLES else AssetPredicateOperator.EQ)
+        for item in leaves
+    )
+
+
+def test_projection_fields_are_typed_and_never_become_selectors() -> None:
+    decision = deterministic_structured_fallback(
+        "find all domain controller assets, show with their vendor and percentage and IP"
+    )
+    assert decision is not None
+    query = decision.query
+    assert query.filters.vendor is None
+    assert {item.value for item in query.requested_output_fields} == {
+        "vendor", "percentage", "ip"
+    }
+    assert query.filters.predicate is not None
+
+
+def test_implicit_router_limit_is_stripped_but_explicit_top_three_is_retained() -> None:
+    aggregate = normalize_structured_query_for_language(
+        StructuredQuerySpec.model_validate({
+            "mode": "aggregate",
+            "operation": "group_count",
+            "group_by": "classification_summary",
+            "filters": {"status": "confirmed"},
+            "limit": 3,
+        }),
+        "group all confirmed assets by classification summary",
+    )
+    ranked = normalize_structured_query_for_language(
+        StructuredQuerySpec.model_validate({
+            "mode": "search",
+            "filters": {},
+            "sort": "model_confidence",
+            "direction": "desc",
+            "limit": 3,
+        }),
+        "top 3 assets by model confidence",
+    )
+    assert aggregate.router_supplied_limit == 3
+    assert aggregate.limit is None and aggregate.user_explicit_limit is False
+    assert ranked.limit == 3 and ranked.user_explicit_limit is True
+
+
+def test_self_contained_set_query_is_rejected_and_again_is_a_fresh_rerun() -> None:
+    payload = _base_payload(
+        "asset_search",
+        {"mode": "search", "filters": {"role": "Domain Controller"}},
+    )
+    payload["structured_result_reference"] = {"kind": "set_query", "ordinals": []}
+    state = SessionRoutingState(structured_query_context=_continuity())
+    decision = validate_structured_router_payload(
+        payload,
+        _empty_entities(),
+        min_confidence=0.5,
+        message="search on role or roles and find the domain controller",
+        routing_state=state,
+    )
+    assert decision.structured_result_reference.kind == "none"
+
+    llm = _RepairLLM([json.dumps(payload)])
+    router = SemanticIntentRouter(
+        replace(get_settings(), intent_router_enabled=True, intent_router_retry_enabled=False),
+        llm,
+    )
+    rerun = router.classify(
+        "find again all Domain Controller assets",
+        _empty_entities(),
+        state,
+        request_id="fresh-rerun",
+    )
+    assert llm.calls == 1
+    assert rerun.structured_result_reference.kind == "none"
+    assert rerun.structured_query is not None and rerun.structured_query.fresh_rerun
+
+
+def test_fallback_preserves_every_material_supported_selector() -> None:
+    decision = deterministic_structured_fallback(
+        "find confirmed Database Server assets with mapping confidence at least 80%"
+    )
+    assert decision is not None
+    query = decision.query
+    assert query.filters.status == "confirmed"
+    assert query.filters.mapping_confidence_min == 0.8
+    assert query.semantic_class == "Database Server"
+    assert query.filters.predicate is not None

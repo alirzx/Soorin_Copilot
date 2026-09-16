@@ -50,7 +50,11 @@ def test_structured_text_filters_are_casefolded_and_strict_above_is_preserved():
         query,
         "List all confirmed Database Server assets with model confidence above 0.95.",
     )
-    assert normalized.filters.role == "database server"
+    assert normalized.filters.role is None
+    assert normalized.filters.predicate is not None
+    assert {item.field.value for item in normalized.filters.predicate.any} == {
+        "suggested_type", "role", "roles"
+    }
     assert normalized.filters.status == "confirmed"
     assert normalized.filters.classification_summary == "high confidence"
     assert normalized.filters.model_confidence_min is not None
@@ -123,7 +127,11 @@ def test_router_failure_fallback_understands_structured_asset_search():
     assert route.structured_query is not None
     assert route.entity_binding == "none"
     assert route.target_entity is None
-    assert route.structured_query.filters.role == "database server"
+    assert route.structured_query.filters.role is None
+    assert route.structured_query.filters.predicate is not None
+    assert {item.field.value for item in route.structured_query.filters.predicate.any} == {
+        "suggested_type", "role", "roles"
+    }
     assert route.structured_query.filters.status == "confirmed"
     assert route.structured_query.filters.model_confidence_min > 0.95
 

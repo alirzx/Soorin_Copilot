@@ -383,9 +383,21 @@ def build_capability_registry(
     def detection(payload: EntityInput) -> ToolResult:
         return product_result("asset.get_detection", "detection", payload)
 
-    def structured_result(capability: str, result: Any) -> ToolResult:
+    def structured_result(
+        capability: str,
+        result: Any,
+        *,
+        semantic_query_id: str | None = None,
+    ) -> ToolResult:
+        context = (
+            dict(result.context)
+            if isinstance(getattr(result, "context", None), dict)
+            else {}
+        )
+        if semantic_query_id:
+            context["semantic_query_id"] = semantic_query_id
+            result = replace(result, context=context)
         normalized = _provider_result(capability, (), result)
-        context = result.context if isinstance(getattr(result, "context", None), dict) else {}
         if capability == "graph.search_assets":
             total_count = int(context.get("matched_total") or 0)
             included_count = int(context.get("returned_count") or 0)
@@ -417,19 +429,30 @@ def build_capability_registry(
                 structured_evidence.query_identity if structured_evidence else ""
             ),
             structured_asset_set=structured_evidence,
+            semantic_query_id=(
+                structured_evidence.semantic_query_id if structured_evidence else ""
+            ),
         )
 
     def structured_search(payload: AssetSearchCapabilityInput) -> ToolResult:
         result = graph_provider.search_assets(
             payload.to_request(),
         )
-        return structured_result("graph.search_assets", result)
+        return structured_result(
+            "graph.search_assets",
+            result,
+            semantic_query_id=payload.semantic_query_id,
+        )
 
     def structured_aggregate(payload: AssetAggregateCapabilityInput) -> ToolResult:
         result = graph_provider.aggregate_assets(
             payload.to_request(),
         )
-        return structured_result("graph.aggregate_assets", result)
+        return structured_result(
+            "graph.aggregate_assets",
+            result,
+            semantic_query_id=payload.semantic_query_id,
+        )
 
     def graph(capability: str) -> CapabilityHandler:
         def run(payload: EntityInput) -> ToolResult:

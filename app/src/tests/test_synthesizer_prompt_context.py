@@ -37,6 +37,7 @@ from src.core.memory.retrieval import LongTermMemorySelection
 from src.core.memory.retrieval import LazyCrossEncoderReranker
 from src.core.memory.episodes import MemoryContextKey, MemoryContextPackage
 from src.core.memory.store import MemoryStore
+from src.core.graph.structured import StructuredQuerySpec
 
 
 LEGACY_PROMPT_SHA256 = "cbe607b7aca45933ebdf55d40dd3254eeac2dc2ada5c4d6a7442c634b967739b"
@@ -598,3 +599,29 @@ def test_timeout_result_reports_observed_latency_instead_of_zero() -> None:
     assert result.status == "unavailable"
     assert result.safe_error_code == "capability_timeout"
     assert result.latency_ms >= 1
+
+
+def test_exact_zero_guard_carries_the_executed_selector_scope_into_synthesis() -> None:
+    query = StructuredQuerySpec.model_validate({
+        "mode": "search",
+        "filters": {"classification_summary": "Domain Controller"},
+    })
+    task = _task(
+        request="classification summary exactly Domain Controller",
+        intent="asset_search",
+        scope="none",
+        direction="none",
+        entities=(),
+        required_capabilities=("graph.search_assets",),
+        structured_query=query,
+    )
+    builder = SynthesizerPromptBuilder()
+    context = builder.build_context(task, ())
+    contract, _ = builder.render_contract(context)
+
+    assert context.structured_query_scope["filters"] == {
+        "classification_summary": "Domain Controller"
+    }
+    assert context.structured_query_scope["exact_zero_scope_only"] is True
+    assert "An exact zero-result applies only to the exact selectors" in contract
+    assert "does not prove that no matching `suggested_type`, `role`, or `roles` value exists" in contract

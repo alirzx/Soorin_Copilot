@@ -30,8 +30,6 @@ from src.core.context.models import (
 )
 from src.core.context.router import normalize_intent_route as _base_normalize_intent_route
 from src.core.context.structured_hardening import (
-    deterministic_structured_fallback,
-    looks_like_structured_set_reference,
     merge_structured_query_for_followup,
     normalize_structured_query_for_language,
     normalize_structured_query_payload_for_language,
@@ -97,7 +95,7 @@ def validate_structured_router_payload(
 ) -> IntentDecision:
     """Validate either the established entity route or one typed Asset-set route."""
     reference = _structured_result_reference(payload.get("structured_result_reference"))
-    if reference.kind == "set_query" and structured_reference_scope(message) == "same_turn":
+    if reference.kind == "set_query" and structured_reference_scope(message) != "previous":
         reference = StructuredResultReferenceDecision()
     # This extension owns structured_result_reference. Remove it after parsing
     # before delegating to the legacy or set-specific field allow-list. The
@@ -340,66 +338,6 @@ class SemanticIntentRouter(_BaseSemanticIntentRouter):
         # its module. Keep that existing path but make its contract 4B.1-aware.
         _intent_module.ROUTER_REPAIR_SYSTEM_PROMPT = _STRUCTURED_REPAIR_SYSTEM_PROMPT
 
-    def classify(
-        self,
-        message: str,
-        entities: EntityResolution,
-        routing_state: SessionRoutingState,
-        *,
-        ui_context: dict[str, Any] | None = None,
-        recent_messages: list[dict[str, str]] | None = None,
-        trace_id: str = "",
-        request_id: str = "",
-    ) -> IntentDecision:
-        context = select_structured_query_context(routing_state, message)
-        compiled = deterministic_structured_fallback(
-            message,
-            prior_query=getattr(context, "query", None),
-            prior_group_values=tuple(
-                str(group.value)
-                for group in tuple(getattr(context, "aggregate_groups", ()) or ())
-                if group.value is not None
-            ),
-        )
-        if compiled is not None:
-            logger.info(
-                "event=intent_router_deterministic_compiler request_id=%s status=matched "
-                "intent=%s reference_kind=%s router_called=false",
-                request_id,
-                compiled.intent,
-                compiled.reference.kind,
-            )
-            return IntentDecision(
-                intent=compiled.intent,  # type: ignore[arg-type]
-                scope="none",
-                direction="none",
-                depth=0,
-                requires_graph=True,
-                structured_query=compiled.query,
-                structured_result_reference=compiled.reference,
-                entity_binding="none",
-                requested_entity_binding="none",
-                binding_source="none",
-                binding_available=True,
-                materialized_entity_count=0,
-                materialized_entities=(),
-                classification_confidence=1.0,
-                reason=compiled.reason,
-                decision_source="deterministic_fallback",
-                router_called=False,
-                content_present=False,
-                fallback_used=False,
-            )
-        return super().classify(
-            message,
-            entities,
-            routing_state,
-            ui_context=ui_context,
-            recent_messages=recent_messages,
-            trace_id=trace_id,
-            request_id=request_id,
-        )
-
     def _decision_from_content(
         self,
         content: str,
@@ -441,13 +379,14 @@ class SemanticIntentRouter(_BaseSemanticIntentRouter):
             entity.source == "message" for entity in entities.entities
         )
         reference_scope = structured_reference_scope(message)
-        if reference_scope == "same_turn" and reference_kind == "set_query":
+        if reference_scope != "previous" and reference_kind == "set_query":
             payload["structured_result_reference"] = {"kind": "none", "ordinals": []}
             reference_kind = "none"
             logger.info(
                 "event=structured_result_reference_normalized request_id=%s "
-                "from_kind=set_query to_kind=none reason=same_turn_antecedent",
+                "from_kind=set_query to_kind=none reason=%s",
                 request_id,
+                reference_scope,
             )
         if (
             reference_kind == "none"

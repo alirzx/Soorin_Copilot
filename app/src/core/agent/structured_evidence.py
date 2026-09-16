@@ -9,7 +9,11 @@ from src.core.agent.contracts import (
     StructuredAssetSearchEvidence,
     StructuredAssetSetEvidence,
 )
-from src.core.graph.structured import StructuredQuerySpec, structured_query_identity
+from src.core.graph.structured import (
+    StructuredQuerySpec,
+    semantic_query_identity,
+    structured_query_identity,
+)
 
 
 def structured_evidence_from_context(
@@ -88,6 +92,11 @@ def expected_structured_query_identity(
         query,
         active_graph_version=evidence.active_graph_version,
     )
+
+
+def expected_semantic_query_identity(query: StructuredQuerySpec) -> str:
+    """Return the immutable execution-independent identity for a task query."""
+    return semantic_query_identity(query)
 
 
 def _optional_string(value: Any) -> str | None:

@@ -25,6 +25,17 @@ class GraphContextProvider:
         self.settings = settings
         self.graph_service = GraphService(settings)
 
+    def _structured_limits(self, requested: int | None) -> tuple[int | None, int | None]:
+        """Read execution bounds from the runtime policy for safe observability."""
+        policy = getattr(getattr(self.graph_service, "repository", None), "policy", None)
+        if policy is not None:
+            return policy.structured_limit(requested), policy.asset_search_max_limit
+        # Lightweight test adapters may expose only settings; production always
+        # uses the GraphQueryPolicy branch above.
+        maximum = getattr(self.settings, "graph_asset_search_max_limit", None)
+        default = getattr(self.settings, "graph_asset_search_default_limit", maximum)
+        return (requested if requested is not None else default), maximum
+
     def provide(
         self,
         entity: ResolvedEntity | None,
@@ -174,6 +185,7 @@ class GraphContextProvider:
                 error_reason="provider_exception",
                 latency_ms=int((time.perf_counter() - started) * 1000),
             )
+        effective_limit, maximum_limit = self._structured_limits(request.limit)
         context = result.model_dump(mode="json", exclude={"next_cursor"})
         context.update(
             {
@@ -189,6 +201,8 @@ class GraphContextProvider:
                 "requested_scope_complete": not result.truncated,
                 "complete_for_user_request": not result.truncated,
                 "serialized_context_complete_for_retrieved_subset": True,
+                "runtime_effective_limit": effective_limit,
+                "runtime_max_limit": maximum_limit,
             }
         )
         return GraphProviderResult(
@@ -233,6 +247,7 @@ class GraphContextProvider:
             if result.group_by or result.group_by_fields
             else result.count
         )
+        effective_limit, maximum_limit = self._structured_limits(request.limit)
         context = result.model_dump(mode="json")
         context.update(
             {
@@ -247,6 +262,12 @@ class GraphContextProvider:
                 "retrieval_truncated": result.truncated,
                 "requested_scope_complete": not result.truncated,
                 "complete_for_user_request": not result.truncated,
+                "runtime_effective_limit": (
+                    effective_limit
+                    if request.operation.value == "group_count"
+                    else None
+                ),
+                "runtime_max_limit": maximum_limit,
                 "serialized_context_complete_for_retrieved_subset": True,
             }
         )

@@ -25,6 +25,7 @@ from src.core.graph.structured import (
     AssetSearchResult,
     StructuredAssetRow,
     StructuredQuerySpec,
+    semantic_query_identity,
 )
 
 
@@ -156,7 +157,10 @@ def test_registry_and_planner_catalog_expose_only_safe_zero_entity_contracts() -
         assert spec.read_only and spec.planner_visible
         assert spec.required_entity_cardinality == (0, 0)
         assert spec.maximum_graph_depth == 0
-        assert set(spec.input_schema.model_json_schema()["properties"]) == set(allowed)
+        assert set(spec.input_schema.model_json_schema()["properties"]) == {
+            *allowed,
+            "semantic_query_id",
+        }
         entry = BoundedPlanner._catalog_entry(spec)
         assert entry["allowed_arguments"] == allowed
         assert set(entry["argument_schema"]["properties"]) == set(allowed)
@@ -252,6 +256,7 @@ def test_direct_plan_is_one_deterministic_zero_entity_step(query_payload, capabi
     assert task.entities == plan.target_entities == ()
     assert len(plan.steps) == 1
     assert plan.steps[0].capability == capability
+    arguments["semantic_query_id"] = semantic_query_identity(query)
     assert plan.steps[0].arguments == arguments
     assert plan.steps[0].arguments.get("depth", 0) == 0
     assert not plan.planner_called

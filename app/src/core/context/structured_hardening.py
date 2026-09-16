@@ -22,6 +22,7 @@ from src.core.context.router import DeterministicFallbackRouter as BaseFallbackR
 from src.core.graph.structured import (
     AssetAggregateOperation,
     AssetGroupField,
+    AssetOutputField,
     AssetPredicate,
     AssetPredicateField,
     AssetPredicateOperator,
@@ -48,6 +49,16 @@ _TEXT_FILTERS = (
 )
 _RANKED_HIGH = re.compile(r"\b(?:highest|top(?:\s+one)?)\b", re.IGNORECASE)
 _RANKED_LOW = re.compile(r"\b(?:lowest|bottom(?:\s+one)?)\b", re.IGNORECASE)
+_EXPLICIT_CARDINALITY = re.compile(
+    r"\b(?:top|first|show|list|return|only)\s+(?P<count>\d{1,4})\b|"
+    r"\breturn\s+the\s+first\s+(?P<return_count>\d{1,4})\b",
+    re.IGNORECASE,
+)
+_FRESH_RERUN = re.compile(
+    r"\b(?:find|search|show|list|run|rerun)\s+again\b|"
+    r"\bagain\s+(?:find|search|show|list|all)\b|\brerun\b",
+    re.IGNORECASE,
+)
 _SET_VERB = re.compile(r"\b(?:list|find|show|count|group|how\s+many)\b", re.IGNORECASE)
 _SET_NOUN = re.compile(r"\b(?:assets?|systems?|devices?)\b", re.IGNORECASE)
 _EXPLICIT_IP = re.compile(r"(?<![\d.])(?:\d{1,3}\.){3}\d{1,3}(?![\d.])")
@@ -136,6 +147,25 @@ _GROUP_FIELD_ALIASES: dict[str, AssetGroupField] = {
     "last detection timestamp": AssetGroupField.LAST_DETECTION_AT,
     "enrichment status": AssetGroupField.ENRICHMENT_STATUS,
 }
+_CANONICAL_ASSET_CLASSES: tuple[tuple[re.Pattern[str], str], ...] = tuple(
+    (re.compile(rf"\b{pattern}\b", re.IGNORECASE), canonical)
+    for pattern, canonical in (
+        (r"(?:domain\s+controllers?|dc\s+assets?)", "Domain Controller"),
+        (r"database\s+servers?", "Database Server"),
+        (r"firewalls?", "Firewall"),
+        (r"splunk\s+indexers?", "Splunk Indexer"),
+        (r"siem(?:\s+assets?)?", "SIEM"),
+        (r"hypervisors?", "Hypervisor"),
+        (r"windows\s+workstations?", "Windows Workstation"),
+        (r"linux\s+servers?", "Linux Server"),
+    )
+)
+_CLASS_PREDICATE_FIELDS = frozenset({
+    AssetPredicateField.SUGGESTED_TYPE,
+    AssetPredicateField.ROLE,
+    AssetPredicateField.ROLES,
+    AssetPredicateField.CLASSIFICATION_SUMMARY,
+})
 
 
 @dataclass(frozen=True)
@@ -289,6 +319,8 @@ def looks_like_structured_set_reference(message: str) -> bool:
 def structured_reference_scope(message: str) -> str:
     """Distinguish same-turn antecedents from actual prior-result references."""
     text = message or ""
+    if _FRESH_RERUN.search(text):
+        return "fresh_rerun"
     if _EXPLICIT_PREVIOUS_SET_REFERENCE.search(text):
         return "previous"
     if _SAME_TURN_SET_ANTECEDENT.search(text):
@@ -392,11 +424,228 @@ def normalize_structured_query_for_language(
             values[maximum] = math.nextafter(float(values[maximum]), -math.inf)
     filters = AssetSearchFilters.model_validate(values)
 
-    updates: dict[str, object] = {"filters": filters}
-    if query.mode is StructuredQueryMode.SEARCH and query.sort is not None:
+    normalized = query.model_copy(update={"filters": filters})
+    normalized = _normalize_asset_class_semantics(normalized, message)
+    requested_outputs = tuple(dict.fromkeys((
+        *normalized.requested_output_fields,
+        *_requested_output_fields(message),
+    )))
+    supplied_limit = (
+        normalized.router_supplied_limit
+        if normalized.router_supplied_limit is not None
+        else normalized.limit
+    )
+    explicit_limit = _explicit_cardinality(message)
+    updates: dict[str, object] = {
+        "requested_output_fields": requested_outputs,
+        "router_supplied_limit": supplied_limit,
+        "user_explicit_limit": explicit_limit is not None,
+        "fresh_rerun": structured_reference_scope(message) == "fresh_rerun",
+        "limit": explicit_limit,
+    }
+    if normalized.mode is StructuredQueryMode.SEARCH and normalized.sort is not None:
         if _RANKED_HIGH.search(message) or _RANKED_LOW.search(message):
-            updates["limit"] = max(3, int(query.limit or 0))
-    return query.model_copy(update=updates)
+            updates["limit"] = max(3, int(explicit_limit or supplied_limit or 0))
+    return normalized.model_copy(update=updates)
+
+
+def _explicit_cardinality(message: str) -> int | None:
+    match = _EXPLICIT_CARDINALITY.search(message or "")
+    if match is None:
+        return None
+    value = int(match.group("count") or match.group("return_count"))
+    return value if value > 0 else None
+
+
+def _requested_output_fields(message: str) -> tuple[AssetOutputField, ...]:
+    """Extract only a clearly introduced presentation/projection clause."""
+    match = re.search(
+        r"(?:,|\band\b)?\s*(?:show|display|return|include)(?:\s+with)?\s+"
+        r"(?P<fields>(?:their\s+)?[^?.!;]+)$|\bshow\s+with\s+(?P<with_fields>[^?.!;]+)$",
+        message or "",
+        re.IGNORECASE,
+    )
+    if match is None:
+        return ()
+    text = (match.group("fields") or match.group("with_fields") or "").casefold()
+    aliases: tuple[tuple[AssetOutputField, str], ...] = (
+        (AssetOutputField.IP, r"\bips?\b|\bip\s+addresses?\b"),
+        (AssetOutputField.ASSET_NAME, r"\basset\s+names?\b|\bhostnames?\b"),
+        (AssetOutputField.VENDOR, r"\bvendors?\b|\bmanufacturers?\b"),
+        (AssetOutputField.PRODUCT, r"\bproducts?\b"),
+        (AssetOutputField.ROLE, r"\bprimary\s+roles?\b|\brole\b"),
+        (AssetOutputField.ROLES, r"\broles\b"),
+        (AssetOutputField.STATUS, r"\bstatus\b"),
+        (AssetOutputField.MODEL_CONFIDENCE, r"\bmodel\s+confidence\b"),
+        (AssetOutputField.MAPPING_CONFIDENCE, r"\bmapping\s+confidence\b"),
+        (AssetOutputField.UNKNOWN_SCORE, r"\bunknown\s+score\b"),
+        (AssetOutputField.CLASSIFICATION_SUMMARY, r"\bclassification\s+summary\b"),
+        (AssetOutputField.SUGGESTED_TYPE, r"\bsuggested\s+type\b"),
+        (AssetOutputField.TAG, r"\btags?\b"),
+        (AssetOutputField.SUB_TAG, r"\bsub[-\s]?tags?\b"),
+        (AssetOutputField.LAST_DETECTION_AT, r"\blast\s+detection(?:\s+time)?\b"),
+        (AssetOutputField.COUNT, r"\bcounts?\b"),
+        (AssetOutputField.PERCENTAGE, r"\bpercentages?\b|%"),
+        (AssetOutputField.MEMBER_IPS, r"\bmember\s+ips?\b"),
+    )
+    return tuple(field for field, pattern in aliases if re.search(pattern, text, re.I))
+
+
+def _canonical_asset_class(message: str) -> str | None:
+    for pattern, canonical in _CANONICAL_ASSET_CLASSES:
+        if pattern.search(message or ""):
+            return canonical
+    return None
+
+
+def _class_mapping(message: str) -> tuple[str, tuple[AssetPredicateField, ...]]:
+    text = message or ""
+    if re.search(r"\b(?:classification\s+(?:summary|description)|classifier\s+summary)\b", text, re.I):
+        return "explicit_classification_summary", (AssetPredicateField.CLASSIFICATION_SUMMARY,)
+    if re.search(
+        r"\b(?:suggested\s+type|asset\s+type|device\s+type|"
+        r"kind\s+of\s+(?:asset|device)|classification\s+type)\b",
+        text,
+        re.I,
+    ):
+        return "explicit_suggested_type", (AssetPredicateField.SUGGESTED_TYPE,)
+    if re.search(r"\broles?\s+include(?:s|d)?\b|\bhas\s+(?:the\s+)?role\b", text, re.I):
+        return "explicit_roles_membership", (AssetPredicateField.ROLES,)
+    if re.search(r"\brole\s+or\s+roles\b|\broles\s+or\s+role\b", text, re.I):
+        return "explicit_role_or_roles", (
+            AssetPredicateField.ROLE,
+            AssetPredicateField.ROLES,
+        )
+    if re.search(
+        r"\b(?:primary\s+role|role\s+(?:is|=)|(?:device\s+)?function)\b",
+        text,
+        re.I,
+    ):
+        return "explicit_role", (AssetPredicateField.ROLE,)
+    return "generic_asset_class", (
+        AssetPredicateField.SUGGESTED_TYPE,
+        AssetPredicateField.ROLE,
+        AssetPredicateField.ROLES,
+    )
+
+
+def _class_predicate(
+    canonical: str,
+    fields: tuple[AssetPredicateField, ...],
+) -> AssetPredicate:
+    leaves = tuple(
+        AssetPredicate(
+            field=field,
+            operator=(
+                AssetPredicateOperator.MEMBER_EQ
+                if field is AssetPredicateField.ROLES
+                else AssetPredicateOperator.EQ
+            ),
+            value=canonical,
+        )
+        for field in fields
+    )
+    return leaves[0] if len(leaves) == 1 else AssetPredicate(any=leaves)
+
+
+def _replace_class_leaves(
+    predicate: AssetPredicate,
+    canonical: str,
+    replacement: AssetPredicate,
+) -> tuple[AssetPredicate, bool]:
+    if _predicate_is_class_only(predicate, canonical):
+        return replacement, True
+    if predicate.all or predicate.any:
+        children: list[AssetPredicate] = []
+        replaced = False
+        for child in predicate.all or predicate.any:
+            updated, child_replaced = _replace_class_leaves(child, canonical, replacement)
+            children.append(updated)
+            replaced = replaced or child_replaced
+        return (
+            AssetPredicate(all=tuple(children))
+            if predicate.all
+            else AssetPredicate(any=tuple(children)),
+            replaced,
+        )
+    if predicate.not_ is not None:
+        updated, replaced = _replace_class_leaves(predicate.not_, canonical, replacement)
+        return AssetPredicate.model_validate({"not": updated}), replaced
+    values = predicate.values or ((predicate.value,) if predicate.value is not None else ())
+    if (
+        predicate.field in _CLASS_PREDICATE_FIELDS
+        and any(str(value).strip().casefold() == canonical.casefold() for value in values)
+    ):
+        return replacement, True
+    return predicate, False
+
+
+def _predicate_is_class_only(predicate: AssetPredicate, canonical: str) -> bool:
+    if predicate.all or predicate.any:
+        return all(
+            _predicate_is_class_only(child, canonical)
+            for child in predicate.all or predicate.any
+        )
+    if predicate.not_ is not None or predicate.field not in _CLASS_PREDICATE_FIELDS:
+        return False
+    values = predicate.values or ((predicate.value,) if predicate.value is not None else ())
+    return bool(values) and all(
+        str(value).strip().casefold() == canonical.casefold() for value in values
+    )
+
+
+def _normalize_asset_class_semantics(
+    query: StructuredQuerySpec,
+    message: str,
+) -> StructuredQuerySpec:
+    canonical = _canonical_asset_class(message)
+    if canonical is None:
+        return query
+    mapping_mode, selector_fields = _class_mapping(message)
+    replacement = _class_predicate(canonical, selector_fields)
+    values = query.filters.model_dump()
+    flat_replaced = False
+    for name in ("suggested_type", "role", "roles", "classification_summary"):
+        value = values.get(name)
+        if isinstance(value, str) and value.strip().casefold() == canonical.casefold():
+            values[name] = None
+            flat_replaced = True
+    predicate = query.filters.predicate
+    predicate_replaced = False
+    if predicate is not None:
+        predicate, predicate_replaced = _replace_class_leaves(
+            predicate,
+            canonical,
+            replacement,
+        )
+    if len(selector_fields) == 1:
+        if not predicate_replaced:
+            values[selector_fields[0].value] = canonical.casefold()
+        values["predicate"] = predicate
+        return query.model_copy(update={
+            "filters": AssetSearchFilters.model_validate(values),
+            "semantic_class": canonical,
+            "class_mapping_mode": mapping_mode,
+            "class_selector_fields": selector_fields,
+        })
+    if flat_replaced:
+        predicate = (
+            AssetPredicate(all=(predicate, replacement))
+            if predicate is not None and not predicate_replaced
+            else predicate or replacement
+        )
+    elif predicate is None:
+        # The Router may correctly identify the class intent but omit the
+        # selector field; bounded normalization can still compile this known
+        # canonical class without inventing database vocabulary.
+        predicate = replacement
+    values["predicate"] = predicate
+    return query.model_copy(update={
+        "filters": AssetSearchFilters.model_validate(values),
+        "semantic_class": canonical,
+        "class_mapping_mode": mapping_mode,
+        "class_selector_fields": selector_fields,
+    })
 
 
 def looks_like_structured_set_request(
@@ -512,7 +761,7 @@ def _natural_filter_values(message: str) -> tuple[dict[str, object], bool]:
             values["role"] = known.group(1)
 
     exact_patterns = {
-        "vendor": r"\b(?:made\s+by|manufacturer(?:\s+is)?|maker(?:\s+is)?|vendor(?:\s+is)?)\s+(?P<value>[\w.&-]+)",
+        "vendor": r"\b(?:made\s+by|manufacturer\s+is|maker\s+is|vendor\s+is)\s+(?P<value>[\w.&-]+)",
         "suggested_type": r"\b(?:suggested\s+type|asset\s+type|device\s+type|kind\s+of\s+(?:asset|device)|classification\s+type)(?:\s+is)?\s+(?P<value>[\w][\w .&/-]*?)(?=[?.!,]|$)",
         "product": r"\b(?:product(?:\s+family)?|platform/product)(?:\s+is)?\s+(?P<value>[\w][\w .&/-]*?)(?=[?.!,]|$)",
         "tag": r"\b(?:tag|asset\s+label)(?:\s+is)?\s+(?P<value>[\w][\w .&/-]*?)(?=[?.!,]|$)",
@@ -650,6 +899,29 @@ def _natural_boolean_predicate(
     return None
 
 
+def _fallback_material_constraints_complete(
+    message: str,
+    values: dict[str, object],
+    group_fields: tuple[AssetGroupField, ...] | None,
+) -> bool:
+    """Fail closed when material allow-listed selector wording was not parsed."""
+    checks: tuple[tuple[re.Pattern[str], tuple[str, ...]], ...] = (
+        (re.compile(r"\b(?:confirmed|unconfirmed)\b", re.I), ("status",)),
+        (re.compile(r"\b(?:made\s+by|manufacturer\s+is|maker\s+is|vendor\s+is)\b", re.I), ("vendor",)),
+        (re.compile(r"\bproduct(?:\s+family)?\s+is\b", re.I), ("product",)),
+        (re.compile(r"\bmapping\s+(?:confidence|certainty)\b", re.I), ("mapping_confidence_min", "mapping_confidence_max")),
+        (re.compile(r"\b(?:model|classification)\s+(?:confidence|certainty)\b", re.I), ("model_confidence_min", "model_confidence_max")),
+        (re.compile(r"\bunknown\s+(?:score|probability)\b", re.I), ("unknown_score_min", "unknown_score_max")),
+    )
+    grouped = {item.value for item in (group_fields or ())}
+    return all(
+        not pattern.search(message)
+        or any(name in values for name in names)
+        or any(name.rsplit("_", 1)[0] in grouped for name in names)
+        for pattern, names in checks
+    )
+
+
 def _group_fields_from_message(message: str) -> tuple[AssetGroupField, ...] | None:
     match = re.search(
         r"\bgroup\s+(?:(?:all\s+)?assets?|them|those|these)\s+by\s+"
@@ -767,6 +1039,8 @@ def deterministic_structured_fallback(
     predicate = _natural_boolean_predicate(text, values)
     if predicate is not None:
         values["predicate"] = predicate
+    if not _fallback_material_constraints_complete(text, values, group_fields):
+        return None
     try:
         filters = AssetSearchFilters.model_validate(values)
     except ValueError:

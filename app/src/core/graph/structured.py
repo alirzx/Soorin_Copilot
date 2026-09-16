@@ -76,6 +76,30 @@ class StructuredQueryMode(str, Enum):
     AGGREGATE = "aggregate"
 
 
+class AssetOutputField(str, Enum):
+    """Bounded presentation fields; these never participate in selection."""
+
+    IP = "ip"
+    ASSET_NAME = "asset_name"
+    STATUS = "status"
+    SUGGESTED_TYPE = "suggested_type"
+    MODEL_CONFIDENCE = "model_confidence"
+    MAPPING_CONFIDENCE = "mapping_confidence"
+    UNKNOWN_SCORE = "unknown_score"
+    CLASSIFICATION_SUMMARY = "classification_summary"
+    VENDOR = "vendor"
+    PRODUCT = "product"
+    ROLE = "role"
+    ROLES = "roles"
+    TAG = "tag"
+    SUB_TAG = "sub_tag"
+    LAST_DETECTION_AT = "last_detection_at"
+    ENRICHMENT_STATUS = "enrichment_status"
+    COUNT = "count"
+    PERCENTAGE = "percentage"
+    MEMBER_IPS = "member_ips"
+
+
 class AssetPredicateField(str, Enum):
     IP = "ip"
     ASSET_NAME = "asset_name"
@@ -374,6 +398,7 @@ class AssetSearchCapabilityInput(BaseModel):
     sort: AssetSortField = AssetSortField.GRAPH_KEY
     direction: SortDirection = SortDirection.ASC
     limit: int | None = Field(default=None, ge=1)
+    semantic_query_id: str | None = Field(default=None, max_length=160)
 
     def to_request(self) -> AssetSearchRequest:
         return AssetSearchRequest(
@@ -473,6 +498,7 @@ class AssetAggregateCapabilityInput(BaseModel):
     group_by: AssetGroupField | None = None
     group_by_fields: tuple[AssetGroupField, ...] = ()
     limit: int | None = Field(default=None, ge=1)
+    semantic_query_id: str | None = Field(default=None, max_length=160)
 
     @model_validator(mode="after")
     def validate_grouping(self) -> "AssetAggregateCapabilityInput":
@@ -590,9 +616,22 @@ class StructuredQuerySpec(BaseModel):
     operation: AssetAggregateOperation | None = None
     group_by: AssetGroupField | None = None
     group_by_fields: tuple[AssetGroupField, ...] = ()
+    requested_output_fields: tuple[AssetOutputField, ...] = ()
+    router_supplied_limit: int | None = Field(default=None, ge=1)
+    user_explicit_limit: bool = False
+    fresh_rerun: bool = False
+    semantic_class: str | None = Field(default=None, max_length=256)
+    class_mapping_mode: str | None = Field(default=None, max_length=64)
+    class_selector_fields: tuple[AssetPredicateField, ...] = ()
 
     @model_validator(mode="after")
     def validate_mode_contract(self) -> "StructuredQuerySpec":
+        if len(set(self.requested_output_fields)) != len(self.requested_output_fields):
+            raise ValueError("requested output fields must be unique")
+        if len(self.requested_output_fields) > len(AssetOutputField):
+            raise ValueError("too many requested output fields")
+        if len(set(self.class_selector_fields)) != len(self.class_selector_fields):
+            raise ValueError("class selector fields must be unique")
         if self.mode is StructuredQueryMode.SEARCH:
             if self.operation is not None or self.group_by is not None or self.group_by_fields:
                 raise ValueError("search structured queries do not accept aggregate fields")
@@ -643,29 +682,7 @@ def structured_query_identity(
     active_graph_version: str | None,
 ) -> str:
     """Hash normalized semantic query fields and the active projection version."""
-    if isinstance(query, StructuredQuerySpec):
-        serialized = query.model_dump(mode="json", exclude_none=True)
-    else:
-        serialized = {key: value for key, value in query.items() if value is not None}
-    mode = str(serialized.get("mode") or "")
-    payload = {
-        "mode": mode,
-        "filters": dict(serialized.get("filters") or {}),
-    }
-    if mode == "search":
-        payload.update(
-            sort=str(serialized.get("sort") or "graph_key"),
-            direction=str(serialized.get("direction") or "asc"),
-        )
-    elif mode == "aggregate":
-        group_fields = list(serialized.get("group_by_fields") or ())
-        if not group_fields and serialized.get("group_by") is not None:
-            group_fields = [serialized["group_by"]]
-        payload.update(
-            operation=str(serialized.get("operation") or "count"),
-            group_by=(group_fields[0] if len(group_fields) == 1 else None),
-            group_by_fields=group_fields,
-        )
+    payload = canonical_structured_query_payload(query)
     canonical = json.dumps(
         {"active_graph_version": active_graph_version, "query": payload},
         ensure_ascii=False,
@@ -673,6 +690,56 @@ def structured_query_identity(
         sort_keys=True,
     ).encode("utf-8")
     return "structured-asset-set:v1:" + hashlib.sha256(canonical).hexdigest()
+
+
+def canonical_structured_query_payload(
+    query: StructuredQuerySpec | dict[str, Any],
+) -> dict[str, Any]:
+    """Return the one execution-independent representation used for identity.
+
+    Re-validating provider dictionaries is intentional: it removes model-dump
+    differences such as explicit null fields and ``not_`` versus the ``not``
+    alias before hashing.
+    """
+
+    parsed = query if isinstance(query, StructuredQuerySpec) else StructuredQuerySpec.model_validate(query)
+    filters = parsed.filters.model_dump(
+        mode="json",
+        by_alias=True,
+        exclude_none=True,
+        exclude_defaults=True,
+    )
+    payload: dict[str, Any] = {
+        "mode": parsed.mode.value,
+        "filters": filters,
+    }
+    if parsed.mode is StructuredQueryMode.SEARCH:
+        payload.update(
+            sort=(parsed.sort or AssetSortField.GRAPH_KEY).value,
+            direction=(parsed.direction or SortDirection.ASC).value,
+        )
+    else:
+        group_fields = parsed.group_by_fields or (
+            (parsed.group_by,) if parsed.group_by is not None else ()
+        )
+        payload.update(
+            operation=(parsed.operation or AssetAggregateOperation.COUNT).value,
+            group_by=(group_fields[0].value if len(group_fields) == 1 else None),
+            group_by_fields=[item.value for item in group_fields],
+        )
+    return payload
+
+
+def semantic_query_identity(query: StructuredQuerySpec | dict[str, Any]) -> str:
+    """Hash only analytical semantics, excluding projection and execution bounds."""
+
+    canonical = json.dumps(
+        canonical_structured_query_payload(query),
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return "structured-semantic-query:v1:" + hashlib.sha256(canonical).hexdigest()
 
 
 AssetPredicate.model_rebuild()

@@ -20,7 +20,11 @@ from src.core.context.models import GraphProviderResult, ProviderProvenance, Rou
 from src.core.context.composer import ContextComposer, PROVIDER_SEMANTICS
 from src.core.context.models import EntityResolution, approx_tokens
 from src.core.context.synthesizer_prompt import SynthesizerPromptBuilder
-from src.core.graph.structured import StructuredQuerySpec
+from src.core.graph.structured import (
+    StructuredQuerySpec,
+    semantic_query_identity,
+    structured_query_identity,
+)
 
 
 class _UnusedProvider:
@@ -235,6 +239,51 @@ def test_structured_query_identity_is_canonical_and_graph_version_bound() -> Non
     assert identity != structured_query_identity(first, active_graph_version="graph-v8")
 
 
+def test_predicate_semantic_identity_survives_plan_provider_and_evidence_reconstruction() -> None:
+    query = StructuredQuerySpec.model_validate({
+        "mode": "search",
+        "filters": {
+            "predicate": {
+                "any": [
+                    {"field": "suggested_type", "operator": "eq", "value": "domain controller"},
+                    {"field": "role", "operator": "eq", "value": "domain controller"},
+                    {"field": "roles", "operator": "member_eq", "value": "domain controller"},
+                ]
+            }
+        },
+        "limit": 3,
+        "requested_output_fields": ["vendor", "ip"],
+    })
+    task = _task(query)
+    plan = compile_direct_plan(task)
+    arguments = plan.steps[0].arguments
+    assert arguments["semantic_query_id"] == semantic_query_identity(query)
+
+    result = _registry().execute("graph.search_assets", arguments)
+    evidence = result.structured_asset_set
+    assert evidence is not None
+    assert result.semantic_query_id == evidence.semantic_query_id == semantic_query_identity(query)
+    assert evidence.query_identity == structured_query_identity(
+        query,
+        active_graph_version="graph-v7",
+    )
+    assert EvidenceReviewer().review(task, [result]).outcome in {
+        "sufficient", "answer_with_limitations"
+    }
+
+
+def test_execution_limit_and_output_projection_do_not_change_semantic_identity() -> None:
+    base = StructuredQuerySpec.model_validate({
+        "mode": "search",
+        "filters": {"status": "confirmed"},
+    })
+    bounded = base.model_copy(update={
+        "limit": 50,
+        "requested_output_fields": ("vendor", "ip"),
+    })
+    assert semantic_query_identity(base) == semantic_query_identity(bounded)
+
+
 def test_successful_empty_search_remains_current_typed_evidence() -> None:
     result = _registry(empty=True).execute("graph.search_assets", {
         "filters": {"status": "CONFIRMED"},
@@ -372,9 +421,13 @@ def test_reviewer_rejects_wrong_query_identity_mode_missing_and_failed_results()
     missing = EvidenceReviewer().review(task, [], allow_supplemental=True)
     assert missing.outcome == "missing_required_evidence"
     assert missing.next_capability == "graph.search_assets"
-    assert missing.next_arguments == {
-        "filters": {"role": "Domain Controller", "status": "CONFIRMED"},
+    assert missing.next_arguments is not None
+    assert missing.next_arguments["filters"] == {
+        "role": "Domain Controller", "status": "CONFIRMED"
     }
+    assert missing.next_arguments["sort"] == "graph_key"
+    assert missing.next_arguments["direction"] == "asc"
+    assert missing.next_arguments["semantic_query_id"] == semantic_query_identity(query)
     failed = EvidenceReviewer().review(
         task,
         [replace(result, status="unavailable", structured_asset_set=None)],

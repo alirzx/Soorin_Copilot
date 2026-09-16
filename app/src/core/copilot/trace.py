@@ -8,6 +8,8 @@ import sys
 from dataclasses import dataclass, field
 from typing import Any, TextIO
 
+from src.core.graph.structured import semantic_query_identity, structured_query_identity
+
 
 logger = logging.getLogger(__name__)
 _SENSITIVE_KEYS = {
@@ -26,6 +28,7 @@ _DETAILED_SECTION_ORDER = (
     "REQUEST",
     "IDENTITY AND ENTITY RESOLUTION",
     "ROUTING DECISION",
+    "STRUCTURED QUERY",
     "TASK AND PLAN",
     "MEMORY SUFFICIENCY AND EVIDENCE GAP",
     "LANGGRAPH WORKFLOW",
@@ -322,6 +325,99 @@ def trace_from_investigation_state(state: dict[str, Any]) -> CopilotRequestTrace
         fallback_used=bool(getattr(route, "fallback_used", False)),
         router_latency_ms=getattr(route, "semantic_router_latency_ms", 0),
     )
+    structured_query = getattr(task, "structured_query", None)
+    if structured_query is not None:
+        structured_results = [
+            item
+            for item in results
+            if getattr(item, "structured_asset_set", None) is not None
+        ]
+        structured_result = structured_results[0] if structured_results else None
+        evidence = (
+            getattr(structured_result, "structured_asset_set", None)
+            if structured_result is not None
+            else None
+        )
+        provider_context = getattr(
+            getattr(structured_result, "provider_result", None),
+            "context",
+            {},
+        )
+        if not isinstance(provider_context, dict):
+            provider_context = {}
+        semantic_id = semantic_query_identity(structured_query)
+        evidence_query_id = getattr(evidence, "query_identity", "")
+        expected_evidence_id = (
+            structured_query_identity(
+                structured_query,
+                active_graph_version=getattr(evidence, "active_graph_version", None),
+            )
+            if evidence is not None
+            else ""
+        )
+        filters = structured_query.filters.model_dump(
+            mode="json",
+            by_alias=True,
+            exclude_none=True,
+            exclude_defaults=True,
+            exclude={"predicate"},
+        )
+        predicate = structured_query.filters.predicate
+        predicate_shape = None
+        if predicate is not None:
+            depth, leaves = predicate.shape()
+            predicate_shape = f"depth={depth},leaves={leaves}"
+        group_fields = structured_query.group_by_fields or (
+            (structured_query.group_by,) if structured_query.group_by is not None else ()
+        )
+        reference_kind = getattr(
+            getattr(route, "structured_result_reference", None),
+            "kind",
+            "none",
+        )
+        identity_match = (
+            evidence is not None
+            and evidence_query_id == expected_evidence_id
+            and getattr(evidence, "semantic_query_id", "") == semantic_id
+            and getattr(structured_result, "normalized_query_hash", "")
+            == expected_evidence_id
+            and getattr(structured_result, "context_identity", "")
+            == expected_evidence_id
+        )
+        trace.put(
+            "STRUCTURED QUERY",
+            query_source=getattr(route, "decision_source", "unknown"),
+            mode=structured_query.mode.value,
+            filters=filters,
+            predicate_shape=predicate_shape,
+            group_by=(structured_query.group_by.value if structured_query.group_by else None),
+            group_by_fields=[item.value for item in group_fields],
+            sort=(structured_query.sort.value if structured_query.sort else None),
+            direction=(structured_query.direction.value if structured_query.direction else None),
+            router_supplied_limit=structured_query.router_supplied_limit,
+            user_explicit_limit=structured_query.user_explicit_limit,
+            normalized_limit=structured_query.limit,
+            runtime_effective_limit=provider_context.get("runtime_effective_limit"),
+            runtime_max_limit=provider_context.get("runtime_max_limit"),
+            requested_output_fields=[
+                item.value for item in structured_query.requested_output_fields
+            ],
+            reference_kind=reference_kind,
+            previous_set_used=reference_kind == "set_query",
+            fresh_rerun=structured_query.fresh_rerun,
+            semantic_class=structured_query.semantic_class,
+            mapping_mode=structured_query.class_mapping_mode,
+            selector_fields=[
+                item.value for item in structured_query.class_selector_fields
+            ],
+            semantic_query_id=semantic_id,
+            evidence_query_identity=evidence_query_id,
+            tool_normalized_query_hash=getattr(
+                structured_result, "normalized_query_hash", ""
+            ),
+            tool_context_identity=getattr(structured_result, "context_identity", ""),
+            identity_match=identity_match,
+        )
     trace.put(
         "TASK AND PLAN",
         workflow_mode=getattr(task, "workflow_mode", "unknown"),

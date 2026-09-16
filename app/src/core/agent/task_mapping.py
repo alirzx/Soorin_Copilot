@@ -22,6 +22,7 @@ from src.core.graph.structured import (
     AssetAggregateCapabilityInput,
     AssetSearchCapabilityInput,
     StructuredQueryMode,
+    semantic_query_identity,
 )
 from src.core.memory.routing_state import SessionRoutingState
 
@@ -520,6 +521,7 @@ def compile_direct_plan(task: TaskSpec, *, plan_id: str | None = None) -> Execut
             mode="json",
             exclude_none=True,
         )
+        arguments["semantic_query_id"] = semantic_query_identity(task.structured_query)
         if not arguments.get("group_by_fields"):
             arguments.pop("group_by_fields", None)
         steps.append(PlanStep(
