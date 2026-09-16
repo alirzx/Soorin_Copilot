@@ -461,7 +461,10 @@ class SoorinMetrics:
         if not self.enabled:
             return
         purpose = _bounded(getattr(call, "purpose", ""), BOUNDED_LLM_PURPOSES)
-        provider = _bounded(getattr(call, "provider", ""), {"arvan"})
+        provider = _bounded(
+            getattr(call, "provider", ""),
+            {"arvan", "vllm", "ollama", "openai_compatible"},
+        )
         model = str(getattr(call, "model", "") or "unknown")[:80]
         status = _bounded(
             getattr(call, "status", ""),

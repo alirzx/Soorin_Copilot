@@ -10,8 +10,8 @@ from collections.abc import Iterator
 from src.config.llm_deployments import LLMRequestConfig, LLMRoleConfig
 from src.config.settings import Settings
 from src.core.llm.errors import LLMDisabledError, LLMError
-from src.core.llm.providers.arvan import ArvanProvider
-from src.core.llm.providers.base import LLMProviderResult, LLMStreamEvent
+from src.core.llm.providers.base import LLMProvider, LLMProviderResult, LLMStreamEvent
+from src.core.llm.providers.factory import build_provider, provider_api_key_required
 from src.core.observability.llm_usage import LLMUsageCall, LLMUsageRecorder
 from src.core.observability.metrics import get_metrics
 
@@ -24,15 +24,17 @@ class LLMClient:
     def __init__(self, settings: Settings, usage_recorder: LLMUsageRecorder | None = None) -> None:
         self.settings = settings
         self.usage_recorder = usage_recorder
-        self.providers: dict[str, ArvanProvider] = {}
-        if settings.llm_provider == "arvan":
-            selected_roles = ("router", "synthesizer", *(["planner"] if settings.planner_enabled else []))
-            for role in selected_roles:
-                deployment = settings.role(role)
-                self.providers[role] = ArvanProvider(
-                    deployment,
-                    enabled=settings.llm_enabled,
-                )
+        self.providers: dict[str, LLMProvider] = {}
+        selected_roles = (
+            "router",
+            "synthesizer",
+            *(["planner"] if settings.planner_enabled else []),
+        )
+        for role in selected_roles:
+            deployment = settings.role(role)
+            provider = build_provider(deployment, enabled=settings.llm_enabled)
+            if provider is not None:
+                self.providers[role] = provider
         self.provider = self.providers.get("synthesizer")
         router = settings.role("router")
         chat = settings.role("synthesizer")
@@ -360,10 +362,15 @@ class LLMClient:
             chat = self.settings.role("synthesizer")
             return {
                 "enabled": self.settings.llm_enabled,
+                "supported": False,
                 "ready": False,
                 "provider": self.settings.llm_provider,
                 "model": chat.model,
                 "deployment": chat.name,
+                "endpoint_configured": bool(chat.endpoint),
+                "model_configured": bool(chat.model),
+                "auth_required": provider_api_key_required(self.settings.llm_provider),
+                "auth_configured": bool(chat.api_key),
                 "reason": "provider_not_supported",
             }
 
@@ -376,6 +383,7 @@ class LLMClient:
         )
         return {
             "enabled": self.settings.llm_enabled,
+            "supported": True,
             "ready": bool(router["ready"] and planner["ready"] and chat["ready"]),
             "provider": chat["provider"],
             "model": chat["model"],

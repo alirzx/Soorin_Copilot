@@ -9,8 +9,8 @@ from src.core.agent.contracts import (
 )
 from src.core.agent.hardened_phase4c import Phase4CWorkflowNodes, _deepened_entities
 from src.core.agent.hardened_reviewer import EvidenceReviewer
-from src.core.agent.phase4c_nodes import Phase4CWorkflowNodes as BasePhase4CWorkflowNodes
-from src.core.context.models import RouteDecision
+from src.core.agent.nodes import CopilotWorkflowNodes
+from src.core.context.models import EntityResolution, RouteDecision
 from src.core.copilot.hardened_service import CopilotService
 from src.core.copilot.service import CopilotService as BaseCopilotService
 from src.core.graph.structured import (
@@ -91,6 +91,8 @@ def test_phase4c_derives_only_actually_deepened_assets_as_focal():
         retrieved_at="now",
         freshness="current",
         completeness="complete",
+        step_id="deepening-1",
+        projection_usable=True,
     )
     search_result = ToolResult(
         status="ok",
@@ -113,6 +115,8 @@ def test_phase4c_deepened_asset_becomes_active_in_memory_transition(monkeypatch)
         retrieved_at="now",
         freshness="current",
         completeness="complete",
+        step_id="deepening-1",
+        projection_usable=True,
     )
     query = _ranked_query()
     query_identity = structured_query_identity(query, active_graph_version="v1")
@@ -150,7 +154,7 @@ def test_phase4c_deepened_asset_becomes_active_in_memory_transition(monkeypatch)
             "active_state": state["active_entity_state"],
         }
 
-    monkeypatch.setattr(BasePhase4CWorkflowNodes, "update_memory", capture)
+    monkeypatch.setattr(CopilotWorkflowNodes, "update_memory", capture)
     node = object.__new__(Phase4CWorkflowNodes)
 
     state = {
@@ -188,6 +192,37 @@ def test_phase4c_deepened_asset_becomes_active_in_memory_transition(monkeypatch)
     assert update["context_key"].entities == ("192.168.8.1",)
     assert update["active_state"].structured_query_context is not None
     assert update["active_state"].structured_query_context.query == query
+
+
+def test_phase4c_search_without_deepening_does_not_activate_search_rows(monkeypatch):
+    previous = SessionRoutingState(
+        active_ip="192.168.30.1",
+        active_entities=("192.168.30.1",),
+    )
+    search = ToolResult(
+        status="ok",
+        entities=(),
+        source_capability="graph.search_assets",
+        retrieved_at="now",
+        freshness="current",
+        completeness="complete",
+    )
+
+    def capture(_self, state):
+        return {"active_entity_state": state["active_entity_state"]}
+
+    monkeypatch.setattr(CopilotWorkflowNodes, "update_memory", capture)
+    node = object.__new__(Phase4CWorkflowNodes)
+
+    update = node.update_memory(
+        {
+            "tool_results": [search],
+            "active_entity_state": previous,
+            "resolved_entities": EntityResolution(status="none"),
+        }
+    )
+
+    assert update["active_entity_state"].active_entities == ("192.168.30.1",)
 
 
 def test_length_truncated_stream_is_not_emitted_before_recovery(monkeypatch):

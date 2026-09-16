@@ -10,6 +10,9 @@ from urllib.parse import urlsplit
 LLMRoleName = Literal["router", "planner", "synthesizer"]
 LLMPurpose = Literal["intent_router", "intent_router_repair", "planner", "planner_repair", "chat"]
 VALID_LLM_ROLES: tuple[LLMRoleName, ...] = ("router", "planner", "synthesizer")
+SUPPORTED_LLM_PROVIDER_TYPES = frozenset(
+    {"arvan", "vllm", "ollama", "openai_compatible"}
+)
 
 
 def normalize_chat_endpoint(base_url: str, chat_path: str) -> str:

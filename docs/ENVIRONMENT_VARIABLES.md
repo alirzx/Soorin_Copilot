@@ -158,7 +158,7 @@ Secrets such as API keys, passwords, Product tokens, captcha bypass values, and 
 
 ### `SOORIN_LLM_PROVIDER`
 
-`SOORIN_LLM_PROVIDER` selects the provider implementation used by the provider-neutral LLM client; the current deployment uses `arvan`. It is a provider identifier, not a boolean. Only provider names implemented by the current code are valid, and changing it can alter transport/authentication behavior. `(double-check the exact current accepted provider enum in settings.py)`
+`SOORIN_LLM_PROVIDER` selects the provider policy used by the shared OpenAI-compatible transport. Accepted values are `arvan`, `vllm`, `ollama`, and `openai_compatible`; any other value fails closed. Arvan requires each selected role's existing API-key field. vLLM, Ollama, and generic compatible endpoints accept the same fields but may omit the API key for a private no-auth endpoint; when a key is present, the configured `SOORIN_LLM_AUTH_SCHEME` is used for the `Authorization` header. Router, Planner, and Synthesizer continue to use their existing independent base URL, model, and API-key variables.
 
 ### `SOORIN_LLM_MAX_TRANSIENT_RETRIES`
 

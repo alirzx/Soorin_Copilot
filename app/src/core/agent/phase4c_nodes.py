@@ -16,8 +16,14 @@ from typing import Any
 
 from src.core.agent.contracts import ExecutionPlan, InvestigationState, TaskSpec
 from src.core.agent.nodes import CopilotWorkflowNodes
+from src.core.agent.structured_continuity import structured_query_context_from_state
 from src.core.agent.task_mapping import compile_direct_plan
-from src.core.context.models import ResolvedEntity
+from src.core.context.models import (
+    EntityResolution,
+    ResolvedEntity,
+    StructuredResultReferenceDecision,
+)
+from src.core.memory.episodes import MemoryContextKey
 
 
 logger = logging.getLogger(__name__)
@@ -59,6 +65,40 @@ _BROAD = re.compile(
     r"\b(?:analy[sz]e|investigate|assess|comprehensive|deep(?:ly)?)\b",
     re.IGNORECASE,
 )
+_FOCAL_CAPABILITIES = {
+    "asset.get_profile",
+    "asset.get_detection",
+    "graph.get_summary",
+    "graph.compare_assets",
+}
+_FOCAL_CAPABILITY_ORDER = (
+    "asset.get_profile",
+    "asset.get_detection",
+    "graph.get_summary",
+    "graph.compare_assets",
+)
+
+
+def _phase4c_deepening_results(state: InvestigationState) -> tuple[Any, ...]:
+    """Return usable focal evidence produced by the bounded Phase 4C fan-out."""
+    return tuple(
+        result
+        for result in state.get("tool_results") or ()
+        if str(getattr(result, "step_id", "") or "").startswith("deepening-")
+        and result.source_capability in _FOCAL_CAPABILITIES
+        and result.status in {"ok", "partial"}
+        and result.projection_usable
+    )
+
+
+def _deepened_entities(state: InvestigationState) -> tuple[str, ...]:
+    """Derive at most two focals; ordinary search/Product rows never qualify."""
+    focal: list[str] = []
+    for result in _phase4c_deepening_results(state):
+        for entity in result.entities:
+            if entity not in focal:
+                focal.append(entity)
+    return tuple(focal[:2])
 
 
 class Phase4CWorkflowNodes(CopilotWorkflowNodes):
@@ -239,6 +279,119 @@ class Phase4CWorkflowNodes(CopilotWorkflowNodes):
             revised.outcome,
         )
         return {**update, "review_decision": revised, "evidence_pack": pack, "next_edge": "compose"}
+
+    def update_memory(self, state: InvestigationState) -> dict[str, Any]:
+        """Persist only successfully deepened Assets as operational focals."""
+        deepening_results = _phase4c_deepening_results(state)
+        focal = _deepened_entities(state)
+        if not focal:
+            return super().update_memory(state)
+
+        resolved = [
+            ResolvedEntity(type="ip", value=value, source="conversation")
+            for value in focal
+        ]
+        resolution = EntityResolution(
+            status="resolved",
+            entities=resolved,
+            primary_entity=resolved[0] if len(resolved) == 1 else None,
+            entity_mode="single" if len(resolved) == 1 else "multiple",
+            candidate_count=len(resolved),
+            explicit_candidate_count=0,
+            valid_entity_count=len(resolved),
+            reference_detected=True,
+            reference_type="phase4c_focal_deepening",
+        )
+        capabilities = {result.source_capability for result in deepening_results}
+        pair = len(focal) == 2
+        graph_used = bool({"graph.get_summary", "graph.compare_assets"} & capabilities)
+        route = replace(
+            state["routing_result"],
+            use_graph=graph_used,
+            use_detection="asset.get_detection" in capabilities,
+            use_asset_profile="asset.get_profile" in capabilities,
+            entity_binding="active_pair" if pair else "active_single",
+            resolved_entity_binding="active_pair" if pair else "active_single",
+            binding_source="conversation",
+            binding_available=True,
+            binding_normalized=True,
+            binding_normalization_reason="phase4c_focal_deepening_persisted",
+            materialized_entity_count=len(focal),
+            materialized_entities=focal,
+            target_entity=resolved[0] if len(resolved) == 1 else None,
+            target_entities=resolved,
+            asset_investigation_detected=True,
+            followup_detected=True,
+            intent="asset_investigation",
+            structured_query=None,
+            structured_result_reference=StructuredResultReferenceDecision(),
+            scope="multi_entity_comparison" if pair else "node_summary",
+            direction="both" if graph_used else "none",
+            depth=1 if pair else 0,
+            requires_multiple_entities=pair,
+            relationship_mode="compare" if pair else "none",
+            route_normalized=True,
+            route_normalization_reason="phase4c_focal_deepening_persisted",
+        )
+        original_task = state["task"]
+        required_capabilities = tuple(
+            capability
+            for capability in _FOCAL_CAPABILITY_ORDER
+            if capability in capabilities
+        )
+        focal_task = replace(
+            original_task,
+            intent="asset_investigation",
+            scope="multi_entity_comparison" if pair else "node_summary",
+            direction="both" if graph_used else "none",
+            entities=focal,
+            required_capabilities=required_capabilities,
+            optional_capabilities=(),
+            structured_query=None,
+            requires_multiple_entities=pair,
+            is_followup=True,
+            graph_depth=1 if pair else 0,
+            relationship_mode="compare" if pair else "none",
+        )
+        patched: InvestigationState = dict(state)  # type: ignore[assignment]
+        patched["resolved_entities"] = resolution
+        patched["routing_result"] = route
+        patched["task"] = focal_task
+        patched["memory_context_key"] = MemoryContextKey.from_task(focal_task)
+        patched["baseline_results"] = [
+            result
+            for result in deepening_results
+            if bool(set(result.entities).intersection(focal))
+        ]
+        patched["require_baseline_for_operational_mutation"] = True
+
+        # The focal task intentionally drops its structured query. Preserve the
+        # separately-reviewed discovery set on the prior routing state before
+        # delegating to the ordinary memory transition.
+        structured_context = structured_query_context_from_state(state)
+        previous = state.get("active_entity_state")
+        if structured_context is not None and previous is not None:
+            reference_kind = getattr(
+                getattr(state.get("routing_result"), "structured_result_reference", None),
+                "kind",
+                "none",
+            )
+            previous_lineage = tuple(
+                getattr(previous, "structured_query_lineage", ()) or ()
+            )
+            lineage = (
+                (*previous_lineage, structured_context)
+                if reference_kind == "set_query"
+                else (structured_context,)
+            )
+            if len(lineage) > 3:
+                lineage = (lineage[0], lineage[-2], lineage[-1])
+            patched["active_entity_state"] = replace(
+                previous,
+                structured_query_context=structured_context,
+                structured_query_lineage=lineage,
+            )
+        return super().update_memory(patched)
 
     @staticmethod
     def _baseline_capture_rejection_reason(

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, Literal, Optional
+from typing import Any, Dict, Literal, Optional, Protocol
 
 
 LLMStreamEventType = Literal[
@@ -67,3 +67,19 @@ class LLMProviderResult:
             "reasoning_exposed": False,
             "payload_format": self.payload_format,
         }
+
+
+class LLMProvider(Protocol):
+    """Transport contract consumed by the provider-neutral client."""
+
+    provider_name: str
+
+    def chat(self, messages: list[dict[str, str]], **kwargs: Any) -> LLMProviderResult: ...
+
+    def stream_chat(
+        self,
+        messages: list[dict[str, str]],
+        **kwargs: Any,
+    ) -> Any: ...
+
+    def health(self) -> dict[str, object]: ...

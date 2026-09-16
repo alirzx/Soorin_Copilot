@@ -1432,12 +1432,15 @@ def test_phase4c_deepened_focal_evidence_gets_its_own_baseline_and_keeps_set_con
     )
     results = (
         search_result,
-        _complete_product_result(),
-        _complete_product_result(
-            "asset.get_detection",
-            payload={"classification": "firewall", "confidence": 0.95},
+        replace(_complete_product_result(), step_id="deepening-1"),
+        replace(
+            _complete_product_result(
+                "asset.get_detection",
+                payload={"classification": "firewall", "confidence": 0.95},
+            ),
+            step_id="deepening-2",
         ),
-        _complete_graph_result(),
+        replace(_complete_graph_result(), step_id="deepening-3"),
     )
     memory = MemoryStore(20)
     service = SimpleNamespace(

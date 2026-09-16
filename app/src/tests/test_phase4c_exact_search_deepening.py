@@ -13,11 +13,15 @@ from src.core.agent.contracts import (
     TaskSpec,
     ToolResult,
 )
+from src.core.agent.nodes import CopilotWorkflowNodes
 from src.core.agent.hardened_phase4c import _deepened_entities
 from src.core.agent.phase4c_nodes import Phase4CWorkflowNodes
 from src.core.agent.reviewer import EvidenceReviewer
 from src.core.agent.task_mapping import compile_direct_plan
+from src.core.context.models import EntityResolution, RouteDecision
+import src.core.copilot.service as production_service
 from src.core.graph.structured import StructuredQuerySpec, structured_query_identity
+from src.core.memory.routing_state import SessionRoutingState
 
 
 def _task(request: str, *, sort: str | None = None) -> TaskSpec:
@@ -105,6 +109,104 @@ def test_one_candidate_is_safe_to_deepen() -> None:
     )
     assert selected == ("192.0.2.1",)
     assert reason == "single_candidate"
+
+
+def test_find_domain_controller_and_analyze_deeply_runs_production_focal_flow(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    task = _task("find the Domain Controller and analyze it deeply")
+    search = _search_result(task)
+
+    class Validator:
+        @staticmethod
+        def validate(plan: ExecutionPlan) -> ExecutionPlan:
+            return plan
+
+    class Executor:
+        @staticmethod
+        def execute(plan: ExecutionPlan, **_kwargs: object) -> list[ToolResult]:
+            return [
+                ToolResult(
+                    status="ok",
+                    entities=tuple(step.arguments.get("entities") or ()),
+                    source_capability=step.capability,
+                    retrieved_at="2026-09-11T10:01:00+00:00",
+                    freshness="current",
+                    completeness="complete",
+                    step_id=step.id,
+                    provider=step.capability.split(".", 1)[0],
+                    projection_usable=True,
+                    source_payload_complete=True,
+                )
+                for step in plan.steps
+            ]
+
+    service = SimpleNamespace(
+        _capability_runtime_snapshot=lambda: (None, Validator(), Executor())
+    )
+    nodes = object.__new__(Phase4CWorkflowNodes)
+    nodes.service = service
+    route = RouteDecision(
+        use_graph=True,
+        reason="structured search",
+        intent="asset_search",
+        structured_query=task.structured_query,
+    )
+    parent = compile_direct_plan(task, plan_id="domain-controller-search")
+    state = {
+        "request_id": "domain-controller-deep",
+        "session_id": "domain-controller-session",
+        "task": task,
+        "routing_result": route,
+        "execution_plan": parent,
+    }
+    monkeypatch.setattr(
+        CopilotWorkflowNodes,
+        "join_specialist_results",
+        lambda _self, _state: {
+            "tool_results": [search],
+            "capability_results": [search],
+        },
+    )
+
+    joined = nodes.join_specialist_results(state)
+    deepening = joined["tool_results"][1:]
+
+    assert production_service.Phase4CWorkflowNodes is Phase4CWorkflowNodes
+    assert [result.source_capability for result in deepening] == [
+        "asset.get_profile",
+        "asset.get_detection",
+        "graph.get_summary",
+    ]
+    assert all(result.step_id.startswith("deepening-") for result in deepening)
+    assert len(parent.steps) + len(deepening) <= 6
+
+    def capture(_self: object, patched: dict[str, object]) -> dict[str, object]:
+        return patched
+
+    monkeypatch.setattr(CopilotWorkflowNodes, "update_memory", capture)
+    update = nodes.update_memory(
+        {
+            **state,
+            "tool_results": joined["tool_results"],
+            "resolved_entities": EntityResolution(status="none"),
+            "active_entity_state": SessionRoutingState(active_ip="192.0.2.99"),
+            "review_decision": SimpleNamespace(outcome="sufficient"),
+        }
+    )
+
+    assert update["task"].entities == ("192.0.2.1",)
+    assert update["task"].required_capabilities == (
+        "asset.get_profile",
+        "asset.get_detection",
+        "graph.get_summary",
+    )
+    assert update["routing_result"].entity_binding == "active_single"
+    assert update["memory_context_key"].entities == ("192.0.2.1",)
+    assert update["resolved_entities"].primary_entity.value == "192.0.2.1"
+    assert update["baseline_results"] == deepening
+    assert update["active_entity_state"].structured_query_context is not None
+    assert update["active_entity_state"].structured_query_context.query == task.structured_query
 
 
 def test_many_candidates_without_deterministic_selection_do_not_fan_out() -> None:
@@ -247,6 +349,7 @@ def test_only_explicit_phase4c_deepening_steps_become_focal_continuity() -> None
         completeness="complete",
         step_id="deepening-1",
         provider="product",
+        projection_usable=True,
     )
 
     assert _deepened_entities({"tool_results": [normal]}) == ()

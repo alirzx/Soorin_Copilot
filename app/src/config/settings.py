@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 
-from src.config.llm_deployments import LLMRoleConfig
+from src.config.llm_deployments import LLMRoleConfig, SUPPORTED_LLM_PROVIDER_TYPES
 
 
 APP_DIR = Path(__file__).resolve().parents[2]
@@ -390,8 +390,10 @@ class Settings:
 
     def validate_selected_llm_deployments(self) -> None:
         """Fail startup safely when an enabled role has no endpoint."""
-        if not self.llm_enabled or self.llm_provider != "arvan":
+        if not self.llm_enabled:
             return
+        if self.llm_provider not in SUPPORTED_LLM_PROVIDER_TYPES:
+            raise ValueError(f"Unsupported LLM provider: {self.llm_provider}")
         roles = ["router", "synthesizer"]
         if self.planner_enabled:
             roles.append("planner")
