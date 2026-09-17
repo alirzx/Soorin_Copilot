@@ -525,6 +525,20 @@ structured Asset retrieval. The default is `200`. Requests above this bound are
 rejected; potentially large searches use opaque keyset cursors rather than
 offset pagination.
 
+### `SOORIN_CONTEXT_STRUCTURED_ASSET_SEARCH_MAX_TOKENS`
+
+`SOORIN_CONTEXT_STRUCTURED_ASSET_SEARCH_MAX_TOKENS` is the maximum model-facing token budget for `graph.search_assets` structured evidence before the overall global context budget is applied. The configured deployment value is `6000`.
+
+### `SOORIN_CONTEXT_STRUCTURED_ASSET_AGGREGATE_MAX_TOKENS`
+
+`SOORIN_CONTEXT_STRUCTURED_ASSET_AGGREGATE_MAX_TOKENS` is the maximum model-facing token budget for `graph.aggregate_assets` structured group evidence before the overall global context budget is applied. The configured deployment value is `8000`.
+
+### `SOORIN_CONTEXT_STRUCTURED_ASSET_SEARCH_MAX_ROWS`
+
+`SOORIN_CONTEXT_STRUCTURED_ASSET_SEARCH_MAX_ROWS` is the maximum number of retrieved structured search rows considered for model serialization before token-budget fitting. The configured deployment value is `200`.
+
+These three settings limit model-facing serialization only. They do not control Neo4j retrieval limits, which remain governed independently by `SOORIN_GRAPH_ASSET_SEARCH_DEFAULT_LIMIT` and `SOORIN_GRAPH_ASSET_SEARCH_MAX_LIMIT`. Their effective budgets also remain bounded by the global LLM context-window calculation.
+
 ### `SOORIN_GRAPH_MAX_UI_NODES`
 
 `SOORIN_GRAPH_MAX_UI_NODES` limits how many graph nodes the Streamlit topology visualization may render. Increasing it can display more of the topology but raises browser rendering, layout, memory, and interaction cost; decreasing it keeps visualization responsive by showing a more bounded subset. It does not change backend Graph evidence.

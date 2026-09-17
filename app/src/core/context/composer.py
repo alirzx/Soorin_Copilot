@@ -66,9 +66,6 @@ ONE_HOP_CONTEXT_MAX_TOKENS = 1800
 TWO_HOP_CONTEXT_MAX_TOKENS = 2500
 COMPARISON_CONTEXT_MAX_TOKENS = 2200
 FULL_NEIGHBORS_CONTEXT_MAX_TOKENS = 3000
-STRUCTURED_ASSET_SEARCH_CONTEXT_MAX_TOKENS = 1800
-STRUCTURED_ASSET_AGGREGATE_CONTEXT_MAX_TOKENS = 700
-STRUCTURED_ASSET_SEARCH_MAX_CONTEXT_ROWS = 20
 PROFILE_CONTEXT_MAX_TOKENS = 3200
 DETECTION_CONTEXT_MAX_TOKENS = 2400
 
@@ -551,8 +548,7 @@ class ContextComposer:
         logger.info("event=delta_context_skipped request_id=%s reason=%s", request_id, reason)
         return ""
 
-    @staticmethod
-    def graph_context_cap(context: dict[str, Any]) -> int:
+    def graph_context_cap(self, context: dict[str, Any]) -> int:
         scope = str(context.get("requested_scope") or context.get("scope") or "node_summary")
         capability = str(context.get("source_capability") or "")
         if (
@@ -564,9 +560,9 @@ class ContextComposer:
         if capability == "graph.get_relationship" or context.get("relationship_mode") == "direct":
             return RELATIONSHIP_CONTEXT_MAX_TOKENS
         if capability == "graph.search_assets" or scope == "asset_search":
-            return STRUCTURED_ASSET_SEARCH_CONTEXT_MAX_TOKENS
+            return self.settings.context_structured_asset_search_max_tokens
         if capability == "graph.aggregate_assets" or scope == "asset_aggregate":
-            return STRUCTURED_ASSET_AGGREGATE_CONTEXT_MAX_TOKENS
+            return self.settings.context_structured_asset_aggregate_max_tokens
         return {
             "node_summary": NODE_SUMMARY_CONTEXT_MAX_TOKENS,
             "path": PATH_CONTEXT_MAX_TOKENS,
@@ -1236,7 +1232,9 @@ class ContextComposer:
         base["query"].update(sort=evidence.sort, direction=evidence.direction)
         selected_rows: list[dict[str, Any]] = []
         text = ""
-        candidate_rows = evidence.rows[:STRUCTURED_ASSET_SEARCH_MAX_CONTEXT_ROWS]
+        candidate_rows = evidence.rows[
+            : self.settings.context_structured_asset_search_max_rows
+        ]
         for row in candidate_rows:
             candidate = [
                 *selected_rows,

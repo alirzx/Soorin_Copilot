@@ -436,7 +436,13 @@ def test_reviewer_rejects_wrong_query_identity_mode_missing_and_failed_results()
     assert failed.outcome == "safe_failure"
 
 
-def _compose(result, task: TaskSpec, *, window: int = 32768):
+def _compose(
+    result,
+    task: TaskSpec,
+    *,
+    window: int = 32768,
+    **settings_overrides,
+):
     pack = EvidenceReviewer().build_pack(task, [result])
     package = context_package_from_evidence(
         pack,
@@ -447,6 +453,7 @@ def _compose(result, task: TaskSpec, *, window: int = 32768):
         llm_context_window_tokens=window,
         llm_context_safety_margin_tokens=256,
         llm_reserved_output_tokens=1024,
+        **settings_overrides,
     )
     composer = ContextComposer(settings)
     text = composer.compose(
@@ -513,7 +520,12 @@ def test_search_context_serializes_empty_one_and_bounded_large_results() -> None
         completeness="partial",
         structured_asset_set=large_evidence,
     )
-    composer, large_text = _compose(large, _task(one_query))
+    composer, large_text = _compose(
+        large,
+        _task(one_query),
+        context_structured_asset_search_max_tokens=1800,
+        context_structured_asset_search_max_rows=20,
+    )
     assert approx_tokens(composer.last_parts["graph"]) <= 1800
     assert approx_tokens(large_text) <= composer.last_budget["max_dynamic_tokens"]
     assert large_text.count('"graph_key"') <= 20

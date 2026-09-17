@@ -312,6 +312,9 @@ class Settings:
     graph_enrichment_shutdown_timeout_seconds: int
     graph_asset_search_default_limit: int
     graph_asset_search_max_limit: int
+    context_structured_asset_search_max_tokens: int
+    context_structured_asset_aggregate_max_tokens: int
+    context_structured_asset_search_max_rows: int
     graph_max_ui_nodes: int
     graph_default_min_degree: int
     graph_api_max_neighbors: int
@@ -822,6 +825,18 @@ def get_settings() -> Settings:
         ),
         graph_asset_search_max_limit=max(
             1, _int("SOORIN_GRAPH_ASSET_SEARCH_MAX_LIMIT", 200)
+        ),
+        context_structured_asset_search_max_tokens=max(
+            1,
+            _int("SOORIN_CONTEXT_STRUCTURED_ASSET_SEARCH_MAX_TOKENS", 1800),
+        ),
+        context_structured_asset_aggregate_max_tokens=max(
+            1,
+            _int("SOORIN_CONTEXT_STRUCTURED_ASSET_AGGREGATE_MAX_TOKENS", 700),
+        ),
+        context_structured_asset_search_max_rows=max(
+            1,
+            _int("SOORIN_CONTEXT_STRUCTURED_ASSET_SEARCH_MAX_ROWS", 20),
         ),
         graph_max_ui_nodes=_int("SOORIN_GRAPH_MAX_UI_NODES", 1000),
         graph_default_min_degree=_int("SOORIN_GRAPH_DEFAULT_MIN_DEGREE", 1),
