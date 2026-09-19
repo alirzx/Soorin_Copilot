@@ -10,7 +10,6 @@ COMPOSE_FILE ?= $(ROOT_DIR)/docker-compose.yaml
 ENV_FILE ?= $(ROOT_DIR)/.env
 DOCKERFILE ?= $(ROOT_DIR)/Dockerfile
 DATA_DIR ?= $(ROOT_DIR)/data
-HF_CACHE_DIR ?= $(ROOT_DIR)/huggingface
 EXPORT_DIR ?= $(ROOT_DIR)/dist
 
 COMPOSE := docker compose \
@@ -34,6 +33,13 @@ PYTHON ?= $(shell \
 define env_value
 $(strip $(shell sed -n 's/^$(1)=//p' "$(ENV_FILE)" 2>/dev/null | tail -n 1))
 endef
+
+# Keep Makefile preflight/image checks aligned with the same host cache source
+# used by Compose. Absolute paths are used as-is; relative paths resolve from
+# the repository root, matching Compose project-directory semantics. An
+# explicit HF_CACHE_DIR make override still takes precedence.
+HF_CACHE_HOST_PATH := $(call env_value,SOORIN_HF_CACHE_HOST_PATH)
+HF_CACHE_DIR ?= $(if $(HF_CACHE_HOST_PATH),$(if $(filter /%,$(HF_CACHE_HOST_PATH)),$(HF_CACHE_HOST_PATH),$(abspath $(ROOT_DIR)/$(HF_CACHE_HOST_PATH))),$(ROOT_DIR)/huggingface)
 
 IMAGE_TAG := $(or $(call env_value,SOORIN_IMAGE_TAG),dev-local)
 IMAGE := soorin-copilot:$(IMAGE_TAG)
