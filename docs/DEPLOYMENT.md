@@ -1,76 +1,297 @@
 # Soorin Copilot Deployment
 
-## Configuration
+This document is the canonical deployment reference for the current Docker/Compose runtime.
 
-The repository-root `.env` is the single private configuration file consumed by
-the application and the current Compose file. `.env.example` is the tracked,
-secret-free schema. Create the private file once and configure its credentials
-locally; do not create `app/.env` or `compose.env`.
+## Configuration Model
+
+The repository-root `.env` is the private runtime configuration consumed by the application, Makefile, and Compose deployment. `.env.example` is the tracked, secret-free schema.
 
 ```bash
 cp .env.example .env
 ```
 
-Compose reads the root `.env` for image tags, restart policy, host bindings,
-Copilot authentication, observability profile values, and application settings.
-The API and UI service definitions provide their container-specific paths and
-runtime overrides directly. The root `.env` remains private and ignored.
+Keep `.env` private. Do not commit Product credentials, LLM API keys, Copilot API keys, Neo4j passwords, Grafana credentials, or other secrets.
 
-## Persistent Data
+The current deployment uses the repository-root `.env`; legacy `app/.env` or `compose.env` files are not part of the canonical deployment layout.
 
-The API bind-mounts the repository `data/` directory at `/workspace/data` with
-read/write access for refresh snapshots and local Qdrant. The Streamlit UI has
-no graph-data mount: it reads the published Neo4j projection through the
-authenticated Graph API. The Hugging Face model cache is mounted from the
-repository `huggingface/` directory and is read-only inside the API container.
-No model, Graph artifact, Qdrant data, or SOC source corpus is baked into the
-image.
+## Services
 
-The original SOC corpus is external to normal runtime retrieval. It is used by
-the separate indexing maintenance flow and is not scanned during application
-import or startup.
+The Compose stack contains the following principal services.
 
-## Neo4j Projection Baseline
+### API
 
-The graph projection uses Neo4j Community Edition 2026.07.1 as a single
-instance with the persistent `neo4j-data` Docker volume. Community creates the
-supported record-aligned store format. Product remains the topology authority,
-so the projection can be rebuilt from a validated Product snapshot. Retain the
-volume as operational state and use host-level/offline volume snapshots for
-backup; this does not replace broader disaster-recovery planning.
+- container: `soorin-copilot-api`
+- internal port: `6998`
+- host port: `SOORIN_API_HOST_PORT`
+- host bind address: `SOORIN_API_BIND_IP`
+- command: `python app/run.py --api`
+- non-root runtime user: `soorin`
+- persistent data target: `/workspace/data`
+- Hugging Face cache target: `/home/soorin/.cache/huggingface`
 
-Enterprise licensing, clustering, online backup, and the `block` store format
-are not runtime requirements. They are optional future upgrade concerns, not
-deployment prerequisites for Copilot.
+### UI
 
-## Local Compose Workflow
+- container: `soorin-copilot-ui`
+- internal Streamlit port: `8501`
+- host port: `SOORIN_UI_HOST_PORT`
+- host bind address: `SOORIN_UI_BIND_IP`
+- API service URL inside Compose: `http://api:6998`
 
-Keep host bindings on `127.0.0.1` unless LAN exposure is intentional. Validate
-the root environment and current data/cache prerequisites before starting:
+### Neo4j
+
+- Neo4j Community 2026.07.1
+- Bolt port inside the network: `7687`
+- host Bolt binding controlled by `SOORIN_NEO4J_BOLT_BIND_IP` and `SOORIN_NEO4J_BOLT_HOST_PORT`
+- persistent named volumes for database and logs
+
+The API uses `bolt://neo4j:7687` inside the Compose network.
+
+### Observability profile
+
+The optional `observability` profile includes:
+
+- Prometheus — host port `SOORIN_OBSERVABILITY_PROMETHEUS_PORT`
+- Loki — host port `SOORIN_OBSERVABILITY_LOKI_PORT`
+- Alloy — Docker log collection
+- Grafana — host port `SOORIN_OBSERVABILITY_GRAFANA_PORT`
+
+The default observability host bindings are loopback-only. Prometheus scrapes the authenticated Copilot metrics endpoint on `api:6998`.
+
+## Docker Image
+
+The Dockerfile uses a multi-stage Python 3.12 slim build.
+
+Build properties:
+
+- a dedicated virtual environment is assembled in the builder stage;
+- CPU-only Torch is installed from the PyTorch CPU index;
+- `pip check` is run during build;
+- the build verifies that CUDA/NVIDIA Python packages are not present;
+- runtime contains `app/` and `lib/` but no private `.env`, Qdrant data, Hugging Face cache, or runtime data;
+- the runtime process executes as the non-root `soorin` user.
+
+The image exposes API port `6998` and Streamlit port `8501`.
+
+## Persistent Data and Mounts
+
+### Application data
+
+The repository/runtime `data/` directory is mounted read/write at:
+
+```text
+/workspace/data
+```
+
+It contains runtime material such as:
+
+```text
+data/
+├── raw/
+├── processed/
+├── qdrant-local/
+└── runtime/
+    ├── logs/
+    └── evidence/
+```
+
+Normal deployment must preserve this tree across API container recreation.
+
+### Hugging Face cache
+
+The host model cache is configured through:
+
+```env
+SOORIN_HF_CACHE_HOST_PATH=/absolute/host/path
+```
+
+Compose mounts it read-only at:
+
+```text
+/home/soorin/.cache/huggingface
+```
+
+The Makefile resolves the same variable for preflight and image-preflight checks. Absolute paths are used directly; relative paths resolve from the repository root. If the variable is absent, the Makefile falls back to `./huggingface`.
+
+For a server installation, use a stable absolute path, for example:
+
+```env
+SOORIN_HF_CACHE_HOST_PATH=/srv/soorin-copilot/huggingface
+```
+
+The configured embedding snapshot must already exist when offline/local-files-only runtime is enabled.
+
+### Qdrant
+
+The normal RAG runtime uses local Qdrant storage under:
+
+```text
+/workspace/data/qdrant-local
+```
+
+The collection name, embedding dimension, embedding model, and exact model revision are configured through `.env` and validated by `make preflight`.
+
+### Neo4j
+
+Neo4j database/log state lives in Docker named volumes. API/UI recreation must not remove these volumes.
+
+## Makefile Deployment Contract
+
+### Show resolved configuration
+
+```bash
+make show-config
+```
+
+This prints non-secret deployment values including image tag, data directory, resolved Hugging Face cache, and API/UI bindings.
+
+### Validate Compose syntax
+
+```bash
+make config
+```
+
+### Preflight runtime prerequisites
+
+```bash
+make preflight
+```
+
+The preflight validates:
+
+- `docker-compose.yaml`, `.env`, and Dockerfile exist;
+- Docker and Compose v2 are available;
+- a usable Python interpreter exists;
+- the data directory exists;
+- the resolved Hugging Face cache exists;
+- configured RAG collection/model/revision are present;
+- Qdrant metadata contains the configured collection;
+- the configured model snapshot contains `config.json`;
+- embedding hidden size matches the configured dimension;
+- Compose interpolation/configuration is valid.
+
+### Build current source
+
+```bash
+make build
+```
+
+or, when a fully clean dependency rebuild is required:
+
+```bash
+make build-no-cache
+```
+
+The image tag comes from `SOORIN_IMAGE_TAG`.
+
+### Validate the built/loaded image
+
+```bash
+make preflight-image
+```
+
+This also verifies that the image user can write `/workspace/data` and read the mounted embedding snapshot.
+
+Additional image checks:
+
+```bash
+make inspect-image
+make inspect-size
+```
+
+`inspect-image` verifies the CPU-only Torch contract and checks that runtime data, secrets, and model-cache files were not baked into the image.
+
+### Deploy current source
 
 ```bash
 make deploy
-make test-local
-make inspect-image
-make inspect-size
+```
+
+This performs preflight, builds the image, validates it, and recreates API/UI with the current image while preserving persistent service state.
+
+### Start a prebuilt image
+
+```bash
+make up
+```
+
+### Recreate without rebuilding
+
+```bash
+make restart
+```
+
+### Health checks
+
+```bash
 make health
 ```
 
-`make down` removes containers and the network but does not remove host data.
-The optional observability profile is documented in
-[`docs/OBSERVABILITY.md`](OBSERVABILITY.md).
+The health target checks:
 
-## Remote Image Import
+- API `/health`
+- API `/openapi.json`
+- Streamlit `/_stcore/health`
 
-1. Set `SOORIN_IMAGE_TAG` to the validated release tag before building.
-2. Build and export the image with the existing Makefile workflow.
-3. Transfer the image archive and checksum, then verify and load them on the
-   destination host.
-4. Create the root `.env` from the matching `.env.example` and configure the
-   destination's private credentials and bind addresses.
-5. Copy the validated `data/` and `huggingface/` trees before `make preflight-image`.
-6. Use `0.0.0.0` bind addresses only when remote access is intentionally required.
-7. After loading the imported image, run `make preflight-image` and `make up`. For a source checkout, use `make deploy` to preflight, build the current source image, and recreate only API/UI. Both flows preserve the Neo4j volume and container.
+## Server Environment
 
-Compose uses `pull_policy: never`; the exact tagged image must already exist on
-the destination host.
+The server `.env` should be derived from the same `.env.example` version as the deployed code, but values must reflect the server environment rather than a developer machine.
+
+Keep these categories synchronized with the validated local configuration where behavior must remain identical:
+
+- LLM provider/role settings and token budgets;
+- Router/Planner behavior;
+- Product endpoint paths and memory backends;
+- Neo4j query/sync settings;
+- graph enrichment policy;
+- structured context limits;
+- RAG collection/model/revision/dimension;
+- conversation and memory budgets;
+- observability behavior.
+
+Keep these values server-specific:
+
+- secrets and credentials;
+- external Product URLs where topology differs;
+- host bind addresses and ports;
+- image release tag;
+- `SOORIN_HF_CACHE_HOST_PATH`;
+- any host filesystem paths.
+
+Do not replace an established server `.env` wholesale with `.env.example`; compare the key set and deliberately preserve server secrets and machine-specific values.
+
+## Recommended Server Rollout
+
+For a source-based server deployment:
+
+```bash
+git pull --ff-only <remote> main
+make show-config
+make config
+make preflight
+make build
+make preflight-image
+make inspect-image
+make deploy
+make health
+```
+
+After startup, verify container state and service logs:
+
+```bash
+make ps
+make logs
+```
+
+Also verify protected API and LLM health using the configured Copilot authentication.
+
+## Network Exposure
+
+Use `127.0.0.1` host bindings for services that do not need remote access. Use `0.0.0.0` or a specific server interface only when upstream network controls intentionally expose the service.
+
+Neo4j, Prometheus, Loki, and Grafana should remain private unless there is an explicit operational requirement for remote access.
+
+## Data Safety
+
+`make down` removes containers/network but does not intentionally remove persistent host data or named volumes. Do not use destructive Docker volume removal during routine deployment.
+
+Before moving or replacing a local Qdrant data tree, stop processes that hold its files and copy it as a consistent snapshot.
