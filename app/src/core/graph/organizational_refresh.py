@@ -1,4 +1,4 @@
-"""Refresh adapter that migrates legacy mixed-peer projections once."""
+"""Refresh adapter that migrates legacy organizational projections once."""
 
 from __future__ import annotations
 
@@ -15,7 +15,7 @@ logger = logging.getLogger(__name__)
 
 
 class GraphRefreshService(BaseGraphRefreshService):
-    """Force one startup refresh when the active projection predates source-only schema."""
+    """Force one startup refresh when the active projection predates RFC1918 endpoints."""
 
     def refresh_once(
         self,

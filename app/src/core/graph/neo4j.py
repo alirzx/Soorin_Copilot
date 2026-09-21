@@ -362,10 +362,9 @@ class Neo4jGraphRepository:
 
     @_serialized_graph_mutation
     def sync_snapshot(self, records: list[TopologyConnectionRecord], version: str) -> GraphProjectionStatus:
-        pairs = self._normalize(records)
+        nodes, pairs = self._projection(records)
         if not pairs:
             raise GraphSyncValidationError("Product topology response contained no valid graph records.")
-        nodes = sorted({ip for pair in pairs for ip in (pair["source"], pair["target"])})
         new_pending_assets = self._write_staging_nodes(nodes, version)
         self._write_staging_edges(pairs, version)
         self._validate_staging(version, len(nodes), len(pairs))
@@ -1490,6 +1489,18 @@ class Neo4jGraphRepository:
                 continue
             weights[(source, target)] = weights.get((source, target), 0) + int(record.weight or 1)
         return [{"source": source, "target": target, "weight": weight} for (source, target), weight in sorted(weights.items())]
+
+    @classmethod
+    def _projection(
+        cls,
+        records: list[TopologyConnectionRecord],
+    ) -> tuple[list[str], list[dict[str, Any]]]:
+        """Return node and edge candidates derived from normalized topology."""
+        pairs = cls._normalize(records)
+        nodes = sorted(
+            {endpoint for pair in pairs for endpoint in (pair["source"], pair["target"])}
+        )
+        return nodes, pairs
 
     def _query(self, cypher: str) -> Any:
         if Query is None:

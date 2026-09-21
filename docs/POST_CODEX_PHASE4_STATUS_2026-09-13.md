@@ -16,9 +16,9 @@ Before `2f1902b` was pushed, the exact local working tree passed:
 
 Product remains authoritative for topology source data and current/deep Asset Profile/Detection facts. Neo4j is the bounded organizational discovery/topology projection. Qdrant remains documentation/memory semantic retrieval, and memory remains conversational/historical continuity rather than current operational truth.
 
-The organizational Neo4j projection uses RFC1918 source Assets as organizational Asset nodes and publishes only a validated active graph version. Refresh failure preserves the last-known-good active projection. Enrichment is independently scheduled, bounded, serialized against Product overview requests, and does not erase prior valid enrichment when a refresh attempt fails.
+The organizational Neo4j projection uses RFC1918 source or destination endpoints as organizational Asset nodes and publishes only a validated active graph version. Refresh failure preserves the last-known-good active projection. Enrichment is independently scheduled, bounded, serialized against Product overview requests, and does not erase prior valid enrichment when a refresh attempt fails.
 
-The chat Graph provider and `/graph` API must use the same `OrganizationalNeo4jGraphRepository` semantics. This keeps source-only Asset authority and case-insensitive structured text selectors consistent between chat Exact Search and graph APIs.
+The chat Graph provider and `/graph` API must use the same `OrganizationalNeo4jGraphRepository` semantics. This keeps RFC1918 endpoint Asset authority and case-insensitive structured text selectors consistent between chat Exact Search and graph APIs.
 
 ## Exact Search and natural-language mapping
 

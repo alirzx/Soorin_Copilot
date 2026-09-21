@@ -388,7 +388,9 @@ def test_topology_publication_wakes_runtime_only_after_publish(tmp_path) -> None
             )
 
     class Repository:
-        _normalize = staticmethod(Neo4jGraphRepository._normalize)
+        @staticmethod
+        def _projection(records):
+            return Neo4jGraphRepository._projection(records)
 
         def status(self) -> GraphProjectionStatus:
             return GraphProjectionStatus("v1", 2, 1, NOW.isoformat())

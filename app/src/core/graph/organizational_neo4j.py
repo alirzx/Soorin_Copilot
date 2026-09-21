@@ -17,7 +17,7 @@ from src.core.graph.structured import AssetAggregateRequest, AssetGroupField, As
 from src.core.product_client.schemas import TopologyConnectionRecord
 
 
-ORGANIZATIONAL_PROJECTION_SCHEMA_VERSION = 2
+ORGANIZATIONAL_PROJECTION_SCHEMA_VERSION = 3
 _RFC1918 = (
     ipaddress.ip_network("10.0.0.0/8"),
     ipaddress.ip_network("172.16.0.0/12"),
@@ -37,7 +37,7 @@ _TEXT_PROPERTIES = {
 }
 
 
-def _internal_source(value: object) -> bool:
+def _organizational_endpoint(value: object) -> bool:
     try:
         address = ipaddress.ip_address(str(value))
     except ValueError:
@@ -46,27 +46,38 @@ def _internal_source(value: object) -> bool:
 
 
 class OrganizationalNeo4jGraphRepository(Neo4jGraphRepository):
-    """Keep Asset nodes source-authoritative and text selectors case-insensitive.
+    """Keep Asset nodes RFC1918-authoritative and text selectors case-insensitive.
 
-    Only RFC1918 source IPs from Product topology are promoted to organizational
-    Asset nodes. Destination-only and public/external peers are excluded until a
-    separate peer/external-endpoint schema exists. Edges remain only when both
-    endpoints are organizational source Assets.
+    Every RFC1918 IPv4 endpoint in Product topology is promoted to an
+    organizational Asset node. Public/external endpoints remain excluded, and
+    edges are retained only when both endpoints are organizational Assets.
     """
 
-    @staticmethod
-    def _all_pairs(records: list[TopologyConnectionRecord]) -> list[dict[str, Any]]:
-        return [
+    @classmethod
+    def _projection(
+        cls,
+        records: list[TopologyConnectionRecord],
+    ) -> tuple[list[str], list[dict[str, Any]]]:
+        normalized = Neo4jGraphRepository._normalize(records)
+        nodes = sorted(
+            {
+                str(endpoint)
+                for pair in normalized
+                for endpoint in (pair["source"], pair["target"])
+                if _organizational_endpoint(endpoint)
+            }
+        )
+        admitted = set(nodes)
+        pairs = [
             pair
-            for pair in Neo4jGraphRepository._normalize(records)
-            if _internal_source(pair["source"])
+            for pair in normalized
+            if str(pair["source"]) in admitted and str(pair["target"]) in admitted
         ]
+        return nodes, pairs
 
-    @staticmethod
-    def _normalize(records: list[TopologyConnectionRecord]) -> list[dict[str, Any]]:
-        pairs = OrganizationalNeo4jGraphRepository._all_pairs(records)
-        source_assets = {str(pair["source"]) for pair in pairs}
-        return [pair for pair in pairs if str(pair["target"]) in source_assets]
+    @classmethod
+    def _normalize(cls, records: list[TopologyConnectionRecord]) -> list[dict[str, Any]]:
+        return cls._projection(records)[1]
 
     @_serialized_graph_mutation
     def sync_snapshot(
@@ -74,14 +85,11 @@ class OrganizationalNeo4jGraphRepository(Neo4jGraphRepository):
         records: list[TopologyConnectionRecord],
         version: str,
     ) -> GraphProjectionStatus:
-        all_pairs = self._all_pairs(records)
-        if not all_pairs:
+        nodes, pairs = self._projection(records)
+        if not nodes:
             raise GraphSyncValidationError(
-                "Product topology response contained no internal source Asset records."
+                "Product topology response contained no organizational RFC1918 endpoints."
             )
-        nodes = sorted({str(pair["source"]) for pair in all_pairs})
-        source_assets = set(nodes)
-        pairs = [pair for pair in all_pairs if str(pair["target"]) in source_assets]
         new_pending_assets = self._write_staging_nodes(nodes, version)
         self._write_staging_edges(pairs, version)
         self._validate_staging(version, len(nodes), len(pairs))

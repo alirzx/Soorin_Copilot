@@ -568,7 +568,7 @@ def test_structured_set_continuation_bypasses_pre_router_long_term_memory_call()
     assert update["resolved_entities"].status == "none"
 
 
-def test_organizational_projection_excludes_public_and_destination_only_peers():
+def test_organizational_projection_includes_private_destination_only_endpoints():
     records = [
         TopologyConnectionRecord("192.168.0.10", "192.168.0.20"),
         TopologyConnectionRecord("192.168.0.20", "192.168.0.10"),
@@ -576,10 +576,8 @@ def test_organizational_projection_excludes_public_and_destination_only_peers():
         TopologyConnectionRecord("1.1.1.1", "192.168.0.10"),
         TopologyConnectionRecord("192.168.0.30", "203.0.113.5"),
     ]
-    all_source_pairs = OrganizationalNeo4jGraphRepository._all_pairs(records)
-    source_nodes = {pair["source"] for pair in all_source_pairs}
-    internal_edges = OrganizationalNeo4jGraphRepository._normalize(records)
-    assert source_nodes == {"192.168.0.10", "192.168.0.20", "192.168.0.30"}
+    nodes, internal_edges = OrganizationalNeo4jGraphRepository._projection(records)
+    assert set(nodes) == {"192.168.0.10", "192.168.0.20", "192.168.0.30"}
     assert {(row["source"], row["target"]) for row in internal_edges} == {
         ("192.168.0.10", "192.168.0.20"),
         ("192.168.0.20", "192.168.0.10"),

@@ -1,4 +1,4 @@
-"""Graph context provider using the source-only organizational projection."""
+"""Graph context provider using the RFC1918 endpoint organizational projection."""
 
 from __future__ import annotations
 

@@ -195,8 +195,9 @@ class GraphRefreshService:
             if not topology.records:
                 raise GraphRefreshError("Product topology response contained no valid graph records.")
 
-            pairs = self.repository._normalize(topology.records)  # noqa: SLF001 - shared projection normalization authority.
-            nodes = {ip for pair in pairs for ip in (pair["source"], pair["target"])}
+            # Repository-specific projection semantics are the authority for both
+            # pre-validation and the subsequent staged publication.
+            nodes, pairs = self.repository._projection(topology.records)  # noqa: SLF001
             if len(nodes) < self.settings.graph_refresh_min_nodes:
                 raise GraphRefreshError("Graph node count is below configured minimum.")
             if len(pairs) < self.settings.graph_refresh_min_edges:

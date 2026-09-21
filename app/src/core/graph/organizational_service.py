@@ -1,4 +1,4 @@
-"""Graph service bound to the organizational source-only Neo4j repository."""
+"""Graph service bound to the organizational RFC1918 endpoint repository."""
 
 from __future__ import annotations
 
