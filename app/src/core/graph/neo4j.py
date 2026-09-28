@@ -1031,6 +1031,81 @@ class Neo4jGraphRepository:
             for record in records
         }
 
+    def canonicalize_semantic_values(
+        self,
+        active_graph_version: str,
+        lookups: tuple[tuple[str, str], ...],
+    ) -> dict[str, dict[str, str]]:
+        """Resolve bounded categorical values against the active projection.
+
+        This is deliberately independent of the top-N Router catalog. A value
+        omitted from that sample may still resolve here; a genuine zero-match is
+        omitted so execution preserves the user's exact selector unchanged.
+        """
+        allowed_fields = {
+            "suggested_type",
+            "role",
+            "roles",
+            "vendor",
+            "product",
+            "tag",
+            "sub_tag",
+            "status",
+            "enrichment_status",
+        }
+        bounded = tuple(
+            (field, value)
+            for field, value in lookups[:64]
+            if field in allowed_fields and value and len(value) <= 256
+        )
+        if not bounded:
+            return {}
+        query = """
+        MATCH (m:GraphMetadata {id: 'active'})
+        WHERE m.active_graph_version = $active_graph_version
+        UNWIND $lookups AS lookup
+        MATCH (a:Asset {graph_version: $active_graph_version})
+        WITH lookup, CASE lookup.field
+          WHEN 'suggested_type' THEN CASE WHEN a.suggested_type IS NULL THEN [] ELSE [a.suggested_type] END
+          WHEN 'role' THEN CASE WHEN a.role IS NULL THEN [] ELSE [a.role] END
+          WHEN 'roles' THEN coalesce(a.roles, [])
+          WHEN 'vendor' THEN CASE WHEN a.vendor IS NULL THEN [] ELSE [a.vendor] END
+          WHEN 'product' THEN CASE WHEN a.product IS NULL THEN [] ELSE [a.product] END
+          WHEN 'tag' THEN CASE WHEN a.tag IS NULL THEN [] ELSE [a.tag] END
+          WHEN 'sub_tag' THEN CASE WHEN a.sub_tag IS NULL THEN [] ELSE [a.sub_tag] END
+          WHEN 'status' THEN CASE WHEN a.status IS NULL THEN [] ELSE [a.status] END
+          WHEN 'enrichment_status' THEN CASE WHEN a.enrichment_status IS NULL THEN [] ELSE [a.enrichment_status] END
+          ELSE []
+        END AS values
+        UNWIND values AS raw_value
+        WITH lookup.field AS field, lookup.value AS requested,
+             trim(toString(raw_value)) AS value
+        WHERE value <> '' AND toLower(value) = toLower(requested)
+        WITH field, requested, value, count(*) AS frequency
+        ORDER BY field ASC, requested ASC, frequency DESC, value ASC
+        WITH field, requested, collect(value)[0] AS canonical
+        RETURN field, requested, canonical
+        ORDER BY field ASC, requested ASC
+        """
+        try:
+            with self.driver.session() as session:
+                records = list(session.run(
+                    self._query(query),
+                    active_graph_version=active_graph_version,
+                    lookups=[
+                        {"field": field, "value": value}
+                        for field, value in bounded
+                    ],
+                ))
+        except Exception as exc:
+            raise Neo4jUnavailable("Neo4j semantic canonicalization query failed.") from exc
+        resolved: dict[str, dict[str, str]] = {}
+        for record in records:
+            resolved.setdefault(str(record["field"]), {})[
+                str(record["requested"]).casefold()
+            ] = str(record["canonical"])
+        return resolved
+
     @staticmethod
     def _structured_filter_clauses(
         request: AssetSearchRequest | AssetAggregateRequest,

@@ -86,10 +86,13 @@ class SemanticIntentRouter(StructuredSemanticIntentRouter):
         )
         if decision.structured_query is None:
             return decision
-        return replace(
-            decision,
-            structured_query=normalize_structured_query_for_language(
-                decision.structured_query,
-                str(routing_context.get("message") or ""),
-            ),
+        query = normalize_structured_query_for_language(
+            decision.structured_query,
+            str(routing_context.get("message") or ""),
         )
+        if self.semantic_catalog_provider is not None:
+            query = self.semantic_catalog_provider.canonicalize_query(
+                query,
+                request_id=request_id,
+            )
+        return replace(decision, structured_query=query)

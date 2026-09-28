@@ -7,6 +7,12 @@ import threading
 import time
 from typing import Any
 
+from src.core.graph.structured import (
+    AssetPredicate,
+    AssetSearchFilters,
+    StructuredQuerySpec,
+)
+
 
 logger = logging.getLogger(__name__)
 
@@ -126,9 +132,7 @@ class SemanticCatalogProvider:
 
     def _bounded_fields(self, raw: Any) -> dict[str, list[str]]:
         source = raw if isinstance(raw, dict) else {}
-        remaining = self.total_value_limit
-        remaining_chars = self.total_value_chars
-        bounded: dict[str, list[str]] = {}
+        candidates_by_field: dict[str, list[str]] = {}
         for field in SEMANTIC_CATALOG_FIELDS:
             limit = self.product_limit if field == "product" else self.per_field_limit
             values: list[str] = []
@@ -137,25 +141,153 @@ class SemanticCatalogProvider:
             if not isinstance(candidates, (list, tuple)):
                 candidates = ()
             for candidate in candidates:
-                value = (
-                    str(candidate).strip()[: self.max_value_chars]
-                    if candidate is not None
-                    else ""
-                )
+                value = str(candidate).strip() if candidate is not None else ""
                 folded = value.casefold()
-                if not value or folded in seen:
+                if not value or len(value) > self.max_value_chars or folded in seen:
                     continue
-                if len(value) > remaining_chars:
-                    break
                 seen.add(folded)
                 values.append(value)
-                remaining_chars -= len(value)
-                if len(values) >= limit or len(values) >= remaining:
+                if len(values) >= limit:
                     break
-            bounded[field] = values
-            remaining -= len(values)
-            if remaining <= 0 or remaining_chars <= 0:
-                for trailing in SEMANTIC_CATALOG_FIELDS[len(bounded) :]:
-                    bounded[trailing] = []
+            candidates_by_field[field] = values
+
+        # Allocate one value per field per pass so early high-cardinality fields
+        # cannot starve later fields under the global count/character bounds.
+        bounded = {field: [] for field in SEMANTIC_CATALOG_FIELDS}
+        remaining = self.total_value_limit
+        remaining_chars = self.total_value_chars
+        positions = {field: 0 for field in SEMANTIC_CATALOG_FIELDS}
+        while remaining > 0 and remaining_chars > 0:
+            added = False
+            advanced = False
+            for field in SEMANTIC_CATALOG_FIELDS:
+                candidates = candidates_by_field[field]
+                while positions[field] < len(candidates):
+                    value = candidates[positions[field]]
+                    positions[field] += 1
+                    advanced = True
+                    if len(value) > remaining_chars:
+                        continue
+                    bounded[field].append(value)
+                    remaining -= 1
+                    remaining_chars -= len(value)
+                    added = True
+                    break
+                if remaining <= 0 or remaining_chars <= 0:
+                    break
+            if not added and not advanced:
                 break
         return bounded
+
+    def canonicalize_query(
+        self,
+        query: StructuredQuerySpec,
+        *,
+        request_id: str = "",
+    ) -> StructuredQuerySpec:
+        """Canonicalize matching categorical values without changing zero-matches."""
+        try:
+            version = self.graph_service.semantic_catalog_version()
+            if not version:
+                return query
+            requested = _query_categorical_values(query)
+            if not requested:
+                return query
+            resolved = self.graph_service.canonicalize_semantic_values(version, requested)
+            if not resolved:
+                logger.info(
+                    "event=semantic_canonicalization request_id=%s active_graph_version=%s "
+                    "requested_value_count=%s resolved_value_count=0 status=zero_match",
+                    request_id,
+                    version,
+                    sum(len(values) for values in requested.values()),
+                )
+                return query
+            canonical = _apply_canonical_values(query, resolved)
+            logger.info(
+                "event=semantic_canonicalization request_id=%s active_graph_version=%s "
+                "requested_value_count=%s resolved_value_count=%s status=resolved",
+                request_id,
+                version,
+                sum(len(values) for values in requested.values()),
+                sum(len(values) for values in resolved.values()),
+            )
+            return canonical
+        except Exception as exc:
+            logger.warning(
+                "event=semantic_canonicalization_failed request_id=%s error_type=%s",
+                request_id,
+                type(exc).__name__,
+            )
+            return query
+
+
+_CANONICAL_FIELDS = frozenset(SEMANTIC_CATALOG_FIELDS)
+
+
+def _query_categorical_values(query: StructuredQuerySpec) -> dict[str, tuple[str, ...]]:
+    collected: dict[str, list[str]] = {}
+    raw = query.filters.model_dump(mode="python")
+    for field in _CANONICAL_FIELDS:
+        value = raw.get(field)
+        if isinstance(value, str) and value.strip():
+            collected.setdefault(field, []).append(value.strip())
+
+    def visit(predicate: AssetPredicate | None) -> None:
+        if predicate is None:
+            return
+        for child in (*predicate.all, *predicate.any):
+            visit(child)
+        visit(predicate.not_)
+        if predicate.field is None or predicate.field.value not in _CANONICAL_FIELDS:
+            return
+        values = predicate.values or (
+            (predicate.value,) if predicate.value is not None else ()
+        )
+        collected.setdefault(predicate.field.value, []).extend(
+            str(value).strip() for value in values if str(value).strip()
+        )
+
+    visit(query.filters.predicate)
+    return {
+        field: tuple(dict.fromkeys(values))
+        for field, values in collected.items()
+    }
+
+
+def _apply_canonical_values(
+    query: StructuredQuerySpec,
+    resolved: dict[str, dict[str, str]],
+) -> StructuredQuerySpec:
+    def canonical(field: str, value: Any) -> Any:
+        if not isinstance(value, str):
+            return value
+        return resolved.get(field, {}).get(value.strip().casefold(), value)
+
+    raw_filters = query.filters.model_dump(mode="python", by_alias=True)
+    for field in _CANONICAL_FIELDS:
+        if raw_filters.get(field) is not None:
+            raw_filters[field] = canonical(field, raw_filters[field])
+
+    def rewrite(raw: Any) -> Any:
+        if not isinstance(raw, dict):
+            return raw
+        updated = dict(raw)
+        field = str(updated.get("field") or "")
+        if field in _CANONICAL_FIELDS:
+            if updated.get("value") is not None:
+                updated["value"] = canonical(field, updated["value"])
+            if updated.get("values"):
+                updated["values"] = [canonical(field, value) for value in updated["values"]]
+        for name in ("all", "any"):
+            if updated.get(name):
+                updated[name] = [rewrite(item) for item in updated[name]]
+        if updated.get("not") is not None:
+            updated["not"] = rewrite(updated["not"])
+        return updated
+
+    predicate = raw_filters.get("predicate")
+    if isinstance(predicate, dict):
+        raw_filters["predicate"] = rewrite(predicate)
+    filters = AssetSearchFilters.model_validate(raw_filters)
+    return query.model_copy(update={"filters": filters})

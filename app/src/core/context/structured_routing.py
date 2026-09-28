@@ -19,7 +19,6 @@ import src.core.context.intent as _intent_module
 from src.core.context.intent import (
     SemanticIntentRouter as _BaseSemanticIntentRouter,
     _extract_first_json_object,
-    _reported_confidence,
     validate_router_payload,
 )
 from src.core.context.models import (
@@ -49,13 +48,15 @@ _STRUCTURED_REPAIR_SYSTEM_PROMPT = (
     "requires_graph, requires_detection, requires_asset_profile, requires_knowledge, structured_query, "
     "structured_result_reference, "
     "entity_binding, requires_multiple_entities, is_followup, reason. "
-    "Allowed intents: general_knowledge, asset_investigation, asset_search, asset_aggregate, graph_neighbors, "
+    "Allowed intents: general_knowledge, out_of_scope, asset_investigation, asset_search, asset_aggregate, graph_neighbors, "
     "graph_relationships, graph_path, graph_followup, unclear. For asset_search or asset_aggregate, preserve only "
     "allow-listed structured_query fields, use scope/direction none, depth 0, requires_graph true, entity_binding none, "
     "and do not invent entities, fields, thresholds, dates, or Cypher. The typed filters support bounded all/any "
     "predicate trees and aggregate group_by_fields supports 1-3 unique allow-listed dimensions; preserve legacy "
     "group_by for one dimension. Same-turn them/their belongs to the current query, while set_query is only for "
-    "actual previous-result references. For other intents structured_query must be null. "
+    "actual previous-result references. Repair structure only and never delete a selector or evidence requirement; "
+    "leave structured_query null when a clear material selector cannot be represented. Preserve requires_asset_profile, requires_detection, and requires_knowledge "
+    "for asset_search because they describe a bounded post-search stage; aggregates never fan out. For other intents structured_query must be null. "
     "structured_result_reference is null or an object with kind none, set_query, select_entities, or "
     "historical_recall and 0-2 one-based ordinals."
 )
@@ -89,7 +90,6 @@ def validate_structured_router_payload(
     payload: dict[str, Any],
     entities: EntityResolution,
     *,
-    min_confidence: float | None = None,
     message: str = "",
     routing_state: SessionRoutingState | None = None,
     ui_context: dict[str, Any] | None = None,
@@ -112,7 +112,6 @@ def validate_structured_router_payload(
             decision = validate_structured_router_payload(
                 clean_payload,
                 entities,
-                min_confidence=min_confidence,
                 message=message,
                 routing_state=routing_state,
                 ui_context=ui_context,
@@ -129,7 +128,6 @@ def validate_structured_router_payload(
             decision = validate_structured_router_payload(
                 clean_payload,
                 entities,
-                min_confidence=min_confidence,
                 message=message,
                 routing_state=routing_state,
                 ui_context=None,
@@ -157,7 +155,6 @@ def validate_structured_router_payload(
             decision = validate_structured_router_payload(
                 clean_payload,
                 empty,
-                min_confidence=min_confidence,
                 message=message,
                 routing_state=replace(
                     routing_state,
@@ -205,7 +202,6 @@ def validate_structured_router_payload(
         decision = validate_structured_router_payload(
             clean_payload,
             selection_entities,
-            min_confidence=min_confidence,
             message=message,
             routing_state=selection_state,
             ui_context=None,
@@ -224,7 +220,6 @@ def validate_structured_router_payload(
         return validate_router_payload(
             legacy_payload,
             entities,
-            min_confidence=min_confidence,
             message=message,
             routing_state=routing_state,
             ui_context=ui_context,
@@ -263,14 +258,11 @@ def validate_structured_router_payload(
         "is_followup",
         "reason",
     }
-    if unexpected := sorted(set(payload).difference(allowed | {"classification_confidence"})):
+    if unexpected := sorted(set(payload).difference(allowed)):
         raise ValueError(f"schema_validation_failed:unexpected={','.join(unexpected)}")
     required = allowed.difference({"requires_knowledge"})
     if missing := sorted(required.difference(payload)):
         raise ValueError(f"schema_validation_failed:missing={','.join(missing)}")
-
-    del min_confidence
-    confidence = _reported_confidence(payload)
 
     if payload.get("scope") != "none" or payload.get("direction") != "none":
         raise ValueError("schema_validation_failed:structured_query_scope")
@@ -291,8 +283,10 @@ def validate_structured_router_payload(
         raise ValueError("schema_validation_failed:requires_knowledge")
     if not payload["requires_graph"]:
         raise ValueError("schema_validation_failed:structured_query_requires_graph")
-    if payload["requires_detection"] or payload["requires_asset_profile"]:
-        raise ValueError("schema_validation_failed:structured_query_cannot_deepen_without_focal_entity")
+    if intent == "asset_aggregate" and (
+        payload["requires_detection"] or payload["requires_asset_profile"]
+    ):
+        raise ValueError("schema_validation_failed:structured_aggregate_cannot_fan_out")
     if payload["requires_multiple_entities"]:
         raise ValueError("schema_validation_failed:structured_query_is_not_entity_pair")
 
@@ -302,8 +296,8 @@ def validate_structured_router_payload(
         direction="none",
         depth=0,
         requires_graph=True,
-        requires_detection=False,
-        requires_asset_profile=False,
+        requires_detection=bool(payload["requires_detection"]),
+        requires_asset_profile=bool(payload["requires_asset_profile"]),
         requires_knowledge=bool(payload.get("requires_knowledge", False)),
         structured_query=query,
         entity_binding="none",
@@ -315,7 +309,6 @@ def validate_structured_router_payload(
         requires_multiple_entities=False,
         relationship_mode="none",
         is_followup=bool(payload["is_followup"]),
-        classification_confidence=confidence,
         reason=str(payload.get("reason") or "")[:220],
         decision_source="semantic_router",
         router_called=True,
@@ -429,8 +422,9 @@ def normalize_intent_route(
     return replace(
         route,
         use_graph=True,
-        use_detection=False,
-        use_asset_profile=False,
+        use_detection=decision.requires_detection,
+        use_asset_profile=decision.requires_asset_profile,
+        use_knowledge=decision.requires_knowledge,
         structured_query=decision.structured_query,
         entity_binding="none",
         requested_entity_binding="none",
@@ -441,7 +435,9 @@ def normalize_intent_route(
         materialized_entities=(),
         target_entity=None,
         target_entities=[],
-        matched_signals=[decision.intent, "structured_asset_set"],
+        matched_signals=[
+            value for value in (decision.intent, "structured_asset_set") if value
+        ],
         graph_intent_detected=True,
         asset_investigation_detected=False,
         intent=decision.intent,

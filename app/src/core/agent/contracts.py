@@ -38,6 +38,7 @@ EpisodeTransition = Literal["keep", "switch", "detach"]
 ResponseDepth = Literal["brief", "standard", "deep", "report"]
 StepRequirement = Literal["required", "optional"]
 PlanSource = Literal["deterministic", "llm", "deterministic_fallback"]
+PostSearchMode = Literal["set_enrichment", "focal_deepening"]
 WorkflowStatus = Literal[
     "running",
     "completed",
@@ -236,6 +237,42 @@ class TaskEnvelope:
 
 
 @dataclass(frozen=True)
+class PostSearchRequirements:
+    """Internal stage-2 requirements derived only from validated Router flags."""
+
+    mode: PostSearchMode
+    entity_capabilities: tuple[str, ...] = ()
+    requires_focal_graph: bool = False
+    requires_knowledge: bool = False
+    max_assets: int = 5
+
+    def __post_init__(self) -> None:
+        allowed = {"asset.get_profile", "asset.get_detection"}
+        if any(capability not in allowed for capability in self.entity_capabilities):
+            raise ValueError("Post-search entity capability is not allow-listed")
+        if len(set(self.entity_capabilities)) != len(self.entity_capabilities):
+            raise ValueError("Post-search entity capabilities must be unique")
+        if not 1 <= self.max_assets <= 5:
+            raise ValueError("Post-search Asset bound must be between one and five")
+
+
+@dataclass(frozen=True)
+class PostSearchEnrichmentSummary:
+    """Exact search truth plus independently bounded stage-2 coverage."""
+
+    mode: PostSearchMode
+    matched_total: int
+    returned_count: int
+    target_count: int
+    completed_count: int
+    partial: bool
+    target_entities: tuple[str, ...] = ()
+    completed_entities: tuple[str, ...] = ()
+    requested_capabilities: tuple[str, ...] = ()
+    limitations: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
 class TaskSpec:
     request: str
     intent: str
@@ -245,6 +282,7 @@ class TaskSpec:
     required_capabilities: tuple[str, ...]
     optional_capabilities: tuple[str, ...] = ()
     structured_query: StructuredQuerySpec | None = None
+    post_search_requirements: PostSearchRequirements | None = None
     workflow_mode: WorkflowMode = "direct"
     semantic_decision_source: str = "unknown"
     requires_multiple_entities: bool = False
@@ -343,6 +381,7 @@ class EvidencePack:
     supplemental_history: tuple[dict[str, Any], ...] = ()
     review_outcome: ReviewOutcome | None = None
     structured_asset_sets: tuple[StructuredAssetSetEvidence, ...] = ()
+    post_search_enrichment: PostSearchEnrichmentSummary | None = None
 
 
 @dataclass(frozen=True)
@@ -459,6 +498,7 @@ class InvestigationState(TypedDict, total=False):
     routing_result: Any
     plan_validation_result: dict[str, Any]
     capability_results: list[ToolResult]
+    post_search_enrichment_summary: PostSearchEnrichmentSummary
     supplemental_retrieval_state: dict[str, Any]
     composed_context: str
     synthesizer_task_context: Any

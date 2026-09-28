@@ -99,7 +99,6 @@ class FakeRoutingProvider:
                         "requires_asset_profile": False,
                         "requires_multiple_entities": False,
                         "is_followup": False,
-                        "classification_confidence": 0.95,
                         "reason": "general",
                     }
                 ),

@@ -19,6 +19,7 @@ from src.core.agent.contracts import (
     CapabilitySpec,
     ExecutionPlan,
     PlanStep,
+    PostSearchEnrichmentSummary,
     RequestConstraints,
     RetryPolicy,
     TaskSpec,
@@ -653,3 +654,40 @@ def test_exact_zero_guard_carries_the_executed_selector_scope_into_synthesis() -
     assert context.structured_query_scope["exact_zero_scope_only"] is True
     assert "An exact zero-result applies only to the exact selectors" in contract
     assert "does not prove that no matching `suggested_type`, `role`, or `roles` value exists" in contract
+
+
+def test_set_enrichment_coverage_is_explicit_in_synth_contract() -> None:
+    query = StructuredQuerySpec.model_validate({
+        "mode": "search",
+        "filters": {"role": "Domain Controller"},
+    })
+    task = _task(
+        request="Find Domain Controllers and show their services and classification state.",
+        intent="asset_search",
+        scope="none",
+        direction="none",
+        entities=(),
+        required_capabilities=("graph.search_assets",),
+        structured_query=query,
+    )
+    summary = PostSearchEnrichmentSummary(
+        mode="set_enrichment",
+        matched_total=55,
+        returned_count=10,
+        target_count=5,
+        completed_count=3,
+        partial=True,
+        target_entities=tuple(f"192.0.2.{index}" for index in range(1, 6)),
+        completed_entities=("192.0.2.1", "192.0.2.2", "192.0.2.3"),
+        requested_capabilities=("asset.get_profile", "asset.get_detection"),
+    )
+    builder = SynthesizerPromptBuilder()
+    context = builder.build_context(task, (), post_search_enrichment=summary)
+    contract, _ = builder.render_contract(context)
+
+    assert context.post_search_enrichment["matched_total"] == 55
+    assert context.post_search_enrichment["target_count"] == 5
+    assert context.post_search_enrichment["completed_count"] == 3
+    assert context.post_search_enrichment["partial"] is True
+    assert '"post_search_enrichment"' in contract
+    assert "exact matched total separate from the number checked" in contract

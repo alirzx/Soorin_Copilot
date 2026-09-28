@@ -281,18 +281,34 @@ class CopilotWorkflowNodes:
                 semantic_router_finish_reason=decision.finish_reason,
                 semantic_router_content_present=decision.content_present,
                 semantic_router_error=decision.error_reason,
+                semantic_router_status=decision.runtime_status,
                 fallback_used=True,
                 fallback_reason=decision.fallback_reason or decision.error_reason,
             )
-            if route.intent == "general_knowledge":
-                route_entities = EntityResolution(status="none")
+            if route.reason == "deterministic_structured_parse_unavailable":
+                return {
+                    "routing_fallback_used": True,
+                    **self._clarification(
+                        "I recognized this as a structured Asset-set request, but its selectors or thresholds are not safely representable. Please restate it with an allow-listed field and an unambiguous value.",
+                        "structured_query_clarification_required",
+                    ),
+                }
+            recognized_fallback = bool(
+                route.structured_query is not None
+                or route.use_graph
+                or route.use_detection
+                or route.use_asset_profile
+                or route.use_knowledge
+            )
+            if decision.runtime_status in {"technical_failure", "disabled"} and not recognized_fallback:
                 route = replace(
                     route,
+                    intent=None,
+                    reason="semantic_router_technical_failure",
                     use_graph=False,
                     use_detection=False,
                     use_asset_profile=False,
                     use_knowledge=False,
-                    reason="semantic_router_unresolved",
                     entity_binding="none",
                     requested_entity_binding="none",
                     resolved_entity_binding="none",
@@ -302,32 +318,74 @@ class CopilotWorkflowNodes:
                     materialized_entities=(),
                     target_entity=None,
                     target_entities=[],
-                    intent="unclear",
                     scope="none",
                     direction="none",
                     depth=0,
                     requires_multiple_entities=False,
                     relationship_mode="none",
-                    matched_signals=["semantic_router_unresolved", "fail_closed"],
+                    matched_signals=["semantic_router_technical_failure", "fail_closed"],
+                    semantic_router_status=decision.runtime_status,
                 )
                 logger.warning(
-                    "event=semantic_router_unresolved request_id=%s fallback_reason=%s",
+                    "event=semantic_router_technical_failure request_id=%s fallback_reason=%s "
+                    "deterministic_route_recognized=false",
                     state["request_id"],
                     str(route.fallback_reason or "router_failed")[:120],
                 )
-            if route.reason == "deterministic_structured_parse_unavailable":
                 return {
+                    "routing_result": route,
+                    "resolved_entities": EntityResolution(status="none"),
                     "routing_fallback_used": True,
-                    **self._clarification(
-                        "I recognized this as a structured Asset-set request, but its selectors or thresholds are not safely representable. Please restate it with an allow-listed field and an unambiguous value.",
-                        "structured_query_clarification_required",
-                    ),
+                    "workflow_status": "failed",
+                    "terminal": True,
+                    "failure_metadata": {
+                        "error_type": "semantic_router_technical_failure",
+                        "safe_error_code": "semantic_router_technical_failure",
+                        "retryable": True,
+                    },
+                    "next_edge": "safe_failure",
                 }
             if route.structured_query is not None:
                 route_entities = EntityResolution(status="none")
         else:
             route_entities = resolution_from_materialized_decision(decision, entities)
             route = normalize_intent_route(decision, route_entities)
+            if decision.intent == "out_of_scope":
+                logger.info(
+                    "event=semantic_router_out_of_scope request_id=%s terminal=true",
+                    state["request_id"],
+                )
+                return {
+                    "routing_result": route,
+                    "resolved_entities": EntityResolution(status="none"),
+                    "turn_policy": replace(
+                        turn_policy,
+                        operation="topic_detach",
+                        target="none",
+                        target_entities=(),
+                        episode_transition="keep",
+                        operational_state_mutation_allowed=False,
+                    ),
+                    "routing_fallback_used": False,
+                    "workflow_status": "failed",
+                    "terminal": True,
+                    "failure_metadata": {
+                        "error_type": "out_of_scope",
+                        "safe_error_code": "out_of_scope",
+                        "retryable": False,
+                    },
+                    "next_edge": "safe_failure",
+                }
+            if decision.intent == "unclear":
+                return {
+                    "routing_result": route,
+                    "resolved_entities": EntityResolution(status="none"),
+                    "routing_fallback_used": False,
+                    **self._clarification(
+                        "I’m not certain which asset, result set, or analysis goal you mean. Please clarify the target and the question you want answered.",
+                        "semantic_request_ambiguous",
+                    ),
+                }
             active_pair = tuple(dict.fromkeys(routing_state.active_entities))
             semantic_comparison = bool(
                 route.scope == "multi_entity_comparison"
@@ -520,7 +578,10 @@ class CopilotWorkflowNodes:
         route = state["routing_result"]
         entities = state["resolved_entities"]
         distinct = tuple(dict.fromkeys(route.materialized_entities))
-        if len(distinct) > self.settings.agent_max_entities:
+        if (
+            entities.explicit_candidate_count > self.settings.agent_max_entities
+            or len(distinct) > self.settings.agent_max_entities
+        ):
             return self._clarification(
                 "Please provide no more than two IP addresses for this request.",
                 "too_many_entities",
@@ -962,6 +1023,7 @@ class CopilotWorkflowNodes:
             supplemental_history=tuple(
                 (state.get("supplemental_retrieval_state") or {}).get("history") or ()
             ),
+            post_search_enrichment=state.get("post_search_enrichment_summary"),
         )
         return {"evidence_pack": pack, "next_edge": "review_retrieval"}
 
@@ -1101,6 +1163,7 @@ class CopilotWorkflowNodes:
             review=state.get("review_decision"),
             request_constraints=state.get("request_constraints"),
             accepted_working_fact_count=len(state.get("pending_working_facts") or ()),
+            post_search_enrichment=state.get("post_search_enrichment_summary"),
             **continuity_arguments,
         )
         preliminary_prompt = self.synthesizer_prompt_builder.render_messages(
@@ -1193,6 +1256,7 @@ class CopilotWorkflowNodes:
             supplemental_history=tuple(
                 (state.get("supplemental_retrieval_state") or {}).get("history") or ()
             ),
+            post_search_enrichment=state.get("post_search_enrichment_summary"),
         )
         task_context = self.synthesizer_prompt_builder.build_context(
             task,
@@ -1202,6 +1266,7 @@ class CopilotWorkflowNodes:
             review=state.get("review_decision"),
             request_constraints=state.get("request_constraints"),
             accepted_working_fact_count=len(state.get("pending_working_facts") or ()),
+            post_search_enrichment=state.get("post_search_enrichment_summary"),
             delta_contexts=self.context_composer.last_delta_contexts,
             baseline_status=self.context_composer.last_baseline_status,
             baseline_present=self.context_composer.last_baseline_present,
@@ -1953,7 +2018,25 @@ class CopilotWorkflowNodes:
 
     def safe_failure_response(self, state: InvestigationState) -> dict[str, Any]:
         metadata = state.get("failure_metadata") or {}
-        answer = "I cannot safely complete this request because workflow validation failed. No unsupported result was generated."
+        code = str(metadata.get("safe_error_code") or "workflow_safe_failure")
+        if code == "out_of_scope":
+            answer = (
+                "I can help with cybersecurity, network and asset intelligence, incident response, "
+                "threat analysis, and Soorin platform questions. That request is outside this scope."
+            )
+            model = "scope-guard"
+            status = "completed"
+        elif code == "semantic_router_technical_failure":
+            answer = (
+                "I couldn’t safely determine the requested cybersecurity workflow because routing "
+                "encountered a technical problem. Please try the request again."
+            )
+            model = "routing-technical-guard"
+            status = "partial_failure"
+        else:
+            answer = "I cannot safely complete this request because workflow validation failed. No unsupported result was generated."
+            model = "workflow-safety-guard"
+            status = "failed"
         if self.stream_sink is not None:
             self.stream_sink(LLMStreamEvent("answer_delta", text=answer))
         return {
@@ -1961,10 +2044,10 @@ class CopilotWorkflowNodes:
                 "session_id": state["session_id"],
                 "answer": answer,
                 "provider": "deterministic",
-                "model": "workflow-safety-guard",
-                "_warnings": [str(metadata.get("safe_error_code") or "workflow_safe_failure")],
+                "model": model,
+                "_warnings": [code],
             },
-            "workflow_status": "failed",
+            "workflow_status": status,
             "terminal": True,
             "next_edge": "terminal",
         }

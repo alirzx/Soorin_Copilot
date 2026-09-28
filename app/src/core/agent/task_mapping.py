@@ -11,6 +11,7 @@ from src.core.agent.contracts import (
     EvidenceMode,
     ExecutionPlan,
     PlanStep,
+    PostSearchRequirements,
     RequestConstraints,
     TaskEnvelope,
     TaskSpec,
@@ -36,6 +37,12 @@ MULTI_STEP_WORDING = re.compile(
 SOURCE_SPECIFIC_KNOWLEDGE = re.compile(
     r"\b(?:according\s+to|quote|cite|use\s+only|what\s+does)\b.*"
     r"\b(?:indexed|uploaded|knowledge[\s-]*base|document|source|nist|mitre)\b",
+    re.IGNORECASE,
+)
+FOCAL_POST_SEARCH_SELECTION = re.compile(
+    r"\b(?:compare|comparison|versus|vs\.?|first\s+(?:one|two|result|asset|match)|"
+    r"top\s+(?:one|two|result|asset|match)|highest(?:\s+(?:one|two))?|"
+    r"lowest(?:\s+(?:one|two))?|leading\s+(?:result|asset|match))\b",
     re.IGNORECASE,
 )
 EXPLICIT_MEMORY_RECALL_REQUEST = re.compile(
@@ -394,6 +401,8 @@ def task_spec_from_route(
     )
     if getattr(route, "scope", "none") == "multi_entity_comparison" and len(entities) != 2:
         raise ValueError("comparison_requires_two_distinct_entities")
+    if getattr(route, "intent", None) is None:
+        raise ValueError("technical routing state cannot be compiled as a semantic task")
     required_capabilities: list[str] = []
     optional_capabilities: list[str] = []
     identity_contradiction = bool(IDENTITY_CONTRADICTION_REQUEST.search(request))
@@ -401,12 +410,36 @@ def task_spec_from_route(
     use_detection = bool(getattr(route, "use_detection", False))
     use_graph = bool(getattr(route, "use_graph", False)) and structured_query is None
     use_knowledge = bool(getattr(route, "use_knowledge", False))
+    post_search_requirements = None
     if allow_capabilities and structured_query is not None:
         required_capabilities.append(
             "graph.search_assets"
             if structured_query.mode is StructuredQueryMode.SEARCH
             else "graph.aggregate_assets"
         )
+        if structured_query.mode is StructuredQueryMode.SEARCH:
+            post_search_mode = (
+                "focal_deepening"
+                if FOCAL_POST_SEARCH_SELECTION.search(request)
+                else "set_enrichment"
+            )
+            entity_capabilities = tuple(
+                capability
+                for capability, enabled in (
+                    ("asset.get_profile", use_profile),
+                    ("asset.get_detection", use_detection),
+                )
+                if enabled
+            )
+            if entity_capabilities or use_knowledge:
+                post_search_requirements = PostSearchRequirements(
+                    mode=post_search_mode,
+                    entity_capabilities=entity_capabilities,
+                    requires_focal_graph=post_search_mode == "focal_deepening",
+                    requires_knowledge=use_knowledge,
+                )
+            use_knowledge = False
+        use_profile = use_detection = False
     if allow_capabilities and identity_contradiction and structured_query is None:
         use_profile = True
         use_detection = True
@@ -462,6 +495,7 @@ def task_spec_from_route(
         required_capabilities=tuple(required_capabilities),
         optional_capabilities=tuple(optional_capabilities),
         structured_query=structured_query,
+        post_search_requirements=post_search_requirements,
         workflow_mode="direct" if structured_query is not None or not allow_capabilities else "multi_step" if multi_step else "direct",
         semantic_decision_source=str(getattr(route, "decision_source", "unknown")),
         requires_multiple_entities=bool(getattr(route, "requires_multiple_entities", False)),
@@ -518,8 +552,22 @@ def compile_direct_plan(task: TaskSpec, *, plan_id: str | None = None) -> Execut
             raise ValueError("Structured query mode contradicts the task intent.")
         if task.entities:
             raise ValueError("Structured Asset-set tasks cannot carry focal entities.")
-        if capabilities != (expected_capability,):
-            raise ValueError("Structured direct tasks require exactly one matching capability.")
+        expected_capabilities = (
+            (expected_capability,)
+            if expected_mode is StructuredQueryMode.SEARCH
+            else (
+                (expected_capability, "knowledge.search")
+                if "knowledge.search" in capabilities
+                else (expected_capability,)
+            )
+        )
+        if expected_mode is StructuredQueryMode.SEARCH and capabilities != expected_capabilities:
+            raise ValueError(
+                "Structured search direct plans must contain exactly one Stage-1 "
+                "graph.search_assets capability."
+            )
+        if expected_mode is StructuredQueryMode.AGGREGATE and capabilities != expected_capabilities:
+            raise ValueError("Structured direct task capabilities do not match the typed staged contract.")
         if expected_mode is StructuredQueryMode.SEARCH:
             request = task.structured_query.to_search_request()
             parsed = AssetSearchCapabilityInput.model_validate(
@@ -544,6 +592,23 @@ def compile_direct_plan(task: TaskSpec, *, plan_id: str | None = None) -> Execut
             requirement="required",
             expected_evidence_type="organizational_asset_set",
         ))
+        if expected_mode is StructuredQueryMode.AGGREGATE and "knowledge.search" in capabilities:
+            steps.append(PlanStep(
+                id="step-2",
+                capability="knowledge.search",
+                depends_on=("step-1",),
+                arguments={
+                    "query": task.request,
+                    "purpose": "interpret_evidence",
+                    "max_context_tokens": 3000,
+                },
+                requirement=(
+                    "required"
+                    if "knowledge.search" in task.required_capabilities
+                    else "optional"
+                ),
+                expected_evidence_type="documentation",
+            ))
         return ExecutionPlan(
             task=task,
             steps=tuple(steps),

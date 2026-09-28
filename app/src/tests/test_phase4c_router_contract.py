@@ -36,7 +36,6 @@ def _search_payload() -> dict[str, object]:
         "entity_binding": "none",
         "requires_multiple_entities": False,
         "is_followup": False,
-        "classification_confidence": 0.98,
         "reason": "Find matching Assets by structured properties.",
     }
 
@@ -56,7 +55,6 @@ def _general_payload() -> dict[str, object]:
         "entity_binding": "none",
         "requires_multiple_entities": False,
         "is_followup": False,
-        "classification_confidence": 0.95,
         "reason": "General cybersecurity knowledge request.",
     }
 
@@ -80,7 +78,6 @@ def test_normal_structured_route_accepts_prompt_contract_null_reference() -> Non
     decision = validate_structured_router_payload(
         _search_payload(),
         _empty_entities(),
-        min_confidence=0.5,
     )
 
     assert decision.intent == "asset_search"
@@ -92,7 +89,6 @@ def test_normal_legacy_route_accepts_prompt_contract_null_reference() -> None:
     decision = validate_structured_router_payload(
         _general_payload(),
         _empty_entities(),
-        min_confidence=0.5,
     )
 
     assert decision.intent == "general_knowledge"

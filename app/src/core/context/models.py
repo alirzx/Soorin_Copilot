@@ -15,6 +15,7 @@ ResolutionStatus = Literal["resolved", "none", "ambiguous", "invalid"]
 EntityMode = Literal["none", "single", "multiple", "ambiguous", "invalid"]
 IntentName = Literal[
     "general_knowledge",
+    "out_of_scope",
     "asset_investigation",
     "asset_search",
     "asset_aggregate",
@@ -25,6 +26,9 @@ IntentName = Literal[
     "unclear",
 ]
 IntentDecisionSource = Literal["semantic_router", "semantic_router_repair", "deterministic_fallback", "disabled"]
+RouterRuntimeStatus = Literal[
+    "resolved", "request_constraint_failure", "technical_failure", "disabled"
+]
 GraphScope = Literal["none", "node_summary", "one_hop", "full_neighbors", "two_hop", "path", "multi_entity_comparison"]
 GraphDirection = Literal["none", "inbound", "outbound", "both"]
 RelationshipMode = Literal["none", "direct", "compare"]
@@ -80,7 +84,7 @@ class StructuredResultReferenceDecision:
 
 @dataclass(frozen=True)
 class IntentDecision:
-    intent: IntentName
+    intent: IntentName | None
     scope: GraphScope
     direction: GraphDirection
     depth: int
@@ -103,9 +107,9 @@ class IntentDecision:
     requires_multiple_entities: bool = False
     relationship_mode: RelationshipMode = "none"
     is_followup: bool = False
-    classification_confidence: float = 0.0
     reason: str = ""
     decision_source: IntentDecisionSource = "deterministic_fallback"
+    runtime_status: RouterRuntimeStatus = "resolved"
     exhaustive_connections_requested: bool = False
     router_called: bool = False
     latency_ms: int = 0
@@ -134,11 +138,6 @@ class IntentDecision:
     def use_knowledge(self) -> bool:
         return self.requires_knowledge
 
-    @property
-    def confidence(self) -> float:
-        return self.classification_confidence
-
-
 @dataclass(frozen=True)
 class RouteDecision:
     use_graph: bool
@@ -165,14 +164,14 @@ class RouteDecision:
     graph_intent_detected: bool = False
     asset_investigation_detected: bool = False
     followup_detected: bool = False
-    intent: IntentName = "unclear"
+    intent: IntentName | None = "unclear"
     scope: GraphScope = "none"
     direction: GraphDirection = "none"
     depth: int = 0
     requires_multiple_entities: bool = False
     relationship_mode: RelationshipMode = "none"
-    intent_confidence: float = 0.0
     decision_source: IntentDecisionSource = "deterministic_fallback"
+    semantic_router_status: RouterRuntimeStatus = "resolved"
     exhaustive_connections_requested: bool = False
     semantic_router_called: bool = False
     semantic_router_latency_ms: int = 0

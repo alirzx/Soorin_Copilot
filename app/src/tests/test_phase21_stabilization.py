@@ -898,7 +898,6 @@ def test_unsafe_final_window_blocks_chat_provider_after_recomposition():
             "entity_binding": "none",
             "requires_multiple_entities": False,
             "is_followup": False,
-            "classification_confidence": 0.95,
             "reason": "general fixture",
         }
     )

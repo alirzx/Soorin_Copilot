@@ -53,7 +53,6 @@ GENERAL_ROUTE = json.dumps(
         "entity_binding": "none",
         "requires_multiple_entities": False,
         "is_followup": False,
-        "classification_confidence": 0.95,
         "reason": "general",
     }
 )

@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
 
 from src.core.agent.contracts import (
     ExecutionPlan,
+    PostSearchRequirements,
     RequestConstraints,
     StructuredAssetSearchEvidence,
     TaskSpec,
@@ -24,7 +26,12 @@ from src.core.graph.structured import StructuredQuerySpec, structured_query_iden
 from src.core.memory.routing_state import SessionRoutingState
 
 
-def _task(request: str, *, sort: str | None = None) -> TaskSpec:
+def _task(
+    request: str,
+    *,
+    sort: str | None = None,
+    post_search: PostSearchRequirements | None = None,
+) -> TaskSpec:
     payload: dict[str, object] = {
         "mode": "search",
         "filters": {"role": "Domain Controller"},
@@ -39,6 +46,7 @@ def _task(request: str, *, sort: str | None = None) -> TaskSpec:
         entities=(),
         required_capabilities=("graph.search_assets",),
         structured_query=StructuredQuerySpec.model_validate(payload),
+        post_search_requirements=post_search,
         workflow_mode="direct",
     )
 
@@ -114,7 +122,14 @@ def test_one_candidate_is_safe_to_deepen() -> None:
 def test_find_domain_controller_and_analyze_deeply_runs_production_focal_flow(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    task = _task("find the Domain Controller and analyze it deeply")
+    task = _task(
+        "find the Domain Controller and analyze it deeply",
+        post_search=PostSearchRequirements(
+            mode="focal_deepening",
+            entity_capabilities=("asset.get_profile", "asset.get_detection"),
+            requires_focal_graph=True,
+        ),
+    )
     search = _search_result(task)
 
     class Validator:
@@ -209,6 +224,101 @@ def test_find_domain_controller_and_analyze_deeply_runs_production_focal_flow(
     assert update["active_entity_state"].structured_query_context.query == task.structured_query
 
 
+def test_set_enrichment_is_bounded_and_keeps_exact_match_coverage(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    requirements = PostSearchRequirements(
+        mode="set_enrichment",
+        entity_capabilities=("asset.get_profile", "asset.get_detection"),
+    )
+    task = _task(
+        "find domain controllers and show profile and detection evidence",
+        post_search=requirements,
+    )
+    base_search = _search_result(task)
+    assert base_search.structured_asset_set is not None
+    search = replace(
+        base_search,
+        structured_asset_set=replace(
+            base_search.structured_asset_set,
+            matched_total=55,
+            returned_count=5,
+            truncated=True,
+            rows=_rows(5),
+        ),
+        total_count=55,
+        included_count=5,
+        omitted_count=50,
+        truncated=True,
+    )
+
+    class Validator:
+        @staticmethod
+        def validate(plan: ExecutionPlan) -> ExecutionPlan:
+            return plan
+
+    class Executor:
+        @staticmethod
+        def execute(plan: ExecutionPlan, **_kwargs: object) -> list[ToolResult]:
+            return [
+                ToolResult(
+                    status="ok",
+                    entities=tuple(step.arguments.get("entities") or ()),
+                    source_capability=step.capability,
+                    retrieved_at="2026-09-11T10:01:00+00:00",
+                    freshness="current",
+                    completeness="complete",
+                    step_id=step.id,
+                    provider=step.capability.split(".", 1)[0],
+                    projection_usable=True,
+                    source_payload_complete=True,
+                )
+                for step in plan.steps
+            ]
+
+    nodes = object.__new__(Phase4CWorkflowNodes)
+    nodes.service = SimpleNamespace(
+        _capability_runtime_snapshot=lambda: (None, Validator(), Executor())
+    )
+    route = RouteDecision(
+        use_graph=True,
+        use_asset_profile=True,
+        use_detection=True,
+        reason="structured search",
+        intent="asset_search",
+        structured_query=task.structured_query,
+    )
+    parent = compile_direct_plan(task, plan_id="bounded-set-search")
+    monkeypatch.setattr(
+        CopilotWorkflowNodes,
+        "join_specialist_results",
+        lambda _self, _state: {
+            "tool_results": [search],
+            "capability_results": [search],
+        },
+    )
+
+    joined = nodes.join_specialist_results({
+        "request_id": "bounded-set",
+        "session_id": "bounded-set-session",
+        "task": task,
+        "routing_result": route,
+        "execution_plan": parent,
+    })
+
+    summary = joined["post_search_enrichment_summary"]
+    assert summary.matched_total == 55
+    assert summary.returned_count == 5
+    assert summary.target_count == 2
+    assert summary.completed_count == 2
+    assert summary.partial is True
+    assert all(
+        result.step_id.startswith("set-enrichment-")
+        for result in joined["tool_results"][1:]
+    )
+    assert _deepened_entities(joined) == ()
+
+
 def test_many_candidates_without_deterministic_selection_do_not_fan_out() -> None:
     selected, reason = Phase4CWorkflowNodes._select_candidates(
         _task("analyze matching domain controllers"),
@@ -269,27 +379,35 @@ def test_more_than_two_comparison_candidates_require_explicit_ranked_pair() -> N
 
 
 def test_total_turn_call_budget_drops_optional_knowledge_first() -> None:
-    query_task = _task("compare the top two and give hardening guidance", sort="model_confidence")
-    parent = compile_direct_plan(query_task, plan_id="parent")
-    focal = TaskSpec(
-        request=query_task.request,
-        intent="asset_investigation",
-        scope="multi_entity_comparison",
-        direction="both",
-        entities=("192.0.2.1", "192.0.2.2"),
-        required_capabilities=(
-            "asset.get_profile",
-            "asset.get_detection",
-            "graph.compare_assets",
-        ),
-        optional_capabilities=("knowledge.search",),
-        workflow_mode="direct",
-        requires_multiple_entities=True,
-        graph_depth=1,
-        relationship_mode="compare",
+    requirements = PostSearchRequirements(
+        mode="focal_deepening",
+        entity_capabilities=("asset.get_profile", "asset.get_detection"),
+        requires_focal_graph=True,
+        requires_knowledge=True,
     )
+    query_task = _task(
+        "compare the top two and give hardening guidance",
+        sort="model_confidence",
+        post_search=requirements,
+    )
+    parent = compile_direct_plan(query_task, plan_id="parent")
+    route = RouteDecision(
+        use_graph=True,
+        reason="structured search",
+        intent="asset_search",
+        structured_query=query_task.structured_query,
+    )
+    nodes = object.__new__(Phase4CWorkflowNodes)
 
-    deepening = Phase4CWorkflowNodes._compile_deepening_plan(focal, parent)
+    batches = nodes._compile_post_search_batches(
+        {"routing_result": route},
+        query_task,
+        ("192.0.2.1", "192.0.2.2"),
+        requirements,
+        parent,
+    )
+    assert len(batches) == 1
+    deepening = batches[0][0]
 
     assert len(parent.steps) + len(deepening.steps) <= 6
     assert all(step.capability != "knowledge.search" for step in deepening.steps)
@@ -299,24 +417,34 @@ def test_total_turn_call_budget_drops_optional_knowledge_first() -> None:
 
 
 def test_required_deepening_fails_closed_if_parent_consumes_budget() -> None:
-    task = TaskSpec(
-        request="analyze the first result",
-        intent="asset_investigation",
-        scope="node_summary",
-        direction="both",
-        entities=("192.0.2.1",),
-        required_capabilities=("asset.get_profile", "asset.get_detection", "graph.get_summary"),
-        workflow_mode="direct",
+    requirements = PostSearchRequirements(
+        mode="focal_deepening",
+        entity_capabilities=("asset.get_profile", "asset.get_detection"),
+        requires_focal_graph=True,
     )
+    task = _task("analyze the first result", post_search=requirements)
     parent = ExecutionPlan(
-        task=_task("analyze the first result"),
-        steps=tuple(compile_direct_plan(_task("analyze the first result")).steps) * 5,
+        task=task,
+        steps=tuple(compile_direct_plan(task).steps) * 5,
         maximum_allowed_calls=6,
         plan_id="almost-full",
     )
+    route = RouteDecision(
+        use_graph=True,
+        reason="structured search",
+        intent="asset_search",
+        structured_query=task.structured_query,
+    )
+    nodes = object.__new__(Phase4CWorkflowNodes)
 
-    with pytest.raises(ValueError, match="phase4c_deepening_call_budget_exceeded"):
-        Phase4CWorkflowNodes._compile_deepening_plan(task, parent)
+    with pytest.raises(ValueError, match="phase4c_post_search_call_budget_exceeded"):
+        nodes._compile_post_search_batches(
+            {"routing_result": route},
+            task,
+            ("192.0.2.1",),
+            requirements,
+            parent,
+        )
 
 
 def test_structured_set_turn_never_becomes_focal_baseline() -> None:

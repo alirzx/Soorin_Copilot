@@ -12,6 +12,7 @@ from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 
 from src.core.agent.contracts import (
     EvidenceMode,
+    PostSearchEnrichmentSummary,
     RequestConstraints,
     ResponseDepth,
     ReviewDecision,
@@ -102,6 +103,7 @@ class SynthesizerTaskContext:
     limitations: tuple[str, ...]
     output_constraints: tuple[str, ...]
     structured_query_scope: dict[str, Any]
+    post_search_enrichment: dict[str, Any]
 
 
 @dataclass(frozen=True)
@@ -224,6 +226,7 @@ class SynthesizerPromptBuilder:
         structured_lineage: tuple[Any, ...] = (),
         structured_reference_kind: str = "none",
         active_focal_entities: tuple[str, ...] = (),
+        post_search_enrichment: PostSearchEnrichmentSummary | None = None,
     ) -> SynthesizerTaskContext:
         memory_package = getattr(snapshot, "memory_context", None)
         selected_count = max(
@@ -347,6 +350,22 @@ class SynthesizerPromptBuilder:
                 "class_mapping_mode": query.class_mapping_mode,
                 "exact_zero_scope_only": True,
             }
+        post_search_metadata = (
+            {
+                "mode": post_search_enrichment.mode,
+                "matched_total": post_search_enrichment.matched_total,
+                "returned_count": post_search_enrichment.returned_count,
+                "target_count": post_search_enrichment.target_count,
+                "completed_count": post_search_enrichment.completed_count,
+                "partial": post_search_enrichment.partial,
+                "target_entities": list(post_search_enrichment.target_entities),
+                "completed_entities": list(post_search_enrichment.completed_entities),
+                "requested_capabilities": list(post_search_enrichment.requested_capabilities),
+                "limitations": list(post_search_enrichment.limitations),
+            }
+            if post_search_enrichment is not None
+            else {}
+        )
         return SynthesizerTaskContext(
             task_category=self._task_category(task),
             intent=task.intent,
@@ -372,6 +391,7 @@ class SynthesizerPromptBuilder:
             limitations=limitations,
             output_constraints=(),
             structured_query_scope=structured_query_scope,
+            post_search_enrichment=post_search_metadata,
         )
 
     def render_contract(self, context: SynthesizerTaskContext) -> tuple[str, tuple[str, ...]]:
@@ -444,6 +464,7 @@ class SynthesizerPromptBuilder:
             "deterministic_delta_available": context.deterministic_delta_available,
             "limitations": list(context.limitations),
             "structured_query_scope": context.structured_query_scope,
+            "post_search_enrichment": context.post_search_enrichment,
         }
         text = (
             "[SOORIN SYNTHESIZER TASK CONTRACT]\n"

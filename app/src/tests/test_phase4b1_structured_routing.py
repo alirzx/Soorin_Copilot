@@ -14,6 +14,7 @@ from src.config.settings import get_settings
 from src.core.agent.contracts import TaskSpec
 from src.core.agent.nodes import CopilotWorkflowNodes
 from src.core.agent.structured_evidence import structured_query_identity
+from src.core.agent.task_mapping import compile_direct_plan, task_spec_from_route
 from src.core.context.intent import build_routing_context
 from src.core.context.models import EntityResolution, IntentDecision, ResolvedEntity
 from src.core.context import DeterministicFallbackRouter
@@ -55,7 +56,6 @@ def _base_payload(intent: str, structured_query: dict[str, object] | None) -> di
         "entity_binding": "none",
         "requires_multiple_entities": False,
         "is_followup": False,
-        "classification_confidence": 0.98,
         "reason": "Structured organizational Asset query.",
     }
 
@@ -105,7 +105,6 @@ def _entity_payload(*, pair: bool = False) -> dict[str, object]:
         "entity_binding": "none",
         "requires_multiple_entities": pair,
         "is_followup": True,
-        "classification_confidence": 0.98,
         "reason": "Use the selected ordered result refs.",
     }
 
@@ -160,7 +159,6 @@ def test_search_route_needs_no_focal_entity_and_keeps_selectors_out_of_entities(
     decision = validate_structured_router_payload(
         payload,
         _empty_entities(),
-        min_confidence=0.5,
         routing_state=SessionRoutingState(active_ip="10.0.0.9"),
         ui_context={"selected_ip": "10.0.0.8"},
     )
@@ -187,7 +185,6 @@ def test_aggregate_route_is_typed_and_mode_mismatch_fails_closed() -> None:
     decision = validate_structured_router_payload(
         payload,
         _empty_entities(),
-        min_confidence=0.5,
     )
     assert decision.structured_query is not None
     aggregate = decision.structured_query.to_aggregate_request()
@@ -200,7 +197,7 @@ def test_aggregate_route_is_typed_and_mode_mismatch_fails_closed() -> None:
         "filters": {"role": "Domain Controller"},
     }
     with pytest.raises(ValueError, match="structured_query_mode"):
-        validate_structured_router_payload(invalid, _empty_entities(), min_confidence=0.5)
+        validate_structured_router_payload(invalid, _empty_entities())
 
 
 def test_structured_route_invariants_fail_closed() -> None:
@@ -210,15 +207,89 @@ def test_structured_route_invariants_fail_closed() -> None:
     )
     bad_binding = dict(payload, entity_binding="active_single")
     with pytest.raises(ValueError, match="entity_binding"):
-        validate_structured_router_payload(bad_binding, _empty_entities(), min_confidence=0.5)
+        validate_structured_router_payload(bad_binding, _empty_entities())
 
-    bad_deepen = dict(payload, requires_asset_profile=True)
-    with pytest.raises(ValueError, match="cannot_deepen"):
-        validate_structured_router_payload(bad_deepen, _empty_entities(), min_confidence=0.5)
+    deepening = validate_structured_router_payload(
+        dict(payload, requires_asset_profile=True, requires_detection=True),
+        _empty_entities(),
+    )
+    assert deepening.requires_asset_profile is True
+    assert deepening.requires_detection is True
+
+    aggregate = _base_payload(
+        "asset_aggregate",
+        {
+            "mode": "aggregate",
+            "filters": {"role": "Domain Controller"},
+            "operation": "count",
+        },
+    )
+    with pytest.raises(ValueError, match="cannot_fan_out"):
+        validate_structured_router_payload(
+            dict(aggregate, requires_asset_profile=True),
+            _empty_entities(),
+        )
 
     bad_graph = dict(payload, requires_graph=False)
     with pytest.raises(ValueError, match="requires_graph"):
-        validate_structured_router_payload(bad_graph, _empty_entities(), min_confidence=0.5)
+        validate_structured_router_payload(bad_graph, _empty_entities())
+
+
+def test_search_evidence_flags_become_typed_stage_two_requirements() -> None:
+    payload = _base_payload(
+        "asset_search",
+        {"mode": "search", "filters": {"role": "Domain Controller"}},
+    )
+    payload.update(
+        requires_asset_profile=True,
+        requires_detection=True,
+        requires_knowledge=True,
+    )
+    decision = validate_structured_router_payload(payload, _empty_entities())
+    route = normalize_intent_route(decision, _empty_entities())
+    task = task_spec_from_route(
+        route,
+        "Find Domain Controllers and show their OS, services, and detection evidence.",
+    )
+
+    assert task.required_capabilities == ("graph.search_assets",)
+    assert task.entities == ()
+    assert task.post_search_requirements is not None
+    assert task.post_search_requirements.mode == "set_enrichment"
+    assert task.post_search_requirements.entity_capabilities == (
+        "asset.get_profile",
+        "asset.get_detection",
+    )
+    assert task.post_search_requirements.requires_knowledge is True
+    plan = compile_direct_plan(task)
+    assert [step.capability for step in plan.steps] == ["graph.search_assets"]
+
+
+@pytest.mark.parametrize(
+    ("literal", "forbidden_class"),
+    (
+        ("Active Directory", "Domain Controller"),
+        ("Linux", "Linux Server"),
+        ("Windows", "Windows Workstation"),
+    ),
+)
+def test_bare_terms_are_not_substituted_with_static_asset_classes(
+    literal: str,
+    forbidden_class: str,
+) -> None:
+    query = StructuredQuerySpec.model_validate({
+        "mode": "search",
+        "filters": {"role": literal},
+    })
+
+    normalized = normalize_structured_query_for_language(
+        query,
+        f"List assets associated with {literal}.",
+    )
+
+    assert normalized.semantic_class != forbidden_class
+    serialized = json.dumps(normalized.model_dump(mode="json"))
+    assert forbidden_class.casefold() not in serialized.casefold()
 
 
 def test_non_set_routes_keep_legacy_validator_contract() -> None:
@@ -235,13 +306,11 @@ def test_non_set_routes_keep_legacy_validator_contract() -> None:
         "entity_binding": "none",
         "requires_multiple_entities": False,
         "is_followup": False,
-        "classification_confidence": 0.9,
         "reason": "Reference knowledge request.",
     }
     decision = validate_structured_router_payload(
         payload,
         _empty_entities(),
-        min_confidence=0.5,
     )
     assert decision.intent == "general_knowledge"
     assert decision.structured_query is None
@@ -252,7 +321,7 @@ def test_non_set_routes_keep_legacy_validator_contract() -> None:
         "filters": {"status": "CONFIRMED"},
     }
     with pytest.raises(ValueError, match="requires_set_intent"):
-        validate_structured_router_payload(polluted, _empty_entities(), min_confidence=0.5)
+        validate_structured_router_payload(polluted, _empty_entities())
 
 
 def test_task_spec_contract_can_carry_structured_query_without_expanding_entities() -> None:
@@ -341,7 +410,6 @@ def test_typed_first_result_selection_is_phrase_agnostic_and_outranks_ui_active_
     decision = validate_structured_router_payload(
         _entity_payload(),
         incidental_pair,
-        min_confidence=0.5,
         message=message,
         routing_state=state,
         ui_context={"selected_ip": "203.0.113.99"},
@@ -365,7 +433,6 @@ def test_typed_first_two_selection_materializes_exactly_two_ordered_refs() -> No
     decision = validate_structured_router_payload(
         _entity_payload(pair=True),
         _empty_entities(),
-        min_confidence=0.5,
         routing_state=state,
     )
 
@@ -388,7 +455,6 @@ def test_explicit_message_entity_overrides_structured_selection() -> None:
     decision = validate_structured_router_payload(
         payload,
         explicit,
-        min_confidence=0.5,
         routing_state=SessionRoutingState(structured_query_context=_continuity()),
     )
 
@@ -411,7 +477,6 @@ def test_set_continuation_accepts_full_typed_query_and_ignores_incidental_ui() -
     decision = validate_structured_router_payload(
         payload,
         _empty_entities(),
-        min_confidence=0.5,
         message="how many of those are there?",
         routing_state=SessionRoutingState(structured_query_context=_continuity()),
         ui_context={"selected_ip": "203.0.113.99"},
@@ -469,7 +534,6 @@ def test_typed_set_followups_keep_prior_filters_for_count_sort_and_grouping(
     decision = validate_structured_router_payload(
         payload,
         _empty_entities(),
-        min_confidence=0.5,
         routing_state=SessionRoutingState(structured_query_context=_continuity()),
     )
 
@@ -498,7 +562,6 @@ def test_empty_out_of_bounds_and_aggregate_selection_fail_validation() -> None:
             validate_structured_router_payload(
                 payload,
                 _empty_entities(),
-                min_confidence=0.5,
                 routing_state=SessionRoutingState(structured_query_context=context),
             )
 
@@ -528,14 +591,12 @@ def test_vague_active_single_remains_in_existing_namespace_when_context_exists()
         "entity_binding": "active_single",
         "requires_multiple_entities": False,
         "is_followup": True,
-        "classification_confidence": 0.98,
         "reason": "Continue with the active focal Asset.",
     }
 
     decision = validate_structured_router_payload(
         payload,
         entities,
-        min_confidence=0.5,
         routing_state=SessionRoutingState(
             active_entities=(active.value,),
             structured_query_context=_continuity(),
@@ -564,7 +625,6 @@ def test_explicit_pair_outranks_structured_result_selection() -> None:
     decision = validate_structured_router_payload(
         payload,
         explicit,
-        min_confidence=0.5,
         routing_state=SessionRoutingState(structured_query_context=_continuity()),
     )
 
@@ -611,6 +671,35 @@ def test_router_repair_path_preserves_typed_result_selection() -> None:
     assert decision.decision_source == "semantic_router_repair"
     assert decision.materialized_entities == ("192.0.2.1", "192.0.2.2")
     assert decision.structured_result_reference.kind == "select_entities"
+
+
+def test_unsupported_selector_is_not_repaired_by_deleting_the_condition() -> None:
+    payload = _base_payload(
+        "asset_search",
+        {"mode": "search", "filters": {"role": "Linux Server"}},
+    )
+    llm = _RepairLLM([json.dumps(payload), json.dumps(payload)])
+    router = SemanticIntentRouter(
+        replace(
+            get_settings(),
+            intent_router_enabled=True,
+            intent_router_retry_enabled=True,
+        ),
+        llm,
+    )
+
+    decision = router.classify(
+        "Find Linux servers owned by Finance.",
+        _empty_entities(),
+        SessionRoutingState(),
+        request_id="unsupported-selector",
+    )
+
+    assert decision.intent is None
+    assert decision.runtime_status == "technical_failure"
+    assert decision.fallback_used is True
+    assert decision.error_reason == "schema_validation_failed:unsupported_structured_property"
+    assert llm.calls == 1
 
 
 @pytest.mark.parametrize(
@@ -747,7 +836,6 @@ def test_route_node_recomputes_pair_authority_for_structured_result_selection() 
     decision = validate_structured_router_payload(
         _entity_payload(pair=True),
         old_pair,
-        min_confidence=0.5,
         routing_state=routing_state,
     )
     service = SimpleNamespace(
@@ -800,7 +888,6 @@ def test_route_node_set_continuation_discards_incidental_pair_envelope() -> None
     decision = validate_structured_router_payload(
         payload,
         old_pair,
-        min_confidence=0.5,
         message="how many of those are there?",
         routing_state=routing_state,
     )
@@ -859,13 +946,11 @@ def test_historical_result_recall_is_no_live_and_does_not_bind_active_or_ui_enti
         "entity_binding": "none",
         "requires_multiple_entities": False,
         "is_followup": True,
-        "classification_confidence": 0.98,
         "reason": "Recall the bounded prior structured result.",
     }
     decision = validate_structured_router_payload(
         payload,
         _empty_entities(),
-        min_confidence=0.5,
         routing_state=routing_state,
         ui_context={"selected_ip": "203.0.113.99"},
     )
@@ -990,7 +1075,6 @@ def test_self_contained_set_query_is_rejected_and_again_is_a_fresh_rerun() -> No
     decision = validate_structured_router_payload(
         payload,
         _empty_entities(),
-        min_confidence=0.5,
         message="search on role or roles and find the domain controller",
         routing_state=state,
     )
@@ -1016,7 +1100,7 @@ def test_router_failure_on_novel_operational_wording_cannot_become_general_knowl
     class FailedRouter:
         def classify(self, *_args, **_kwargs):
             return IntentDecision(
-                intent="unclear",
+                intent=None,
                 scope="none",
                 direction="none",
                 depth=0,
@@ -1025,10 +1109,12 @@ def test_router_failure_on_novel_operational_wording_cannot_become_general_knowl
                 fallback_reason="repair_timeout",
                 error_reason="repair_timeout",
                 router_called=True,
+                runtime_status="technical_failure",
             )
 
     nodes = object.__new__(CopilotWorkflowNodes)
     nodes.settings = get_settings()
+    nodes.stream_sink = None
     nodes.service = SimpleNamespace(
         intent_router=FailedRouter(),
         fallback_router=DeterministicFallbackRouter(),
@@ -1042,11 +1128,127 @@ def test_router_failure_on_novel_operational_wording_cannot_become_general_knowl
         "trace_id": "trace",
     })
 
-    assert update["routing_result"].intent == "unclear"
-    assert update["routing_result"].reason == "semantic_router_unresolved"
+    assert update["routing_result"].intent is None
+    assert update["routing_result"].semantic_router_status == "technical_failure"
     assert update["routing_result"].use_graph is False
     assert update["routing_result"].use_asset_profile is False
     assert update["routing_result"].entity_binding == "none"
+    assert update["terminal"] is True
+    assert update["next_edge"] == "safe_failure"
+
+
+def test_router_technical_failure_uses_only_a_recognized_safe_fallback() -> None:
+    class FailedRouter:
+        def classify(self, *_args, **_kwargs):
+            return IntentDecision(
+                intent=None,
+                scope="none",
+                direction="none",
+                depth=0,
+                requires_graph=False,
+                fallback_used=True,
+                fallback_reason="timeout",
+                error_reason="timeout",
+                router_called=True,
+                runtime_status="technical_failure",
+            )
+
+    nodes = object.__new__(CopilotWorkflowNodes)
+    nodes.settings = get_settings()
+    nodes.service = SimpleNamespace(
+        intent_router=FailedRouter(),
+        fallback_router=DeterministicFallbackRouter(),
+    )
+    update = nodes.route({
+        "message": "What is Kerberos authentication?",
+        "resolved_entities": _empty_entities(),
+        "active_entity_state": SessionRoutingState(),
+        "recent_messages": [],
+        "request_id": "recognized-fallback",
+        "trace_id": "trace",
+    })
+
+    assert update["routing_result"].intent == "general_knowledge"
+    assert update["routing_result"].use_knowledge is True
+    assert update["routing_result"].semantic_router_status == "technical_failure"
+    assert update["next_edge"] == "validate_task"
+    assert update.get("terminal") is not True
+
+
+def test_out_of_scope_terminates_before_planning_and_preserves_active_target() -> None:
+    class ScopeRouter:
+        def classify(self, *_args, **_kwargs):
+            return IntentDecision(
+                intent="out_of_scope",
+                scope="none",
+                direction="none",
+                depth=0,
+                requires_graph=False,
+                decision_source="semantic_router",
+                router_called=True,
+            )
+
+    nodes = object.__new__(CopilotWorkflowNodes)
+    nodes.settings = get_settings()
+    nodes.stream_sink = None
+    nodes.service = SimpleNamespace(
+        intent_router=ScopeRouter(),
+        fallback_router=DeterministicFallbackRouter(),
+    )
+    state = {
+        "message": "Write a poem about spring.",
+        "session_id": "scope-session",
+        "resolved_entities": _empty_entities(),
+        "active_entity_state": SessionRoutingState(active_ip="192.0.2.10"),
+        "recent_messages": [],
+        "request_id": "scope-request",
+        "trace_id": "trace",
+    }
+
+    update = nodes.route(state)
+    response = nodes.safe_failure_response({**state, **update})
+
+    assert update["routing_result"].intent == "out_of_scope"
+    assert update["resolved_entities"].entities == []
+    assert update["turn_policy"].operational_state_mutation_allowed is False
+    assert update["next_edge"] == "safe_failure"
+    assert response["final_response"]["provider"] == "deterministic"
+    assert response["final_response"]["model"] == "scope-guard"
+    assert "Router" not in response["final_response"]["answer"]
+
+
+def test_semantic_unclear_returns_immediate_clarification() -> None:
+    class AmbiguousRouter:
+        def classify(self, *_args, **_kwargs):
+            return IntentDecision(
+                intent="unclear",
+                scope="none",
+                direction="none",
+                depth=0,
+                requires_graph=False,
+                decision_source="semantic_router",
+                router_called=True,
+            )
+
+    nodes = object.__new__(CopilotWorkflowNodes)
+    nodes.settings = get_settings()
+    nodes.service = SimpleNamespace(
+        intent_router=AmbiguousRouter(),
+        fallback_router=DeterministicFallbackRouter(),
+    )
+    update = nodes.route({
+        "message": "Compare it with the other one.",
+        "resolved_entities": _empty_entities(),
+        "active_entity_state": SessionRoutingState(),
+        "recent_messages": [],
+        "request_id": "ambiguous-request",
+        "trace_id": "trace",
+    })
+
+    assert update["workflow_status"] == "clarification_required"
+    assert update["terminal"] is True
+    assert update["next_edge"] == "clarification"
+    assert update["resolved_entities"].entities == []
 
 
 def test_fallback_preserves_every_material_supported_selector() -> None:

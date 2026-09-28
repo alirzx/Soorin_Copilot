@@ -466,7 +466,6 @@ def test_semantic_comparison_recovers_unique_active_pair_independently() -> None
         materialized_entities=(IP_B,),
         requires_multiple_entities=True,
         relationship_mode="compare",
-        classification_confidence=0.94,
         reason="comparison requested",
         router_called=True,
     )

@@ -68,7 +68,7 @@ class GraphContextProvider:
                     direction=direction,
                     depth=depth,
                     entities=entities,
-                    intent=route.intent if route else "graph_neighbors",
+                    intent=(route.intent if route and route.intent else "graph_neighbors"),
                     relationship_mode=route.relationship_mode if route else "none",
                     exhaustive_connections_requested=route.exhaustive_connections_requested if route else False,
                 ),

@@ -444,11 +444,9 @@ class RoutingWorkflowAndReviewerTests(unittest.TestCase):
                 "entity_binding": "none",
                 "requires_multiple_entities": False,
                 "is_followup": False,
-                "classification_confidence": 0.95,
                 "reason": "Approved SOC knowledge is useful.",
             },
             EntityResolution(status="none"),
-            min_confidence=0.65,
             message="What is Kerberos?",
         )
         route = normalize_intent_route(decision, EntityResolution(status="none"))

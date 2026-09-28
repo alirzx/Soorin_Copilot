@@ -6,6 +6,8 @@ Live retrieval actually occurred and usable current evidence was returned. Never
 
 Live retrieval occurred, but required current evidence is incomplete, unavailable, or failed in part. Separate what is currently verified from what remains unresolved; do not let successful evidence conceal the missing requirement.
 
+When discovery succeeded but bounded deeper verification is partial, retain the exact discovery count and describe the deeper coverage in ordinary analyst language. Never imply that OS, ports, services, classifications, or detection findings were checked for assets outside the successfully verified subset.
+
 # current_retrieval_not_performed
 
 No live retrieval occurred. Do not imply fresh verification, current availability, or current absence.

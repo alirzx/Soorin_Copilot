@@ -13,6 +13,7 @@ from src.core.context.intent import SemanticIntentRouter as BaseSemanticIntentRo
 from src.core.context.models import EntityResolution
 from src.core.context.semantic_catalog import SemanticCatalogProvider
 from src.core.graph.neo4j import Neo4jGraphRepository
+from src.core.graph.structured import StructuredQuerySpec
 from src.core.llm.providers.base import LLMProviderResult
 from src.core.memory.routing_state import SessionRoutingState
 
@@ -22,6 +23,7 @@ class _GraphService:
         self.version = version
         self.version_calls = 0
         self.value_calls = 0
+        self.canonical_calls: list[tuple[str, dict[str, tuple[str, ...]]]] = []
         self.values = {
             "role": ("Domain Controller", "domain controller", "DNS", ""),
             "roles": ("Authentication", None, "DNS"),
@@ -38,6 +40,29 @@ class _GraphService:
         assert per_field_limit <= 64
         self.value_calls += 1
         return self.values
+
+    def canonicalize_semantic_values(
+        self,
+        version: str,
+        values: dict[str, tuple[str, ...]],
+    ) -> dict[str, dict[str, str]]:
+        self.canonical_calls.append((version, values))
+        available = {
+            "role": {"domain controller": "Domain Controller"},
+            "product": {"rare appliance": "Rare Appliance"},
+        }
+        return {
+            field: {
+                value.casefold(): available[field][value.casefold()]
+                for value in requested
+                if value.casefold() in available.get(field, {})
+            }
+            for field, requested in values.items()
+            if any(
+                value.casefold() in available.get(field, {})
+                for value in requested
+            )
+        }
 
 
 class _FailingGraphService:
@@ -166,6 +191,66 @@ def test_catalog_ttl_refresh_and_neo4j_failure_are_nonfatal() -> None:
     assert unavailable.get() == {"available": False}
     assert unavailable.get() == {"available": False}
     assert failing.calls == 1
+
+
+def test_catalog_bounds_fields_fairly_and_omits_overlong_categories() -> None:
+    graph = _GraphService()
+    graph.values = {
+        field: (f"{field}-value",)
+        for field in (
+            "suggested_type",
+            "role",
+            "roles",
+            "vendor",
+            "product",
+            "tag",
+            "sub_tag",
+            "status",
+            "enrichment_status",
+        )
+    }
+    graph.values["role"] = ("x" * 40, "valid-role")
+    provider = SemanticCatalogProvider(
+        graph,
+        per_field_limit=4,
+        total_value_limit=9,
+        max_value_chars=32,
+    )
+
+    fields = provider.get()["fields"]
+
+    assert fields["role"] == ["valid-role"]
+    assert fields["sub_tag"] == ["sub_tag-value"]
+    assert fields["status"] == ["status-value"]
+    assert fields["enrichment_status"] == ["enrichment_status-value"]
+    assert "x" * 20 not in fields["role"]
+
+
+def test_active_graph_canonicalization_is_exact_and_not_limited_by_prompt_sample() -> None:
+    graph = _GraphService(version="graph-v9")
+    provider = SemanticCatalogProvider(graph)
+    query = StructuredQuerySpec.model_validate({
+        "mode": "search",
+        "filters": {
+            "role": "domain controller",
+            "product": "rare appliance",
+            "vendor": "No Such Vendor",
+        },
+    })
+
+    canonical = provider.canonicalize_query(query, request_id="canonical")
+
+    assert canonical.filters.role == "Domain Controller"
+    assert canonical.filters.product == "Rare Appliance"
+    assert canonical.filters.vendor == "No Such Vendor"
+    assert graph.canonical_calls == [(
+        "graph-v9",
+        {
+            "role": ("domain controller",),
+            "vendor": ("No Such Vendor",),
+            "product": ("rare appliance",),
+        },
+    )]
 
 
 def test_router_context_receives_catalog_without_making_it_an_input_allow_list() -> None:
@@ -306,3 +391,42 @@ def test_repository_catalog_query_is_bound_to_active_projection_and_flattens_rol
     assert "GraphMetadata" in driver.last_session.query
     assert "a:Asset {graph_version: $active_graph_version}" in driver.last_session.query
     assert "coalesce(a.roles, [])" in driver.last_session.query
+
+
+class _CanonicalSession(_Session):
+    def run(self, query, **params):
+        self.query = str(query)
+        self.params = params
+        return [
+            {
+                "field": "role",
+                "requested": "domain controller",
+                "canonical": "Domain Controller",
+            }
+        ]
+
+
+class _CanonicalDriver(_Driver):
+    def session(self):
+        self.last_session = _CanonicalSession()
+        return self.last_session
+
+
+def test_repository_canonicalization_is_batched_case_insensitive_and_version_bound() -> None:
+    driver = _CanonicalDriver()
+    repository = Neo4jGraphRepository(driver, _settings())  # type: ignore[arg-type]
+
+    resolved = repository.canonicalize_semantic_values(
+        "graph-v11",
+        (("role", "domain controller"), ("vendor", "VMware")),
+    )
+
+    assert resolved == {"role": {"domain controller": "Domain Controller"}}
+    assert driver.last_session.params["active_graph_version"] == "graph-v11"
+    assert driver.last_session.params["lookups"] == [
+        {"field": "role", "value": "domain controller"},
+        {"field": "vendor", "value": "VMware"},
+    ]
+    assert "UNWIND $lookups" in driver.last_session.query
+    assert "toLower(value) = toLower(requested)" in driver.last_session.query
+    assert "graph_version: $active_graph_version" in driver.last_session.query

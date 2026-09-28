@@ -64,6 +64,13 @@ TOPOLOGY_SUMMARY_WORDS = re.compile(
     re.IGNORECASE,
 )
 SECURITY_ANALYSIS_WORDS = re.compile(r"\b(?:anomal(?:y|ies|ous)|suspicious|unusual|abnormal|security|threat|compromise[ds]?)\b", re.IGNORECASE)
+GENERAL_SECURITY_KNOWLEDGE_WORDS = re.compile(
+    r"\b(?:cyber(?:security)?|security|soc|noc|ndr|siem|soar|incident\s+response|threat|"
+    r"malware|phishing|ransomware|firewall|zero\s+trust|mitre|att&ck|nist|"
+    r"vulnerabilit(?:y|ies)|authentication|authorization|network(?:ing)?|ipv[46]|dns|dhcp|"
+    r"active\s+directory|kerberos|ldap|hardening|detection\s+engineering)\b",
+    re.IGNORECASE,
+)
 COMPREHENSIVE_WORDS = re.compile(
     r"\b(?:all\s+(?:available\s+)?evidence|complete\s+(?:investigation|analysis|evidence|asset\s+report)|full\s+(?:investigation|asset\s+assessment)|"
     r"deep\s+analysis|comprehensive\s+(?:investigation|asset\s+report|report)|everything\s+known|identity,?\s+classification,?\s+and\s+(?:behavior|communications?))\b",
@@ -142,6 +149,7 @@ class DeterministicFallbackRouter:
         profile_signal = bool(ASSET_PROFILE_WORDS.search(message or ""))
         comprehensive_signal = bool(COMPREHENSIVE_WORDS.search(message or ""))
         security_signal = bool(SECURITY_ANALYSIS_WORDS.search(message or ""))
+        general_security_signal = bool(GENERAL_SECURITY_KNOWLEDGE_WORDS.search(message or ""))
         entity_followup_signal = bool(entities.reference_detected or ENTITY_REFERENCE_WORDS.search(message or "") or FOLLOWUP_WORDS.search(message or ""))
 
         if topic_detached:
@@ -177,6 +185,8 @@ class DeterministicFallbackRouter:
             use_graph, reason, signal_group = True, "fallback_graph_neighbors", "graph_topology"
         elif target and entity_count == 1 and (profile_signal or detection_signal or comprehensive_signal or security_signal or ASSET_WORDS.search(message or "")):
             intent, reason, signal_group = "asset_investigation", "fallback_asset_investigation", "asset_evidence"
+        elif not target and general_security_signal:
+            intent, reason, signal_group = "general_knowledge", "fallback_general_security_knowledge", "general_security_knowledge"
         elif (
             target
             and entity_followup_signal
@@ -259,6 +269,7 @@ class DeterministicFallbackRouter:
             reason=reason,
             use_detection=use_detection,
             use_asset_profile=use_asset_profile,
+            use_knowledge=bool(not target and general_security_signal),
             entity_binding=entity_binding,
             requested_entity_binding=entity_binding,
             resolved_entity_binding=entity_binding,
@@ -278,7 +289,6 @@ class DeterministicFallbackRouter:
             depth=depth,
             requires_multiple_entities=requires_multiple,
             relationship_mode="compare" if scope == "multi_entity_comparison" else "direct" if intent == "graph_relationships" else "none",
-            intent_confidence=1.0 if (use_graph or use_detection or use_asset_profile) else 0.8,
             decision_source="deterministic_fallback",
             exhaustive_connections_requested=exhaustive_connections,
             fallback_used=True,
@@ -336,8 +346,12 @@ def normalize_intent_route(decision: IntentDecision, entities: EntityResolution)
         materialized_entities=tuple(item.value for item in target_entities),
         target_entity=target_entity,
         target_entities=target_entities,
-        matched_signals=[decision.intent, decision.scope, decision.direction],
-        graph_intent_detected=decision.intent.startswith("graph_"),
+        matched_signals=[
+            value
+            for value in (decision.intent, decision.scope, decision.direction)
+            if value
+        ],
+        graph_intent_detected=bool(decision.intent and decision.intent.startswith("graph_")),
         asset_investigation_detected=decision.intent == "asset_investigation",
         followup_detected=decision.is_followup,
         intent=decision.intent,
@@ -346,8 +360,8 @@ def normalize_intent_route(decision: IntentDecision, entities: EntityResolution)
         depth=decision.depth,
         requires_multiple_entities=decision.requires_multiple_entities,
         relationship_mode=decision.relationship_mode,
-        intent_confidence=decision.classification_confidence,
         decision_source=decision.decision_source,
+        semantic_router_status=decision.runtime_status,
         exhaustive_connections_requested=decision.exhaustive_connections_requested,
         semantic_router_called=decision.router_called,
         semantic_router_latency_ms=decision.latency_ms,

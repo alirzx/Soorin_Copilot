@@ -33,7 +33,6 @@ GENERAL_ROUTE = json.dumps(
         "requires_asset_profile": False,
         "requires_multiple_entities": False,
         "is_followup": False,
-        "classification_confidence": 0.9,
         "reason": "general",
     }
 )

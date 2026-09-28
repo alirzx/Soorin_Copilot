@@ -546,13 +546,11 @@ class ProductRoutingTests(unittest.TestCase):
             "entity_binding": "ui",
             "requires_multiple_entities": False,
             "is_followup": False,
-            "classification_confidence": 0.95,
             "reason": "profile",
         }
         decision = validate_router_payload(
             payload,
             entities,
-            min_confidence=0.65,
             ui_context={"selected_ip": "192.0.2.99"},
         )
         route = normalize_intent_route(decision, entities)
@@ -585,12 +583,11 @@ class ProductRoutingTests(unittest.TestCase):
             "requires_asset_profile": False,
             "requires_multiple_entities": False,
             "is_followup": False,
-            "classification_confidence": 0.95,
             "reason": "classification",
             "detection_detail": "summary",
         }
         with self.assertRaisesRegex(ValueError, "unexpected=detection_detail"):
-            validate_router_payload(payload, entities, min_confidence=0.65)
+            validate_router_payload(payload, entities)
 
 
 class CopilotProductOrchestrationTests(unittest.TestCase):
@@ -608,7 +605,6 @@ class CopilotProductOrchestrationTests(unittest.TestCase):
                 "entity_binding": "explicit",
                 "requires_multiple_entities": False,
                 "is_followup": False,
-                "classification_confidence": 0.98,
                 "reason": "single-asset evidence",
             }
         )
@@ -627,7 +623,6 @@ class CopilotProductOrchestrationTests(unittest.TestCase):
                 "entity_binding": "explicit",
                 "requires_multiple_entities": True,
                 "is_followup": False,
-                "classification_confidence": 0.98,
                 "reason": "two-asset evidence",
             }
         )
@@ -647,7 +642,6 @@ class CopilotProductOrchestrationTests(unittest.TestCase):
                 "entity_binding": "none",
                 "requires_multiple_entities": False,
                 "is_followup": False,
-                "classification_confidence": 0.98,
                 "reason": "general concept",
             }
         )
@@ -767,7 +761,6 @@ class CopilotProductOrchestrationTests(unittest.TestCase):
                 "entity_binding": "explicit",
                 "requires_multiple_entities": False,
                 "is_followup": False,
-                "classification_confidence": 0.98,
                 "reason": "product evidence",
             }
         )

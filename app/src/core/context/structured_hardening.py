@@ -397,6 +397,8 @@ def _normalized_predicate(predicate: AssetPredicate) -> AssetPredicate:
 def normalize_structured_query_for_language(
     query: StructuredQuerySpec,
     message: str,
+    *,
+    normalize_asset_classes: bool = True,
 ) -> StructuredQuerySpec:
     """Canonicalize text selectors and preserve strict/ranked user semantics.
 
@@ -408,6 +410,7 @@ def normalize_structured_query_for_language(
     tie, and a larger tie without inventing a winner.
     """
 
+    class_value_hint = _query_class_value(query, message)
     filters = _normalized_filters(query.filters)
     values = filters.model_dump()
     for score_name, alias_pattern in _SCORE_ALIASES.items():
@@ -428,7 +431,12 @@ def normalize_structured_query_for_language(
     filters = AssetSearchFilters.model_validate(values)
 
     normalized = query.model_copy(update={"filters": filters})
-    normalized = _normalize_asset_class_semantics(normalized, message)
+    if normalize_asset_classes:
+        normalized = _normalize_asset_class_semantics(
+            normalized,
+            message,
+            canonical_hint=class_value_hint,
+        )
     requested_outputs = tuple(dict.fromkeys((
         *normalized.requested_output_fields,
         *_requested_output_fields(message),
@@ -495,10 +503,56 @@ def _requested_output_fields(message: str) -> tuple[AssetOutputField, ...]:
 
 
 def _canonical_asset_class(message: str) -> str | None:
+    """Conservative vocabulary used only by deterministic fallback parsing."""
     for pattern, canonical in _CANONICAL_ASSET_CLASSES:
         if pattern.search(message or ""):
             return canonical
     return None
+
+
+def _query_class_value(
+    query: StructuredQuerySpec,
+    message: str = "",
+) -> str | None:
+    """Use the semantic Router's typed selector as the primary class vocabulary."""
+    fields = tuple(_CLASS_PREDICATE_FIELDS)
+    allowed = set(fields)
+    values: list[str] = []
+    raw = query.filters.model_dump(mode="python")
+    for field in fields:
+        value = raw.get(field.value)
+        if isinstance(value, str) and value.strip():
+            values.append(value.strip())
+
+    def visit(predicate: AssetPredicate | None) -> None:
+        if predicate is None:
+            return
+        for child in (*predicate.all, *predicate.any):
+            visit(child)
+        visit(predicate.not_)
+        if predicate.field not in allowed:
+            return
+        candidates = predicate.values or (
+            (predicate.value,) if predicate.value is not None else ()
+        )
+        values.extend(
+            str(value).strip()
+            for value in candidates
+            if isinstance(value, str) and value.strip()
+        )
+
+    visit(query.filters.predicate)
+    mentioned = tuple(
+        value
+        for value in values
+        if value.casefold() in (message or "").casefold()
+    )
+    if mentioned:
+        values = list(mentioned)
+    unique = tuple(dict.fromkeys(value.casefold() for value in values))
+    if len(unique) != 1:
+        return None
+    return next(value for value in values if value.casefold() == unique[0])
 
 
 def _class_mapping(message: str) -> tuple[str, tuple[AssetPredicateField, ...]]:
@@ -512,7 +566,12 @@ def _class_mapping(message: str) -> tuple[str, tuple[AssetPredicateField, ...]]:
         re.I,
     ):
         return "explicit_suggested_type", (AssetPredicateField.SUGGESTED_TYPE,)
-    if re.search(r"\broles?\s+include(?:s|d)?\b|\bhas\s+(?:the\s+)?role\b", text, re.I):
+    if re.search(
+        r"\broles?\s+include(?:s|d)?\b|"
+        r"\b(?:includes?|carries|has)\s+(?:the\s+)?role\b",
+        text,
+        re.I,
+    ):
         return "explicit_roles_membership", (AssetPredicateField.ROLES,)
     if re.search(r"\brole\s+or\s+roles\b|\broles\s+or\s+role\b", text, re.I):
         return "explicit_role_or_roles", (
@@ -600,11 +659,13 @@ def _predicate_is_class_only(predicate: AssetPredicate, canonical: str) -> bool:
 def _normalize_asset_class_semantics(
     query: StructuredQuerySpec,
     message: str,
+    *,
+    canonical_hint: str | None = None,
 ) -> StructuredQuerySpec:
-    canonical = _canonical_asset_class(message)
+    mapping_mode, selector_fields = _class_mapping(message)
+    canonical = canonical_hint or _query_class_value(query)
     if canonical is None:
         return query
-    mapping_mode, selector_fields = _class_mapping(message)
     replacement = _class_predicate(canonical, selector_fields)
     values = query.filters.model_dump()
     flat_replaced = False
@@ -747,14 +808,8 @@ def _natural_filter_values(message: str) -> tuple[dict[str, object], bool]:
     elif value := _captured_value(role_match):
         values["role"] = value
     else:
-        known = re.search(
-            r"\b(domain\s+controller|database\s+server|firewall|siem|splunk\s+indexer|"
-            r"hypervisor|windows\s+workstation|linux\s+server)\b",
-            text,
-            re.I,
-        )
-        if known:
-            values["role"] = known.group(1)
+        if canonical := _canonical_asset_class(text):
+            values["role"] = canonical
 
     exact_patterns = {
         "vendor": r"\b(?:made\s+by|manufacturer\s+is|maker\s+is|vendor\s+is)\s+(?P<value>[\w.&-]+)",
@@ -1015,7 +1070,11 @@ def deterministic_structured_fallback(
             return None
         return StructuredFallbackDecision(
             "asset_search",
-            normalize_structured_query_for_language(current, text),
+            normalize_structured_query_for_language(
+                current,
+                text,
+                normalize_asset_classes=False,
+            ),
             "deterministic_structured_group_membership",
             StructuredResultReferenceDecision(kind="set_query"),
         )
@@ -1035,6 +1094,10 @@ def deterministic_structured_fallback(
     predicate = _natural_boolean_predicate(text, values)
     if predicate is not None:
         values["predicate"] = predicate
+    current_class_selector = bool(
+        {"suggested_type", "role", "roles", "classification_summary"}
+        .intersection(values)
+    )
     if not _fallback_material_constraints_complete(text, values, group_fields):
         return None
     try:
@@ -1076,7 +1139,11 @@ def deterministic_structured_fallback(
                 query,
                 reference=reference,
             )
-            query = normalize_structured_query_for_language(query, text)
+            query = normalize_structured_query_for_language(
+                query,
+                text,
+                normalize_asset_classes=not reference or current_class_selector,
+            )
         except ValueError:
             return None
         return StructuredFallbackDecision(
@@ -1109,7 +1176,11 @@ def deterministic_structured_fallback(
             query,
             reference=reference,
         )
-        query = normalize_structured_query_for_language(query, text)
+        query = normalize_structured_query_for_language(
+            query,
+            text,
+            normalize_asset_classes=not reference or current_class_selector,
+        )
     except ValueError:
         return None
     return StructuredFallbackDecision(
@@ -1167,7 +1238,6 @@ class StructuredAwareFallbackRouter(BaseFallbackRouter):
                 depth=0,
                 requires_multiple_entities=False,
                 relationship_mode="none",
-                intent_confidence=1.0,
                 decision_source="deterministic_fallback",
                 fallback_used=True,
                 fallback_reason=str(kwargs.get("fallback_reason") or "semantic_router_unavailable"),

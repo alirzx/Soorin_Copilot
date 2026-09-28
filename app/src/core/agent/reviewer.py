@@ -6,7 +6,14 @@ import logging
 from dataclasses import replace
 from typing import Any
 
-from src.core.agent.contracts import EvidencePack, ExecutionPlan, ReviewDecision, TaskSpec, ToolResult
+from src.core.agent.contracts import (
+    EvidencePack,
+    ExecutionPlan,
+    PostSearchEnrichmentSummary,
+    ReviewDecision,
+    TaskSpec,
+    ToolResult,
+)
 from src.core.agent.context_identity import identity_for_tool_result
 from src.core.agent.structured_evidence import (
     expected_semantic_query_identity,
@@ -275,6 +282,7 @@ class EvidenceReviewer:
         trace_id: str = "",
         supplemental_history: tuple[dict[str, Any], ...] = (),
         review: ReviewDecision | None = None,
+        post_search_enrichment: PostSearchEnrichmentSummary | None = None,
     ) -> EvidencePack:
         coverage = {result.source_capability: result.status for result in results}
         missing = tuple(
@@ -345,6 +353,7 @@ class EvidenceReviewer:
                 for result in results
                 if result.structured_asset_set is not None
             ),
+            post_search_enrichment=post_search_enrichment,
         )
 
     @staticmethod

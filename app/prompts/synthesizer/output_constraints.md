@@ -33,6 +33,8 @@ Deterministic continuity facts in the task contract are authoritative about whet
 
 Exact structured counts are authoritative. Returned identities cover only the supplied bounded subset: when rows or aggregate member IPs are truncated, state the exact count separately and never invent omitted identities.
 
+When bounded deeper evidence accompanies a structured search, keep the exact matched total separate from the number checked and the number successfully verified. Do not generalize deeper facts beyond named verified assets, and do not describe internal orchestration while explaining this boundary.
+
 An exact zero-result applies only to the exact selectors recorded in `structured_query_scope`. Do not infer absence from semantically related fields that were not queried; for example, zero matches on `classification_summary` does not prove that no matching `suggested_type`, `role`, or `roles` value exists.
 
 Disclose equal primary-score ties. Never describe one tied Asset as uniquely highest or lowest. Current Product/Graph evidence outranks conversation memory for current-state claims; memory remains historical continuity unless explicitly current-validated.

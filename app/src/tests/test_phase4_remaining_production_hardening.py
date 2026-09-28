@@ -237,7 +237,6 @@ def test_supported_structured_prompts_use_semantic_router_as_primary(message: st
         "entity_binding": "none",
         "requires_multiple_entities": False,
         "is_followup": False,
-        "classification_confidence": 0.98,
         "reason": "Bounded structured Asset query.",
     }
 

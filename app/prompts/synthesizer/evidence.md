@@ -12,6 +12,10 @@ Treat Graph as bounded observed topology. Distinguish aggregate totals from retu
 
 For structured sets, supplied counts and percentages are exact under the stated filters. Member IPs and rows are authoritative only for the returned bounded subset; a truncated identity list is not a truncated count.
 
+Current Product evidence remains authoritative within its validated entity, field, scope, and time boundaries.
+
+For bounded set enrichment, keep four boundaries distinct: exact assets matched, identities returned, assets targeted for deeper verification, and assets successfully verified. Product or Detection facts apply only to successfully verified identities. Partial deeper verification does not invalidate the exact discovery result.
+
 # knowledge
 
 Use Knowledge to strengthen explanation, terminology, investigation logic, hardening, and response guidance. It is background/reference evidence, not proof of current organization-specific facts. Preserve supplied citations when useful.

@@ -1,10 +1,10 @@
 """Phase 4C bounded cross-source deepening for structured Asset discovery.
 
 The structured Asset search remains a zero-entity discovery operation. This
-runtime extension may select at most two returned Assets *after* discovery and
-then execute existing Product/Detection/Graph/Knowledge capabilities for those
-focal Assets. Search rows never become conversational entities merely because
-they were returned by Neo4j.
+runtime extension executes Router-requested Product/Detection/Knowledge
+requirements only after discovery, under the existing call and entity bounds.
+Set enrichment never turns returned rows into conversational entities; explicit
+focal selection may persist at most two successfully deepened Assets.
 """
 
 from __future__ import annotations
@@ -14,7 +14,13 @@ import re
 from dataclasses import replace
 from typing import Any
 
-from src.core.agent.contracts import ExecutionPlan, InvestigationState, TaskSpec
+from src.core.agent.contracts import (
+    ExecutionPlan,
+    InvestigationState,
+    PostSearchEnrichmentSummary,
+    PostSearchRequirements,
+    TaskSpec,
+)
 from src.core.agent.nodes import CopilotWorkflowNodes
 from src.core.agent.structured_continuity import structured_query_context_from_state
 from src.core.agent.task_mapping import compile_direct_plan
@@ -28,11 +34,6 @@ from src.core.memory.episodes import MemoryContextKey
 
 logger = logging.getLogger(__name__)
 
-_DEEP_ANALYSIS = re.compile(
-    r"\b(?:analy[sz]e|investigate|assess|examine|review|inspect|deep(?:ly)?|comprehensive|"
-    r"suspicious|anomal(?:y|ous)|risk|security|classification|detection|behavio(?:u)?r|profile)\b",
-    re.IGNORECASE,
-)
 _COMPARE = re.compile(
     r"\b(?:compare|comparison|versus|vs\.?|difference|differences|both|first\s+two|top\s+two)\b",
     re.IGNORECASE,
@@ -44,25 +45,6 @@ _RANKED_ONE = re.compile(
 )
 _RANKED_TWO = re.compile(
     r"\b(?:first\s+two|top\s+two|highest\s+two|lowest\s+two|two\s+highest|two\s+lowest)\b",
-    re.IGNORECASE,
-)
-_TOPOLOGY = re.compile(
-    r"\b(?:graph|topology|network|connection|connections|peer|peers|relationship|relationships|"
-    r"communication|communications|reach|degree|inbound|outbound|behavio(?:u)?r|anomal(?:y|ous)|suspicious)\b",
-    re.IGNORECASE,
-)
-_DETECTION = re.compile(
-    r"\b(?:detection|classification|classifier|confidence|rule|rules|signal|signals|role|"
-    r"anomal(?:y|ous)|suspicious|risk|security|compromise|malicious)\b",
-    re.IGNORECASE,
-)
-_KNOWLEDGE = re.compile(
-    r"\b(?:mitre|att&ck|nist|hardening|guidance|procedure|runbook|playbook|response|remediation|"
-    r"containment|recommendation|recommendations|best\s+practice)\b",
-    re.IGNORECASE,
-)
-_BROAD = re.compile(
-    r"\b(?:analy[sz]e|investigate|assess|comprehensive|deep(?:ly)?)\b",
     re.IGNORECASE,
 )
 _FOCAL_CAPABILITIES = {
@@ -110,8 +92,19 @@ class Phase4CWorkflowNodes(CopilotWorkflowNodes):
         task = state.get("task")
         if task is None or task.intent != "asset_search" or task.structured_query is None:
             return base
-        if not _DEEP_ANALYSIS.search(task.request):
+        requirements = task.post_search_requirements
+        if requirements is None:
             return base
+        logger.info(
+            "event=post_search_enrichment_requested request_id=%s mode=%s "
+            "entity_capability_count=%s focal_graph=%s knowledge=%s max_assets=%s",
+            state.get("request_id", ""),
+            requirements.mode,
+            len(requirements.entity_capabilities),
+            str(requirements.requires_focal_graph).lower(),
+            str(requirements.requires_knowledge).lower(),
+            requirements.max_assets,
+        )
 
         search_result = next(
             (
@@ -137,11 +130,27 @@ class Phase4CWorkflowNodes(CopilotWorkflowNodes):
 
         evidence = search_result.structured_asset_set
         rows = tuple(getattr(evidence, "rows", ()) or ())
-        selected, reason = self._select_candidates(
-            task,
-            rows,
-            retrieval_truncated=bool(getattr(evidence, "truncated", False)),
-            matched_total=int(getattr(evidence, "matched_total", len(rows)) or 0),
+        matched_total = int(getattr(evidence, "matched_total", len(rows)) or 0)
+        candidate_ips = tuple(
+            dict.fromkeys(
+                str(row.get("ip") or "").strip()
+                for row in rows
+                if str(row.get("ip") or "").strip()
+            )
+        )
+        if requirements.mode == "focal_deepening":
+            selected, reason = self._select_candidates(
+                task,
+                rows,
+                retrieval_truncated=bool(getattr(evidence, "truncated", False)),
+                matched_total=matched_total,
+            )
+        else:
+            selected, reason = candidate_ips, "returned_set_in_stable_search_order"
+        selected, budget_limitations = self._bounded_post_search_targets(
+            selected,
+            requirements,
+            state["execution_plan"],
         )
         logger.info(
             "event=phase4c_candidate_selection request_id=%s candidates_found=%s candidates_selected=%s "
@@ -152,22 +161,59 @@ class Phase4CWorkflowNodes(CopilotWorkflowNodes):
             reason,
             bool(getattr(evidence, "truncated", False)),
         )
-        if not selected:
-            return base
+        requested_capabilities = (
+            *requirements.entity_capabilities,
+            *(
+                (
+                    "graph.compare_assets"
+                    if len(selected) == 2
+                    else "graph.get_summary",
+                )
+                if requirements.requires_focal_graph
+                else ()
+            ),
+            *(("knowledge.search",) if requirements.requires_knowledge else ()),
+        )
+        if (
+            not selected
+            and (requirements.entity_capabilities or requirements.requires_focal_graph)
+            and not requirements.requires_knowledge
+        ):
+            summary = PostSearchEnrichmentSummary(
+                mode=requirements.mode,
+                matched_total=matched_total,
+                returned_count=len(rows),
+                target_count=0,
+                completed_count=0,
+                partial=bool(matched_total),
+                requested_capabilities=requested_capabilities,
+                limitations=tuple(dict.fromkeys((reason, *budget_limitations))),
+            )
+            return {
+                **base,
+                "post_search_enrichment_summary": summary,
+            }
 
         try:
-            focal_task, focal_route = self._focal_task_and_route(state, task, selected)
-            plan = self._compile_deepening_plan(focal_task, state["execution_plan"])
             _registry, validator, executor = self.service._capability_runtime_snapshot()
-            validated = validator.validate(plan)
-            deepening_results = executor.execute(
-                validated,
-                base_payload={
-                    "request_id": state["request_id"],
-                    "session_id": state["session_id"],
-                    "route": focal_route,
-                },
+            batches = self._compile_post_search_batches(
+                state,
+                task,
+                selected,
+                requirements,
+                state["execution_plan"],
             )
+            deepening_results = []
+            for plan, execution_route in batches:
+                validated = validator.validate(plan)
+                deepening_results.extend(executor.execute(
+                    validated,
+                    base_payload={
+                        "request_id": state["request_id"],
+                        "session_id": state["session_id"],
+                        "route": execution_route,
+                    },
+                ))
         except Exception as exc:
             logger.exception(
                 "event=phase4c_deepening_failed request_id=%s candidates_selected=%s error_type=%s",
@@ -175,7 +221,18 @@ class Phase4CWorkflowNodes(CopilotWorkflowNodes):
                 len(selected),
                 type(exc).__name__,
             )
-            return base
+            summary = PostSearchEnrichmentSummary(
+                mode=requirements.mode,
+                matched_total=matched_total,
+                returned_count=len(rows),
+                target_count=len(selected),
+                completed_count=0,
+                partial=True,
+                target_entities=selected,
+                requested_capabilities=requested_capabilities,
+                limitations=tuple(dict.fromkeys((*budget_limitations, "post_search_execution_failed"))),
+            )
+            return {**base, "post_search_enrichment_summary": summary}
 
         product_calls = sum(
             item.source_capability in {"asset.get_profile", "asset.get_detection"}
@@ -206,6 +263,85 @@ class Phase4CWorkflowNodes(CopilotWorkflowNodes):
             partial_failures,
         )
 
+        entity_completion_capabilities = (
+            *requirements.entity_capabilities,
+            *(
+                (
+                    "graph.compare_assets"
+                    if len(selected) == 2
+                    else "graph.get_summary",
+                )
+                if requirements.requires_focal_graph and selected
+                else ()
+            ),
+        )
+        completed_entities = tuple(
+            entity
+            for entity in selected
+            if all(
+                any(
+                    result.source_capability == capability
+                    and entity in result.entities
+                    and result.status in {"ok", "partial"}
+                    and result.projection_usable
+                    for result in deepening_results
+                )
+                for capability in entity_completion_capabilities
+            )
+        )
+        knowledge_complete = (
+            not requirements.requires_knowledge
+            or any(
+                result.source_capability == "knowledge.search"
+                and result.status in {"ok", "partial", "empty"}
+                for result in deepening_results
+            )
+        )
+        coverage_partial = bool(
+            len(completed_entities) < len(selected)
+            or not knowledge_complete
+            or (
+                not selected
+                and bool(matched_total)
+                and bool(
+                    requirements.entity_capabilities
+                    or requirements.requires_focal_graph
+                )
+            )
+            or (
+                requirements.mode == "set_enrichment"
+                and bool(requirements.entity_capabilities)
+                and (matched_total > len(selected) or bool(getattr(evidence, "truncated", False)))
+            )
+        )
+        limitations = list(budget_limitations)
+        if not selected and (
+            requirements.entity_capabilities or requirements.requires_focal_graph
+        ):
+            limitations.append(reason)
+        if (
+            requirements.mode == "set_enrichment"
+            and requirements.entity_capabilities
+            and matched_total > len(selected)
+        ):
+            limitations.append("post_search_enrichment_bounded_below_exact_match_count")
+        if len(completed_entities) < len(selected):
+            limitations.append("post_search_entity_enrichment_incomplete")
+        if not knowledge_complete:
+            limitations.append("post_search_knowledge_incomplete")
+        summary = PostSearchEnrichmentSummary(
+            mode=requirements.mode,
+            matched_total=matched_total,
+            returned_count=len(rows),
+            target_count=len(selected),
+            completed_count=len(completed_entities),
+            partial=coverage_partial,
+            target_entities=selected,
+            completed_entities=completed_entities,
+            requested_capabilities=requested_capabilities,
+            limitations=tuple(dict.fromkeys(limitations)),
+        )
+
         # Parent search evidence remains first-class discovery evidence. Focal
         # results are appended as independent ToolResults, so EvidencePack,
         # ContextComposer and Synth preserve native provider provenance.
@@ -214,6 +350,7 @@ class Phase4CWorkflowNodes(CopilotWorkflowNodes):
             **base,
             "tool_results": merged,
             "capability_results": merged,
+            "post_search_enrichment_summary": summary,
         }
 
     def review_retrieval(self, state: InvestigationState) -> dict[str, Any]:
@@ -225,9 +362,10 @@ class Phase4CWorkflowNodes(CopilotWorkflowNodes):
         deepening = tuple(
             item
             for item in state.get("tool_results") or ()
-            if item.step_id.startswith("deepening-")
+            if item.step_id.startswith(("deepening-", "set-enrichment-"))
         )
-        if not deepening:
+        summary = state.get("post_search_enrichment_summary")
+        if not deepening and summary is None:
             return update
 
         decision = update["review_decision"]
@@ -250,6 +388,14 @@ class Phase4CWorkflowNodes(CopilotWorkflowNodes):
             ):
                 material.append(f"{label} did not supply a usable Product projection for the selected focal Asset.")
             caveats.extend(result.limitations)
+
+        if summary is not None and summary.partial:
+            material.append(
+                "The structured search matched exactly "
+                f"{summary.matched_total} Assets; bounded post-search enrichment targeted "
+                f"{summary.target_count} and completed {summary.completed_count}."
+            )
+            caveats.extend(summary.limitations)
 
         material_tuple = tuple(dict.fromkeys(material))
         caveat_tuple = tuple(dict.fromkeys(caveats))
@@ -348,6 +494,7 @@ class Phase4CWorkflowNodes(CopilotWorkflowNodes):
             required_capabilities=required_capabilities,
             optional_capabilities=(),
             structured_query=None,
+            post_search_requirements=None,
             requires_multiple_entities=pair,
             is_followup=True,
             graph_depth=1 if pair else 0,
@@ -482,44 +629,90 @@ class Phase4CWorkflowNodes(CopilotWorkflowNodes):
 
         return (), "ambiguous_multi_candidate_selection"
 
-    def _focal_task_and_route(
+    @staticmethod
+    def _bounded_post_search_targets(
+        candidates: tuple[str, ...],
+        requirements: PostSearchRequirements,
+        parent_plan: ExecutionPlan,
+    ) -> tuple[tuple[str, ...], tuple[str, ...]]:
+        remaining_calls = max(
+            0,
+            min(parent_plan.maximum_allowed_calls, 6) - len(parent_plan.steps),
+        )
+        graph_calls = int(requirements.requires_focal_graph and bool(candidates))
+        knowledge_calls = int(
+            requirements.requires_knowledge and requirements.mode == "set_enrichment"
+        )
+        width = len(requirements.entity_capabilities)
+        limitations: list[str] = []
+        if graph_calls > remaining_calls:
+            limitations.append("post_search_graph_call_budget_unavailable")
+            return (), tuple(limitations)
+        if graph_calls + knowledge_calls > remaining_calls:
+            limitations.append("post_search_knowledge_call_budget_unavailable")
+            knowledge_calls = 0
+        if width:
+            capacity = max(0, remaining_calls - graph_calls - knowledge_calls) // width
+            limit = min(requirements.max_assets, capacity)
+            selected = candidates[:limit]
+            if len(candidates) > len(selected):
+                limitations.append("post_search_asset_call_budget_applied")
+            return selected, tuple(limitations)
+        limit = min(requirements.max_assets, 2 if requirements.requires_focal_graph else 0)
+        return candidates[:limit], tuple(limitations)
+
+    def _post_search_task_and_route(
         self,
         state: InvestigationState,
         parent: TaskSpec,
         selected: tuple[str, ...],
+        requirements: PostSearchRequirements,
+        *,
+        include_knowledge: bool,
     ) -> tuple[TaskSpec, Any]:
-        request = parent.request
         pair = len(selected) == 2
-        broad = bool(_BROAD.search(request))
-        use_detection = broad or bool(_DETECTION.search(request))
-        use_topology = broad or bool(_TOPOLOGY.search(request)) or pair
-        use_knowledge = bool(_KNOWLEDGE.search(request))
-
-        capabilities: list[str] = ["asset.get_profile"]
-        if use_detection:
-            capabilities.append("asset.get_detection")
-        if use_topology:
-            capabilities.append("graph.compare_assets" if pair else "graph.get_summary")
-        optional: tuple[str, ...] = ("knowledge.search",) if use_knowledge else ()
+        required_capabilities = list(requirements.entity_capabilities)
+        if requirements.requires_focal_graph and selected:
+            required_capabilities.append(
+                "graph.compare_assets" if pair else "graph.get_summary"
+            )
+        optional_capabilities = ("knowledge.search",) if include_knowledge else ()
 
         focal_task = TaskSpec(
-            request=request,
+            request=parent.request,
             intent="asset_investigation",
-            scope="multi_entity_comparison" if pair else "node_summary",
-            direction="both",
+            scope=(
+                "multi_entity_comparison"
+                if requirements.requires_focal_graph and pair
+                else "node_summary"
+                if requirements.requires_focal_graph and selected
+                else "none"
+            ),
+            direction="both" if requirements.requires_focal_graph and selected else "none",
             entities=selected,
-            required_capabilities=tuple(capabilities),
-            optional_capabilities=optional,
+            required_capabilities=tuple(required_capabilities),
+            optional_capabilities=optional_capabilities,
             structured_query=None,
+            post_search_requirements=None,
             workflow_mode="direct",
-            semantic_decision_source="deterministic_fallback",
-            requires_multiple_entities=pair,
-            recommended_steps=min(6, len(capabilities) + len(optional)),
+            semantic_decision_source=parent.semantic_decision_source,
+            requires_multiple_entities=bool(requirements.requires_focal_graph and pair),
+            recommended_steps=min(
+                6,
+                max(
+                    1,
+                    len(requirements.entity_capabilities) * max(1, len(selected))
+                    + int(requirements.requires_focal_graph and bool(selected))
+                    + int(include_knowledge),
+                ),
+            ),
             detail_level=parent.detail_level,
             freshness_requirement=parent.freshness_requirement,
             is_followup=False,
-            graph_depth=1 if pair else 0,
-            relationship_mode="compare" if pair else "none",
+            graph_depth=1 if requirements.requires_focal_graph and pair else 0,
+            relationship_mode=(
+                "compare" if requirements.requires_focal_graph and pair else "none"
+            ),
             temporal_mode=parent.temporal_mode,
             evidence_mode=parent.evidence_mode,
             response_depth=parent.response_depth,
@@ -531,16 +724,20 @@ class Phase4CWorkflowNodes(CopilotWorkflowNodes):
         ]
         route = replace(
             state["routing_result"],
-            use_graph=use_topology,
-            use_detection=use_detection,
-            use_asset_profile=True,
-            use_knowledge=use_knowledge,
+            use_graph=bool(requirements.requires_focal_graph and selected),
+            use_detection="asset.get_detection" in requirements.entity_capabilities,
+            use_asset_profile="asset.get_profile" in requirements.entity_capabilities,
+            use_knowledge=include_knowledge,
             structured_query=None,
-            entity_binding="active_pair" if pair else "active_single",
+            entity_binding=(
+                "active_pair" if pair else "active_single" if selected else "none"
+            ),
             requested_entity_binding="none",
-            resolved_entity_binding="active_pair" if pair else "active_single",
-            binding_source="conversation",
-            binding_available=True,
+            resolved_entity_binding=(
+                "active_pair" if pair else "active_single" if selected else "none"
+            ),
+            binding_source="conversation" if selected else "none",
+            binding_available=bool(selected),
             binding_normalized=True,
             binding_normalization_reason="phase4c_deterministic_candidate_selection",
             materialized_entity_count=len(selected),
@@ -552,51 +749,82 @@ class Phase4CWorkflowNodes(CopilotWorkflowNodes):
                     (*((state["routing_result"].matched_signals or [])), "phase4c_focal_deepening")
                 )
             ),
-            graph_intent_detected=use_topology,
+            graph_intent_detected=False,
             asset_investigation_detected=True,
             followup_detected=False,
             intent="asset_investigation",
-            scope="multi_entity_comparison" if pair else "node_summary",
-            direction="both",
-            depth=1 if pair else 0,
-            requires_multiple_entities=pair,
-            relationship_mode="compare" if pair else "none",
+            scope=focal_task.scope,
+            direction=focal_task.direction,
+            depth=focal_task.graph_depth,
+            requires_multiple_entities=focal_task.requires_multiple_entities,
+            relationship_mode=focal_task.relationship_mode,
             route_normalized=True,
             route_normalization_reason="phase4c_deterministic_candidate_selection",
         )
         return focal_task, route
 
-    @staticmethod
-    def _compile_deepening_plan(
-        task: TaskSpec,
+    def _compile_post_search_batches(
+        self,
+        state: InvestigationState,
+        parent_task: TaskSpec,
+        selected: tuple[str, ...],
+        requirements: PostSearchRequirements,
         parent_plan: ExecutionPlan,
-    ) -> ExecutionPlan:
-        compiled = compile_direct_plan(
-            task,
-            plan_id=f"{parent_plan.plan_id}-deep"[:32],
-        )
+    ) -> tuple[tuple[ExecutionPlan, Any], ...]:
         remaining_calls = max(
             0,
             min(parent_plan.maximum_allowed_calls, 6) - len(parent_plan.steps),
         )
-        steps = list(compiled.steps)
-        if len(steps) > remaining_calls:
-            optional_ids = {
-                step.id for step in steps if step.requirement == "optional"
-            }
-            if optional_ids:
-                steps = [step for step in steps if step.id not in optional_ids]
-                task = replace(task, optional_capabilities=())
-                compiled = replace(compiled, task=task)
-        if len(steps) > remaining_calls:
-            raise ValueError("phase4c_deepening_call_budget_exceeded")
-        renamed = tuple(
-            replace(step, id=f"deepening-{index}")
-            for index, step in enumerate(steps, start=1)
-        )
-        return replace(
-            compiled,
-            steps=renamed,
-            maximum_allowed_calls=remaining_calls,
-            source="deterministic",
-        )
+        chunks = tuple(selected[index : index + 2] for index in range(0, len(selected), 2))
+        if not chunks and requirements.requires_knowledge:
+            chunks = ((),)
+        batches: list[tuple[ExecutionPlan, Any]] = []
+        step_offset = 0
+        knowledge_pending = requirements.requires_knowledge
+        prefix = "deepening" if requirements.mode == "focal_deepening" else "set-enrichment"
+        for batch_index, chunk in enumerate(chunks, start=1):
+            include_knowledge = knowledge_pending
+            task, route = self._post_search_task_and_route(
+                state,
+                parent_task,
+                chunk,
+                requirements,
+                include_knowledge=include_knowledge,
+            )
+            compiled = compile_direct_plan(
+                task,
+                plan_id=f"{parent_plan.plan_id}-post-{batch_index}"[:32],
+            )
+            if len(compiled.steps) > remaining_calls:
+                if include_knowledge:
+                    include_knowledge = False
+                    task, route = self._post_search_task_and_route(
+                        state,
+                        parent_task,
+                        chunk,
+                        requirements,
+                        include_knowledge=False,
+                    )
+                    compiled = compile_direct_plan(
+                        task,
+                        plan_id=f"{parent_plan.plan_id}-post-{batch_index}"[:32],
+                    )
+                if len(compiled.steps) > remaining_calls:
+                    raise ValueError("phase4c_post_search_call_budget_exceeded")
+            renamed = tuple(
+                replace(step, id=f"{prefix}-{step_offset + index}")
+                for index, step in enumerate(compiled.steps, start=1)
+            )
+            step_offset += len(renamed)
+            remaining_calls -= len(renamed)
+            knowledge_pending = knowledge_pending and not include_knowledge
+            batches.append((
+                replace(
+                    compiled,
+                    steps=renamed,
+                    maximum_allowed_calls=max(1, len(renamed)),
+                    source="deterministic",
+                ),
+                route,
+            ))
+        return tuple(batches)

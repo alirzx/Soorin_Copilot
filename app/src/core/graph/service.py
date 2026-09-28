@@ -96,6 +96,44 @@ class GraphService:
             per_field_limit=per_field_limit,
         )
 
+    def canonicalize_semantic_values(
+        self,
+        active_graph_version: str,
+        values: dict[str, tuple[str, ...]],
+    ) -> dict[str, dict[str, str]]:
+        """Batch exact categorical lookups through the active Neo4j projection."""
+        allowed_fields = {
+            "suggested_type",
+            "role",
+            "roles",
+            "vendor",
+            "product",
+            "tag",
+            "sub_tag",
+            "status",
+            "enrichment_status",
+        }
+        lookups: list[tuple[str, str]] = []
+        for field in sorted(values):
+            if field not in allowed_fields:
+                raise ValueError("Semantic canonicalization field is not allow-listed.")
+            seen: set[str] = set()
+            for raw in values[field]:
+                value = str(raw).strip()
+                folded = value.casefold()
+                if not value or len(value) > 256 or folded in seen:
+                    continue
+                seen.add(folded)
+                lookups.append((field, value))
+                if len(lookups) >= 64:
+                    break
+            if len(lookups) >= 64:
+                break
+        return self.repository.canonicalize_semantic_values(
+            active_graph_version,
+            tuple(lookups),
+        )
+
     def context(self, spec: GraphRetrievalSpec) -> dict[str, object]:
         context = self.repository.get_context(spec)
         projection = self.repository.status()

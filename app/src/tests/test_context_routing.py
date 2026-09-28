@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import unittest
-from dataclasses import replace
+from dataclasses import fields, replace
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -26,6 +26,7 @@ from src.core.context.models import (
     DetectionProviderResult,
     EntityResolution,
     GraphProviderResult,
+    IntentDecision,
     ProviderProvenance,
     ResolvedEntity,
 )
@@ -320,7 +321,6 @@ class RouterSchemaTests(unittest.TestCase):
             "entity_binding": "explicit",
             "requires_multiple_entities": False,
             "is_followup": False,
-            "classification_confidence": 0.9,
             "reason": "ok",
         }
         data.update(overrides)
@@ -328,11 +328,11 @@ class RouterSchemaTests(unittest.TestCase):
 
     def test_reject_unsupported_intent_scope_direction_and_inherit(self) -> None:
         with self.assertRaises(ValueError):
-            validate_router_payload(self.payload(intent="bad"), self.entities, min_confidence=0.65)
+            validate_router_payload(self.payload(intent="bad"), self.entities)
         with self.assertRaises(ValueError):
-            validate_router_payload(self.payload(scope="bad"), self.entities, min_confidence=0.65)
+            validate_router_payload(self.payload(scope="bad"), self.entities)
         with self.assertRaises(ValueError):
-            validate_router_payload(self.payload(direction="inherit"), self.entities, min_confidence=0.65)
+            validate_router_payload(self.payload(direction="inherit"), self.entities)
 
     def test_reject_invalid_scope_depth_combinations(self) -> None:
         cases = [
@@ -346,19 +346,17 @@ class RouterSchemaTests(unittest.TestCase):
         for case in cases:
             with self.subTest(case=case):
                 with self.assertRaises(ValueError):
-                    validate_router_payload(self.payload(**case), self.entities, min_confidence=0.65)
+                    validate_router_payload(self.payload(**case), self.entities)
 
     def test_requires_multiple_entities_needs_exactly_two(self) -> None:
         with self.assertRaises(ValueError):
             validate_router_payload(
                 self.payload(intent="graph_relationships", scope="one_hop", requires_multiple_entities=True),
                 self.entities,
-                min_confidence=0.65,
             )
         decision = validate_router_payload(
             self.payload(intent="graph_path", scope="path", depth=0, requires_multiple_entities=True),
             self.two_entities,
-            min_confidence=0.65,
         )
         self.assertEqual(decision.scope, "path")
 
@@ -377,7 +375,6 @@ class RouterSchemaTests(unittest.TestCase):
                 is_followup=True,
             ),
             entities,
-            min_confidence=0.65,
             message=message,
             routing_state=state,
         )
@@ -402,7 +399,6 @@ class RouterSchemaTests(unittest.TestCase):
         decision = validate_router_payload(
             self.payload(requires_multiple_entities=True),
             self.two_entities,
-            min_confidence=0.65,
         )
         self.assertEqual(decision.intent, "graph_relationships")
         self.assertEqual(decision.scope, "multi_entity_comparison")
@@ -420,7 +416,6 @@ class RouterSchemaTests(unittest.TestCase):
                 requires_multiple_entities=False,
             ),
             self.entities,
-            min_confidence=0.65,
         )
         route = normalize_intent_route(decision, self.entities)
         self.assertEqual(decision.intent, "asset_investigation")
@@ -439,7 +434,6 @@ class RouterSchemaTests(unittest.TestCase):
         decision = validate_router_payload(
             self.payload(intent="asset_investigation", scope="node_summary", direction="both", depth=0),
             self.entities,
-            min_confidence=0.65,
             message="Tell me about 192.168.30.115.",
         )
         route = normalize_intent_route(decision, self.entities)
@@ -451,7 +445,6 @@ class RouterSchemaTests(unittest.TestCase):
         decision = validate_router_payload(
             self.payload(intent="asset_investigation", scope="none", direction="none", depth=0, requires_graph=False, requires_detection=True),
             self.entities,
-            min_confidence=0.65,
             message="Why is 192.168.30.115 classified as a Windows workstation?",
         )
         route = normalize_intent_route(decision, self.entities)
@@ -463,7 +456,6 @@ class RouterSchemaTests(unittest.TestCase):
         decision = validate_router_payload(
             self.payload(intent="graph_neighbors", scope="one_hop", direction="outbound", depth=1, requires_detection=True),
             self.entities,
-            min_confidence=0.65,
             message="Find its outbound peers.",
         )
         route = normalize_intent_route(decision, self.entities)
@@ -481,7 +473,6 @@ class RouterSchemaTests(unittest.TestCase):
                 requires_detection=True,
             ),
             self.entities,
-            min_confidence=0.65,
             message="Does its detected role agree with its topology?",
         )
         route = normalize_intent_route(decision, self.entities)
@@ -503,7 +494,6 @@ class RouterSchemaTests(unittest.TestCase):
                         requires_asset_profile=True,
                     ),
                     self.entities,
-                    min_confidence=0.65,
                     message="Analyze this asset using all evidence.",
                 )
                 route = normalize_intent_route(decision, self.entities)
@@ -519,7 +509,6 @@ class RouterSchemaTests(unittest.TestCase):
             validate_router_payload(
                 {**self.payload(requires_detection=True), "detection_detail": "summary"},
                 self.entities,
-                min_confidence=0.65,
             )
 
     def test_detection_selection_is_preserved_with_graph(self) -> None:
@@ -536,7 +525,6 @@ class RouterSchemaTests(unittest.TestCase):
                         requires_detection=True,
                     ),
                     self.entities,
-                    min_confidence=0.65,
                     message="Include every matched detection rule, all supporting signals, and all conflicts.",
                 )
                 route = normalize_intent_route(decision, self.entities)
@@ -556,7 +544,6 @@ class RouterSchemaTests(unittest.TestCase):
                 requires_detection=False,
             ),
             self.entities,
-            min_confidence=0.65,
             message="Does this asset show unusual behavior?",
         )
         route = normalize_intent_route(decision, self.entities)
@@ -578,7 +565,6 @@ class RouterSchemaTests(unittest.TestCase):
                 requires_asset_profile=True,
             ),
             self.entities,
-            min_confidence=0.65,
             message="Perform a deep anomaly assessment using all detection rules, conflicts, and two-hop communication patterns.",
         )
         self.assertEqual(decision.scope, "two_hop")
@@ -598,7 +584,6 @@ class RouterSchemaTests(unittest.TestCase):
                 requires_detection=True,
             ),
             self.entities,
-            min_confidence=0.65,
             message="What is a domain-joined workstation?",
         )
         route = normalize_intent_route(decision, self.entities)
@@ -617,7 +602,6 @@ class RouterSchemaTests(unittest.TestCase):
                 requires_multiple_entities=True,
             ),
             self.two_entities,
-            min_confidence=0.65,
             message="Find path from 192.168.30.115 to 192.168.0.149",
         )
         route = normalize_intent_route(decision, self.two_entities)
@@ -639,7 +623,6 @@ class RouterSchemaTests(unittest.TestCase):
                 is_followup=True,
             ),
             no_entities,
-            min_confidence=0.65,
             message="Show me more detection evidence.",
             routing_state=SessionRoutingState(active_ip="192.168.30.111"),
         )
@@ -664,7 +647,6 @@ class RouterSchemaTests(unittest.TestCase):
                 is_followup=False,
             ),
             entities,
-            min_confidence=0.65,
             message="Use all of its evidence.",
             routing_state=state,
         )
@@ -683,7 +665,6 @@ class RouterSchemaTests(unittest.TestCase):
                 entity_binding="active_single",
             ),
             EntityResolver().resolve("What is Kerberos?"),
-            min_confidence=0.65,
             message="What is Kerberos?",
             routing_state=SessionRoutingState(active_ip="192.168.30.111"),
         )
@@ -708,7 +689,6 @@ class RouterSchemaTests(unittest.TestCase):
                 entity_binding="active_single",
             ),
             detached,
-            min_confidence=0.65,
             message="Not about this asset; explain Kerberos.",
             routing_state=SessionRoutingState(active_ip="192.168.30.111"),
         )
@@ -730,7 +710,6 @@ class RouterSchemaTests(unittest.TestCase):
                 entity_binding="active_single",
             ),
             explicit,
-            min_confidence=0.65,
             message="Show detection evidence for 192.168.30.112.",
             routing_state=SessionRoutingState(active_ip="192.168.30.111"),
         )
@@ -755,7 +734,6 @@ class RouterSchemaTests(unittest.TestCase):
                 entity_binding="ui",
             ),
             ui_entities,
-            min_confidence=0.65,
             message="Tell me about this asset.",
             ui_context={"selected_ip": "192.168.30.113"},
             routing_state=SessionRoutingState(active_ip="192.168.30.111"),
@@ -780,7 +758,6 @@ class RouterSchemaTests(unittest.TestCase):
                 entity_binding="none",
             ),
             ui_entities,
-            min_confidence=0.65,
             message="What is selected?",
             ui_context={"selected_ip": "192.168.30.113"},
             routing_state=SessionRoutingState(active_ip="192.168.30.111"),
@@ -809,7 +786,6 @@ class RouterSchemaTests(unittest.TestCase):
                 entity_binding="ui",
             ),
             explicit,
-            min_confidence=0.65,
             message="Show detection evidence for 192.168.30.112.",
             ui_context={"selected_ip": "192.168.30.113"},
             routing_state=SessionRoutingState(active_ip="192.168.30.111"),
@@ -834,7 +810,6 @@ class RouterSchemaTests(unittest.TestCase):
                 entity_binding="explicit",
             ),
             explicit,
-            min_confidence=0.65,
             message="Tell me about 192.168.3.137.",
             ui_context={"selected_ip": "192.168.3.103"},
         )
@@ -861,7 +836,6 @@ class RouterSchemaTests(unittest.TestCase):
                 requires_multiple_entities=True,
             ),
             explicit_pair,
-            min_confidence=0.65,
             message="Find path between 192.168.3.137 and 192.168.3.138.",
             ui_context={"selected_ip": "192.168.3.103"},
         )
@@ -889,7 +863,6 @@ class RouterSchemaTests(unittest.TestCase):
                 entity_binding="none",
             ),
             ui_entities,
-            min_confidence=0.65,
             message="What is this?",
             ui_context={"selected_ip": "192.168.3.103"},
             routing_state=SessionRoutingState(active_ip="192.168.3.99"),
@@ -915,7 +888,6 @@ class RouterSchemaTests(unittest.TestCase):
                 entity_binding="active_single",
             ),
             explicit,
-            min_confidence=0.65,
             message="Tell me about 192.168.3.137.",
             routing_state=SessionRoutingState(active_ip="192.168.3.99"),
         )
@@ -939,7 +911,6 @@ class RouterSchemaTests(unittest.TestCase):
                 requires_multiple_entities=True,
             ),
             no_entities,
-            min_confidence=0.65,
             message="Find their path.",
             routing_state=SessionRoutingState(
                 active_ip="192.168.30.111",
@@ -962,7 +933,6 @@ class RouterSchemaTests(unittest.TestCase):
                 entity_binding="",
             ),
             no_entities,
-            min_confidence=0.65,
             message="Show more detail.",
             routing_state=SessionRoutingState(
                 active_ip="192.168.30.111",
@@ -985,7 +955,6 @@ class RouterSchemaTests(unittest.TestCase):
                     entity_binding="active_single",
                 ),
                 EntityResolver().resolve("Show detection evidence."),
-                min_confidence=0.65,
                 message="Show detection evidence.",
                 routing_state=SessionRoutingState(),
             )
@@ -995,7 +964,6 @@ class RouterSchemaTests(unittest.TestCase):
             validate_router_payload(
                 self.payload(entity_binding="memory_magic"),
                 self.entities,
-                min_confidence=0.65,
             )
 
     def test_unknown_router_fields_are_rejected(self) -> None:
@@ -1003,7 +971,6 @@ class RouterSchemaTests(unittest.TestCase):
             validate_router_payload(
                 {**self.payload(), "legacy_mode": "verbose"},
                 self.entities,
-                min_confidence=0.65,
             )
 
     def test_followup_show_more_evidence_uses_active_ip(self) -> None:
@@ -1024,7 +991,6 @@ class RouterSchemaTests(unittest.TestCase):
                 is_followup=True,
             ),
             entities,
-            min_confidence=0.65,
             message="show more evidence",
             routing_state=SessionRoutingState(active_ip="192.168.30.115", last_provider="detection"),
         )
@@ -1039,32 +1005,23 @@ class RouterSchemaTests(unittest.TestCase):
             validate_router_payload(
                 self.payload(intent="graph_relationships", scope="multi_entity_comparison", requires_multiple_entities=True),
                 three,
-                min_confidence=0.65,
             )
 
-    def test_high_confidence_unclear_is_valid(self) -> None:
+    def test_genuine_unclear_is_valid(self) -> None:
         decision = validate_router_payload(
             self.payload(intent="unclear", scope="none", direction="none", depth=0, requires_graph=False),
             self.entities,
-            min_confidence=0.65,
         )
         self.assertEqual(decision.intent, "unclear")
 
-    def test_low_reported_confidence_is_accepted_as_telemetry(self) -> None:
-        decision = validate_router_payload(
-            self.payload(
-                intent="unclear",
-                scope="none",
-                direction="none",
-                depth=0,
-                requires_graph=False,
-                classification_confidence=0.2,
-            ),
-            self.entities,
-            min_confidence=0.65,
-        )
-        self.assertEqual(decision.intent, "unclear")
-        self.assertEqual(decision.classification_confidence, 0.2)
+    def test_removed_router_opinion_field_is_not_in_contract(self) -> None:
+        removed_key = "classification_" + "confidence"
+        self.assertNotIn(removed_key, {field.name for field in fields(IntentDecision)})
+        with self.assertRaisesRegex(ValueError, "unexpected"):
+            validate_router_payload(
+                {**self.payload(), removed_key: 0.9},
+                self.entities,
+            )
 
 
 class RouterJSONExtractionTests(unittest.TestCase):
@@ -1104,7 +1061,7 @@ class LLMPrimaryRouterTests(unittest.TestCase):
     def test_valid_glm_decision_normalizes_without_fallback(self) -> None:
         router = GLMIntentRouter(
             self.settings,
-            FakeLLMClient([fake_result('{"intent":"asset_investigation","scope":"node_summary","direction":"both","depth":0,"requires_graph":true,"requires_detection":true,"requires_asset_profile":true,"requires_multiple_entities":false,"is_followup":false,"classification_confidence":0.92,"reason":"asset question"}')]),  # type: ignore[arg-type]
+            FakeLLMClient([fake_result('{"intent":"asset_investigation","scope":"node_summary","direction":"both","depth":0,"requires_graph":true,"requires_detection":true,"requires_asset_profile":true,"requires_multiple_entities":false,"is_followup":false,"reason":"asset question"}')]),  # type: ignore[arg-type]
         )
         decision = router.classify("Tell me about 192.168.30.115", self.entities, SessionRoutingState())
         route = normalize_intent_route(decision, self.entities)
@@ -1139,7 +1096,7 @@ class LLMPrimaryRouterTests(unittest.TestCase):
             self.settings,
             FakeLLMClient([
                 fake_result("", finish_reason="length"),
-                fake_result('{"intent":"asset_investigation","scope":"node_summary","direction":"both","depth":0,"requires_graph":true,"requires_detection":false,"requires_asset_profile":false,"requires_multiple_entities":false,"is_followup":false,"classification_confidence":0.9,"reason":"ok"}'),
+                fake_result('{"intent":"asset_investigation","scope":"node_summary","direction":"both","depth":0,"requires_graph":true,"requires_detection":false,"requires_asset_profile":false,"requires_multiple_entities":false,"is_followup":false,"reason":"ok"}'),
             ]),  # type: ignore[arg-type]
         )
         decision = router.classify("192.168.30.115", self.entities, SessionRoutingState())
@@ -1147,7 +1104,7 @@ class LLMPrimaryRouterTests(unittest.TestCase):
         self.assertEqual(decision.retry_count, 0)
         self.assertEqual(len(router.llm_client.calls), 1)
 
-    def test_provider_error_falls_back_but_reported_confidence_is_telemetry_only(self) -> None:
+    def test_provider_error_returns_typed_technical_failure(self) -> None:
         llm = FakeLLMClient([LLMError("boom", reason="timeout")])
         router = GLMIntentRouter(self.settings, llm)  # type: ignore[arg-type]
         failed = router.classify("x", self.entities, SessionRoutingState())
@@ -1155,17 +1112,11 @@ class LLMPrimaryRouterTests(unittest.TestCase):
         self.assertEqual(failed.fallback_reason, "timeout")
         self.assertFalse(failed.content_present)
         self.assertIsNone(failed.finish_reason)
+        self.assertIsNone(failed.intent)
+        self.assertEqual(failed.runtime_status, "technical_failure")
         self.assertEqual(len(llm.calls), 1)
-        low = GLMIntentRouter(
-            make_settings(intent_router_retry_enabled=False),
-            FakeLLMClient([fake_result('{"intent":"asset_investigation","scope":"node_summary","direction":"both","depth":0,"requires_graph":true,"requires_detection":false,"requires_asset_profile":false,"requires_multiple_entities":false,"is_followup":false,"classification_confidence":0.2,"reason":"low"}')]),  # type: ignore[arg-type]
-        )
-        low_decision = low.classify("x", self.entities, SessionRoutingState())
-        self.assertFalse(low_decision.fallback_used)
-        self.assertEqual(low_decision.classification_confidence, 0.2)
-        self.assertEqual(len(low.llm_client.calls), 1)
 
-    def test_missing_reported_confidence_is_accepted_without_repair(self) -> None:
+    def test_valid_payload_requires_no_router_opinion_field(self) -> None:
         payload = (
             '{"intent":"asset_investigation","scope":"node_summary","direction":"both","depth":0,'
             '"requires_graph":true,"requires_detection":false,"requires_asset_profile":false,'
@@ -1176,7 +1127,6 @@ class LLMPrimaryRouterTests(unittest.TestCase):
         decision = router.classify("x", self.entities, SessionRoutingState())
 
         self.assertFalse(decision.fallback_used)
-        self.assertEqual(decision.classification_confidence, 0.0)
         self.assertEqual(len(router.llm_client.calls), 1)
 
     def test_repair_transport_failure_has_distinct_failure_reason(self) -> None:
@@ -1211,7 +1161,7 @@ class LLMPrimaryRouterTests(unittest.TestCase):
         )
         llm = FakeLLMClient([
             fake_result("", finish_reason="length"),
-            fake_result('{"intent":"asset_investigation","scope":"node_summary","direction":"both","depth":0,"requires_graph":true,"requires_detection":false,"requires_asset_profile":false,"requires_multiple_entities":false,"is_followup":false,"classification_confidence":0.9,"reason":"ok"}'),
+            fake_result('{"intent":"asset_investigation","scope":"node_summary","direction":"both","depth":0,"requires_graph":true,"requires_detection":false,"requires_asset_profile":false,"requires_multiple_entities":false,"is_followup":false,"reason":"ok"}'),
         ])
         router = GLMIntentRouter(settings, llm)  # type: ignore[arg-type]
         decision = router.classify("192.168.30.115", self.entities, SessionRoutingState())
@@ -1228,7 +1178,7 @@ class LLMPrimaryRouterTests(unittest.TestCase):
         valid = (
             '{"intent":"asset_investigation","scope":"node_summary","direction":"both","depth":0,'
             '"requires_graph":true,"requires_detection":false,"requires_asset_profile":false,"requires_multiple_entities":false,"is_followup":false,'
-            '"classification_confidence":0.9,"reason":"repaired"}'
+            '"reason":"repaired"}'
         )
         invalid_outputs = [
             valid.replace('"asset_investigation"', '"invalid_intent"'),
@@ -1270,7 +1220,7 @@ class LLMPrimaryRouterTests(unittest.TestCase):
         valid = (
             '{"intent":"asset_investigation","scope":"node_summary","direction":"both","depth":0,'
             '"requires_graph":true,"requires_detection":false,"requires_asset_profile":false,"requires_multiple_entities":false,"is_followup":false,'
-            '"classification_confidence":0.9,"reason":"ok"}'
+            '"reason":"ok"}'
         )
         router = GLMIntentRouter(
             self.settings,
@@ -1290,7 +1240,7 @@ class LLMPrimaryRouterTests(unittest.TestCase):
             '{"intent":"asset_investigation","scope":"node_summary","direction":"both","depth":0,'
             '"requires_graph":true,"requires_detection":true,"requires_asset_profile":true,'
             '"entity_binding":"explicit","requires_multiple_entities":false,"is_followup":false,'
-            '"classification_confidence":0.97,"reason":"combined analysis"}'
+            '"reason":"combined analysis"}'
         )
         router = GLMIntentRouter(self.settings, FakeLLMClient([fake_result(payload)]))  # type: ignore[arg-type]
 
@@ -1323,7 +1273,7 @@ class LLMPrimaryRouterTests(unittest.TestCase):
             '{"intent":"asset_investigation","scope":"full_neighbors","direction":"both","depth":1,'
             '"requires_graph":true,"requires_detection":true,"requires_asset_profile":true,'
             '"entity_binding":"active_single","requires_multiple_entities":false,"is_followup":true,'
-            '"classification_confidence":0.97,"reason":"combined follow-up"}'
+            '"reason":"combined follow-up"}'
         )
         llm = FakeLLMClient([fake_result('{"intent":"asset_investigation"', finish_reason="length"), fake_result(repaired)])
         router = GLMIntentRouter(self.settings, llm)  # type: ignore[arg-type]
@@ -1341,7 +1291,6 @@ class LLMPrimaryRouterTests(unittest.TestCase):
 
     def test_router_prompt_loads_from_file_and_missing_file_falls_back(self) -> None:
         router = GLMIntentRouter(self.settings, FakeLLMClient([fake_result("{}")]))  # type: ignore[arg-type]
-        self.assertNotIn('"classification_confidence"', router.system_prompt)
         self.assertIn("multi_entity_comparison", router.system_prompt)
         missing = GLMIntentRouter(
             make_settings(intent_router_system_prompt_path="/tmp/soorin-missing-router-prompt.md"),
@@ -1770,18 +1719,17 @@ class ExhaustiveConnectionRoutingTests(unittest.TestCase):
             "requires_asset_profile": False,
             "requires_multiple_entities": False,
             "is_followup": False,
-            "classification_confidence": 0.95,
             "reason": "fixture",
         }
         single = self.resolver.resolve("Show all connections for 192.168.0.125")
-        decision = validate_router_payload(base, single, min_confidence=0.65, message="Show all connections for 192.168.0.125")
+        decision = validate_router_payload(base, single, message="Show all connections for 192.168.0.125")
         self.assertEqual((decision.intent, decision.scope, decision.depth), ("graph_neighbors", "full_neighbors", 1))
         self.assertEqual(decision.route_normalization_reason, "exhaustive_connections_require_full_neighbors")
         self.assertEqual(decision.decision_source, "semantic_router")
 
         pair_message = "Compare the complete neighborhoods of 192.168.0.125 and 192.168.0.126"
         pair = self.resolver.resolve(pair_message)
-        pair_decision = validate_router_payload(base, pair, min_confidence=0.65, message=pair_message)
+        pair_decision = validate_router_payload(base, pair, message=pair_message)
         self.assertEqual((pair_decision.intent, pair_decision.scope), ("graph_relationships", "multi_entity_comparison"))
         self.assertTrue(pair_decision.requires_multiple_entities)
 
@@ -1840,7 +1788,6 @@ class GraphRetrievalTests(unittest.TestCase):
             depth=depth,
             requires_multiple_entities=len(ents) == 2,
             relationship_mode=relationship_mode,
-            intent_confidence=1,
         )
 
     def test_node_summary_counts_total_and_returned_separately(self) -> None:
@@ -2674,7 +2621,7 @@ class ComparisonFollowupRegressionTests(unittest.TestCase):
             '"direction":"both","depth":1,"requires_graph":true,'
             '"requires_detection":false,"requires_asset_profile":false,'
             '"entity_binding":"explicit","requires_multiple_entities":true,'
-            '"is_followup":false,"classification_confidence":0.95,'
+            '"is_followup":false,'
             '"reason":"too many entities"}'
         )
         llm = FakeLLMClient([fake_result(route_json)])
@@ -2703,7 +2650,7 @@ class ComparisonFollowupRegressionTests(unittest.TestCase):
             '"direction":"both","depth":1,"requires_graph":true,'
             '"requires_detection":false,"requires_asset_profile":false,'
             '"entity_binding":"explicit","requires_multiple_entities":true,'
-            '"is_followup":true,"classification_confidence":0.95,'
+            '"is_followup":true,'
             '"reason":"compare explicit asset with recent asset"}'
         )
         llm = FakeLLMClient([fake_result(route_json), fake_result("comparison answer")])
@@ -2759,7 +2706,7 @@ class ComparisonFollowupRegressionTests(unittest.TestCase):
             '"direction":"both","depth":1,"requires_graph":true,'
             '"requires_detection":true,"requires_asset_profile":true,'
             '"entity_binding":"explicit","requires_multiple_entities":true,'
-            '"is_followup":true,"classification_confidence":0.95,'
+            '"is_followup":true,'
             '"reason":"compare explicit asset with active asset"}'
         )
         invalid_plan_json = (
@@ -2829,7 +2776,7 @@ class ComparisonFollowupRegressionTests(unittest.TestCase):
 class ServiceAndTraceTests(unittest.TestCase):
     def test_state_updates_previous_route_and_general_question_preserves_active_entity(self) -> None:
         settings = make_settings()
-        router_json = '{"intent":"asset_investigation","scope":"node_summary","direction":"both","depth":0,"requires_graph":true,"requires_detection":false,"requires_asset_profile":false,"requires_multiple_entities":false,"is_followup":false,"classification_confidence":0.9,"reason":"asset"}'
+        router_json = '{"intent":"asset_investigation","scope":"node_summary","direction":"both","depth":0,"requires_graph":true,"requires_detection":false,"requires_asset_profile":false,"requires_multiple_entities":false,"is_followup":false,"reason":"asset"}'
         llm = FakeLLMClient([fake_result(router_json), fake_result("answer")])
         state_store = SessionRoutingStateStore()
         service = CopilotService(settings, llm, MemoryStore(10), state_store)
@@ -2849,7 +2796,7 @@ class ServiceAndTraceTests(unittest.TestCase):
 
     def test_successful_response_stores_latest_raw_user_and_assistant_turn(self) -> None:
         settings = make_settings()
-        router_json = '{"intent":"asset_investigation","scope":"node_summary","direction":"both","depth":0,"requires_graph":true,"requires_detection":false,"requires_asset_profile":false,"requires_multiple_entities":false,"is_followup":false,"classification_confidence":0.9,"reason":"asset"}'
+        router_json = '{"intent":"asset_investigation","scope":"node_summary","direction":"both","depth":0,"requires_graph":true,"requires_detection":false,"requires_asset_profile":false,"requires_multiple_entities":false,"is_followup":false,"reason":"asset"}'
         memory = MemoryStore(10)
         service = CopilotService(settings, FakeLLMClient([fake_result(router_json), fake_result("asset answer")]), memory, SessionRoutingStateStore())
         service.graph_provider.provide = lambda entity, **kwargs: GraphProviderResult(  # type: ignore[method-assign]
@@ -2870,9 +2817,9 @@ class ServiceAndTraceTests(unittest.TestCase):
 
     def test_single_asset_summary_and_possessive_followups_use_graph_and_state(self) -> None:
         settings = make_settings()
-        asset_json = '{"intent":"asset_investigation","scope":"node_summary","direction":"both","depth":0,"requires_graph":true,"requires_detection":false,"requires_asset_profile":false,"requires_multiple_entities":false,"is_followup":false,"classification_confidence":0.9,"reason":"asset"}'
-        malformed_asset_json = '{"intent":"asset_investigation","scope":"node_summary","direction":"none","depth":1,"requires_graph":false,"requires_detection":false,"requires_asset_profile":false,"requires_multiple_entities":false,"is_followup":true,"classification_confidence":0.9,"reason":"asset followup"}'
-        connections_json = '{"intent":"graph_neighbors","scope":"one_hop","direction":"both","depth":1,"requires_graph":true,"requires_detection":false,"requires_asset_profile":false,"requires_multiple_entities":false,"is_followup":true,"classification_confidence":0.9,"reason":"connections"}'
+        asset_json = '{"intent":"asset_investigation","scope":"node_summary","direction":"both","depth":0,"requires_graph":true,"requires_detection":false,"requires_asset_profile":false,"requires_multiple_entities":false,"is_followup":false,"reason":"asset"}'
+        malformed_asset_json = '{"intent":"asset_investigation","scope":"node_summary","direction":"none","depth":1,"requires_graph":false,"requires_detection":false,"requires_asset_profile":false,"requires_multiple_entities":false,"is_followup":true,"reason":"asset followup"}'
+        connections_json = '{"intent":"graph_neighbors","scope":"one_hop","direction":"both","depth":1,"requires_graph":true,"requires_detection":false,"requires_asset_profile":false,"requires_multiple_entities":false,"is_followup":true,"reason":"connections"}'
         llm = FakeLLMClient([
             fake_result(asset_json),
             fake_result("asset answer"),
@@ -2949,8 +2896,8 @@ class ServiceAndTraceTests(unittest.TestCase):
 
     def test_two_entity_state_is_preserved_for_followup_path(self) -> None:
         settings = make_settings()
-        relationship_json = '{"intent":"graph_relationships","scope":"one_hop","direction":"both","depth":1,"requires_graph":true,"requires_detection":false,"requires_asset_profile":false,"requires_multiple_entities":true,"is_followup":false,"classification_confidence":0.9,"reason":"direct"}'
-        path_json = '{"intent":"graph_path","scope":"path","direction":"both","depth":0,"requires_graph":true,"requires_detection":false,"requires_asset_profile":false,"requires_multiple_entities":true,"is_followup":true,"classification_confidence":0.9,"reason":"path"}'
+        relationship_json = '{"intent":"graph_relationships","scope":"one_hop","direction":"both","depth":1,"requires_graph":true,"requires_detection":false,"requires_asset_profile":false,"requires_multiple_entities":true,"is_followup":false,"reason":"direct"}'
+        path_json = '{"intent":"graph_path","scope":"path","direction":"both","depth":0,"requires_graph":true,"requires_detection":false,"requires_asset_profile":false,"requires_multiple_entities":true,"is_followup":true,"reason":"path"}'
         llm = FakeLLMClient([fake_result(relationship_json), fake_result("answer one"), fake_result(path_json), fake_result("answer two")])
         state_store = SessionRoutingStateStore()
         service = CopilotService(settings, llm, MemoryStore(20), state_store)
@@ -2981,7 +2928,7 @@ class ServiceAndTraceTests(unittest.TestCase):
 
     def test_single_entity_replaces_pair_state(self) -> None:
         settings = make_settings()
-        router_json = '{"intent":"asset_investigation","scope":"node_summary","direction":"both","depth":0,"requires_graph":true,"requires_detection":false,"requires_asset_profile":false,"requires_multiple_entities":false,"is_followup":false,"classification_confidence":0.9,"reason":"asset"}'
+        router_json = '{"intent":"asset_investigation","scope":"node_summary","direction":"both","depth":0,"requires_graph":true,"requires_detection":false,"requires_asset_profile":false,"requires_multiple_entities":false,"is_followup":false,"reason":"asset"}'
         llm = FakeLLMClient([fake_result(router_json), fake_result("answer")])
         state_store = SessionRoutingStateStore()
         state_store.set("s", SessionRoutingState(active_entities=("192.168.30.100", "192.168.30.101")))
@@ -3000,8 +2947,8 @@ class ServiceAndTraceTests(unittest.TestCase):
 
     def test_general_and_unclear_turns_preserve_active_pair_state(self) -> None:
         settings = make_settings()
-        general_json = '{"intent":"general_knowledge","scope":"none","direction":"none","depth":0,"requires_graph":false,"requires_detection":false,"requires_asset_profile":false,"requires_multiple_entities":false,"is_followup":false,"classification_confidence":0.9,"reason":"general"}'
-        unclear_json = '{"intent":"unclear","scope":"none","direction":"none","depth":0,"requires_graph":false,"requires_detection":false,"requires_asset_profile":false,"requires_multiple_entities":false,"is_followup":false,"classification_confidence":0.9,"reason":"unclear"}'
+        general_json = '{"intent":"general_knowledge","scope":"none","direction":"none","depth":0,"requires_graph":false,"requires_detection":false,"requires_asset_profile":false,"requires_multiple_entities":false,"is_followup":false,"reason":"general"}'
+        unclear_json = '{"intent":"unclear","scope":"none","direction":"none","depth":0,"requires_graph":false,"requires_detection":false,"requires_asset_profile":false,"requires_multiple_entities":false,"is_followup":false,"reason":"unclear"}'
         llm = FakeLLMClient([fake_result(general_json), fake_result("general answer"), fake_result(unclear_json), fake_result("unclear answer")])
         state_store = SessionRoutingStateStore()
         pair = ("192.168.30.100", "192.168.30.101")
@@ -3022,8 +2969,8 @@ class ServiceAndTraceTests(unittest.TestCase):
 
     def test_general_and_unclear_turns_preserve_active_single_state_and_previous_route(self) -> None:
         settings = make_settings()
-        general_json = '{"intent":"general_knowledge","scope":"none","direction":"none","depth":0,"requires_graph":false,"requires_detection":false,"requires_asset_profile":false,"requires_multiple_entities":false,"is_followup":false,"classification_confidence":0.9,"reason":"general"}'
-        unclear_json = '{"intent":"unclear","scope":"none","direction":"none","depth":0,"requires_graph":false,"requires_detection":false,"requires_asset_profile":false,"requires_multiple_entities":false,"is_followup":false,"classification_confidence":0.9,"reason":"unclear"}'
+        general_json = '{"intent":"general_knowledge","scope":"none","direction":"none","depth":0,"requires_graph":false,"requires_detection":false,"requires_asset_profile":false,"requires_multiple_entities":false,"is_followup":false,"reason":"general"}'
+        unclear_json = '{"intent":"unclear","scope":"none","direction":"none","depth":0,"requires_graph":false,"requires_detection":false,"requires_asset_profile":false,"requires_multiple_entities":false,"is_followup":false,"reason":"unclear"}'
         llm = FakeLLMClient([fake_result(general_json), fake_result("general answer"), fake_result(unclear_json), fake_result("unclear answer")])
         state_store = SessionRoutingStateStore()
         state_store.set(
@@ -3057,7 +3004,7 @@ class ServiceAndTraceTests(unittest.TestCase):
 
     def test_explicit_new_ip_replaces_previous_active_single_ip(self) -> None:
         settings = make_settings()
-        router_json = '{"intent":"asset_investigation","scope":"node_summary","direction":"both","depth":0,"requires_graph":true,"requires_detection":false,"requires_asset_profile":false,"requires_multiple_entities":false,"is_followup":false,"classification_confidence":0.9,"reason":"asset"}'
+        router_json = '{"intent":"asset_investigation","scope":"node_summary","direction":"both","depth":0,"requires_graph":true,"requires_detection":false,"requires_asset_profile":false,"requires_multiple_entities":false,"is_followup":false,"reason":"asset"}'
         llm = FakeLLMClient([fake_result(router_json), fake_result("answer")])
         state_store = SessionRoutingStateStore()
         state_store.set("single", SessionRoutingState(active_ip="192.168.21.1"))
@@ -3077,7 +3024,7 @@ class ServiceAndTraceTests(unittest.TestCase):
 
     def test_explicit_broad_comparison_executes_comparison_route_and_stores_pair(self) -> None:
         settings = make_settings()
-        comparison_json = '{"intent":"graph_relationships","scope":"multi_entity_comparison","direction":"both","depth":1,"requires_graph":true,"requires_detection":false,"requires_asset_profile":false,"requires_multiple_entities":true,"is_followup":false,"classification_confidence":0.9,"reason":"compare"}'
+        comparison_json = '{"intent":"graph_relationships","scope":"multi_entity_comparison","direction":"both","depth":1,"requires_graph":true,"requires_detection":false,"requires_asset_profile":false,"requires_multiple_entities":true,"is_followup":false,"reason":"compare"}'
         llm = FakeLLMClient([fake_result(comparison_json), fake_result("comparison answer")])
         state_store = SessionRoutingStateStore()
         service = CopilotService(settings, llm, MemoryStore(20), state_store)
@@ -3128,7 +3075,7 @@ class ServiceAndTraceTests(unittest.TestCase):
             conversation_recent_raw_messages=2,
             conversation_summary_max_tokens=80,
         )
-        router_json = '{"intent":"general_knowledge","scope":"none","direction":"none","depth":0,"requires_graph":false,"requires_detection":false,"requires_asset_profile":false,"requires_multiple_entities":false,"is_followup":false,"classification_confidence":0.9,"reason":"general"}'
+        router_json = '{"intent":"general_knowledge","scope":"none","direction":"none","depth":0,"requires_graph":false,"requires_detection":false,"requires_asset_profile":false,"requires_multiple_entities":false,"is_followup":false,"reason":"general"}'
         long_old_answer = "OLD_ASSISTANT_REPORT " * 80
         memory = MemoryStore(50)
         memory.append("m", "user", "older question")
@@ -3151,7 +3098,7 @@ class ServiceAndTraceTests(unittest.TestCase):
             conversation_recent_raw_messages=2,
             conversation_summary_max_tokens=80,
         )
-        comparison_json = '{"intent":"graph_relationships","scope":"multi_entity_comparison","direction":"both","depth":1,"requires_graph":true,"requires_detection":false,"requires_asset_profile":false,"requires_multiple_entities":true,"is_followup":true,"classification_confidence":0.9,"reason":"compare"}'
+        comparison_json = '{"intent":"graph_relationships","scope":"multi_entity_comparison","direction":"both","depth":1,"requires_graph":true,"requires_detection":false,"requires_asset_profile":false,"requires_multiple_entities":true,"is_followup":true,"reason":"compare"}'
         long_old_answer = "OLD_PAIR_ASSISTANT_REPORT " * 80
         memory = MemoryStore(50)
         memory.append("pair", "user", "older pair question")

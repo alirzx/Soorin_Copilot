@@ -204,7 +204,6 @@ def test_router_none_cannot_erase_resolved_entity_for_memory_only_request() -> N
         depth=0,
         requires_graph=False,
         entity_binding="none",
-        classification_confidence=0.99,
         decision_source="semantic_router",
     )
     service = SimpleNamespace(
@@ -487,12 +486,10 @@ def test_ui_selected_comparison_materializes_pair_for_router_and_fallback() -> N
             "requires_asset_profile": True,
             "requires_multiple_entities": False,
             "is_followup": False,
-            "classification_confidence": 0.95,
             "reason": "selected asset",
             "entity_binding": "ui",
         },
         entities,
-        min_confidence=0.65,
         message=message,
         routing_state=state,
         ui_context={"selected_ip": asset_b},
@@ -519,7 +516,6 @@ def test_ui_selected_comparison_materializes_pair_for_router_and_fallback() -> N
         direction="none",
         depth=0,
         requires_graph=False,
-        classification_confidence=0.0,
         decision_source="deterministic_fallback",
         router_called=True,
         fallback_used=True,

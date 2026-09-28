@@ -316,7 +316,6 @@ def test_invalid_structured_followup_clarifies_before_any_state_or_memory_mutati
         direction="none",
         depth=0,
         requires_graph=False,
-        classification_confidence=0.0,
         reason="invalid structured score",
         decision_source="deterministic_fallback",
         router_called=True,
