@@ -59,7 +59,10 @@ _FRESH_RERUN = re.compile(
     r"\bagain\s+(?:find|search|show|list|all)\b|\brerun\b",
     re.IGNORECASE,
 )
-_SET_VERB = re.compile(r"\b(?:list|find|show|count|group|how\s+many)\b", re.IGNORECASE)
+_FALLBACK_SET_VERB = re.compile(
+    r"\b(?:list|find|show|count|group|how\s+many)\b",
+    re.IGNORECASE,
+)
 _SET_NOUN = re.compile(r"\b(?:assets?|systems?|devices?)\b", re.IGNORECASE)
 _EXPLICIT_IP = re.compile(r"(?<![\d.])(?:\d{1,3}\.){3}\d{1,3}(?![\d.])")
 _STRUCTURED_SET_REFERENCE = re.compile(
@@ -653,10 +656,11 @@ def looks_like_structured_set_request(
     *,
     structured_context_available: bool = False,
 ) -> bool:
-    """Conservatively identify self-contained set operations before UI binding.
+    """Recognize only bounded set forms for deterministic fallback parsing.
 
-    Explicit IPs deliberately opt out so ordinary focal-asset questions preserve
-    the established explicit > UI > active authority.
+    This helper is not an input-vocabulary gate and must not run before the
+    semantic Router. Explicit IPs opt out so fallback routing preserves the
+    established explicit > UI > active authority.
     """
 
     text = (message or "").strip()
@@ -682,7 +686,7 @@ def looks_like_structured_set_request(
         re.I,
     ):
         return True
-    if _SET_VERB.search(text) and (
+    if _FALLBACK_SET_VERB.search(text) and (
         _SET_NOUN.search(text)
         or re.search(
             r"\b(?:domain\s+controllers?|database\s+servers?|firewalls?|siem|splunk\s+indexers?|hypervisors?)\b",
@@ -695,7 +699,7 @@ def looks_like_structured_set_request(
 
 
 class StructuredAwareEntityResolver(BaseEntityResolver):
-    """Prevent incidental UI selection from contaminating self-contained set queries."""
+    """Preserve deterministic entity precedence until semantic routing."""
 
     def resolve(
         self,
@@ -704,14 +708,6 @@ class StructuredAwareEntityResolver(BaseEntityResolver):
         routing_state: Any = None,
         **kwargs: Any,
     ) -> EntityResolution:
-        structured_context_available = bool(
-            getattr(routing_state, "structured_query_context", None)
-        )
-        if looks_like_structured_set_request(
-            message,
-            structured_context_available=structured_context_available,
-        ):
-            ui_context = None
         return super().resolve(
             message,
             ui_context,

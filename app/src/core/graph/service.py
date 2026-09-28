@@ -82,6 +82,20 @@ class GraphService:
     def stats(self) -> dict[str, Any]:
         return self.repository.stats()
 
+    def semantic_catalog_version(self) -> str | None:
+        return self.repository.semantic_catalog_version()
+
+    def semantic_catalog_values(
+        self,
+        active_graph_version: str,
+        *,
+        per_field_limit: int,
+    ) -> dict[str, tuple[str, ...]]:
+        return self.repository.semantic_catalog_values(
+            active_graph_version,
+            per_field_limit=per_field_limit,
+        )
+
     def context(self, spec: GraphRetrievalSpec) -> dict[str, object]:
         context = self.repository.get_context(spec)
         projection = self.repository.status()

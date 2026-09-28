@@ -19,6 +19,7 @@ import src.core.context.intent as _intent_module
 from src.core.context.intent import (
     SemanticIntentRouter as _BaseSemanticIntentRouter,
     _extract_first_json_object,
+    _reported_confidence,
     validate_router_payload,
 )
 from src.core.context.models import (
@@ -44,10 +45,10 @@ from src.core.memory.routing_state import SessionRoutingState
 logger = logging.getLogger(__name__)
 _SET_INTENTS = {"asset_search", "asset_aggregate"}
 _STRUCTURED_REPAIR_SYSTEM_PROMPT = (
-    "Repair one Soorin routing object. Return JSON only. Required keys: intent, scope, direction, depth, "
+    "Repair only the schema of one Soorin routing object while preserving its semantic intent. Return JSON only. Required keys: intent, scope, direction, depth, "
     "requires_graph, requires_detection, requires_asset_profile, requires_knowledge, structured_query, "
     "structured_result_reference, "
-    "entity_binding, requires_multiple_entities, is_followup, classification_confidence, reason. "
+    "entity_binding, requires_multiple_entities, is_followup, reason. "
     "Allowed intents: general_knowledge, asset_investigation, asset_search, asset_aggregate, graph_neighbors, "
     "graph_relationships, graph_path, graph_followup, unclear. For asset_search or asset_aggregate, preserve only "
     "allow-listed structured_query fields, use scope/direction none, depth 0, requires_graph true, entity_binding none, "
@@ -88,7 +89,7 @@ def validate_structured_router_payload(
     payload: dict[str, Any],
     entities: EntityResolution,
     *,
-    min_confidence: float,
+    min_confidence: float | None = None,
     message: str = "",
     routing_state: SessionRoutingState | None = None,
     ui_context: dict[str, Any] | None = None,
@@ -260,23 +261,16 @@ def validate_structured_router_payload(
         "entity_binding",
         "requires_multiple_entities",
         "is_followup",
-        "classification_confidence",
         "reason",
     }
-    if unexpected := sorted(set(payload).difference(allowed)):
+    if unexpected := sorted(set(payload).difference(allowed | {"classification_confidence"})):
         raise ValueError(f"schema_validation_failed:unexpected={','.join(unexpected)}")
     required = allowed.difference({"requires_knowledge"})
     if missing := sorted(required.difference(payload)):
         raise ValueError(f"schema_validation_failed:missing={','.join(missing)}")
 
-    try:
-        confidence = float(payload["classification_confidence"])
-    except (TypeError, ValueError) as exc:
-        raise ValueError("schema_validation_failed:classification_confidence") from exc
-    if not 0 <= confidence <= 1:
-        raise ValueError("schema_validation_failed:classification_confidence_range")
-    if confidence < min_confidence:
-        raise ValueError("low_confidence")
+    del min_confidence
+    confidence = _reported_confidence(payload)
 
     if payload.get("scope") != "none" or payload.get("direction") != "none":
         raise ValueError("schema_validation_failed:structured_query_scope")
@@ -353,8 +347,15 @@ class SemanticIntentRouter(_BaseSemanticIntentRouter):
         if finish_reason == "length":
             raise ValueError("finish_reason_length")
         try:
-            payload = json.loads(_extract_first_json_object(content))
-        except (ValueError, json.JSONDecodeError):
+            extracted = _extract_first_json_object(content)
+            payload = json.loads(extracted)
+        except json.JSONDecodeError as exc:
+            logger.warning(
+                "event=intent_router_json_parse_failed request_id=%s reason=malformed_json_decode",
+                request_id,
+            )
+            raise ValueError("malformed_json:decode") from exc
+        except ValueError:
             logger.warning(
                 "event=intent_router_json_parse_failed request_id=%s reason=structured_extension_parse",
                 request_id,
@@ -402,7 +403,6 @@ class SemanticIntentRouter(_BaseSemanticIntentRouter):
         decision = validate_structured_router_payload(
             payload,
             entities,
-            min_confidence=self.settings.intent_router_min_confidence,
             message=message,
             routing_state=routing_state,
             ui_context=ui_context,

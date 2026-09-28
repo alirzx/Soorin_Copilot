@@ -95,14 +95,16 @@ def test_ranked_search_retains_three_rows_to_prove_tie_boundary():
     assert normalized.limit == 3
 
 
-def test_structured_set_request_ignores_incidental_ui_selected_ip():
+def test_set_wording_keeps_ui_as_candidate_until_semantic_router():
     resolver = StructuredAwareEntityResolver()
     result = resolver.resolve(
         "Group all assets by role and show me the count for each role.",
         {"selected_ip": "192.168.30.115"},
     )
-    assert result.status == "none"
-    assert not result.entities
+    assert result.status == "resolved"
+    assert result.primary_entity is not None
+    assert result.primary_entity.value == "192.168.30.115"
+    assert result.primary_entity.source == "ui"
 
 
 def test_normal_ui_focal_question_preserves_selected_ip():
@@ -147,7 +149,7 @@ def test_router_failure_fallback_understands_grouped_aggregate():
     assert route.structured_query.group_by.value == "role"
 
 
-def test_contextual_set_reference_ignores_incidental_ui_selected_ip():
+def test_contextual_set_reference_keeps_ui_as_candidate_until_semantic_router():
     prior = StructuredQuerySpec(
         mode=StructuredQueryMode.SEARCH,
         filters=AssetSearchFilters(role="Linux Server"),
@@ -173,8 +175,10 @@ def test_contextual_set_reference_ignores_incidental_ui_selected_ip():
         state,
     )
 
-    assert result.status == "none"
-    assert not result.entities
+    assert result.status == "resolved"
+    assert result.primary_entity is not None
+    assert result.primary_entity.value == "192.168.30.1"
+    assert result.primary_entity.source == "ui"
 
 
 @pytest.mark.parametrize(
@@ -521,7 +525,7 @@ def test_unknown_prior_aggregate_group_membership_fails_closed():
     assert route.target_entity is None
 
 
-def test_structured_set_continuation_bypasses_pre_router_long_term_memory_call():
+def test_structured_set_continuation_does_not_use_lexical_pre_router_memory_bypass():
     prior = StructuredQuerySpec(
         mode=StructuredQueryMode.SEARCH,
         filters=AssetSearchFilters(role="Linux Server"),
@@ -563,9 +567,10 @@ def test_structured_set_continuation_bypasses_pre_router_long_term_memory_call()
         "ui_context": {"selected_ip": "192.168.30.1"},
     })
 
-    assert calls == []
+    assert len(calls) == 1
+    assert calls[0]["entity_ids"] == ("192.168.30.1",)
     assert update["long_term_memory_selection"] is None
-    assert update["resolved_entities"].status == "none"
+    assert update["resolved_entities"].status == "resolved"
 
 
 def test_organizational_projection_includes_private_destination_only_endpoints():

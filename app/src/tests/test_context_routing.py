@@ -24,6 +24,7 @@ from src.core.context.models import (
     AssetProfileProviderResult,
     CopilotContextPackage,
     DetectionProviderResult,
+    EntityResolution,
     GraphProviderResult,
     ProviderProvenance,
     ResolvedEntity,
@@ -97,7 +98,6 @@ def make_settings(**overrides):
         "planner_model": "fake",
         "copilot_human_trace_enabled": False,
         "intent_router_enabled": True,
-        "intent_router_min_confidence": 0.65,
         "intent_router_retry_enabled": True,
         "product_api_base_url": "",
         "product_api_token": "",
@@ -1050,20 +1050,21 @@ class RouterSchemaTests(unittest.TestCase):
         )
         self.assertEqual(decision.intent, "unclear")
 
-    def test_low_confidence_unclear_is_rejected(self) -> None:
-        with self.assertRaises(ValueError):
-            validate_router_payload(
-                self.payload(
-                    intent="unclear",
-                    scope="none",
-                    direction="none",
-                    depth=0,
-                    requires_graph=False,
-                    classification_confidence=0.2,
-                ),
-                self.entities,
-                min_confidence=0.65,
-            )
+    def test_low_reported_confidence_is_accepted_as_telemetry(self) -> None:
+        decision = validate_router_payload(
+            self.payload(
+                intent="unclear",
+                scope="none",
+                direction="none",
+                depth=0,
+                requires_graph=False,
+                classification_confidence=0.2,
+            ),
+            self.entities,
+            min_confidence=0.65,
+        )
+        self.assertEqual(decision.intent, "unclear")
+        self.assertEqual(decision.classification_confidence, 0.2)
 
 
 class RouterJSONExtractionTests(unittest.TestCase):
@@ -1118,6 +1119,21 @@ class LLMPrimaryRouterTests(unittest.TestCase):
         self.assertTrue(decision.fallback_used)
         self.assertEqual(decision.retry_count, 1)
 
+    def test_balanced_but_malformed_json_uses_schema_repair(self) -> None:
+        repaired = (
+            '{"intent":"asset_investigation","scope":"node_summary","direction":"both","depth":0,'
+            '"requires_graph":true,"requires_detection":false,"requires_asset_profile":false,'
+            '"requires_multiple_entities":false,"is_followup":false,"reason":"repaired"}'
+        )
+        llm = FakeLLMClient([fake_result('{"intent":}'), fake_result(repaired)])
+        router = GLMIntentRouter(self.settings, llm)  # type: ignore[arg-type]
+
+        decision = router.classify("192.168.30.115", self.entities, SessionRoutingState())
+
+        self.assertFalse(decision.fallback_used)
+        self.assertEqual(decision.retry_count, 1)
+        self.assertEqual(len(llm.calls), 2)
+
     def test_missing_content_and_finish_reason_length_trigger_retry(self) -> None:
         router = GLMIntentRouter(
             self.settings,
@@ -1131,7 +1147,7 @@ class LLMPrimaryRouterTests(unittest.TestCase):
         self.assertEqual(decision.retry_count, 0)
         self.assertEqual(len(router.llm_client.calls), 1)
 
-    def test_provider_error_and_low_confidence_fall_back(self) -> None:
+    def test_provider_error_falls_back_but_reported_confidence_is_telemetry_only(self) -> None:
         llm = FakeLLMClient([LLMError("boom", reason="timeout")])
         router = GLMIntentRouter(self.settings, llm)  # type: ignore[arg-type]
         failed = router.classify("x", self.entities, SessionRoutingState())
@@ -1144,7 +1160,24 @@ class LLMPrimaryRouterTests(unittest.TestCase):
             make_settings(intent_router_retry_enabled=False),
             FakeLLMClient([fake_result('{"intent":"asset_investigation","scope":"node_summary","direction":"both","depth":0,"requires_graph":true,"requires_detection":false,"requires_asset_profile":false,"requires_multiple_entities":false,"is_followup":false,"classification_confidence":0.2,"reason":"low"}')]),  # type: ignore[arg-type]
         )
-        self.assertTrue(low.classify("x", self.entities, SessionRoutingState()).fallback_used)
+        low_decision = low.classify("x", self.entities, SessionRoutingState())
+        self.assertFalse(low_decision.fallback_used)
+        self.assertEqual(low_decision.classification_confidence, 0.2)
+        self.assertEqual(len(low.llm_client.calls), 1)
+
+    def test_missing_reported_confidence_is_accepted_without_repair(self) -> None:
+        payload = (
+            '{"intent":"asset_investigation","scope":"node_summary","direction":"both","depth":0,'
+            '"requires_graph":true,"requires_detection":false,"requires_asset_profile":false,'
+            '"requires_multiple_entities":false,"is_followup":false,"reason":"valid"}'
+        )
+        router = GLMIntentRouter(self.settings, FakeLLMClient([fake_result(payload)]))  # type: ignore[arg-type]
+
+        decision = router.classify("x", self.entities, SessionRoutingState())
+
+        self.assertFalse(decision.fallback_used)
+        self.assertEqual(decision.classification_confidence, 0.0)
+        self.assertEqual(len(router.llm_client.calls), 1)
 
     def test_repair_transport_failure_has_distinct_failure_reason(self) -> None:
         llm = FakeLLMClient(
@@ -1209,6 +1242,21 @@ class LLMPrimaryRouterTests(unittest.TestCase):
                 self.assertFalse(decision.fallback_used)
                 self.assertEqual(decision.retry_count, 1)
                 self.assertEqual(len(llm.calls), 2)
+
+    def test_semantic_entity_contradiction_does_not_trigger_repair(self) -> None:
+        payload = (
+            '{"intent":"asset_investigation","scope":"node_summary","direction":"both","depth":0,'
+            '"requires_graph":true,"requires_detection":false,"requires_asset_profile":false,'
+            '"requires_multiple_entities":false,"is_followup":false,"reason":"needs an entity"}'
+        )
+        llm = FakeLLMClient([fake_result(payload), fake_result(payload)])
+        router = GLMIntentRouter(self.settings, llm)  # type: ignore[arg-type]
+
+        decision = router.classify("inspect something", EntityResolution(status="none"), SessionRoutingState())
+
+        self.assertTrue(decision.fallback_used)
+        self.assertEqual(decision.retry_count, 0)
+        self.assertEqual(len(llm.calls), 1)
 
     def test_repair_failure_uses_deterministic_fallback(self) -> None:
         llm = FakeLLMClient([fake_result('{"intent":"invalid"}'), fake_result('{"scope":"still-invalid"}')])
@@ -1293,7 +1341,7 @@ class LLMPrimaryRouterTests(unittest.TestCase):
 
     def test_router_prompt_loads_from_file_and_missing_file_falls_back(self) -> None:
         router = GLMIntentRouter(self.settings, FakeLLMClient([fake_result("{}")]))  # type: ignore[arg-type]
-        self.assertIn("classification_confidence", router.system_prompt)
+        self.assertNotIn('"classification_confidence"', router.system_prompt)
         self.assertIn("multi_entity_comparison", router.system_prompt)
         missing = GLMIntentRouter(
             make_settings(intent_router_system_prompt_path="/tmp/soorin-missing-router-prompt.md"),

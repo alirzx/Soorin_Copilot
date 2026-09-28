@@ -15,7 +15,8 @@ from src.core.agent.contracts import TaskSpec
 from src.core.agent.nodes import CopilotWorkflowNodes
 from src.core.agent.structured_evidence import structured_query_identity
 from src.core.context.intent import build_routing_context
-from src.core.context.models import EntityResolution, ResolvedEntity
+from src.core.context.models import EntityResolution, IntentDecision, ResolvedEntity
+from src.core.context import DeterministicFallbackRouter
 from src.core.context.structured_routing import (
     SemanticIntentRouter,
     normalize_intent_route,
@@ -299,6 +300,21 @@ def test_router_input_exposes_only_bounded_structured_continuity_summary() -> No
     assert "classification_summary" not in json.dumps(summary)
 
 
+def test_router_input_retains_longer_natural_language_request() -> None:
+    trailing = "then group the matches by vendor and product, highest count first"
+    message = (
+        "describe the organizational asset population using semantic qualifiers "
+        + "with contextual detail " * 90
+        + trailing
+    )
+
+    payload = build_routing_context(message, _empty_entities(), SessionRoutingState())
+
+    assert len(payload["message"]) == 1200
+    assert len(payload["message"]) > 360
+    assert payload["message"].endswith(trailing)
+
+
 @pytest.mark.parametrize(
     "message",
     ["analyze the first one", "inspect the top match", "tell me about the leading result"],
@@ -579,7 +595,6 @@ def test_router_repair_path_preserves_typed_result_selection() -> None:
         get_settings(),
         intent_router_enabled=True,
         intent_router_retry_enabled=True,
-        intent_router_min_confidence=0.5,
     )
     router = SemanticIntentRouter(
         settings,
@@ -623,7 +638,6 @@ def test_semantic_router_normalizes_natural_score_before_typed_validation(
         get_settings(),
         intent_router_enabled=True,
         intent_router_retry_enabled=False,
-        intent_router_min_confidence=0.5,
     )
     router = SemanticIntentRouter(settings, _RepairLLM([json.dumps(payload)]))
 
@@ -654,7 +668,6 @@ def test_semantic_router_scopes_percent_units_to_the_matching_score_field() -> N
         get_settings(),
         intent_router_enabled=True,
         intent_router_retry_enabled=False,
-        intent_router_min_confidence=0.5,
     )
     router = SemanticIntentRouter(settings, _RepairLLM([json.dumps(payload)]))
 
@@ -676,7 +689,6 @@ def test_empty_result_selection_repair_failure_routes_to_clarification_not_activ
         get_settings(),
         intent_router_enabled=True,
         intent_router_retry_enabled=True,
-        intent_router_min_confidence=0.5,
     )
     router = SemanticIntentRouter(
         settings,
@@ -998,6 +1010,43 @@ def test_self_contained_set_query_is_rejected_and_again_is_a_fresh_rerun() -> No
     assert llm.calls == 1
     assert rerun.structured_result_reference.kind == "none"
     assert rerun.structured_query is not None and rerun.structured_query.fresh_rerun
+
+
+def test_router_failure_on_novel_operational_wording_cannot_become_general_knowledge() -> None:
+    class FailedRouter:
+        def classify(self, *_args, **_kwargs):
+            return IntentDecision(
+                intent="unclear",
+                scope="none",
+                direction="none",
+                depth=0,
+                requires_graph=False,
+                fallback_used=True,
+                fallback_reason="repair_timeout",
+                error_reason="repair_timeout",
+                router_called=True,
+            )
+
+    nodes = object.__new__(CopilotWorkflowNodes)
+    nodes.settings = get_settings()
+    nodes.service = SimpleNamespace(
+        intent_router=FailedRouter(),
+        fallback_router=DeterministicFallbackRouter(),
+    )
+    update = nodes.route({
+        "message": "Enumerate every AD DC in the estate",
+        "resolved_entities": _empty_entities(),
+        "active_entity_state": SessionRoutingState(),
+        "recent_messages": [],
+        "request_id": "unresolved-operational-route",
+        "trace_id": "trace",
+    })
+
+    assert update["routing_result"].intent == "unclear"
+    assert update["routing_result"].reason == "semantic_router_unresolved"
+    assert update["routing_result"].use_graph is False
+    assert update["routing_result"].use_asset_profile is False
+    assert update["routing_result"].entity_binding == "none"
 
 
 def test_fallback_preserves_every_material_supported_selector() -> None:

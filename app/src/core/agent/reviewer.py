@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from dataclasses import replace
 from typing import Any
 
@@ -17,6 +18,8 @@ _NO_DEDICATED_ANOMALY_EVIDENCE = (
     "No dedicated anomaly provider evidence is available; only bounded graph structural analysis is supplied."
 )
 
+logger = logging.getLogger(__name__)
+
 
 class EvidenceReviewer:
     def review(
@@ -26,6 +29,24 @@ class EvidenceReviewer:
         *,
         allow_supplemental: bool = False,
     ) -> ReviewDecision:
+        if (
+            task.routing_required
+            and task.routing_unresolved
+            and not task.required_capabilities
+            and not results
+        ):
+            logger.warning(
+                "event=zero_evidence_guard outcome=missing_required_evidence "
+                "routing_required=true routing_unresolved=true"
+            )
+            material = (
+                "Semantic routing remained unresolved; no validated evidence path was established.",
+            )
+            return ReviewDecision(
+                outcome="missing_required_evidence",
+                reasons=material,
+                material_limitations=material,
+            )
         required_cardinality = {
             "asset.get_profile": (1, 2),
             "asset.get_detection": (1, 2),

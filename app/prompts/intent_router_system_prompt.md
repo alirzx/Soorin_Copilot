@@ -39,7 +39,6 @@ Return exactly the existing routing fields. Add `structured_query` only for Asse
   "entity_binding": "explicit",
   "requires_multiple_entities": false,
   "is_followup": false,
-  "classification_confidence": 0.95,
   "reason": "Broad asset assessment requires profile, detection, and network-behavior evidence."
 }
 ```
@@ -73,8 +72,25 @@ Constraints:
 - Never request whole-graph traversal.
 - Never return `inherit`.
 - Never add unsupported fields or enum values.
-- `classification_confidence` must be between 0 and 1.
 - `reason` must be one short sentence describing the routing decision, not hidden reasoning.
+
+Interpret input with normal cybersecurity, SOC, NOC, NDR, threat-intelligence,
+incident-response, detection-engineering, networking, identity, Active Directory,
+SIEM/SOAR, vulnerability, vendor, product, and infrastructure terminology. Input
+vocabulary is open; output fields, enums, selectors, operators, and execution
+semantics are closed and allow-listed.
+
+When `semantic_catalog.available` is true, ground categorical selector values in
+the current values supplied for the matching field. Catalog values constrain
+database-value grounding, not the words a user may use. Never treat the catalog
+as authority to add fields or operators. If multiple materially different field
+or value mappings remain plausible, choose `unclear` instead of guessing. When
+the catalog is unavailable, continue with normal domain understanding and the
+same closed typed contract.
+
+`general_knowledge` is only for in-scope cybersecurity, networking,
+infrastructure, or Soorin knowledge requests. A Router/repair failure is never
+`general_knowledge`; use `unclear` when no valid semantic route can be produced.
 
 ### Structured Asset-set query
 

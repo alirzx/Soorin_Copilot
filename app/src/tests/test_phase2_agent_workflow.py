@@ -19,11 +19,13 @@ from src.core.agent.contracts import (
     EvidenceFact,
     ExecutionPlan,
     PlanStep,
+    ReviewDecision,
     RetryPolicy,
     TaskSpec,
     ToolResult,
 )
 from src.core.agent.events import WorkflowEventContext, WorkflowEventLogger
+from src.core.agent.nodes import CopilotWorkflowNodes
 from src.core.agent.executor import CapabilityExecutor
 from src.core.agent.plan_validator import PlanValidationError, PlanValidator
 from src.core.agent.planner import BoundedPlanner, PlannerError
@@ -598,6 +600,68 @@ class TestEvidenceAndReview:
         )
         assert final.outcome == "answer_with_limitations"
         assert not final.supplemental_allowed
+
+    def test_unresolved_required_route_with_zero_evidence_is_not_sufficient(self):
+        unresolved = TaskSpec(
+            request="Inspect the estate",
+            intent="unclear",
+            scope="none",
+            direction="none",
+            entities=(),
+            required_capabilities=(),
+            routing_required=True,
+            routing_unresolved=True,
+        )
+
+        decision = EvidenceReviewer().review(unresolved, [])
+
+        assert decision.outcome == "missing_required_evidence"
+        assert "routing remained unresolved" in decision.reasons[0]
+
+    def test_legitimate_zero_capability_task_remains_sufficient(self):
+        memory_task = TaskSpec(
+            request="What did we discuss?",
+            intent="memory_recall",
+            scope="none",
+            direction="none",
+            entities=(),
+            required_capabilities=(),
+            evidence_mode="memory_only",
+            routing_required=False,
+            routing_unresolved=False,
+        )
+
+        assert EvidenceReviewer().review(memory_task, []).outcome == "sufficient"
+
+    def test_unresolved_zero_evidence_path_bypasses_synthesizer_model(self):
+        calls = []
+        nodes = object.__new__(CopilotWorkflowNodes)
+        nodes.service = SimpleNamespace(
+            llm_client=SimpleNamespace(chat=lambda *_args, **_kwargs: calls.append(True))
+        )
+        nodes.stream_sink = None
+        unresolved = TaskSpec(
+            request="Inspect the estate",
+            intent="unclear",
+            scope="none",
+            direction="none",
+            entities=(),
+            required_capabilities=(),
+            routing_required=True,
+            routing_unresolved=True,
+        )
+
+        update = nodes.synthesize({
+            "task": unresolved,
+            "review_decision": ReviewDecision(outcome="missing_required_evidence"),
+            "tool_results": [],
+            "request_id": "zero-evidence",
+            "session_id": "session",
+        })
+
+        assert calls == []
+        assert update["synthesis_result"]["model"] == "routing-unresolved-guard"
+        assert update["workflow_status"] == "completed_with_limitations"
 
     def test_evidence_pack_contains_ids_coverage_and_review(self):
         current = task("a")

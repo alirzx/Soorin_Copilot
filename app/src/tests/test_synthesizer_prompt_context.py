@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 import shutil
 import sys
@@ -40,9 +39,6 @@ from src.core.memory.store import MemoryStore
 from src.core.graph.structured import StructuredQuerySpec
 
 
-LEGACY_PROMPT_SHA256 = "cbe607b7aca45933ebdf55d40dd3254eeac2dc2ada5c4d6a7442c634b967739b"
-
-
 def _task(**overrides) -> TaskSpec:
     values = {
         "request": "Investigate 192.0.2.10",
@@ -75,10 +71,12 @@ def _route(*, entities: tuple[str, ...] = ()) -> SimpleNamespace:
     )
 
 
-def test_new_static_prompt_is_default_and_legacy_is_byte_stable(monkeypatch, tmp_path: Path) -> None:
-    legacy = Path("app/prompts/system_prompt.md").read_bytes()
-    assert hashlib.sha256(legacy).hexdigest() == LEGACY_PROMPT_SHA256
-    assert Path("app/prompts/synthesizer/synthesizer_static_prompt.md").read_text(encoding="utf-8").strip()
+def test_new_static_prompt_is_default_and_legacy_has_no_scope_refusal(monkeypatch, tmp_path: Path) -> None:
+    legacy = Path("app/prompts/system_prompt.md").read_text(encoding="utf-8")
+    static = Path("app/prompts/synthesizer/synthesizer_static_prompt.md").read_text(encoding="utf-8")
+    assert static.strip()
+    assert "I can assist only with cybersecurity" not in legacy
+    assert "I can assist only with cybersecurity" not in static
 
     monkeypatch.setattr(settings_module, "ENV_PATH", tmp_path / "missing.env")
     monkeypatch.setattr(settings_module, "LEGACY_ENV_PATH", tmp_path / "missing-legacy.env")
@@ -96,6 +94,36 @@ def test_static_prompt_uses_user_facing_memory_language() -> None:
     assert "our earlier discussion" in static
     assert "do not expose internal workflow, storage, retrieval" in static.casefold()
     assert "Translate evidence limitations into honest plain language" in static
+
+
+@pytest.mark.parametrize(
+    "user_request",
+    (
+        "Summarize the SOC triage implications",
+        "Explain the NOC reliability impact",
+        "Assess this NDR network behavior",
+        "Review Active Directory and Kerberos exposure",
+        "Explain the DNS routing pattern",
+        "Summarize SIEM coverage gaps",
+        "Describe the asset inventory server roles",
+        "Relate this threat intelligence to detection engineering",
+    ),
+)
+def test_synthesizer_trusts_validated_domain_route_for_varied_wording(user_request: str) -> None:
+    static = Path("app/prompts/synthesizer/synthesizer_static_prompt.md").read_text(
+        encoding="utf-8"
+    )
+    task = _task(request=user_request)
+    rendered = SynthesizerPromptBuilder().render_messages(
+        static_core=static,
+        context=SynthesizerPromptBuilder().build_context(task, ()),
+        dynamic_evidence="",
+        history=[],
+        user_message=user_request,
+    )
+
+    assert "I can assist only with cybersecurity" not in rendered.messages[0]["content"]
+    assert rendered.messages[-1] == {"role": "user", "content": user_request}
 
 
 def test_missing_new_prompt_uses_unchanged_legacy_compatibility_fallback(tmp_path: Path) -> None:

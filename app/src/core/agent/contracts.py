@@ -257,6 +257,8 @@ class TaskSpec:
     temporal_mode: TemporalMode = "current"
     evidence_mode: EvidenceMode = "normal"
     response_depth: ResponseDepth = "standard"
+    routing_required: bool = False
+    routing_unresolved: bool = False
 
     @property
     def max_steps(self) -> int:

@@ -353,7 +353,6 @@ class Settings:
     rag_upsert_batch_size: int
     intent_router_enabled: bool
     intent_router_system_prompt_path: str
-    intent_router_min_confidence: float
     intent_router_retry_enabled: bool
     graph_auto_refresh_enabled: bool
     graph_refresh_interval_seconds: int
@@ -885,7 +884,6 @@ def get_settings() -> Settings:
             "SOORIN_INTENT_ROUTER_SYSTEM_PROMPT_PATH",
             "app/prompts/intent_router_system_prompt.md",
         ).strip(),
-        intent_router_min_confidence=_float("SOORIN_INTENT_ROUTER_MIN_CONFIDENCE", 0.65),
         intent_router_retry_enabled=_bool("SOORIN_INTENT_ROUTER_RETRY_ENABLED", True),
         graph_auto_refresh_enabled=_bool("SOORIN_GRAPH_AUTO_REFRESH_ENABLED", True),
         graph_refresh_interval_seconds=max(600, _int("SOORIN_GRAPH_REFRESH_INTERVAL_SECONDS", 3600)),

@@ -105,7 +105,6 @@ def test_router_repair_accepts_null_structured_result_reference() -> None:
         get_settings(),
         intent_router_enabled=True,
         intent_router_retry_enabled=True,
-        intent_router_min_confidence=0.5,
     )
     router = SemanticIntentRouter(
         settings,

@@ -47,7 +47,6 @@ from src.core.context.intent import (
     resolution_from_materialized_decision,
 )
 from src.core.context.models import EntityResolution, ResolvedEntity, RouteDecision, approx_tokens
-from src.core.context.structured_hardening import looks_like_structured_set_request
 from src.core.context.compaction import (
     current_evidence_projections,
     episodic_baseline_projections,
@@ -138,10 +137,6 @@ class CopilotWorkflowNodes:
             len(constraints.reason_codes),
         )
         retrieve_long_term = getattr(self.service, "retrieve_long_term_memory", None)
-        structured_set_request = looks_like_structured_set_request(
-            state["message"],
-            structured_context_available=bool(routing_state.structured_query_context),
-        )
         long_term_selection = (
             retrieve_long_term(
                 identity=state["request_identity"],
@@ -156,14 +151,9 @@ class CopilotWorkflowNodes:
                     state["message"]
                 ),
             )
-            if retrieve_long_term is not None and not structured_set_request
+            if retrieve_long_term is not None
             else None
         )
-        if structured_set_request and retrieve_long_term is not None:
-            logger.info(
-                "event=long_term_memory_bypassed request_id=%s reason=structured_asset_set_authority",
-                state["request_id"],
-            )
         update: dict[str, Any] = {
             "resolved_entities": resolution,
             "active_entity_state": routing_state,
@@ -294,6 +284,37 @@ class CopilotWorkflowNodes:
                 fallback_used=True,
                 fallback_reason=decision.fallback_reason or decision.error_reason,
             )
+            if route.intent == "general_knowledge":
+                route_entities = EntityResolution(status="none")
+                route = replace(
+                    route,
+                    use_graph=False,
+                    use_detection=False,
+                    use_asset_profile=False,
+                    use_knowledge=False,
+                    reason="semantic_router_unresolved",
+                    entity_binding="none",
+                    requested_entity_binding="none",
+                    resolved_entity_binding="none",
+                    binding_source="none",
+                    binding_available=False,
+                    materialized_entity_count=0,
+                    materialized_entities=(),
+                    target_entity=None,
+                    target_entities=[],
+                    intent="unclear",
+                    scope="none",
+                    direction="none",
+                    depth=0,
+                    requires_multiple_entities=False,
+                    relationship_mode="none",
+                    matched_signals=["semantic_router_unresolved", "fail_closed"],
+                )
+                logger.warning(
+                    "event=semantic_router_unresolved request_id=%s fallback_reason=%s",
+                    state["request_id"],
+                    str(route.fallback_reason or "router_failed")[:120],
+                )
             if route.reason == "deterministic_structured_parse_unavailable":
                 return {
                     "routing_fallback_used": True,
@@ -1332,7 +1353,18 @@ class CopilotWorkflowNodes:
             statuses["asset_profile"],
             statuses["knowledge"],
         )
-        if context_review.get("decision") == "blocked":
+        if (
+            state["task"].routing_unresolved
+            and review.outcome in {"safe_failure", "missing_required_evidence"}
+        ):
+            result = self._deterministic(
+                "I couldn't safely determine the requested cybersecurity task, so no evidence-backed answer was generated. Please restate the request with the asset, set, or analysis goal you want.",
+                "routing-unresolved-guard",
+            )
+            warning.append("semantic_routing_unresolved")
+            status = "completed_with_limitations"
+            limitation_reasons.extend(review.reasons or ("semantic_routing_unresolved",))
+        elif context_review.get("decision") == "blocked":
             result = self._deterministic(
                 "I cannot safely generate this response because the bounded evidence context "
                 "exceeds the model input window after deterministic compaction.",

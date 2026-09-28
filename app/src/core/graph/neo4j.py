@@ -976,6 +976,61 @@ class Neo4jGraphRepository:
         )
         return str(row["version"]) if row and row["version"] is not None else None
 
+    def semantic_catalog_version(self) -> str | None:
+        """Return the cheap cache identity for the currently published projection."""
+        return self._active_graph_version()
+
+    def semantic_catalog_values(
+        self,
+        active_graph_version: str,
+        *,
+        per_field_limit: int,
+    ) -> dict[str, tuple[str, ...]]:
+        """Return bounded frequent values from one explicitly versioned projection."""
+        query = """
+        MATCH (m:GraphMetadata {id: 'active'})
+        WHERE m.active_graph_version = $active_graph_version
+        MATCH (a:Asset {graph_version: $active_graph_version})
+        UNWIND [
+          {field: 'suggested_type', values: CASE WHEN a.suggested_type IS NULL THEN [] ELSE [a.suggested_type] END},
+          {field: 'role', values: CASE WHEN a.role IS NULL THEN [] ELSE [a.role] END},
+          {field: 'roles', values: coalesce(a.roles, [])},
+          {field: 'vendor', values: CASE WHEN a.vendor IS NULL THEN [] ELSE [a.vendor] END},
+          {field: 'product', values: CASE WHEN a.product IS NULL THEN [] ELSE [a.product] END},
+          {field: 'tag', values: CASE WHEN a.tag IS NULL THEN [] ELSE [a.tag] END},
+          {field: 'sub_tag', values: CASE WHEN a.sub_tag IS NULL THEN [] ELSE [a.sub_tag] END},
+          {field: 'status', values: CASE WHEN a.status IS NULL THEN [] ELSE [a.status] END},
+          {field: 'enrichment_status', values: CASE WHEN a.enrichment_status IS NULL THEN [] ELSE [a.enrichment_status] END}
+        ] AS entry
+        UNWIND entry.values AS raw_value
+        WITH entry.field AS field, trim(toString(raw_value)) AS value
+        WHERE value IS NOT NULL AND value <> ''
+        WITH field, toLower(value) AS normalized, value, count(*) AS variant_frequency
+        ORDER BY field ASC, normalized ASC, variant_frequency DESC, value ASC
+        WITH field, collect({value: value, frequency: variant_frequency}) AS variants,
+             sum(variant_frequency) AS frequency
+        WITH field, variants[0].value AS value, frequency
+        ORDER BY field ASC, frequency DESC, toLower(value) ASC, value ASC
+        WITH field, collect(value)[..$per_field_limit] AS values
+        RETURN field, values
+        ORDER BY field ASC
+        """
+        try:
+            with self.driver.session() as session:
+                records = list(
+                    session.run(
+                        self._query(query),
+                        active_graph_version=active_graph_version,
+                        per_field_limit=max(1, min(int(per_field_limit), 64)),
+                    )
+                )
+        except Exception as exc:
+            raise Neo4jUnavailable("Neo4j semantic catalog query failed.") from exc
+        return {
+            str(record["field"]): tuple(str(value) for value in (record["values"] or ()))
+            for record in records
+        }
+
     @staticmethod
     def _structured_filter_clauses(
         request: AssetSearchRequest | AssetAggregateRequest,

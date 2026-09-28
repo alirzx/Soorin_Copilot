@@ -22,6 +22,7 @@ from src.core.agent.reviewer import EvidenceReviewer
 from src.core.agent.workflow import BoundedCopilotWorkflow
 from src.core.agent.phase4c_nodes import Phase4CWorkflowNodes
 from src.core.context import ContextComposer, DeterministicFallbackRouter, EntityResolver, SemanticIntentRouter
+from src.core.context.semantic_catalog import SemanticCatalogProvider
 from src.core.copilot.input_guard import prompt_injection_refusal
 from src.core.context.providers import AssetProfileContextProvider, DetectionContextProvider, GraphContextProvider
 from src.core.llm.client import LLMClient
@@ -125,6 +126,9 @@ class CopilotService:
         self.fallback_router = DeterministicFallbackRouter()
         self.intent_router = SemanticIntentRouter(settings, llm_client)
         self.graph_provider = GraphContextProvider(settings)
+        self.intent_router.semantic_catalog_provider = SemanticCatalogProvider(
+            self.graph_provider.graph_service
+        )
         product_client = product_client or ProductApiClient(settings)
         self.product_client = product_client
         self.usage_reporter = usage_reporter or ProductUsageReporter(settings, product_client)

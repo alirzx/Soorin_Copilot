@@ -486,6 +486,19 @@ def task_spec_from_route(
             else "brief" if any(word in request_lower for word in ("brief", "short"))
             else "standard"
         ),
+        routing_required=(
+            bool(turn_policy.requires_domain_router)
+            if turn_policy is not None
+            else evidence_mode != "memory_only"
+        ),
+        routing_unresolved=(
+            (
+                bool(turn_policy.requires_domain_router)
+                if turn_policy is not None
+                else evidence_mode != "memory_only"
+            )
+            and str(getattr(route, "intent", "unclear")) == "unclear"
+        ),
     )
 
 

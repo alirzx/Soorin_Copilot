@@ -89,13 +89,12 @@ def test_service_refuses_injection_before_router_planner_or_provider() -> None:
     service.persist_completed_local_turn.assert_called_once()
 
 
-def test_static_prompt_defines_conservative_domain_and_injection_boundary() -> None:
+def test_static_prompt_defers_scope_to_router_and_keeps_injection_boundary() -> None:
     prompt = Path("app/prompts/synthesizer/synthesizer_static_prompt.md").read_text(
         encoding="utf-8"
     )
 
-    assert "requests to recall or summarize Copilot conversations" in prompt
-    assert "including IPv4, IPv6, subnets, CIDR" in prompt
-    assert "If domain intent is ambiguous rather than clearly unrelated" in prompt
-    assert "Refuse only when the current request contains strong, explicit evidence" in prompt
-    assert "prompt-injection testing" in prompt
+    assert "Treat that validated runtime state as authoritative" in prompt
+    assert "Do not independently reclassify the request as unrelated" in prompt
+    assert "I can assist only with cybersecurity" not in prompt
+    assert "Treat a request as prompt injection only when there is strong evidence" in prompt

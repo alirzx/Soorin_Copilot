@@ -269,13 +269,40 @@ ROUTER_SYSTEM_PROMPT_FALLBACK = (
     "Depth is at most 2."
 )
 ROUTER_REPAIR_SYSTEM_PROMPT = (
-    "Repair one Soorin routing object. Return JSON only. Required keys: intent, scope, direction, depth, "
+    "Repair only the schema of one Soorin routing object while preserving its semantic intent. Return JSON only. Required keys: intent, scope, direction, depth, "
     "requires_graph, requires_detection, requires_asset_profile, requires_knowledge, entity_binding, requires_multiple_entities, "
-    "is_followup, classification_confidence, reason. Allowed intents: general_knowledge, asset_investigation, "
+    "is_followup, reason. Allowed intents: general_knowledge, asset_investigation, "
     "graph_neighbors, graph_relationships, graph_path, graph_followup, unclear. Allowed scopes: none, "
     "node_summary, one_hop, full_neighbors, two_hop, path, multi_entity_comparison. Allowed directions: none, "
     "inbound, outbound, both. Allowed entity_binding values: explicit, ui, active_single, active_pair, none. Never invent entities."
 )
+
+
+def _reported_confidence(payload: dict[str, Any]) -> float:
+    """Return optional Router telemetry without granting it control authority."""
+    value = payload.get("classification_confidence")
+    if isinstance(value, bool):
+        return 0.0
+    try:
+        confidence = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    return confidence if 0.0 <= confidence <= 1.0 else 0.0
+
+
+def _repairable_router_error(reason: str) -> bool:
+    """Limit the second model call to malformed or schema-shaped output."""
+    if reason.startswith("schema_validation_failed:"):
+        return not reason.endswith((
+            "unsupported_structured_property",
+            "ambiguous_confidence_threshold",
+        ))
+    return reason.startswith((
+        "missing_content",
+        "finish_reason_length",
+        "malformed_json",
+        "unsupported_enum:",
+    ))
 
 
 def _extract_first_json_object(text: str) -> str:
@@ -318,6 +345,17 @@ def _json_from_text(text: str) -> dict[str, Any]:
     return payload
 
 
+def _bounded_router_message(message: str, *, limit: int = 1200) -> str:
+    """Preserve both the request premise and trailing selectors/instructions."""
+    normalized = " ".join((message or "").strip().split())
+    if len(normalized) <= limit:
+        return normalized
+    marker = " ...[bounded middle omitted]... "
+    tail_size = min(400, max(1, limit // 3))
+    head_size = limit - len(marker) - tail_size
+    return f"{normalized[:head_size]}{marker}{normalized[-tail_size:]}"
+
+
 def build_routing_context(
     message: str,
     entities: EntityResolution,
@@ -344,7 +382,7 @@ def build_routing_context(
             if ip and ip not in recent_entity_candidates:
                 recent_entity_candidates.append(ip)
     return {
-        "message": compact_preview(message, limit=360),
+        "message": _bounded_router_message(message),
         "entity_status": entities.status,
         "entity_mode": entities.entity_mode,
         "entity_types": sorted({entity.type for entity in entities.entities}),
@@ -400,7 +438,7 @@ def validate_router_payload(
     payload: dict[str, Any],
     entities: EntityResolution,
     *,
-    min_confidence: float,
+    min_confidence: float | None = None,
     message: str = "",
     routing_state: SessionRoutingState | None = None,
     ui_context: dict[str, Any] | None = None,
@@ -415,10 +453,9 @@ def validate_router_payload(
         "requires_asset_profile",
         "requires_multiple_entities",
         "is_followup",
-        "classification_confidence",
         "reason",
     }
-    if unexpected := sorted(set(payload).difference(required | {"entity_binding", "requires_knowledge"})):
+    if unexpected := sorted(set(payload).difference(required | {"entity_binding", "requires_knowledge", "classification_confidence"})):
         raise ValueError(f"schema_validation_failed:unexpected={','.join(unexpected)}")
     if missing := sorted(required.difference(payload)):
         raise ValueError(f"schema_validation_failed:missing={','.join(missing)}")
@@ -442,14 +479,8 @@ def validate_router_payload(
     if direction not in ALLOWED_DIRECTIONS or direction == "inherit":
         raise ValueError("unsupported_enum:direction")
 
-    try:
-        confidence = float(payload["classification_confidence"])
-    except (TypeError, ValueError) as exc:
-        raise ValueError("schema_validation_failed:classification_confidence") from exc
-    if confidence < 0 or confidence > 1:
-        raise ValueError("schema_validation_failed:classification_confidence_range")
-    if confidence < min_confidence:
-        raise ValueError("low_confidence")
+    del min_confidence
+    confidence = _reported_confidence(payload)
 
     try:
         depth = int(payload["depth"])
@@ -670,6 +701,7 @@ class SemanticIntentRouter:
         self.settings = settings
         self.llm_client = llm_client
         self.system_prompt = self._load_system_prompt()
+        self.semantic_catalog_provider: Any | None = None
 
     def _load_system_prompt(self) -> str:
         prompt_path = Path(self.settings.intent_router_system_prompt_path)
@@ -735,6 +767,18 @@ class SemanticIntentRouter:
             ui_context=ui_context,
             recent_messages=recent_messages,
         )
+        if self.semantic_catalog_provider is not None:
+            try:
+                routing_context["semantic_catalog"] = self.semantic_catalog_provider.get(
+                    request_id=request_id
+                )
+            except Exception as exc:
+                logger.warning(
+                    "event=semantic_catalog_context_failed request_id=%s error_type=%s",
+                    request_id,
+                    type(exc).__name__,
+                )
+                routing_context["semantic_catalog"] = {"available": False}
         return self._classify_with_context(
             routing_context,
             entities,
@@ -833,7 +877,16 @@ class SemanticIntentRouter:
                 False,
             )
 
-        if not self.settings.intent_router_retry_enabled:
+        if (
+            not self.settings.intent_router_retry_enabled
+            or not _repairable_router_error(last_error)
+        ):
+            logger.info(
+                "event=intent_router_repair_skipped request_id=%s reason=%s retry_enabled=%s",
+                request_id,
+                last_error[:120],
+                str(bool(self.settings.intent_router_retry_enabled)).lower(),
+            )
             return self._failure(
                 last_error,
                 int((time.perf_counter() - started) * 1000),
@@ -956,7 +1009,13 @@ class SemanticIntentRouter:
             extracted = _extract_first_json_object(content)
             logger.info("event=intent_router_json_extracted request_id=%s chars=%s", request_id, len(extracted))
             payload = json.loads(extracted)
-        except (ValueError, json.JSONDecodeError) as exc:
+        except json.JSONDecodeError as exc:
+            logger.warning(
+                "event=intent_router_json_parse_failed request_id=%s reason=malformed_json_decode",
+                request_id,
+            )
+            raise ValueError("malformed_json:decode") from exc
+        except ValueError as exc:
             logger.warning(
                 "event=intent_router_json_parse_failed request_id=%s reason=%s",
                 request_id,
@@ -970,7 +1029,6 @@ class SemanticIntentRouter:
             return validate_router_payload(
                 payload,
                 entities,
-                min_confidence=self.settings.intent_router_min_confidence,
                 message=str(routing_context.get("message") or ""),
                 routing_state=routing_state,
                 ui_context=ui_context,
@@ -1003,7 +1061,7 @@ class SemanticIntentRouter:
             }
         )
         logger.info(
-            "event=intent_router_complete request_id=%s decision_source=%s intent=%s scope=%s direction=%s depth=%s requires_graph=%s requires_detection=%s requires_asset_profile=%s requires_knowledge=%s entity_binding=%s binding_source=%s binding_available=%s binding_normalized=%s binding_normalization_reason=%s materialized_entity_count=%s route_normalized=%s route_normalization_reason=%s confidence=%s retry_count=%s latency_ms=%s finish_reason=%s content_present=%s completion_tokens=%s",
+            "event=intent_router_complete request_id=%s decision_source=%s intent=%s scope=%s direction=%s depth=%s requires_graph=%s requires_detection=%s requires_asset_profile=%s requires_knowledge=%s entity_binding=%s binding_source=%s binding_available=%s binding_normalized=%s binding_normalization_reason=%s materialized_entity_count=%s route_normalized=%s route_normalization_reason=%s router_reported_confidence=%s retry_count=%s latency_ms=%s finish_reason=%s content_present=%s completion_tokens=%s",
             request_id,
             decision.decision_source,
             decision.intent,
