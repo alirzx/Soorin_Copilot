@@ -22,6 +22,7 @@ from src.core.context.product_views import (
     normalize_purpose,
     select_product_views,
 )
+from src.core.graph.structured import semantic_query_identity
 
 
 KNOWLEDGE_PURPOSES = {
@@ -115,8 +116,26 @@ class PlanValidator:
                 spec.allowed_arguments
                 or tuple(spec.input_schema.model_json_schema().get("properties", {}))
             )
+            internal_arguments: set[str] = set()
+            if (
+                plan.source == "investigator"
+                and step.capability in {"graph.search_assets", "graph.aggregate_assets"}
+            ):
+                if plan.task.structured_query is None:
+                    raise PlanValidationError(
+                        "structured_query_missing",
+                        "Structured Investigator action lacks Router-owned query authority.",
+                    )
+                expected_query_id = semantic_query_identity(plan.task.structured_query)
+                supplied_query_id = str(arguments.get("semantic_query_id") or "")
+                if supplied_query_id != expected_query_id:
+                    raise PlanValidationError(
+                        "structured_query_authority_violation",
+                        "Structured Investigator action contradicted Router-owned query identity.",
+                    )
+                internal_arguments.add("semantic_query_id")
             unsupported = (
-                sorted(set(arguments) - allowed_arguments)
+                sorted(set(arguments) - allowed_arguments - internal_arguments)
                 if plan.source in {"llm", "investigator"}
                 else []
             )
