@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import logging
+import re
 import threading
 import time
 from typing import Any
 
 from src.core.graph.structured import (
     AssetPredicate,
+    AssetPredicateField,
+    AssetPredicateOperator,
     AssetSearchFilters,
     StructuredQuerySpec,
 )
@@ -27,6 +30,22 @@ SEMANTIC_CATALOG_FIELDS = (
     "status",
     "enrichment_status",
 )
+
+_CLASS_CATALOG_FIELDS = frozenset({"suggested_type", "role", "roles"})
+_CLASS_NOISE_TOKENS = frozenset({
+    "asset",
+    "assets",
+    "device",
+    "devices",
+    "system",
+    "systems",
+    "machine",
+    "machines",
+    "host",
+    "hosts",
+})
+_MAX_CLASS_EXPANSION_LEAVES = 18
+_TOKEN_RE = re.compile(r"[a-z0-9]+", re.IGNORECASE)
 
 
 class SemanticCatalogProvider:
@@ -185,7 +204,16 @@ class SemanticCatalogProvider:
         *,
         request_id: str = "",
     ) -> StructuredQuerySpec:
-        """Canonicalize matching categorical values without changing zero-matches."""
+        """Ground Router categorical values in the active graph vocabulary.
+
+        Execution remains exact.  First, case-insensitive exact values are
+        canonicalized through Neo4j.  If a *generic asset-class* concept has no
+        exact class match, a bounded lexical concept expansion may replace it
+        only with canonical class/function values present in the current
+        catalog.  This supports broad concepts such as ``Linux`` -> ``Linux
+        Server`` and ``Windows`` -> all current Windows class variants without a
+        static environment-specific alias table or fuzzy Cypher.
+        """
         try:
             version = self.graph_service.semantic_catalog_version()
             if not version:
@@ -194,23 +222,39 @@ class SemanticCatalogProvider:
             if not requested:
                 return query
             resolved = self.graph_service.canonicalize_semantic_values(version, requested)
-            if not resolved:
-                logger.info(
-                    "event=semantic_canonicalization request_id=%s active_graph_version=%s "
-                    "requested_value_count=%s resolved_value_count=0 status=zero_match",
-                    request_id,
-                    version,
-                    sum(len(values) for values in requested.values()),
-                )
-                return query
-            canonical = _apply_canonical_values(query, resolved)
+            canonical = _apply_canonical_values(query, resolved) if resolved else query
+
+            class_exact = _semantic_class_exactly_resolved(query, resolved)
+            expanded_pairs: tuple[tuple[str, str], ...] = ()
+            if (
+                query.semantic_class
+                and query.class_mapping_mode == "generic_asset_class"
+                and not class_exact
+            ):
+                catalog = self.get(request_id=request_id)
+                expanded_pairs = _catalog_class_expansion(query, catalog)
+                if expanded_pairs:
+                    canonical = _apply_class_expansion(canonical, expanded_pairs)
+                    logger.info(
+                        "event=semantic_class_expanded request_id=%s active_graph_version=%s "
+                        "semantic_class=%s canonical_value_count=%s leaf_count=%s source=active_catalog",
+                        request_id,
+                        version,
+                        query.semantic_class,
+                        len({value.casefold() for _, value in expanded_pairs}),
+                        len(expanded_pairs),
+                    )
+
+            resolved_count = sum(len(values) for values in resolved.values())
+            status = "expanded" if expanded_pairs else "resolved" if resolved else "zero_match"
             logger.info(
                 "event=semantic_canonicalization request_id=%s active_graph_version=%s "
-                "requested_value_count=%s resolved_value_count=%s status=resolved",
+                "requested_value_count=%s resolved_value_count=%s status=%s",
                 request_id,
                 version,
                 sum(len(values) for values in requested.values()),
-                sum(len(values) for values in resolved.values()),
+                resolved_count,
+                status,
             )
             return canonical
         except Exception as exc:
@@ -291,3 +335,190 @@ def _apply_canonical_values(
         raw_filters["predicate"] = rewrite(predicate)
     filters = AssetSearchFilters.model_validate(raw_filters)
     return query.model_copy(update={"filters": filters})
+
+
+def _semantic_class_exactly_resolved(
+    query: StructuredQuerySpec,
+    resolved: dict[str, dict[str, str]],
+) -> bool:
+    semantic_class = (query.semantic_class or "").strip().casefold()
+    if not semantic_class:
+        return False
+    fields = {
+        field.value
+        for field in query.class_selector_fields
+        if field.value in _CLASS_CATALOG_FIELDS
+    }
+    return any(semantic_class in resolved.get(field, {}) for field in fields)
+
+
+def _token_key(token: str) -> str:
+    value = token.casefold()
+    if len(value) > 4 and value.endswith("ies"):
+        return value[:-3] + "y"
+    if len(value) > 3 and value.endswith("s") and not value.endswith("ss"):
+        return value[:-1]
+    return value
+
+
+def _semantic_tokens(value: str) -> tuple[str, ...]:
+    return tuple(_token_key(token) for token in _TOKEN_RE.findall(value.casefold()))
+
+
+def _catalog_class_expansion(
+    query: StructuredQuerySpec,
+    catalog: dict[str, Any],
+) -> tuple[tuple[str, str], ...]:
+    if not catalog.get("available") or not query.semantic_class:
+        return ()
+    raw_fields = catalog.get("fields")
+    if not isinstance(raw_fields, dict):
+        return ()
+
+    selector_fields = tuple(
+        field.value
+        for field in query.class_selector_fields
+        if field.value in _CLASS_CATALOG_FIELDS
+    )
+    if not selector_fields:
+        return ()
+
+    concept_tokens = tuple(
+        token
+        for token in _semantic_tokens(query.semantic_class)
+        if token not in {_token_key(item) for item in _CLASS_NOISE_TOKENS}
+    )
+    if not concept_tokens:
+        return ()
+    concept = set(concept_tokens)
+
+    pairs: list[tuple[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for field in selector_fields:
+        candidates = raw_fields.get(field, ())
+        if not isinstance(candidates, (list, tuple)):
+            continue
+        for candidate in candidates:
+            canonical = str(candidate).strip()
+            if not canonical:
+                continue
+            tokens = _semantic_tokens(canonical)
+            token_set = set(tokens)
+            initials = "".join(token[0] for token in tokens if token)
+            matches_concept = concept.issubset(token_set)
+            matches_initialism = len(concept_tokens) == 1 and concept_tokens[0] == initials
+            if not (matches_concept or matches_initialism):
+                continue
+            key = (field, canonical.casefold())
+            if key in seen:
+                continue
+            seen.add(key)
+            pairs.append((field, canonical))
+            if len(pairs) >= _MAX_CLASS_EXPANSION_LEAVES:
+                return tuple(pairs)
+    return tuple(pairs)
+
+
+def _class_leaf(field: str, value: str) -> AssetPredicate:
+    predicate_field = AssetPredicateField(field)
+    return AssetPredicate(
+        field=predicate_field,
+        operator=(
+            AssetPredicateOperator.MEMBER_EQ
+            if predicate_field is AssetPredicateField.ROLES
+            else AssetPredicateOperator.EQ
+        ),
+        value=value,
+    )
+
+
+def _class_only_predicate(
+    predicate: AssetPredicate,
+    semantic_class: str,
+    selector_fields: frozenset[str],
+) -> bool:
+    if predicate.all or predicate.any:
+        children = predicate.all or predicate.any
+        return bool(children) and all(
+            _class_only_predicate(child, semantic_class, selector_fields)
+            for child in children
+        )
+    if predicate.not_ is not None or predicate.field is None:
+        return False
+    if predicate.field.value not in selector_fields:
+        return False
+    values = predicate.values or (
+        (predicate.value,) if predicate.value is not None else ()
+    )
+    return bool(values) and all(
+        str(value).strip().casefold() == semantic_class
+        for value in values
+    )
+
+
+def _replace_class_predicate(
+    predicate: AssetPredicate,
+    semantic_class: str,
+    selector_fields: frozenset[str],
+    replacement: AssetPredicate,
+) -> AssetPredicate:
+    if _class_only_predicate(predicate, semantic_class, selector_fields):
+        return replacement
+    if predicate.all:
+        return AssetPredicate(all=tuple(
+            _replace_class_predicate(child, semantic_class, selector_fields, replacement)
+            for child in predicate.all
+        ))
+    if predicate.any:
+        return AssetPredicate(any=tuple(
+            _replace_class_predicate(child, semantic_class, selector_fields, replacement)
+            for child in predicate.any
+        ))
+    if predicate.not_ is not None:
+        return AssetPredicate.model_validate({
+            "not": _replace_class_predicate(
+                predicate.not_, semantic_class, selector_fields, replacement
+            )
+        })
+    return predicate
+
+
+def _apply_class_expansion(
+    query: StructuredQuerySpec,
+    pairs: tuple[tuple[str, str], ...],
+) -> StructuredQuerySpec:
+    semantic_class = (query.semantic_class or "").strip().casefold()
+    selector_fields = frozenset(
+        field.value
+        for field in query.class_selector_fields
+        if field.value in _CLASS_CATALOG_FIELDS
+    )
+    leaves = tuple(_class_leaf(field, value) for field, value in pairs)
+    if not leaves or not semantic_class or not selector_fields:
+        return query
+    replacement = leaves[0] if len(leaves) == 1 else AssetPredicate(any=leaves)
+
+    raw_filters = query.filters.model_dump(mode="python", by_alias=True)
+    for field in selector_fields:
+        value = raw_filters.get(field)
+        if isinstance(value, str) and value.strip().casefold() == semantic_class:
+            raw_filters[field] = None
+
+    predicate = query.filters.predicate
+    if predicate is None:
+        predicate = replacement
+    else:
+        predicate = _replace_class_predicate(
+            predicate,
+            semantic_class,
+            selector_fields,
+            replacement,
+        )
+    raw_filters["predicate"] = predicate.model_dump(mode="python", by_alias=True)
+    filters = AssetSearchFilters.model_validate(raw_filters)
+    return query.model_copy(
+        update={
+            "filters": filters,
+            "class_mapping_mode": "generic_asset_class_catalog_expansion",
+        }
+    )
