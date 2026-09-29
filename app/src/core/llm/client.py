@@ -110,9 +110,17 @@ class LLMClient:
         resolved_timeout = defaults.read_timeout_seconds if timeout_seconds is None else max(1, int(timeout_seconds))
 
         configured_retries = max(0, int(self.settings.llm_max_transient_retries))
-        requested_retries = configured_retries if transient_retries is None else max(0, int(transient_retries))
-        max_retries = 0 if purpose in STRUCTURED_PURPOSES else min(1, requested_retries)
+        requested_retries = (
+            configured_retries
+            if transient_retries is None
+            else max(0, int(transient_retries))
+        )
 
+        # Allow bounded transient retries for every non-stream LLM role.
+        # Schema/authority failures are not retried here; only provider errors
+        # explicitly marked retryable reach the retry path.
+        max_retries = min(3, requested_retries)
+        
         for attempt in range(max_retries + 1):
             attempt_started = time.perf_counter()
             call_id = self._call_id(request_id, purpose, deployment.name, attempt)
