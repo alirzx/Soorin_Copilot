@@ -7,9 +7,11 @@ from typing import Any, Literal
 from urllib.parse import urlsplit
 
 
-LLMRoleName = Literal["router", "planner", "synthesizer"]
-LLMPurpose = Literal["intent_router", "intent_router_repair", "planner", "planner_repair", "chat"]
-VALID_LLM_ROLES: tuple[LLMRoleName, ...] = ("router", "planner", "synthesizer")
+LLMRoleName = Literal["router", "planner", "investigator", "synthesizer"]
+LLMPurpose = Literal[
+    "intent_router", "intent_router_repair", "planner", "planner_repair", "investigator", "chat"
+]
+VALID_LLM_ROLES: tuple[LLMRoleName, ...] = ("router", "planner", "investigator", "synthesizer")
 SUPPORTED_LLM_PROVIDER_TYPES = frozenset(
     {"arvan", "vllm", "ollama", "openai_compatible"}
 )
@@ -73,7 +75,7 @@ class LLMRoleConfig:
         """Resolve role limits while preserving the router/planner repair behavior."""
         if purpose in {"intent_router_repair", "planner_repair"}:
             requested_max_tokens = self.retry_max_tokens
-        elif purpose in {"intent_router", "planner", "chat"}:
+        elif purpose in {"intent_router", "planner", "investigator", "chat"}:
             requested_max_tokens = self.role_max_tokens
         else:
             raise ValueError(f"Unsupported LLM request purpose: {purpose}")

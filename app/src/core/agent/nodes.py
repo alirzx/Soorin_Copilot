@@ -8,7 +8,22 @@ import time
 from dataclasses import replace
 from typing import Any
 
-from src.core.agent.contracts import InvestigationState
+from src.core.agent.action_validator import AgentActionValidationError, AgentActionValidator
+from src.core.agent.agent_loop import (
+    build_observation,
+    evaluate_progress,
+    initialize_ledger,
+    update_ledger,
+)
+from src.core.agent.contracts import (
+    AgentClarifyDecision,
+    AgentContinueDecision,
+    AgentFinishDecision,
+    AgentLoopBudget,
+    AgentLoopState,
+    AgentObservation,
+    InvestigationState,
+)
 from src.core.agent.events import WorkflowEventContext, WorkflowEventLogger
 from src.core.agent.evidence_policy import (
     EvidenceRequirementPolicy,
@@ -22,6 +37,11 @@ from src.core.agent.evidence_policy import (
 from src.core.agent.evidence import apply_context_inclusion, context_package_from_evidence
 from src.core.agent.plan_validator import PlanValidationError
 from src.core.agent.planner import PlannerError
+from src.core.agent.investigator import InvestigatorError
+from src.core.agent.investigator_context import (
+    InvestigatorContextBuilder,
+    InvestigatorContextError,
+)
 from src.core.agent.task_mapping import (
     compile_direct_plan,
     compile_supplemental_plan,
@@ -34,6 +54,7 @@ from src.core.agent.task_mapping import (
     is_broad_conversation_recall,
     materialize_turn_policy_target,
     task_spec_from_route,
+    select_orchestration_mode,
 )
 from src.core.agent.specialists import AssetInvestigationSpecialist, GraphAnalysisSpecialist
 from src.core.agent.structured_continuity import structured_query_context_from_state
@@ -635,21 +656,656 @@ class CopilotWorkflowNodes:
             and bool((state.get("request_constraints") or derive_request_constraints(state["message"])).allow_live)
             and self.settings.planner_enabled
         )
+        orchestration_mode = select_orchestration_mode(
+            task,
+            constraints=constraints,
+            adaptive_enabled=self.settings.adaptive_agent_enabled,
+            planner_selected=planner_selected,
+        )
+        task = replace(task, orchestration_mode=orchestration_mode)
+        planner_selected = planner_selected and orchestration_mode == "fixed"
         requirements = self.evidence_requirement_policy.derive(task)
         selection = state.get("long_term_memory_selection")
         memories = tuple(getattr(selection, "memories", ()) or ())
         decisions = self.memory_sufficiency_gate.evaluate(requirements, memories)
         gap_plan = build_gap_plan(requirements, decisions)
         log_gap_plan(state["request_id"], gap_plan)
+        WorkflowEventLogger(
+            logger,
+            WorkflowEventContext(
+                state.get("request_id", ""),
+                state.get("trace_id", ""),
+                state.get("session_id", ""),
+            ),
+        ).emit(
+            "orchestration_mode_selected",
+            orchestration_mode=orchestration_mode,
+            status="selected",
+            planner_called=planner_selected,
+        )
         return {
             "task": task,
             "workflow_mode": task.workflow_mode,
+            "orchestration_mode": orchestration_mode,
             "planner_called": planner_selected,
             "memory_context_key": self._authorized_memory_context_key(state, task),
             "evidence_requirements": requirements,
             "evidence_gap_plan": gap_plan,
             "memory_tool_results": [],
-            "next_edge": "planner" if planner_selected else "direct",
+            "next_edge": (
+                "adaptive" if orchestration_mode == "adaptive"
+                else "planner" if planner_selected
+                else "direct"
+            ),
+        }
+
+    def initialize_agent_loop(self, state: InvestigationState) -> dict[str, Any]:
+        """Initialize request-local adaptive state after memory and routing authority."""
+        route = state.get("routing_result")
+        router_calls = (
+            1 + int(getattr(route, "semantic_router_retry_count", 0) or 0)
+            if bool(getattr(route, "semantic_router_called", False))
+            else 0
+        )
+        gap_plan = state.get("evidence_gap_plan")
+        memory_results: list[Any] = []
+        if gap_plan is not None:
+            try:
+                _unused_plan, gap_plan, memory_results = apply_gap_plan(
+                    compile_direct_plan(state["task"]),
+                    gap_plan,
+                )
+            except ValueError:
+                memory_results = []
+        ledger = initialize_ledger(state["task"], gap_plan)
+        if memory_results:
+            ledger = update_ledger(
+                ledger,
+                state["task"],
+                tuple(memory_results),
+            )
+        budget = AgentLoopBudget(
+            max_investigator_turns=self.settings.agent_max_investigator_turns,
+            max_llm_calls=self.settings.agent_max_llm_calls,
+            max_capabilities_per_decision=2,
+            max_total_capability_calls=self.settings.agent_max_total_capability_calls,
+            max_deepened_entities=self.settings.agent_max_deepened_entities,
+            max_graph_depth=self.settings.agent_max_graph_depth,
+            max_technical_failures=self.settings.agent_max_technical_failures,
+            deadline_monotonic=time.monotonic() + self.settings.agent_request_timeout_seconds,
+            llm_calls=router_calls,
+        )
+        loop = AgentLoopState(
+            turn=0,
+            budget=budget,
+            ledger=ledger,
+            started_monotonic=time.monotonic(),
+        )
+        self._agent_events(state).emit(
+            "agent_loop_initialized",
+            orchestration_mode="adaptive",
+            agent_turn=0,
+            gap_count=len(ledger.gaps),
+            llm_call_count=router_calls,
+            remaining_turns=budget.remaining_turns,
+            remaining_tool_calls=budget.remaining_capability_calls,
+            status="started",
+        )
+        get_metrics().agent_loops.labels("started").inc() if get_metrics().enabled else None
+        return {
+            "agent_loop_state": loop,
+            "agent_loop_started_at": loop.started_monotonic,
+            "memory_tool_results": memory_results,
+            "tool_results": memory_results,
+            "capability_results": memory_results,
+            "evidence_gap_plan": gap_plan,
+            "next_edge": "evaluate",
+        }
+
+    def evaluate_agent_progress(self, state: InvestigationState) -> dict[str, Any]:
+        loop = state["agent_loop_state"]
+        stop_reason = evaluate_progress(
+            loop.ledger,
+            loop.budget,
+            consecutive_no_progress=loop.consecutive_no_progress,
+        )
+        if stop_reason is None:
+            self._agent_events(state).emit(
+                "agent_progress_evaluated",
+                agent_turn=loop.turn,
+                gap_count=sum(item.status == "open" for item in loop.ledger.gaps),
+                remaining_turns=loop.budget.remaining_turns,
+                remaining_tool_calls=loop.budget.remaining_capability_calls,
+                material_progress=(loop.observations[-1].material_progress if loop.observations else False),
+                status="continue",
+            )
+            return {"next_edge": "decide"}
+        return self._finish_agent_loop(state, loop, stop_reason)
+
+    def investigator_decide(self, state: InvestigationState) -> dict[str, Any]:
+        loop = state["agent_loop_state"]
+        turn = loop.budget.investigator_turns + 1
+        events = self._agent_events(state)
+        events.emit(
+            "agent_decision_requested",
+            agent_turn=turn,
+            gap_count=sum(item.status == "open" for item in loop.ledger.gaps),
+            llm_call_count=loop.budget.llm_calls,
+            remaining_turns=loop.budget.remaining_turns,
+            remaining_tool_calls=loop.budget.remaining_capability_calls,
+            status="requested",
+        )
+        registry, _validator, _executor = self.service._capability_runtime_snapshot()
+        try:
+            context = InvestigatorContextBuilder(self.settings, registry).build(
+                task=state["task"],
+                constraints=state["request_constraints"],
+                envelope=state["task_envelope"],
+                ledger=loop.ledger,
+                latest_observation=loop.observations[-1] if loop.observations else None,
+                budget=loop.budget,
+                long_term_selection=state.get("long_term_memory_selection"),
+                turn=turn,
+                system_prompt=getattr(self.service.investigator, "system_prompt", ""),
+            )
+        except InvestigatorContextError:
+            return self._finish_agent_loop(state, loop, "context_budget_exhausted", budget_type="context")
+        get_metrics().observe_investigator_context(
+            context.input_tokens_before,
+            context.input_tokens_after,
+        )
+        events.emit(
+            "agent_context_budget_checked",
+            agent_turn=turn,
+            raw_estimate=context.raw_estimate,
+            calibrated_estimate=context.calibrated_estimate,
+            output_reservation=context.output_reservation,
+            input_tokens_before=context.input_tokens_before,
+            input_tokens_after=context.input_tokens_after,
+            compacted_tokens=context.compacted_tokens,
+            reference_count=context.evidence_reference_count,
+            delta_count=context.delta_count,
+            capability_schema_count=context.capability_schema_count,
+            remaining_hard_budget=context.remaining_hard_budget,
+            remaining_turns=loop.budget.remaining_turns,
+            status="ok",
+        )
+        if context.compacted:
+            events.emit(
+                "agent_context_compacted",
+                agent_turn=turn,
+                input_tokens_before=context.input_tokens_before,
+                input_tokens_after=context.input_tokens_after,
+                compacted_tokens=context.compacted_tokens,
+                reference_count=context.evidence_reference_count,
+                status="compacted",
+            )
+        consumed = replace(
+            loop.budget,
+            investigator_turns=turn,
+            llm_calls=loop.budget.llm_calls + 1,
+        )
+        contextual_loop = replace(
+            loop,
+            latest_context_tokens_before=context.input_tokens_before,
+            latest_context_tokens_after=context.input_tokens_after,
+        )
+        try:
+            if self.service.investigator is None:
+                raise InvestigatorError("investigator_unavailable", "Investigator role is unavailable.")
+            decision = self.service.investigator.decide(
+                context.context_json,
+                request_id=state["request_id"],
+                trace_id=state["trace_id"],
+            )
+        except InvestigatorError as exc:
+            failed_budget = replace(
+                consumed,
+                technical_failures=consumed.technical_failures + 1,
+            )
+            failed_loop = replace(contextual_loop, turn=turn, budget=failed_budget)
+            events.emit(
+                "agent_decision_invalid",
+                level=logging.WARNING,
+                agent_turn=turn,
+                status="invalid",
+                error_type=exc.code,
+                llm_call_count=failed_budget.llm_calls,
+            )
+            return {
+                "agent_loop_state": failed_loop,
+                "agent_decision_status": "invalid",
+                "next_edge": "retry",
+            }
+        updated = replace(contextual_loop, turn=turn, budget=consumed, latest_decision=decision)
+        events.emit(
+            "agent_decision_received",
+            agent_turn=turn,
+            decision_kind=decision.kind,
+            capability_count=len(decision.capability_requests) if isinstance(decision, AgentContinueDecision) else 0,
+            llm_call_count=consumed.llm_calls,
+            status="received",
+        )
+        return {
+            "agent_loop_state": updated,
+            "agent_decision": decision,
+            "agent_decision_status": "valid",
+            "next_edge": "validate",
+        }
+
+    def validate_agent_action(self, state: InvestigationState) -> dict[str, Any]:
+        loop = state["agent_loop_state"]
+        decision = state["agent_decision"]
+        events = self._agent_events(state)
+        if isinstance(decision, AgentClarifyDecision):
+            events.emit(
+                "agent_loop_finished",
+                agent_turn=loop.turn,
+                decision_kind=decision.kind,
+                stop_reason="clarification_required",
+                status="clarification_required",
+            )
+            return {
+                **self._clarification(decision.clarification_summary, decision.clarification_code),
+                "agent_loop_state": replace(loop, stop_reason="clarification_required"),
+                "agent_action_edge": "clarify",
+            }
+        if isinstance(decision, AgentFinishDecision):
+            open_required = tuple(
+                item for item in loop.ledger.gaps
+                if item.importance == "required" and item.status == "open"
+            )
+            deterministic_stop = evaluate_progress(
+                loop.ledger,
+                loop.budget,
+                consecutive_no_progress=loop.consecutive_no_progress,
+            )
+            if open_required and deterministic_stop is None:
+                failed = replace(
+                    loop,
+                    budget=replace(
+                        loop.budget,
+                        technical_failures=loop.budget.technical_failures + 1,
+                    ),
+                )
+                events.emit(
+                    "agent_action_rejected",
+                    level=logging.WARNING,
+                    agent_turn=loop.turn,
+                    decision_kind=decision.kind,
+                    status="rejected",
+                    reason="finish_with_obtainable_required_gap",
+                )
+                get_metrics().observe_agent_action("rejected")
+                return {"agent_loop_state": failed, "agent_action_edge": "retry", "next_edge": "retry"}
+            reason = deterministic_stop or decision.stop_reason
+            return self._finish_agent_loop(state, loop, reason)
+        if not isinstance(decision, AgentContinueDecision):
+            return self._reject_agent_action(state, loop, "investigator_decision_type_invalid")
+
+        registry, validator, _executor = self.service._capability_runtime_snapshot()
+        get_metrics().observe_agent_action("selected")
+        try:
+            validated = AgentActionValidator(registry, validator).validate(
+                decision,
+                task=state["task"],
+                constraints=state["request_constraints"],
+                ledger=loop.ledger,
+                budget=loop.budget,
+                turn=loop.turn,
+            )
+        except AgentActionValidationError as exc:
+            if exc.code == "repeated_action":
+                return self._finish_agent_loop(state, loop, "repeated_action")
+            if exc.code in {
+                "equivalent_evidence_already_available",
+                "repeated_failed_action",
+            }:
+                capability = (
+                    decision.capability_requests[0].capability
+                    if decision.capability_requests
+                    else ""
+                )
+                self._agent_events(state).emit(
+                    "agent_evidence_equivalent",
+                    agent_turn=loop.turn,
+                    capability=capability,
+                    status="equivalent",
+                    reason=exc.code,
+                    material_progress=False,
+                )
+                self._agent_events(state).emit(
+                    "agent_action_equivalent_blocked",
+                    level=logging.INFO,
+                    agent_turn=loop.turn,
+                    capability=capability,
+                    status="skipped",
+                    reason=exc.code,
+                    material_progress=False,
+                )
+                get_metrics().observe_agent_equivalent_action(exc.code)
+                if exc.code == "equivalent_evidence_already_available":
+                    return self._reuse_equivalent_agent_evidence(
+                        state,
+                        loop,
+                        reference_id=exc.evidence_reference_id,
+                        gap_id=exc.evidence_gap_id,
+                        reason=exc.code,
+                    )
+                return self._reject_agent_action(state, loop, exc.code)
+            if exc.code == "tool_budget_exhausted":
+                return self._finish_agent_loop(state, loop, "tool_budget_exhausted", budget_type="tool")
+            return self._reject_agent_action(state, loop, exc.code)
+        events.emit(
+            "agent_action_validated",
+            agent_turn=loop.turn,
+            decision_kind=decision.kind,
+            capability_count=len(validated.plan.steps),
+            status="validated",
+        )
+        get_metrics().observe_agent_action("validated")
+        return {
+            "agent_action_plan": validated.plan,
+            "agent_action_fingerprints": validated.fingerprints,
+            "agent_action_edge": "execute",
+            "next_edge": "execute",
+        }
+
+    def execute_agent_action(self, state: InvestigationState) -> dict[str, Any]:
+        loop = state["agent_loop_state"]
+        plan = state["agent_action_plan"]
+        _registry, _validator, executor = self.service._capability_runtime_snapshot()
+        results = executor.execute(
+            plan,
+            base_payload={
+                "request_id": state["request_id"],
+                "session_id": state["session_id"],
+                "route": state["routing_result"],
+            },
+        )
+        candidates = set(loop.ledger.structured_candidates)
+        deepened = tuple(
+            entity for entity in plan.target_entities
+            if entity in candidates and entity not in loop.budget.deepened_entities
+        )
+        budget = replace(
+            loop.budget,
+            capability_calls=loop.budget.capability_calls + len(plan.steps),
+            deepened_entities=tuple(dict.fromkeys((*loop.budget.deepened_entities, *deepened))),
+        )
+        updated_loop = replace(loop, budget=budget)
+        existing = list(state.get("tool_results") or ())
+        self._agent_events(state).emit(
+            "agent_tool_observation",
+            agent_turn=loop.turn,
+            capability_count=len(plan.steps),
+            tool_call_count=budget.capability_calls,
+            status="observed",
+        )
+        get_metrics().observe_agent_action("executed")
+        return {
+            "agent_loop_state": updated_loop,
+            "agent_action_results": results,
+            "tool_results": [*existing, *results],
+            "capability_results": [*existing, *results],
+            "execution_plan": plan,
+            "iteration_count": int(state.get("iteration_count", 0)) + 1,
+            "next_edge": "observe",
+        }
+
+    def build_agent_observation(self, state: InvestigationState) -> dict[str, Any]:
+        loop = state["agent_loop_state"]
+        results = tuple(state.get("agent_action_results") or ())
+        current = update_ledger(
+            loop.ledger,
+            state["task"],
+            results,
+            action_fingerprints=state.get("agent_action_fingerprints") or (),
+            action_steps=tuple(state["agent_action_plan"].steps),
+        )
+        decision = state.get("agent_decision")
+        requests = decision.capability_requests if isinstance(decision, AgentContinueDecision) else ()
+        observation = build_observation(
+            turn=loop.turn,
+            requests=requests,
+            results=results,
+            previous=loop.ledger,
+            current=current,
+            context_input_tokens_before=loop.latest_context_tokens_before,
+            context_input_tokens_after=loop.latest_context_tokens_after,
+        )
+        created_count = len(observation.new_evidence_references)
+        changed_count = len(observation.changed_evidence_references)
+        get_metrics().observe_agent_evidence_references(created_count, changed_count)
+        get_metrics().observe_agent_material_progress(observation.material_progress)
+        if created_count or changed_count:
+            self._agent_events(state).emit(
+                "agent_evidence_reference_created",
+                agent_turn=loop.turn,
+                reference_count=observation.evidence_reference_count,
+                new_reference_count=created_count,
+                changed_reference_count=changed_count,
+                status="updated",
+            )
+        if not observation.material_progress:
+            self._agent_events(state).emit(
+                "agent_no_material_progress",
+                agent_turn=loop.turn,
+                capability_count=len(requests),
+                reference_count=observation.evidence_reference_count,
+                material_progress=False,
+                status="no_progress",
+            )
+        self._agent_events(state).emit(
+            "agent_observation_delta_built",
+            agent_turn=loop.turn,
+            capability_count=len(requests),
+            gap_count=len(observation.remaining_gap_ids),
+            new_reference_count=created_count,
+            changed_reference_count=changed_count,
+            resolved_gap_count=len(observation.new_coverage),
+            remaining_gap_count=len(observation.remaining_gap_ids),
+            material_progress=observation.material_progress,
+            status="built",
+        )
+        return {
+            "agent_pending_ledger": current,
+            "agent_pending_observation": observation,
+            "next_edge": "update",
+        }
+
+    def update_agent_ledger(self, state: InvestigationState) -> dict[str, Any]:
+        loop = state["agent_loop_state"]
+        observation = state["agent_pending_observation"]
+        updated = replace(
+            loop,
+            ledger=state["agent_pending_ledger"],
+            observations=(*loop.observations, observation)[-8:],
+            consecutive_no_progress=(
+                0 if observation.material_progress else loop.consecutive_no_progress + 1
+            ),
+        )
+        self._agent_events(state).emit(
+            "agent_ledger_updated",
+            agent_turn=loop.turn,
+            reference_count=len(updated.ledger.evidence_references),
+            remaining_gap_count=sum(item.status == "open" for item in updated.ledger.gaps),
+            material_progress=observation.material_progress,
+            status="updated",
+        )
+        return {"agent_loop_state": updated, "next_edge": "evaluate"}
+
+    @staticmethod
+    def _agent_events(state: InvestigationState) -> WorkflowEventLogger:
+        return WorkflowEventLogger(
+            logger,
+            WorkflowEventContext(state["request_id"], state["trace_id"], state["session_id"]),
+        )
+
+    def _reject_agent_action(
+        self,
+        state: InvestigationState,
+        loop: AgentLoopState,
+        reason: str,
+    ) -> dict[str, Any]:
+        budget = replace(
+            loop.budget,
+            technical_failures=loop.budget.technical_failures + 1,
+        )
+        decision = loop.latest_decision
+        requests = decision.capability_requests if isinstance(decision, AgentContinueDecision) else ()
+        observation = AgentObservation(
+            turn=loop.turn,
+            capability_requests=requests,
+            result_references=(),
+            status_summary=(),
+            new_coverage=(),
+            new_contradictions=(),
+            remaining_gap_ids=tuple(item.gap_id for item in loop.ledger.gaps if item.status == "open"),
+            material_progress=False,
+            tool_call_count=0,
+            rejected_actions=(reason,),
+            budget_delta=(("technical_failures", 1),),
+            evidence_reference_count=len(loop.ledger.evidence_references),
+            context_input_tokens_before=loop.latest_context_tokens_before,
+            context_input_tokens_after=loop.latest_context_tokens_after,
+        )
+        updated = replace(
+            loop,
+            budget=budget,
+            observations=(*loop.observations, observation)[-8:],
+            consecutive_no_progress=loop.consecutive_no_progress + 1,
+        )
+        self._agent_events(state).emit(
+            "agent_action_rejected",
+            level=logging.WARNING,
+            agent_turn=loop.turn,
+            status="rejected",
+            reason=reason,
+        )
+        get_metrics().observe_agent_action("rejected")
+        return {"agent_loop_state": updated, "agent_action_edge": "retry", "next_edge": "retry"}
+
+    def _reuse_equivalent_agent_evidence(
+        self,
+        state: InvestigationState,
+        loop: AgentLoopState,
+        *,
+        reference_id: str,
+        gap_id: str,
+        reason: str,
+    ) -> dict[str, Any]:
+        """Close only the proven compatible gap without mutating its ToolResult."""
+        reference_exists = any(
+            item.reference_id == reference_id
+            for item in loop.ledger.evidence_references
+        )
+        gap_is_open = any(
+            item.gap_id == gap_id and item.status == "open"
+            for item in loop.ledger.gaps
+        )
+        if not reference_exists or not gap_is_open:
+            return self._reject_agent_action(
+                state,
+                loop,
+                "equivalent_evidence_reference_invalid",
+            )
+        references = tuple(
+            replace(
+                item,
+                covered_gap_ids=tuple(dict.fromkeys((*item.covered_gap_ids, gap_id))),
+            )
+            if item.reference_id == reference_id
+            else item
+            for item in loop.ledger.evidence_references
+        )
+        gaps = tuple(
+            replace(item, status="satisfied")
+            if item.gap_id == gap_id and item.status == "open"
+            else item
+            for item in loop.ledger.gaps
+        )
+        ledger = replace(loop.ledger, gaps=gaps, evidence_references=references)
+        decision = loop.latest_decision
+        requests = decision.capability_requests if isinstance(decision, AgentContinueDecision) else ()
+        observation = AgentObservation(
+            turn=loop.turn,
+            capability_requests=requests,
+            result_references=(reference_id,) if reference_id else (),
+            status_summary=(),
+            new_coverage=(gap_id,),
+            new_contradictions=(),
+            remaining_gap_ids=tuple(item.gap_id for item in gaps if item.status == "open"),
+            material_progress=True,
+            tool_call_count=0,
+            rejected_actions=(reason,),
+            evidence_reference_count=len(references),
+            context_input_tokens_before=loop.latest_context_tokens_before,
+            context_input_tokens_after=loop.latest_context_tokens_after,
+        )
+        updated = replace(
+            loop,
+            ledger=ledger,
+            observations=(*loop.observations, observation)[-8:],
+            consecutive_no_progress=0,
+        )
+        get_metrics().observe_agent_material_progress(True)
+        self._agent_events(state).emit(
+            "agent_observation_delta_built",
+            agent_turn=loop.turn,
+            capability_count=len(requests),
+            gap_count=len(observation.remaining_gap_ids),
+            resolved_gap_count=len(observation.new_coverage),
+            remaining_gap_count=len(observation.remaining_gap_ids),
+            material_progress=True,
+            reason=reason,
+            status="reused",
+        )
+        self._agent_events(state).emit(
+            "agent_ledger_updated",
+            agent_turn=loop.turn,
+            reference_count=len(references),
+            remaining_gap_count=len(observation.remaining_gap_ids),
+            material_progress=True,
+            status="updated",
+        )
+        return {"agent_loop_state": updated, "agent_action_edge": "retry", "next_edge": "retry"}
+
+    def _finish_agent_loop(
+        self,
+        state: InvestigationState,
+        loop: AgentLoopState,
+        stop_reason: Any,
+        *,
+        budget_type: str = "",
+    ) -> dict[str, Any]:
+        updated = replace(loop, stop_reason=stop_reason)
+        if budget_type:
+            get_metrics().observe_agent_budget_exhaustion(budget_type)
+        status = "completed" if stop_reason in {"evidence_sufficient", "goal_satisfied"} else "limited"
+        get_metrics().observe_agent_loop(
+            status=status,
+            turns=loop.budget.investigator_turns,
+            duration_seconds=max(0.0, time.monotonic() - loop.started_monotonic),
+            stop_reason=stop_reason,
+        )
+        self._agent_events(state).emit(
+            "agent_loop_finished",
+            orchestration_mode="adaptive",
+            agent_turn=loop.turn,
+            stop_reason=stop_reason,
+            llm_call_count=loop.budget.llm_calls,
+            tool_call_count=loop.budget.capability_calls,
+            status=status,
+        )
+        limitations = list(state.get("limitation_reasons") or ())
+        if status == "limited" and stop_reason not in limitations:
+            limitations.append(str(stop_reason))
+        return {
+            "agent_loop_state": updated,
+            "agent_action_edge": "finish",
+            "limitation_reasons": limitations,
+            "next_edge": "finish",
         }
 
     @staticmethod
@@ -1029,6 +1685,9 @@ class CopilotWorkflowNodes:
 
     def review_retrieval(self, state: InvestigationState) -> dict[str, Any]:
         allow = (
+            state.get("orchestration_mode") != "adaptive"
+            and getattr(state.get("task"), "orchestration_mode", "direct") != "adaptive"
+            and
             bool((state.get("request_constraints") or derive_request_constraints(state["message"])).allow_live)
             and
             self.settings.agent_max_supplemental_retrievals > 0
@@ -1038,6 +1697,14 @@ class CopilotWorkflowNodes:
             state["task"],
             state.get("tool_results") or [],
             allow_supplemental=allow,
+        )
+        get_metrics().observe_evidence_review(
+            str(
+                state.get("orchestration_mode")
+                or getattr(state.get("task"), "orchestration_mode", "unknown")
+                or "unknown"
+            ),
+            decision.outcome,
         )
         pack = self.service.evidence_reviewer.with_review(state["evidence_pack"], decision)
         logger.info(
@@ -1164,6 +1831,7 @@ class CopilotWorkflowNodes:
             request_constraints=state.get("request_constraints"),
             accepted_working_fact_count=len(state.get("pending_working_facts") or ()),
             post_search_enrichment=state.get("post_search_enrichment_summary"),
+            agent_loop_state=state.get("agent_loop_state"),
             **continuity_arguments,
         )
         preliminary_prompt = self.synthesizer_prompt_builder.render_messages(
@@ -1249,7 +1917,7 @@ class CopilotWorkflowNodes:
         pack = self.service.evidence_reviewer.build_pack(
             task,
             results,
-            plan=state["execution_plan"],
+            plan=state.get("execution_plan"),
             request_id=state["request_id"],
             trace_id=state["trace_id"],
             review=state["review_decision"],
@@ -1271,6 +1939,7 @@ class CopilotWorkflowNodes:
             baseline_status=self.context_composer.last_baseline_status,
             baseline_present=self.context_composer.last_baseline_present,
             baseline_compatible=self.context_composer.last_baseline_compatible,
+            agent_loop_state=state.get("agent_loop_state"),
             **continuity_arguments,
         )
         logger.info(

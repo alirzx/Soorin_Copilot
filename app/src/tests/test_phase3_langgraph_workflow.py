@@ -225,6 +225,55 @@ class ClarificationRuntime(FakeNodeRuntime):
         }
 
 
+class AdaptiveRuntime(FakeNodeRuntime):
+    def __init__(self) -> None:
+        super().__init__()
+        self.agent_turns = 0
+
+    def validate_task(self, state: InvestigationState) -> dict[str, Any]:
+        self._call("validate_task")
+        task = TaskSpec(
+            request=state["message"],
+            intent="asset_investigation",
+            scope="node_summary",
+            direction="both",
+            entities=("192.0.2.10",),
+            required_capabilities=("asset.get_profile", "asset.get_detection"),
+            workflow_mode="multi_step",
+            orchestration_mode="adaptive",
+        )
+        return {"task": task, "orchestration_mode": "adaptive", "planner_called": False}
+
+    def initialize_agent_loop(self, state: InvestigationState) -> dict[str, Any]:
+        self._call("initialize_agent_loop")
+        return {"adaptive_complete": False}
+
+    def evaluate_agent_progress(self, state: InvestigationState) -> dict[str, Any]:
+        self._call("evaluate_agent_progress")
+        return {"next_edge": "finish" if self.agent_turns >= 2 else "decide"}
+
+    def investigator_decide(self, state: InvestigationState) -> dict[str, Any]:
+        self._call("investigator_decide")
+        return {"next_edge": "validate"}
+
+    def validate_agent_action(self, state: InvestigationState) -> dict[str, Any]:
+        self._call("validate_agent_action")
+        return {"agent_action_edge": "execute"}
+
+    def execute_agent_action(self, state: InvestigationState) -> dict[str, Any]:
+        self._call("execute_agent_action")
+        self.agent_turns += 1
+        return {"agent_action_results": []}
+
+    def build_agent_observation(self, state: InvestigationState) -> dict[str, Any]:
+        self._call("build_agent_observation")
+        return {}
+
+    def update_agent_ledger(self, state: InvestigationState) -> dict[str, Any]:
+        self._call("update_agent_ledger")
+        return {}
+
+
 def run_workflow(workflow: BoundedCopilotWorkflow, runtime: FakeNodeRuntime, request_id: str = "r1") -> dict[str, Any]:
     return workflow.run(
         message="Investigate 192.0.2.10",
@@ -258,6 +307,22 @@ def test_direct_request_skips_planner_and_updates_memory_once() -> None:
     assert result["answer"] == "ok"
     assert "build_direct_plan" in runtime.calls
     assert "build_plan" not in runtime.calls
+    assert runtime.memory_writes == 1
+
+
+def test_adaptive_request_observes_two_actions_then_reuses_final_pipeline() -> None:
+    runtime = AdaptiveRuntime()
+    result = run_workflow(BoundedCopilotWorkflow(), runtime, "adaptive")
+    assert result["answer"] == "ok"
+    assert runtime.calls.count("investigator_decide") == 2
+    assert runtime.calls.count("validate_agent_action") == 2
+    assert runtime.calls.count("execute_agent_action") == 2
+    assert runtime.calls.count("build_agent_observation") == 2
+    assert runtime.calls.count("update_agent_ledger") == 2
+    assert "build_plan" not in runtime.calls
+    assert "build_direct_plan" not in runtime.calls
+    assert runtime.calls.index("resolve_entities") < runtime.calls.index("initialize_agent_loop")
+    assert runtime.calls.index("build_evidence") < runtime.calls.index("synthesize")
     assert runtime.memory_writes == 1
 
 

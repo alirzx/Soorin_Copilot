@@ -49,6 +49,11 @@ def test_metrics_registry_exposes_expected_prometheus_families() -> None:
     metrics.observe_memory_canonical_reload("product", "success")
     metrics.observe_memory_vector("search", "failure")
     metrics.observe_workflow_fallback("routing")
+    metrics.observe_investigator_context(3200, 2100)
+    metrics.observe_agent_equivalent_action("equivalent_evidence_already_available")
+    metrics.observe_agent_evidence_references(created=2, changed=1)
+    metrics.observe_agent_material_progress(True)
+    metrics.observe_evidence_review("adaptive", "sufficient")
     metrics.graph_enrichment_cycle_started("scheduled")
     metrics.observe_graph_enrichment_assets(
         "scheduled", attempted=2, succeeded=1, unavailable=1, updated=1
@@ -98,6 +103,13 @@ def test_metrics_registry_exposes_expected_prometheus_families() -> None:
         "soorin_memory_canonical_reload",
         "soorin_memory_vector_operations",
         "soorin_workflow_fallbacks",
+        "soorin_investigator_context_tokens",
+        "soorin_investigator_context_tokens_before_compaction",
+        "soorin_investigator_context_token_savings",
+        "soorin_agent_equivalent_actions_blocked",
+        "soorin_agent_evidence_references",
+        "soorin_agent_material_progress_turns",
+        "soorin_evidence_review_outcomes",
         "soorin_graph_enrichment_scheduler_cycles",
         "soorin_graph_enrichment_assets",
         "soorin_graph_enrichment_product_overview_requests",
@@ -141,6 +153,24 @@ def test_product_and_stream_label_values_are_bounded() -> None:
     )
     assert "192.0.2.1" not in rendered
     assert "request-123" not in rendered
+
+
+def test_adaptive_equivalence_and_progress_labels_are_bounded() -> None:
+    metrics = SoorinMetrics(registry=CollectorRegistry())
+    metrics.observe_agent_equivalent_action("192.0.2.1")
+    metrics.observe_agent_material_progress(False)
+    metrics.observe_agent_evidence_references(created=1, changed=1)
+    metrics.observe_evidence_review("request-123", "arbitrary-result")
+    rendered = metrics.render().decode("utf-8")
+    assert 'soorin_agent_equivalent_actions_blocked_total{reason="other"} 1.0' in rendered
+    assert 'soorin_agent_material_progress_turns_total{progress="no"} 1.0' in rendered
+    assert 'soorin_agent_evidence_references_total{change="created"} 1.0' in rendered
+    assert 'soorin_agent_evidence_references_total{change="changed"} 1.0' in rendered
+    assert (
+        'soorin_evidence_review_outcomes_total{mode="unknown",outcome="safe_failure"} 1.0'
+        in rendered
+    )
+    assert "192.0.2.1" not in rendered
 
 
 @pytest.mark.parametrize(

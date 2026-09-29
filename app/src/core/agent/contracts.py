@@ -37,8 +37,34 @@ TurnTarget = Literal[
 EpisodeTransition = Literal["keep", "switch", "detach"]
 ResponseDepth = Literal["brief", "standard", "deep", "report"]
 StepRequirement = Literal["required", "optional"]
-PlanSource = Literal["deterministic", "llm", "deterministic_fallback"]
+PlanSource = Literal["deterministic", "llm", "investigator", "deterministic_fallback"]
 PostSearchMode = Literal["set_enrichment", "focal_deepening"]
+OrchestrationMode = Literal["direct", "fixed", "adaptive"]
+AgentDecisionKind = Literal["CONTINUE", "FINISH", "CLARIFY"]
+StopReason = Literal[
+    "evidence_sufficient",
+    "goal_satisfied",
+    "answer_with_limitations",
+    "clarification_required",
+    "no_useful_action",
+    "repeated_action",
+    "budget_exhausted",
+    "tool_budget_exhausted",
+    "llm_budget_exhausted",
+    "technical_failure_ceiling",
+    "context_budget_exhausted",
+    "current_evidence_unavailable",
+]
+TemporalRequirement = Literal["current", "historical", "either"]
+AuthorityRequirement = Literal[
+    "product_current",
+    "graph_projection",
+    "knowledge_reference",
+    "memory_historical",
+    "authorized_source",
+]
+EvidenceGapStatus = Literal["open", "satisfied", "unavailable", "blocked"]
+EvidenceGapImportance = Literal["required", "optional"]
 WorkflowStatus = Literal[
     "running",
     "completed",
@@ -58,6 +84,171 @@ class EvidenceFact:
     entity: str | None = None
     fact_type: str = "observed"
     confidence: float | None = None
+
+
+@dataclass(frozen=True)
+class AgentLoopBudget:
+    """Request-level adaptive budget; LangGraph recursion is only a backstop."""
+
+    max_investigator_turns: int
+    max_llm_calls: int
+    max_capabilities_per_decision: int
+    max_total_capability_calls: int
+    max_deepened_entities: int
+    max_graph_depth: int
+    max_technical_failures: int
+    deadline_monotonic: float
+    investigator_turns: int = 0
+    llm_calls: int = 0
+    capability_calls: int = 0
+    technical_failures: int = 0
+    deepened_entities: tuple[str, ...] = ()
+
+    @property
+    def remaining_turns(self) -> int:
+        return max(0, self.max_investigator_turns - self.investigator_turns)
+
+    @property
+    def remaining_llm_calls(self) -> int:
+        return max(0, self.max_llm_calls - self.llm_calls)
+
+    @property
+    def remaining_capability_calls(self) -> int:
+        return max(0, self.max_total_capability_calls - self.capability_calls)
+
+
+@dataclass(frozen=True)
+class EvidenceGap:
+    """One bounded evidence need with explicit temporal and source authority."""
+
+    gap_id: str
+    dimension: str
+    importance: EvidenceGapImportance
+    status: EvidenceGapStatus
+    temporal_requirement: TemporalRequirement
+    authorized_capabilities: tuple[str, ...]
+    authority_requirement: AuthorityRequirement
+    entities: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class EvidenceReference:
+    """Bounded request-local index entry for immutable ToolResult evidence."""
+
+    reference_id: str
+    context_identity: str
+    source_capability: str
+    entities: tuple[str, ...]
+    evidence_classes: tuple[str, ...]
+    covered_gap_ids: tuple[str, ...]
+    status: ToolStatus
+    freshness: str
+    completeness: Completeness
+    authority_class: AuthorityRequirement
+    temporal_class: TemporalRequirement
+    projection_schema_version: str
+    semantic_fingerprint: str
+    canonical_action_fingerprint: str = ""
+    structured_query_identity: str = ""
+    semantic_query_identity: str = ""
+    active_graph_version: str = ""
+    selected_views: tuple[str, ...] = ()
+    detail: str = "standard"
+    purpose: str = ""
+    scope: str = "none"
+    direction: str = "none"
+    depth: int = 0
+    relationship_mode: str = "none"
+    query_term_hashes: tuple[str, ...] = ()
+    material_limitation_flags: tuple[str, ...] = ()
+    source_payload_complete: bool = False
+    projection_usable: bool = False
+    reusable: bool = False
+    material: bool = False
+
+
+@dataclass(frozen=True)
+class EvidenceLedger:
+    """Model-safe decision projection; raw provider payloads remain in ToolResult."""
+
+    authorized_entities: tuple[str, ...] = ()
+    structured_candidates: tuple[str, ...] = ()
+    attempted_capabilities: tuple[str, ...] = ()
+    capability_coverage: tuple[tuple[str, str], ...] = ()
+    important_facts: tuple[str, ...] = ()
+    contradictions: tuple[str, ...] = ()
+    gaps: tuple[EvidenceGap, ...] = ()
+    coverage_limitations: tuple[str, ...] = ()
+    failures: tuple[str, ...] = ()
+    action_fingerprints: tuple[str, ...] = ()
+    evidence_fingerprints: tuple[str, ...] = ()
+    evidence_references: tuple[EvidenceReference, ...] = ()
+
+
+@dataclass(frozen=True)
+class AgentCapabilityRequest:
+    capability: str
+    arguments: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class AgentObservation:
+    turn: int
+    capability_requests: tuple[AgentCapabilityRequest, ...]
+    result_references: tuple[str, ...]
+    status_summary: tuple[tuple[str, str], ...]
+    new_coverage: tuple[str, ...]
+    new_contradictions: tuple[str, ...]
+    remaining_gap_ids: tuple[str, ...]
+    material_progress: bool
+    tool_call_count: int
+    new_evidence_references: tuple[str, ...] = ()
+    changed_evidence_references: tuple[str, ...] = ()
+    resolved_contradictions: tuple[str, ...] = ()
+    rejected_actions: tuple[str, ...] = ()
+    budget_delta: tuple[tuple[str, int], ...] = ()
+    evidence_reference_count: int = 0
+    context_input_tokens_before: int = 0
+    context_input_tokens_after: int = 0
+
+
+@dataclass(frozen=True)
+class AgentContinueDecision:
+    kind: Literal["CONTINUE"]
+    evidence_gap_id: str
+    capability_requests: tuple[AgentCapabilityRequest, ...]
+    assessment_summary: str = ""
+
+
+@dataclass(frozen=True)
+class AgentFinishDecision:
+    kind: Literal["FINISH"]
+    stop_reason: StopReason
+    limitation_summary: str = ""
+
+
+@dataclass(frozen=True)
+class AgentClarifyDecision:
+    kind: Literal["CLARIFY"]
+    clarification_code: str
+    clarification_summary: str
+
+
+AgentDecision: TypeAlias = AgentContinueDecision | AgentFinishDecision | AgentClarifyDecision
+
+
+@dataclass(frozen=True)
+class AgentLoopState:
+    turn: int
+    budget: AgentLoopBudget
+    ledger: EvidenceLedger
+    observations: tuple[AgentObservation, ...] = ()
+    latest_decision: AgentDecision | None = None
+    stop_reason: StopReason | None = None
+    started_monotonic: float = 0.0
+    consecutive_no_progress: int = 0
+    latest_context_tokens_before: int = 0
+    latest_context_tokens_after: int = 0
 
 
 @dataclass(frozen=True)
@@ -284,6 +475,7 @@ class TaskSpec:
     structured_query: StructuredQuerySpec | None = None
     post_search_requirements: PostSearchRequirements | None = None
     workflow_mode: WorkflowMode = "direct"
+    orchestration_mode: OrchestrationMode = "direct"
     semantic_decision_source: str = "unknown"
     requires_multiple_entities: bool = False
     recommended_steps: int = 1
@@ -539,6 +731,17 @@ class InvestigationState(TypedDict, total=False):
     fallback_used: bool
     routing_fallback_used: bool
     workflow_mode: WorkflowMode
+    orchestration_mode: OrchestrationMode
+    agent_loop_state: AgentLoopState
+    agent_decision: AgentDecision
+    agent_action_plan: ExecutionPlan
+    agent_action_fingerprints: tuple[str, ...]
+    agent_action_results: list[ToolResult]
+    agent_pending_ledger: EvidenceLedger
+    agent_pending_observation: AgentObservation
+    agent_action_edge: str
+    agent_decision_status: str
+    agent_loop_started_at: float
     iteration_count: int
     errors: Annotated[list[str], operator.add]
     stages: Annotated[list[str], operator.add]

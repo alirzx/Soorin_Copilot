@@ -34,6 +34,13 @@ class WorkflowNodeRuntime(Protocol):
     def resolve_entities(self, state: InvestigationState) -> dict[str, Any]: ...
     def route(self, state: InvestigationState) -> dict[str, Any]: ...
     def validate_task(self, state: InvestigationState) -> dict[str, Any]: ...
+    def initialize_agent_loop(self, state: InvestigationState) -> dict[str, Any]: ...
+    def evaluate_agent_progress(self, state: InvestigationState) -> dict[str, Any]: ...
+    def investigator_decide(self, state: InvestigationState) -> dict[str, Any]: ...
+    def validate_agent_action(self, state: InvestigationState) -> dict[str, Any]: ...
+    def execute_agent_action(self, state: InvestigationState) -> dict[str, Any]: ...
+    def build_agent_observation(self, state: InvestigationState) -> dict[str, Any]: ...
+    def update_agent_ledger(self, state: InvestigationState) -> dict[str, Any]: ...
     def build_direct_plan(self, state: InvestigationState) -> dict[str, Any]: ...
     def build_plan(self, state: InvestigationState) -> dict[str, Any]: ...
     def validate_plan(self, state: InvestigationState) -> dict[str, Any]: ...
@@ -71,8 +78,24 @@ class _CompatibilityRuntime:
         return {}
 
     resolve_entities = _empty
-    route = _empty
-    validate_task = _empty
+    @staticmethod
+    def route(_state: InvestigationState) -> dict[str, Any]:
+        return {"routing_result": {}, "next_edge": "validate_task"}
+
+    @staticmethod
+    def validate_task(_state: InvestigationState) -> dict[str, Any]:
+        return {
+            "orchestration_mode": "direct",
+            "planner_called": False,
+            "next_edge": "direct",
+        }
+    initialize_agent_loop = _empty
+    evaluate_agent_progress = _empty
+    investigator_decide = _empty
+    validate_agent_action = _empty
+    execute_agent_action = _empty
+    build_agent_observation = _empty
+    update_agent_ledger = _empty
     build_direct_plan = _empty
     build_plan = _empty
     build_fallback_plan = _empty
@@ -119,11 +142,18 @@ class _CompatibilityRuntime:
 class BoundedCopilotWorkflow:
     """Compile the full request lifecycle as explicit bounded LangGraph nodes."""
 
-    recursion_limit = 32
+    recursion_limit = 64
     required_nodes = (
         "resolve_entities",
         "route",
         "validate_task",
+        "initialize_agent_loop",
+        "evaluate_agent_progress",
+        "investigator_decide",
+        "validate_agent_action",
+        "execute_agent_action",
+        "build_agent_observation",
+        "update_agent_ledger",
         "build_direct_plan",
         "build_plan",
         "validate_plan",
@@ -194,6 +224,12 @@ class BoundedCopilotWorkflow:
                 "validate_plan",
                 "build_evidence",
                 "review_retrieval",
+                "evaluate_agent_progress",
+                "investigator_decide",
+                "validate_agent_action",
+                "execute_agent_action",
+                "build_agent_observation",
+                "update_agent_ledger",
             }
             if name in set(state.get("completed_nodes") or ()) and not repeatable:
                 events.emit(
@@ -413,10 +449,35 @@ class BoundedCopilotWorkflow:
             {
                 "direct": "build_direct_plan",
                 "planner": "build_plan",
+                "adaptive": "initialize_agent_loop",
                 "clarification": "clarification",
                 "safe_failure": "safe_failure",
             },
         )
+        graph.add_edge("initialize_agent_loop", "evaluate_agent_progress")
+        graph.add_conditional_edges(
+            "evaluate_agent_progress",
+            self._after_agent_progress,
+            {"decide": "investigator_decide", "finish": "build_evidence"},
+        )
+        graph.add_conditional_edges(
+            "investigator_decide",
+            self._after_agent_decision,
+            {"validate": "validate_agent_action", "retry": "evaluate_agent_progress", "finish": "build_evidence"},
+        )
+        graph.add_conditional_edges(
+            "validate_agent_action",
+            self._after_agent_action,
+            {
+                "execute": "execute_agent_action",
+                "retry": "evaluate_agent_progress",
+                "finish": "build_evidence",
+                "clarify": "clarification",
+            },
+        )
+        graph.add_edge("execute_agent_action", "build_agent_observation")
+        graph.add_edge("build_agent_observation", "update_agent_ledger")
+        graph.add_edge("update_agent_ledger", "evaluate_agent_progress")
         graph.add_edge("build_direct_plan", "validate_plan")
         graph.add_edge("build_plan", "validate_plan")
         graph.add_conditional_edges(
@@ -509,7 +570,23 @@ class BoundedCopilotWorkflow:
         if state.get("workflow_status") in {"failed", "cancelled"}:
             return "safe_failure"
         task = state.get("task")
+        if task and task.orchestration_mode == "adaptive":
+            return "adaptive"
         return "planner" if task and task.workflow_mode == "multi_step" and state.get("planner_called") else "direct"
+
+    @staticmethod
+    def _after_agent_progress(state: InvestigationState) -> str:
+        return "finish" if state.get("next_edge") == "finish" else "decide"
+
+    @staticmethod
+    def _after_agent_decision(state: InvestigationState) -> str:
+        edge = str(state.get("next_edge") or "retry")
+        return edge if edge in {"validate", "retry", "finish"} else "retry"
+
+    @staticmethod
+    def _after_agent_action(state: InvestigationState) -> str:
+        edge = str(state.get("agent_action_edge") or state.get("next_edge") or "retry")
+        return edge if edge in {"execute", "retry", "finish", "clarify"} else "retry"
 
     @staticmethod
     def _after_plan_validation(state: InvestigationState) -> str:
@@ -639,7 +716,7 @@ class BoundedCopilotWorkflow:
                 clarification = final.get("clarification") or {}
                 get_metrics().observe_copilot(
                     "partial",
-                    str(getattr(final.get("task"), "workflow_mode", "unknown")),
+                    self._metric_workflow_mode(final),
                     time.perf_counter() - request_started,
                 )
                 return {
@@ -652,12 +729,12 @@ class BoundedCopilotWorkflow:
                 }
             get_metrics().observe_copilot(
                 "failed",
-                str(getattr(final.get("task"), "workflow_mode", "unknown")),
+                self._metric_workflow_mode(final),
                 time.perf_counter() - request_started,
             )
             raise RuntimeError("Workflow completed without a final response.")
         status = str(final.get("workflow_status") or "completed")
-        workflow_mode = str(getattr(final.get("task"), "workflow_mode", "unknown"))
+        workflow_mode = self._metric_workflow_mode(final)
         events.emit(
             "langgraph_workflow_completed" if status.startswith("completed") else "langgraph_workflow_partial",
             workflow_id=workflow_id,
@@ -686,6 +763,14 @@ class BoundedCopilotWorkflow:
         if final.get("fallback_used"):
             get_metrics().observe_workflow_fallback("plan")
         return response
+
+    @staticmethod
+    def _metric_workflow_mode(state: InvestigationState) -> str:
+        task = state.get("task")
+        orchestration_mode = getattr(task, "orchestration_mode", None)
+        if orchestration_mode:
+            return str(orchestration_mode)
+        return str(getattr(task, "workflow_mode", "unknown"))
 
     def _config(self, request_id: str) -> dict[str, Any]:
         return {"recursion_limit": self.recursion_limit}
@@ -721,6 +806,37 @@ class BoundedCopilotWorkflow:
         edge = self._after_task(current)
         if edge in {"clarification", "safe_failure"}:
             current.update(getattr(runtime, f"{edge}_response")(current) or {})
+            return current  # type: ignore[return-value]
+        if edge == "adaptive":
+            current.update(runtime.initialize_agent_loop(current) or {})
+            while True:
+                current.update(runtime.evaluate_agent_progress(current) or {})
+                if self._after_agent_progress(current) == "finish":
+                    break
+                current.update(runtime.investigator_decide(current) or {})
+                decision_edge = self._after_agent_decision(current)
+                if decision_edge == "finish":
+                    break
+                if decision_edge == "retry":
+                    continue
+                current.update(runtime.validate_agent_action(current) or {})
+                action_edge = self._after_agent_action(current)
+                if action_edge == "finish":
+                    break
+                if action_edge == "clarify":
+                    current.update(runtime.clarification_response(current) or {})
+                    return current  # type: ignore[return-value]
+                if action_edge == "retry":
+                    continue
+                current.update(runtime.execute_agent_action(current) or {})
+                current.update(runtime.build_agent_observation(current) or {})
+                current.update(runtime.update_agent_ledger(current) or {})
+            current.update(runtime.build_evidence(current) or {})
+            current.update(runtime.review_retrieval(current) or {})
+            for name in ("compose_context", "review_context", "synthesize"):
+                current.update(getattr(runtime, name)(current) or {})
+            if self._after_synthesis(current) == "memory":
+                current.update(runtime.update_memory(current) or {})
             return current  # type: ignore[return-value]
         current.update(getattr(runtime, "build_plan" if edge == "planner" else "build_direct_plan")(current) or {})
         current.update(runtime.validate_plan(current) or {})

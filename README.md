@@ -17,8 +17,12 @@ flowchart TD
     RT --> TV[Task Validation]
     TV --> DP[Deterministic Direct Plan]
     TV --> PL[Bounded Planner]
+    TV -. optional adaptive mode .-> INV[Bounded Investigator Loop]
     DP --> EX[Capability Executor]
     PL --> EX
+    INV --> AV[Action + Plan Validation]
+    AV --> EX
+    EX -. bounded observation .-> INV
 
     EX --> AS[Asset Profile / Detection]
     EX --> GR[Graph Capabilities]
@@ -55,11 +59,11 @@ Every request moves through a bounded investigation pipeline:
 1. Restore the authorized thread state, recent transcript context, working memory, episodic context, and eligible long-term memory.
 2. Resolve explicit entities, UI-selected context, active investigation state, and current request constraints.
 3. Route the request with the semantic Router into a typed intent and structured query when applicable.
-4. Validate the task deterministically and choose either a direct execution plan or one bounded Planner proposal.
+4. Validate the task deterministically and choose direct, fixed Planner, or feature-flagged bounded adaptive orchestration. Adaptive turns use stable evidence references, normalized action fingerprints, conservative equivalent-action suppression, and delta-only Investigator state.
 5. Execute only registered read-only capabilities with entity, depth, concurrency, timeout, and call-count limits.
 6. Normalize tool output into evidence receipts and a unified `EvidencePack` carrying freshness, completeness, provenance, and truncation metadata.
 7. Review required evidence deterministically and perform at most the configured bounded supplemental retrieval when evidence gaps remain.
-8. Compose a token-bounded context from current evidence, graph context, knowledge, and authorized memory.
+8. Compose a token-bounded context from current evidence, graph context, knowledge, and authorized memory. Investigator context is compacted separately from final Synth evidence, with authority sections retained and pre/post token estimates recorded.
 9. Synthesize the analyst-facing answer and persist bounded continuity for the next turn.
 
 ## Capabilities
@@ -131,10 +135,11 @@ Current evidence and memory are composed under explicit token budgets. Memory is
 
 ## LLM Layer
 
-The model layer has three independently configured roles:
+The model layer has four independently configured roles:
 
 - **Router** — intent, scope, evidence needs, and typed structured-query semantics.
 - **Planner** — bounded multi-step planning when deterministic direct execution is insufficient.
+- **Investigator** — strict, one-action-at-a-time evidence selection for eligible adaptive investigations; deterministic validators retain authority.
 - **Synthesizer** — grounded correlation and final analyst-facing explanation.
 
 The shared transport is OpenAI-compatible and supports these provider types:
@@ -144,7 +149,7 @@ The shared transport is OpenAI-compatible and supports these provider types:
 - `ollama`
 - `openai_compatible`
 
-Router, Planner, and Synthesizer have independent base URLs, model names, API-key fields, token budgets, and timeouts while sharing the selected provider policy.
+Router, Planner, Investigator, and Synthesizer have independent base URLs, model names, API-key fields, token budgets, and timeouts while sharing the selected provider policy. Adaptive mode defaults off; repeated no-progress turns stop safely, and the final evidence/Synth path remains unchanged. See [Bounded Adaptive Investigator Workflow](docs/AUTONOMOUS_AGENT_WORKFLOW.md).
 
 ## Knowledge / RAG
 
@@ -223,6 +228,7 @@ Canonical operational references:
 - [Frontend / Backend Integration](docs/FRONTEND_BACKEND_COPILOT_INTEGRATION.md)
 - [Neo4j Graph and Enrichment](docs/NEO4J_GRAPH_ENRICHMENT_GRAPHRAG.md)
 - [Observability](docs/OBSERVABILITY.md)
+- [Bounded Adaptive Investigator Workflow](docs/AUTONOMOUS_AGENT_WORKFLOW.md)
 
 ## Validation
 

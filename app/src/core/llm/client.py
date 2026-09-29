@@ -17,7 +17,9 @@ from src.core.observability.metrics import get_metrics
 
 
 logger = logging.getLogger(__name__)
-STRUCTURED_PURPOSES = {"intent_router", "intent_router_repair", "planner", "planner_repair"}
+STRUCTURED_PURPOSES = {
+    "intent_router", "intent_router_repair", "planner", "planner_repair", "investigator"
+}
 
 
 class LLMClient:
@@ -29,6 +31,7 @@ class LLMClient:
             "router",
             "synthesizer",
             *(["planner"] if settings.planner_enabled else []),
+            *(["investigator"] if settings.adaptive_agent_enabled else []),
         )
         for role in selected_roles:
             deployment = settings.role(role)
@@ -39,8 +42,9 @@ class LLMClient:
         router = settings.role("router")
         chat = settings.role("synthesizer")
         planner = settings.role("planner")
+        investigator = settings.role("investigator")
         logger.info(
-            "event=provider_initialization provider=%s enabled=%s router_deployment=%s router_model=%s router_host=%s planner_enabled=%s planner_deployment=%s planner_model=%s planner_host=%s chat_deployment=%s chat_model=%s chat_host=%s ready=%s",
+            "event=provider_initialization provider=%s enabled=%s router_deployment=%s router_model=%s router_host=%s planner_enabled=%s planner_deployment=%s planner_model=%s planner_host=%s adaptive_enabled=%s investigator_deployment=%s investigator_model=%s investigator_host=%s chat_deployment=%s chat_model=%s chat_host=%s ready=%s",
             settings.llm_provider,
             settings.llm_enabled,
             router.name,
@@ -50,6 +54,10 @@ class LLMClient:
             planner.name,
             planner.model,
             planner.safe_host,
+            settings.adaptive_agent_enabled,
+            investigator.name,
+            investigator.model,
+            investigator.safe_host,
             chat.name,
             chat.model,
             chat.safe_host,
@@ -381,14 +389,22 @@ class LLMClient:
             if self.settings.planner_enabled
             else {"enabled": False, "ready": True, "deployment": "planner"}
         )
+        investigator = (
+            self.providers["investigator"].health()
+            if self.settings.adaptive_agent_enabled
+            else {"enabled": False, "ready": True, "deployment": "investigator"}
+        )
         return {
             "enabled": self.settings.llm_enabled,
             "supported": True,
-            "ready": bool(router["ready"] and planner["ready"] and chat["ready"]),
+            "ready": bool(
+                router["ready"] and planner["ready"] and investigator["ready"] and chat["ready"]
+            ),
             "provider": chat["provider"],
             "model": chat["model"],
             "deployment": chat["deployment"],
             "router": router,
             "planner": planner,
+            "investigator": investigator,
             "chat": chat,
         }

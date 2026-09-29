@@ -62,6 +62,7 @@ jobs:
           app/src/tests/test_product_transcript_memory.py
           app/src/tests/test_phase3_specialists.py
           app/src/tests/test_agentic_rag_foundation.py
+          app/src/tests/test_adaptive_agent_workflow.py
           --deselect=app/src/tests/test_context_routing.py::ServiceAndTraceTests::test_compaction_honors_one_recent_raw_message_exactly
           -q
       - name: Run structured Neo4j integration regression

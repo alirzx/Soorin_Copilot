@@ -101,6 +101,18 @@ def _role_config(role: str, settings: "Settings") -> LLMRoleConfig:
             settings.planner_supports_temperature,
             settings.planner_supports_top_p,
         ),
+        "investigator": (
+            settings.investigator_base_url,
+            settings.investigator_model,
+            settings.investigator_api_key,
+            settings.investigator_timeout_seconds,
+            settings.investigator_max_tokens,
+            settings.investigator_max_tokens,
+            settings.investigator_temperature,
+            settings.investigator_top_p,
+            settings.investigator_supports_temperature,
+            settings.investigator_supports_top_p,
+        ),
         "synthesizer": (
             settings.synthesizer_base_url,
             settings.synthesizer_model,
@@ -128,7 +140,9 @@ def _role_config(role: str, settings: "Settings") -> LLMRoleConfig:
             supports_top_p,
         ) = values[role]
     except KeyError as exc:
-        raise ValueError("Unknown LLM role. Valid roles: router, planner, synthesizer") from exc
+        raise ValueError(
+            "Unknown LLM role. Valid roles: router, planner, investigator, synthesizer"
+        ) from exc
     return LLMRoleConfig(
         name=role,  # type: ignore[arg-type]
         base_url=base_url,
@@ -172,8 +186,14 @@ class Settings:
     planner_enabled: bool
     planner_repair_enabled: bool
     planner_system_prompt_path: str
+    adaptive_agent_enabled: bool
     agent_max_supplemental_retrievals: int
     agent_max_capability_calls: int
+    agent_max_investigator_turns: int
+    agent_max_llm_calls: int
+    agent_max_total_capability_calls: int
+    agent_max_deepened_entities: int
+    agent_max_technical_failures: int
     agent_max_entities: int
     agent_max_graph_depth: int
     agent_executor_max_concurrency: int
@@ -201,6 +221,18 @@ class Settings:
     planner_top_p: float | None
     planner_supports_temperature: bool
     planner_supports_top_p: bool
+    investigator_base_url: str
+    investigator_model: str
+    investigator_api_key: str
+    investigator_timeout_seconds: int
+    investigator_max_tokens: int
+    investigator_temperature: float | None
+    investigator_top_p: float | None
+    investigator_supports_temperature: bool
+    investigator_supports_top_p: bool
+    investigator_system_prompt_path: str
+    investigator_max_input_tokens: int
+    investigator_hard_input_tokens: int
     synthesizer_base_url: str
     synthesizer_model: str
     synthesizer_api_key: str
@@ -384,6 +416,8 @@ class Settings:
     def deployment_for_purpose(self, purpose: str) -> LLMRoleConfig:
         if purpose == "chat":
             role = "synthesizer"
+        elif purpose == "investigator":
+            role = "investigator"
         elif purpose in {"planner", "planner_repair"}:
             role = "planner"
         else:
@@ -399,10 +433,25 @@ class Settings:
         roles = ["router", "synthesizer"]
         if self.planner_enabled:
             roles.append("planner")
+        if self.adaptive_agent_enabled:
+            roles.append("investigator")
         missing = [role for role in roles if not self.role(role).base_url]
         if missing:
             raise ValueError(
                 "Selected LLM role base URL is not configured for: " + ", ".join(missing)
+            )
+
+    def validate_adaptive_agent_configuration(self) -> None:
+        if self.investigator_hard_input_tokens < self.investigator_max_input_tokens:
+            raise ValueError(
+                "SOORIN_INVESTIGATOR_HARD_INPUT_TOKENS must be at least "
+                "SOORIN_INVESTIGATOR_MAX_INPUT_TOKENS."
+            )
+        if self.agent_max_llm_calls < 3:
+            raise ValueError("SOORIN_AGENT_MAX_LLM_CALLS must reserve Router, Investigator, and Synth calls.")
+        if self.agent_max_investigator_turns > self.agent_max_llm_calls - 2:
+            raise ValueError(
+                "SOORIN_AGENT_MAX_INVESTIGATOR_TURNS must leave LLM budget for Router and Synth."
             )
 
     def validate_product_paths(self) -> None:
@@ -594,8 +643,16 @@ def get_settings() -> Settings:
             "SOORIN_PLANNER_SYSTEM_PROMPT_PATH",
             "app/prompts/planner_system_prompt.md",
         ).strip(),
+        adaptive_agent_enabled=_bool("SOORIN_ADAPTIVE_AGENT_ENABLED", False),
         agent_max_supplemental_retrievals=max(0, min(1, _int("SOORIN_AGENT_MAX_SUPPLEMENTAL_RETRIEVALS", 1))),
         agent_max_capability_calls=max(1, min(6, _int("SOORIN_AGENT_MAX_CAPABILITY_CALLS", 6))),
+        agent_max_investigator_turns=max(1, min(8, _int("SOORIN_AGENT_MAX_INVESTIGATOR_TURNS", 4))),
+        agent_max_llm_calls=max(3, min(12, _int("SOORIN_AGENT_MAX_LLM_CALLS", 6))),
+        agent_max_total_capability_calls=max(
+            1, min(12, _int("SOORIN_AGENT_MAX_TOTAL_CAPABILITY_CALLS", 6))
+        ),
+        agent_max_deepened_entities=max(1, min(2, _int("SOORIN_AGENT_MAX_DEEPENED_ENTITIES", 2))),
+        agent_max_technical_failures=max(1, min(4, _int("SOORIN_AGENT_MAX_TECHNICAL_FAILURES", 2))),
         agent_max_entities=max(1, min(2, _int("SOORIN_AGENT_MAX_ENTITIES", 2))),
         agent_max_graph_depth=max(0, min(2, _int("SOORIN_AGENT_MAX_GRAPH_DEPTH", 2))),
         agent_executor_max_concurrency=max(1, min(4, _int("SOORIN_AGENT_EXECUTOR_MAX_CONCURRENCY", 4))),
@@ -623,6 +680,21 @@ def get_settings() -> Settings:
         planner_top_p=_optional_float("SOORIN_PLANNER_TOP_P"),
         planner_supports_temperature=_bool("SOORIN_PLANNER_SUPPORTS_TEMPERATURE", False),
         planner_supports_top_p=_bool("SOORIN_PLANNER_SUPPORTS_TOP_P", False),
+        investigator_base_url=os.getenv("SOORIN_INVESTIGATOR_BASE_URL", "").strip().rstrip("/"),
+        investigator_model=os.getenv("SOORIN_INVESTIGATOR_MODEL", "CHANGE_ME_MODEL").strip(),
+        investigator_api_key=os.getenv("SOORIN_INVESTIGATOR_API_KEY", "").strip(),
+        investigator_timeout_seconds=_int("SOORIN_INVESTIGATOR_TIMEOUT_SECONDS", 60),
+        investigator_max_tokens=max(1, _int("SOORIN_INVESTIGATOR_MAX_TOKENS", 512)),
+        investigator_temperature=_optional_float("SOORIN_INVESTIGATOR_TEMPERATURE"),
+        investigator_top_p=_optional_float("SOORIN_INVESTIGATOR_TOP_P"),
+        investigator_supports_temperature=_bool("SOORIN_INVESTIGATOR_SUPPORTS_TEMPERATURE", False),
+        investigator_supports_top_p=_bool("SOORIN_INVESTIGATOR_SUPPORTS_TOP_P", False),
+        investigator_system_prompt_path=os.getenv(
+            "SOORIN_INVESTIGATOR_SYSTEM_PROMPT_PATH",
+            "app/prompts/investigator_system_prompt.md",
+        ).strip(),
+        investigator_max_input_tokens=max(256, _int("SOORIN_INVESTIGATOR_MAX_INPUT_TOKENS", 8000)),
+        investigator_hard_input_tokens=max(256, _int("SOORIN_INVESTIGATOR_HARD_INPUT_TOKENS", 12000)),
         synthesizer_base_url=os.getenv("SOORIN_SYNTHESIZER_BASE_URL", "").strip().rstrip("/"),
         synthesizer_model=os.getenv("SOORIN_SYNTHESIZER_MODEL", "CHANGE_ME_MODEL").strip(),
         synthesizer_api_key=os.getenv("SOORIN_SYNTHESIZER_API_KEY", "").strip(),
@@ -930,6 +1002,7 @@ def get_settings() -> Settings:
     settings.validate_product_paths()
     settings.validate_graph_enrichment_configuration()
     settings.validate_observability_configuration()
+    settings.validate_adaptive_agent_configuration()
     settings.validate_local_persistence_configuration()
     settings.validate_long_term_memory_configuration()
     logger.info(

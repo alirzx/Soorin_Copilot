@@ -3,9 +3,7 @@
 from __future__ import annotations
 
 import logging
-import hashlib
 import json
-import re
 import threading
 from dataclasses import replace
 from datetime import datetime, timezone
@@ -20,6 +18,7 @@ from src.core.agent.contracts import (
     RetryPolicy,
     ToolResult,
 )
+from src.core.agent.context_identity import knowledge_query_hash
 from src.core.agent.structured_evidence import structured_evidence_from_context
 from src.core.rag.models import KnowledgeSearchResult
 from src.core.graph.structured import (
@@ -482,8 +481,7 @@ def build_capability_registry(
         return run
 
     def knowledge(payload: KnowledgeInput) -> ToolResult:
-        normalized_query = re.sub(r"\s+", " ", payload.query.casefold().strip())
-        query_hash = hashlib.sha256(normalized_query.encode("utf-8")).hexdigest()[:16]
+        query_hash = knowledge_query_hash(payload.query)
         purpose = normalize_purpose(payload.purpose, "general_reference")
         result: KnowledgeSearchResult = knowledge_service.search(
             payload.query,

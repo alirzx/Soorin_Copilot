@@ -12,6 +12,7 @@ These documents describe the current runtime and should be treated as the primar
 - [FRONTEND_BACKEND_COPILOT_INTEGRATION.md](FRONTEND_BACKEND_COPILOT_INTEGRATION.md) — frontend/API integration contract, authentication, conversation IDs, UI-selected asset context, and streaming behavior.
 - [NEO4J_GRAPH_ENRICHMENT_GRAPHRAG.md](NEO4J_GRAPH_ENRICHMENT_GRAPHRAG.md) — Neo4j projection, synchronization, enrichment, structured graph retrieval, and graph-aware investigation.
 - [OBSERVABILITY.md](OBSERVABILITY.md) — application logging, Prometheus, Loki, Alloy, Grafana, metrics authentication, and evidence diagnostics.
+- [AUTONOMOUS_AGENT_WORKFLOW.md](AUTONOMOUS_AGENT_WORKFLOW.md) — feature-flagged bounded adaptive investigation, contracts, budgets, safety boundaries, and rollout behavior.
 
 ## Architecture and Design References
 

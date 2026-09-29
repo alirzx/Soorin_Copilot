@@ -36,6 +36,7 @@ class LLMHealthData(BaseModel):
     reason: str | None = None
     router: LLMDeploymentHealth | None = None
     planner: LLMDeploymentHealth | None = None
+    investigator: LLMDeploymentHealth | None = None
     chat: LLMDeploymentHealth | None = None
 
 

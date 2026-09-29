@@ -59,10 +59,11 @@ def create_app() -> FastAPI:
     def on_startup() -> None:
         settings.validate_selected_llm_deployments()
         router_deployment = settings.deployment_for_purpose("intent_router")
+        investigator_deployment = settings.deployment_for_purpose("investigator")
         chat_deployment = settings.deployment_for_purpose("chat")
         logger.info("==================== API STARTUP ====================")
         logger.info(
-            "event=application_startup host=%s port=%s provider=%s router_deployment=%s router_model=%s planner_enabled=%s planner_deployment=%s planner_model=%s chat_deployment=%s chat_model=%s agent_max_calls=%s agent_max_graph_depth=%s agent_max_concurrency=%s",
+            "event=application_startup host=%s port=%s provider=%s router_deployment=%s router_model=%s planner_enabled=%s planner_deployment=%s planner_model=%s adaptive_enabled=%s investigator_deployment=%s investigator_model=%s chat_deployment=%s chat_model=%s agent_max_calls=%s agent_max_graph_depth=%s agent_max_concurrency=%s",
             settings.api_host,
             settings.api_port,
             settings.llm_provider,
@@ -71,6 +72,9 @@ def create_app() -> FastAPI:
             settings.planner_enabled,
             "planner",
             settings.deployment_for_purpose("planner").model,
+            settings.adaptive_agent_enabled,
+            investigator_deployment.name,
+            investigator_deployment.model,
             chat_deployment.name,
             chat_deployment.model,
             settings.agent_max_capability_calls,

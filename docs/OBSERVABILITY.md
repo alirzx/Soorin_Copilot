@@ -103,6 +103,16 @@ Copilot and workflow:
 - `soorin_stream_completions_total`
 - `soorin_workflow_fallbacks_total`
 
+Bounded adaptive Investigator:
+
+- `soorin_agent_loops_total{status}`
+- `soorin_agent_turns_per_request`
+- `soorin_agent_loop_duration_seconds{status}`
+- `soorin_agent_actions_total{result}`
+- `soorin_agent_stop_reasons_total{reason}`
+- `soorin_agent_budget_exhaustion_total{budget_type}`
+- `soorin_investigator_context_tokens`
+
 LLM:
 
 - `soorin_llm_requests_total`
@@ -142,6 +152,25 @@ Context and errors:
 - `soorin_context_token_savings_total`
 - `soorin_errors_total`
 
+Bounded adaptive execution:
+
+- `soorin_agent_loops_total`
+- `soorin_agent_turns_per_request`
+- `soorin_agent_loop_duration_seconds`
+- `soorin_agent_actions_total`
+- `soorin_agent_stop_reasons_total`
+- `soorin_agent_budget_exhaustion_total`
+- `soorin_agent_equivalent_actions_blocked_total{reason}`
+- `soorin_agent_evidence_references_total{change}`
+- `soorin_agent_material_progress_turns_total{progress}`
+- `soorin_evidence_review_outcomes_total{mode,outcome}`
+- `soorin_investigator_context_tokens`
+- `soorin_investigator_context_tokens_before_compaction`
+- `soorin_investigator_context_token_savings_total`
+
+Adaptive labels are closed low-cardinality sets. They never contain request,
+session, entity, gap, query, or reference identifiers.
+
 Metrics are recorded at existing authoritative lifecycle boundaries. No Python
 code parses log text to reconstruct business events.
 
@@ -153,10 +182,43 @@ totals. Token throughput is displayed as tokens/minute, while separate panels
 show selected-range totals, tokens per LLM call, and tokens per completed
 Copilot request.
 
-Router and planner repair calls are real provider calls and are included in
-both Prometheus LLM totals and the Product usage-report aggregate under their
-own repair purposes. This keeps operational telemetry and Product accounting
-aligned with actual provider usage.
+Router and Planner repair calls and Investigator decisions are real provider
+calls. They are included in both Prometheus LLM totals and the Product
+usage-report aggregate under their own purposes, including
+`purpose=investigator`. This keeps operational telemetry and Product
+accounting aligned with actual provider usage.
+
+## Adaptive Events and Human Trace
+
+The adaptive path emits allow-listed workflow events at its authoritative
+boundaries:
+
+- `orchestration_mode_selected`
+- `agent_loop_initialized`
+- `agent_progress_evaluated`
+- `agent_decision_requested`, `agent_decision_received`, and `agent_decision_invalid`
+- `agent_context_budget_checked` and `agent_context_compacted`
+- `agent_action_validated` and `agent_action_rejected`
+- `agent_evidence_equivalent` and `agent_action_equivalent_blocked`
+- `agent_tool_observation`
+- `agent_evidence_reference_created`
+- `agent_observation_delta_built` and `agent_ledger_updated`
+- `agent_no_material_progress`
+- `agent_loop_finished`
+
+Safe fields include bounded orchestration mode, turn/LLM/tool counts, decision
+kind, gap/reference change counts, stop reason, material-progress flag,
+pre/post context-token estimates, compacted-token count, and budget category.
+Prompts, assessment text, model output, raw provider payloads, credentials, and
+entity values are not emitted as event fields or metric labels.
+
+Human Trace uses the existing trace renderer. It records orchestration mode in
+`TASK AND PLAN` and, only when adaptive execution runs, adds an
+`ADAPTIVE AGENT LOOP` section with loop status, stop reason, aggregate counts,
+and up to eight per-turn reference/gap deltas, skipped-execution reasons,
+context-token estimates, and capability/status/progress summaries. Summary-mode
+trace shows the mode and the aggregate turn/stop outcome. This is a bounded
+workflow explanation, not chain-of-thought.
 
 ## Cardinality And Data Safety
 

@@ -16,6 +16,7 @@ from src.core.agent.contracts import (
     TaskEnvelope,
     TaskSpec,
     TurnPolicy,
+    OrchestrationMode,
 )
 from src.core.context.models import EntityResolution, ResolvedEntity
 from src.core.context.product_views import select_product_views
@@ -138,6 +139,44 @@ EXPLICIT_RECALL_ENTITY_SCOPE = re.compile(
 )
 
 RecallClassification = Literal["none", "explicit_memory", "historical_summary"]
+
+
+def select_orchestration_mode(
+    task: TaskSpec,
+    *,
+    constraints: RequestConstraints,
+    adaptive_enabled: bool,
+    planner_selected: bool,
+) -> OrchestrationMode:
+    """Select direct/fixed/adaptive from validated state without another model call."""
+    legacy = "fixed" if task.workflow_mode == "multi_step" and planner_selected else "direct"
+    if not adaptive_enabled:
+        return legacy
+    if not constraints.allow_live or not (*task.required_capabilities, *task.optional_capabilities):
+        return "direct"
+    if task.structured_query is not None:
+        requirements = task.post_search_requirements
+        eligible_search = bool(
+            requirements
+            and (
+                requirements.mode == "focal_deepening"
+                or MULTI_STEP_WORDING.search(task.request)
+                or IDENTITY_CONTRADICTION_REQUEST.search(task.request)
+            )
+        )
+        return "adaptive" if eligible_search else "direct"
+    adaptive_intent = task.intent in {
+        "asset_investigation",
+        "security_investigation",
+        "anomaly_investigation",
+    }
+    open_ended = bool(
+        MULTI_STEP_WORDING.search(task.request)
+        or IDENTITY_CONTRADICTION_REQUEST.search(task.request)
+    )
+    if task.workflow_mode == "multi_step" and (adaptive_intent or open_ended):
+        return "adaptive"
+    return legacy
 
 
 def is_broad_conversation_recall(request: str) -> bool:

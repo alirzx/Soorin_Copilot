@@ -25,6 +25,12 @@ SAFE_EVENT_FIELDS = {
     "error_type", "retryable", "resumed",
     "backend", "specialist", "subgraph_node", "capability_count",
     "result_count", "missing_count",
+    "orchestration_mode", "agent_turn", "decision_kind", "gap_count",
+    "llm_call_count", "remaining_turns", "remaining_tool_calls", "stop_reason",
+    "material_progress", "budget_type", "reference_count", "new_reference_count",
+    "changed_reference_count", "resolved_gap_count", "remaining_gap_count",
+    "compacted_tokens", "input_tokens_before", "input_tokens_after",
+    "delta_count", "capability_schema_count", "remaining_hard_budget",
 }
 
 

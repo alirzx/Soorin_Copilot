@@ -104,6 +104,11 @@ class SynthesizerTaskContext:
     output_constraints: tuple[str, ...]
     structured_query_scope: dict[str, Any]
     post_search_enrichment: dict[str, Any]
+    orchestration_mode: str
+    agent_stop_reason: str
+    agent_turn_count: int
+    unresolved_gap_count: int
+    agent_budget_exhausted: bool
 
 
 @dataclass(frozen=True)
@@ -227,6 +232,7 @@ class SynthesizerPromptBuilder:
         structured_reference_kind: str = "none",
         active_focal_entities: tuple[str, ...] = (),
         post_search_enrichment: PostSearchEnrichmentSummary | None = None,
+        agent_loop_state: Any = None,
     ) -> SynthesizerTaskContext:
         memory_package = getattr(snapshot, "memory_context", None)
         selected_count = max(
@@ -392,6 +398,22 @@ class SynthesizerPromptBuilder:
             output_constraints=(),
             structured_query_scope=structured_query_scope,
             post_search_enrichment=post_search_metadata,
+            orchestration_mode=task.orchestration_mode,
+            agent_stop_reason=str(getattr(agent_loop_state, "stop_reason", "") or ""),
+            agent_turn_count=int(
+                getattr(getattr(agent_loop_state, "budget", None), "investigator_turns", 0) or 0
+            ),
+            unresolved_gap_count=sum(
+                item.status == "open"
+                for item in tuple(getattr(getattr(agent_loop_state, "ledger", None), "gaps", ()) or ())
+            ),
+            agent_budget_exhausted=str(getattr(agent_loop_state, "stop_reason", "") or "") in {
+                "budget_exhausted",
+                "tool_budget_exhausted",
+                "llm_budget_exhausted",
+                "technical_failure_ceiling",
+                "context_budget_exhausted",
+            },
         )
 
     def render_contract(self, context: SynthesizerTaskContext) -> tuple[str, tuple[str, ...]]:
@@ -465,6 +487,13 @@ class SynthesizerPromptBuilder:
             "limitations": list(context.limitations),
             "structured_query_scope": context.structured_query_scope,
             "post_search_enrichment": context.post_search_enrichment,
+            "adaptive_execution": {
+                "orchestration_mode": context.orchestration_mode,
+                "stop_reason": context.agent_stop_reason,
+                "turn_count": context.agent_turn_count,
+                "unresolved_gap_count": context.unresolved_gap_count,
+                "budget_exhausted": context.agent_budget_exhausted,
+            },
         }
         text = (
             "[SOORIN SYNTHESIZER TASK CONTRACT]\n"

@@ -3,14 +3,18 @@
 from __future__ import annotations
 
 import json
-import hashlib
-import re
 from dataclasses import replace
 from typing import Any
 
 from pydantic import ValidationError
 
 from src.core.agent.contracts import ExecutionPlan, PlanStep
+from src.core.agent.context_identity import (
+    knowledge_actions_equivalent,
+    knowledge_query_hash,
+    knowledge_query_term_hashes,
+    normalize_knowledge_query,
+)
 from src.core.agent.registry import CapabilityRegistry
 from src.core.context.product_views import (
     approved_views,
@@ -89,7 +93,7 @@ class PlanValidator:
 
         normalized: list[PlanStep] = []
         signatures: set[str] = set()
-        knowledge_signatures: list[tuple[str, str, set[str]]] = []
+        knowledge_signatures: list[tuple[str, str, tuple[str, ...]]] = []
         knowledge_budget_total = 0
         known_ids = set(step_ids)
         for step in plan.steps:
@@ -99,7 +103,7 @@ class PlanValidator:
                 raise PlanValidationError("unknown_capability", "Plan requested an unknown capability.") from exc
             if not spec.read_only or spec.side_effect_class != "read_only":
                 raise PlanValidationError("capability_not_read_only", "Plan requested a non-read-only capability.")
-            if plan.source == "llm" and not spec.planner_visible:
+            if plan.source in {"llm", "investigator"} and not spec.planner_visible:
                 raise PlanValidationError("capability_not_planner_visible", "Plan requested a hidden capability.")
             if any(dependency not in known_ids for dependency in step.depends_on):
                 raise PlanValidationError("unknown_dependency", "Plan references an unknown dependency.")
@@ -111,7 +115,11 @@ class PlanValidator:
                 spec.allowed_arguments
                 or tuple(spec.input_schema.model_json_schema().get("properties", {}))
             )
-            unsupported = sorted(set(arguments) - allowed_arguments) if plan.source == "llm" else []
+            unsupported = (
+                sorted(set(arguments) - allowed_arguments)
+                if plan.source in {"llm", "investigator"}
+                else []
+            )
             if unsupported:
                 raise PlanValidationError(
                     "unsupported_argument",
@@ -134,16 +142,18 @@ class PlanValidator:
                 purpose = str(arguments["purpose"]).strip().casefold()
                 if purpose not in KNOWLEDGE_PURPOSES:
                     raise PlanValidationError("knowledge_purpose_invalid", "Knowledge purpose is not approved.")
-                normalized_query = _normalize_query(str(arguments["query"]))
+                normalized_query = normalize_knowledge_query(str(arguments["query"]))
                 if not normalized_query:
                     raise PlanValidationError("knowledge_query_invalid", "Knowledge query is empty after normalization.")
-                query_hash = hashlib.sha256(normalized_query.encode("utf-8")).hexdigest()[:16]
-                query_terms = set(normalized_query.split())
+                query_hash = knowledge_query_hash(normalized_query)
+                query_terms = knowledge_query_term_hashes(normalized_query)
                 if len(knowledge_signatures) >= 2:
                     raise PlanValidationError("knowledge_call_limit_exceeded", "At most two Knowledge calls are allowed.")
                 for previous_purpose, previous_hash, previous_terms in knowledge_signatures:
-                    equivalent = query_hash == previous_hash or _query_similarity(query_terms, previous_terms) >= 0.85
-                    if purpose == previous_purpose or equivalent:
+                    equivalent = query_hash == previous_hash or knowledge_actions_equivalent(
+                        purpose, query_terms, previous_purpose, previous_terms
+                    )
+                    if equivalent:
                         raise PlanValidationError(
                             "duplicate_knowledge_search",
                             "A second Knowledge call requires a distinct purpose and meaningfully different query.",
@@ -324,7 +334,7 @@ class PlanValidator:
             steps = repaired
         elif error.code in {"duplicate_knowledge_search", "duplicate_capability_call"}:
             seen: set[str] = set()
-            seen_knowledge: list[tuple[str, set[str]]] = []
+            seen_knowledge: list[tuple[str, tuple[str, ...]]] = []
             repaired = []
             for step in steps:
                 signature = json.dumps(
@@ -333,12 +343,14 @@ class PlanValidator:
                     default=str,
                     separators=(",", ":"),
                 )
-                normalized_query = _normalize_query(str(step.arguments.get("query", "")))
+                normalized_query = normalize_knowledge_query(str(step.arguments.get("query", "")))
                 if step.capability == "knowledge.search":
                     purpose = str(step.arguments.get("purpose", "interpret_evidence")).strip().casefold()
-                    terms = set(normalized_query.split())
+                    terms = knowledge_query_term_hashes(normalized_query)
                     if any(
-                        purpose == previous_purpose or _query_similarity(terms, previous_terms) >= 0.85
+                        knowledge_actions_equivalent(
+                            purpose, terms, previous_purpose, previous_terms
+                        )
                         for previous_purpose, previous_terms in seen_knowledge
                     ):
                         actions.append("remove_duplicate_retrieval")
@@ -389,13 +401,3 @@ class PlanValidator:
             if not ready:
                 raise PlanValidationError("dependency_cycle", "Plan dependencies must form a directed acyclic graph.")
             completed.update(ready)
-
-
-def _normalize_query(query: str) -> str:
-    return re.sub(r"\s+", " ", re.sub(r"[^\w\s-]", " ", query.casefold())).strip()
-
-
-def _query_similarity(first: set[str], second: set[str]) -> float:
-    if not first or not second:
-        return 0.0
-    return len(first & second) / len(first | second)

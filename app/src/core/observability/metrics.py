@@ -31,15 +31,33 @@ FORBIDDEN_LABEL_NAMES = frozenset(
     }
 )
 
-WORKFLOW_MODES = frozenset({"direct", "multi_step", "unknown"})
+WORKFLOW_MODES = frozenset({"direct", "fixed", "adaptive", "multi_step", "unknown"})
 REQUEST_STATUSES = frozenset({"completed", "partial", "failed", "cancelled"})
 MEMORY_KINDS = frozenset({"short_term", "exact", "semantic"})
 MEMORY_RESULTS = frozenset({"hit", "miss", "unavailable"})
 MEMORY_DECISIONS = frozenset({"reuse", "verify", "live", "conflict"})
 MEMORY_ACTIONS = frozenset({"skip", "verify", "live"})
 CONTEXT_SECTIONS = frozenset(
-    {"profile", "detection", "graph", "memory", "knowledge", "history", "product"}
+    {"profile", "detection", "graph", "memory", "knowledge", "history", "product", "investigator"}
 )
+AGENT_LOOP_STATUSES = frozenset({"started", "completed", "limited", "failed"})
+AGENT_ACTION_RESULTS = frozenset({"selected", "validated", "rejected", "executed"})
+AGENT_STOP_REASONS = frozenset({
+    "evidence_sufficient", "goal_satisfied", "answer_with_limitations",
+    "clarification_required", "no_useful_action", "repeated_action",
+    "budget_exhausted", "tool_budget_exhausted", "llm_budget_exhausted",
+    "technical_failure_ceiling", "context_budget_exhausted",
+    "current_evidence_unavailable", "unknown",
+})
+AGENT_BUDGET_TYPES = frozenset({"turn", "llm", "tool", "technical", "context", "deadline", "other"})
+AGENT_EQUIVALENCE_REASONS = frozenset({
+    "equivalent_evidence_already_available", "repeated_failed_action", "other",
+})
+AGENT_REFERENCE_CHANGES = frozenset({"created", "changed"})
+MATERIAL_PROGRESS_RESULTS = frozenset({"yes", "no"})
+EVIDENCE_REVIEW_OUTCOMES = frozenset({
+    "sufficient", "answer_with_limitations", "missing_required_evidence", "safe_failure",
+})
 KNOWN_VIEWS = frozenset(
     {
         "none",
@@ -363,6 +381,84 @@ class SoorinMetrics:
             ("kind",),
             registry=self.registry,
         )
+        self.agent_loops = Counter(
+            "soorin_agent_loops_total",
+            "Bounded adaptive agent loop lifecycle outcomes.",
+            ("status",),
+            registry=self.registry,
+        )
+        self.agent_turns = Histogram(
+            "soorin_agent_turns_per_request",
+            "Investigator turns used by one adaptive request.",
+            buckets=(1, 2, 3, 4, 5, 6, 8),
+            registry=self.registry,
+        )
+        self.agent_loop_duration = Histogram(
+            "soorin_agent_loop_duration_seconds",
+            "Duration of one bounded adaptive loop.",
+            ("status",),
+            buckets=WORKFLOW_DURATION_BUCKETS,
+            registry=self.registry,
+        )
+        self.agent_actions = Counter(
+            "soorin_agent_actions_total",
+            "Adaptive action selection and validation outcomes.",
+            ("result",),
+            registry=self.registry,
+        )
+        self.agent_stops = Counter(
+            "soorin_agent_stop_reasons_total",
+            "Bounded adaptive loop stop reasons.",
+            ("reason",),
+            registry=self.registry,
+        )
+        self.agent_budget_exhaustion = Counter(
+            "soorin_agent_budget_exhaustion_total",
+            "Adaptive request budget exhaustion by bounded category.",
+            ("budget_type",),
+            registry=self.registry,
+        )
+        self.investigator_context_tokens = Histogram(
+            "soorin_investigator_context_tokens",
+            "Calibrated Investigator input-token estimates.",
+            buckets=CONTEXT_TOKEN_BUCKETS,
+            registry=self.registry,
+        )
+        self.investigator_context_tokens_before = Histogram(
+            "soorin_investigator_context_tokens_before_compaction",
+            "Calibrated Investigator input-token estimates before compaction.",
+            buckets=CONTEXT_TOKEN_BUCKETS,
+            registry=self.registry,
+        )
+        self.investigator_context_token_savings = Counter(
+            "soorin_investigator_context_token_savings_total",
+            "Estimated Investigator input tokens removed by deterministic compaction.",
+            registry=self.registry,
+        )
+        self.agent_equivalent_actions = Counter(
+            "soorin_agent_equivalent_actions_blocked_total",
+            "Adaptive actions skipped because equivalent evidence or failure already exists.",
+            ("reason",),
+            registry=self.registry,
+        )
+        self.agent_evidence_references = Counter(
+            "soorin_agent_evidence_references_total",
+            "Bounded adaptive evidence-reference changes.",
+            ("change",),
+            registry=self.registry,
+        )
+        self.agent_material_progress = Counter(
+            "soorin_agent_material_progress_turns_total",
+            "Adaptive turns with or without deterministic material progress.",
+            ("progress",),
+            registry=self.registry,
+        )
+        self.evidence_review_outcomes = Counter(
+            "soorin_evidence_review_outcomes_total",
+            "Deterministic evidence-review outcomes by bounded orchestration mode.",
+            ("mode", "outcome"),
+            registry=self.registry,
+        )
         self.graph_enrichment_cycles = Counter(
             "soorin_graph_enrichment_scheduler_cycles_total",
             "Graph enrichment scheduler cycle lifecycle outcomes.",
@@ -606,6 +702,71 @@ class SoorinMetrics:
         if self.enabled:
             self.workflow_fallbacks.labels(_bounded(kind, WORKFLOW_FALLBACK_KINDS)).inc()
 
+    def observe_agent_action(self, result: str) -> None:
+        if self.enabled:
+            self.agent_actions.labels(_bounded(result, AGENT_ACTION_RESULTS, "rejected")).inc()
+
+    def observe_investigator_context(self, tokens_before: int, tokens_after: int) -> None:
+        if self.enabled:
+            before = max(0, int(tokens_before))
+            after = max(0, int(tokens_after))
+            self.investigator_context_tokens_before.observe(before)
+            self.investigator_context_tokens.observe(after)
+            self.investigator_context_token_savings.inc(max(0, before - after))
+
+    def observe_agent_equivalent_action(self, reason: str) -> None:
+        if self.enabled:
+            self.agent_equivalent_actions.labels(
+                _bounded(reason, AGENT_EQUIVALENCE_REASONS)
+            ).inc()
+
+    def observe_agent_evidence_references(self, created: int, changed: int) -> None:
+        if not self.enabled:
+            return
+        if created:
+            self.agent_evidence_references.labels(
+                _bounded("created", AGENT_REFERENCE_CHANGES)
+            ).inc(max(0, int(created)))
+        if changed:
+            self.agent_evidence_references.labels(
+                _bounded("changed", AGENT_REFERENCE_CHANGES)
+            ).inc(max(0, int(changed)))
+
+    def observe_agent_material_progress(self, material_progress: bool) -> None:
+        if self.enabled:
+            self.agent_material_progress.labels(
+                _bounded("yes" if material_progress else "no", MATERIAL_PROGRESS_RESULTS)
+            ).inc()
+
+    def observe_evidence_review(self, mode: str, outcome: str) -> None:
+        if self.enabled:
+            self.evidence_review_outcomes.labels(
+                _bounded(mode, WORKFLOW_MODES, "unknown"),
+                _bounded(outcome, EVIDENCE_REVIEW_OUTCOMES, "safe_failure"),
+            ).inc()
+
+    def observe_agent_budget_exhaustion(self, budget_type: str) -> None:
+        if self.enabled:
+            self.agent_budget_exhaustion.labels(
+                _bounded(budget_type, AGENT_BUDGET_TYPES)
+            ).inc()
+
+    def observe_agent_loop(
+        self,
+        *,
+        status: str,
+        turns: int,
+        duration_seconds: float,
+        stop_reason: str,
+    ) -> None:
+        if not self.enabled:
+            return
+        safe_status = _bounded(status, AGENT_LOOP_STATUSES, "failed")
+        self.agent_loops.labels(safe_status).inc()
+        self.agent_turns.observe(max(0, int(turns)))
+        self.agent_loop_duration.labels(safe_status).observe(max(0.0, duration_seconds))
+        self.agent_stops.labels(_bounded(stop_reason, AGENT_STOP_REASONS, "unknown")).inc()
+
     def graph_enrichment_cycle_started(self, trigger: str) -> None:
         if not self.enabled:
             return
@@ -718,6 +879,8 @@ BOUNDED_CAPABILITIES = frozenset(
     {
         "asset.get_profile",
         "asset.get_detection",
+        "graph.search_assets",
+        "graph.aggregate_assets",
         "graph.get_summary",
         "graph.get_neighbors",
         "graph.get_relationship",
@@ -730,10 +893,10 @@ BOUNDED_TOOL_STATUSES = frozenset(
     {"ok", "empty", "not_found", "partial", "unavailable", "invalid", "not_configured"}
 )
 BOUNDED_LLM_PURPOSES = frozenset(
-    {"intent_router", "intent_router_repair", "planner", "planner_repair", "chat"}
+    {"intent_router", "intent_router_repair", "planner", "planner_repair", "investigator", "chat"}
 )
 BOUNDED_SUBSYSTEMS = frozenset(
-    {"http", "workflow", "llm", "tool", "memory", "context", "graph", "product", "rag"}
+    {"http", "workflow", "llm", "tool", "memory", "context", "graph", "product", "rag", "agent"}
 )
 BOUNDED_WORKFLOW_STAGES = frozenset(
     {
@@ -757,6 +920,13 @@ BOUNDED_WORKFLOW_STAGES = frozenset(
         "clarification_response",
         "safe_failure",
         "safe_failure_response",
+        "initialize_agent_loop",
+        "evaluate_agent_progress",
+        "investigator_decide",
+        "validate_agent_action",
+        "execute_agent_action",
+        "build_agent_observation",
+        "update_agent_ledger",
     }
 )
 GRAPH_ENRICHMENT_TRIGGERS = frozenset({"scheduled", "manual", "on_demand"})

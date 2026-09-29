@@ -31,6 +31,7 @@ _DETAILED_SECTION_ORDER = (
     "STRUCTURED QUERY",
     "TASK AND PLAN",
     "MEMORY SUFFICIENCY AND EVIDENCE GAP",
+    "ADAPTIVE AGENT LOOP",
     "LANGGRAPH WORKFLOW",
     "SPECIALISTS",
     "CAPABILITY EXECUTION",
@@ -141,6 +142,8 @@ def _summary_trace(trace: CopilotRequestTrace, *, color: bool, utf8: bool) -> st
     entity = trace.sections.get("ENTITY", {})
     intent = trace.sections.get("INTENT", {})
     plan = trace.sections.get("EXECUTION PLAN", {})
+    task_plan = trace.sections.get("TASK AND PLAN", {})
+    adaptive = trace.sections.get("ADAPTIVE AGENT LOOP", {})
     capabilities = trace.sections.get("CAPABILITY STEPS", {})
     review = trace.sections.get("REVIEW DECISION", {})
     model = trace.sections.get("MODEL RESPONSE", {})
@@ -158,10 +161,21 @@ def _summary_trace(trace: CopilotRequestTrace, *, color: bool, utf8: bool) -> st
         f"{ok} ROUTER   {intent.get('intent') or trace.sections.get('AGENT TASK', {}).get('intent', 'unknown')}",
         "",
         _paint("PLAN", "34", color),
-        f"{ok} {plan.get('step_count', 0)} bounded step(s){divider}{plan.get('source', 'deterministic')}",
+        f"{ok} {plan.get('step_count', task_plan.get('step_count', 0))} bounded step(s)"
+        f"{divider}{plan.get('source', task_plan.get('plan_source', 'deterministic'))}"
+        f"{divider}{task_plan.get('orchestration_mode', 'direct')}",
         "",
         _paint("EXECUTION", "36", color),
         f"{ok} {capabilities.get('statuses') or 'no live capability required'}",
+        *(
+            [
+                f"{ok if adaptive.get('status') == 'completed' else warning} AGENT   "
+                f"turns={adaptive.get('agent_turns', 0)}{divider}"
+                f"stop={adaptive.get('stop_reason') or 'running'}"
+            ]
+            if adaptive
+            else []
+        ),
         "",
         _paint("EVIDENCE", "36", color),
         f"{review_mark} REVIEW   {review.get('outcome', 'not_required')}",
@@ -421,6 +435,7 @@ def trace_from_investigation_state(state: dict[str, Any]) -> CopilotRequestTrace
     trace.put(
         "TASK AND PLAN",
         workflow_mode=getattr(task, "workflow_mode", "unknown"),
+        orchestration_mode=getattr(task, "orchestration_mode", state.get("orchestration_mode", "direct")),
         planner_called=bool(state.get("planner_called")),
         plan_id=getattr(plan, "plan_id", ""),
         plan_source=getattr(plan, "source", ""),
@@ -439,6 +454,37 @@ def trace_from_investigation_state(state: dict[str, Any]) -> CopilotRequestTrace
             for item in (getattr(gap_plan, "view_selections", ()) or ())
         ],
     )
+    loop = state.get("agent_loop_state")
+    if loop is not None:
+        observations = tuple(getattr(loop, "observations", ()) or ())
+        budget = getattr(loop, "budget", None)
+        detail = getattr(getattr(state.get("task"), "orchestration_mode", None), "value", None)
+        trace.put(
+            "ADAPTIVE AGENT LOOP",
+            orchestration_mode=str(detail or state.get("orchestration_mode") or "adaptive"),
+            status="completed" if getattr(loop, "stop_reason", None) else "running",
+            stop_reason=getattr(loop, "stop_reason", None),
+            agent_turns=getattr(budget, "investigator_turns", 0),
+            llm_calls=getattr(budget, "llm_calls", 0),
+            tool_calls=getattr(budget, "capability_calls", 0),
+            details=[
+                {
+                    "turn": item.turn,
+                    "capabilities": [request.capability for request in item.capability_requests],
+                    "statuses": [status for _capability, status in item.status_summary],
+                    "evidence_refs_added": len(item.new_evidence_references),
+                    "evidence_refs_changed": len(item.changed_evidence_references),
+                    "gaps_resolved": len(item.new_coverage),
+                    "remaining_gaps": len(item.remaining_gap_ids),
+                    "execution_skipped": bool(item.rejected_actions),
+                    "safe_rejection_reason": item.rejected_actions[0] if item.rejected_actions else None,
+                    "material_progress": item.material_progress,
+                    "context_tokens_before": item.context_input_tokens_before,
+                    "context_tokens_after": item.context_input_tokens_after,
+                }
+                for item in observations[:8]
+            ],
+        )
     trace.put(
         "LANGGRAPH WORKFLOW",
         status=state.get("workflow_status"),
@@ -503,15 +549,17 @@ def trace_from_investigation_state(state: dict[str, Any]) -> CopilotRequestTrace
         else 0
     )
     planner_calls = int(bool(state.get("planner_called")))
+    investigator_calls = int(getattr(getattr(loop, "budget", None), "investigator_turns", 0))
     synthesis_calls = int(bool(synthesis) and synthesis.get("provider") != "deterministic")
     usage = synthesis.get("usage") or {}
     trace.put(
         "LLM CALLS",
         router_calls=router_calls,
         planner_calls=planner_calls,
+        investigator_calls=investigator_calls,
         specialist_calls=0,
         synthesis_calls=synthesis_calls,
-        total_calls=router_calls + planner_calls + synthesis_calls,
+        total_calls=router_calls + planner_calls + investigator_calls + synthesis_calls,
         synthesis_latency_ms=synthesis.get("latency_ms", 0),
         prompt_tokens=usage.get("prompt_tokens") or usage.get("input_tokens"),
         completion_tokens=usage.get("completion_tokens") or usage.get("output_tokens"),

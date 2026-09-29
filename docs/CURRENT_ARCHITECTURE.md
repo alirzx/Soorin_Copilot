@@ -25,8 +25,12 @@ flowchart TD
     ROUTE --> VALIDATE[Task Validation]
     VALIDATE --> DIRECT[Deterministic Direct Plan]
     VALIDATE --> PLAN[Bounded Planner]
+    VALIDATE -. feature-flagged eligible task .-> AGENT[Bounded Adaptive Investigator Loop]
     DIRECT --> EXEC[Capability Executor]
     PLAN --> EXEC
+    AGENT --> AVALIDATE[Deterministic Action + Plan Validation]
+    AVALIDATE --> EXEC
+    EXEC -. observation / ledger update .-> AGENT
 
     EXEC --> PROFILE[asset.get_profile]
     EXEC --> DET[asset.get_detection]
@@ -65,7 +69,9 @@ The Router produces typed intent and scope. Structured asset requests can includ
 
 ### 4. Planning
 
-Requests with a deterministic execution path bypass the Planner. More complex supported requests may use one bounded Planner proposal that is validated before execution.
+The validated task is assigned a deterministic orchestration mode. Simple requests use a direct plan. More complex supported requests may use one bounded Planner proposal in `fixed` mode. When `SOORIN_ADAPTIVE_AGENT_ENABLED=true`, eligible investigations whose next action depends on previous evidence can instead enter the bounded adaptive loop. The flag defaults off, and simple/no-live/memory-only requests remain direct.
+
+In adaptive mode, the Investigator proposes one strict typed decision at a time. Deterministic code validates capability, evidence-gap, entity, temporal, Graph, request-constraint, repetition, and budget authority; compiles the action to an `ExecutionPlan`; runs the existing `PlanValidator`; fingerprints the normalized action; suppresses only proven equivalent/repeated work; and executes new work through the existing `CapabilityExecutor`. See [AUTONOMOUS_AGENT_WORKFLOW.md](AUTONOMOUS_AGENT_WORKFLOW.md).
 
 ### 5. Capability execution
 
@@ -101,11 +107,13 @@ Ambiguous multi-result searches remain set-level rather than triggering unbounde
 
 ### 7. Evidence normalization and review
 
-Each tool result is normalized into evidence metadata that includes source capability, entity binding, freshness, completeness, truncation, retrieval time, and safe limitations. The Evidence Reviewer evaluates whether the request's required evidence is satisfied before synthesis. A bounded supplemental retrieval may be attempted when configured and useful.
+Each tool result is normalized into evidence metadata that includes source capability, entity binding, freshness, completeness, truncation, retrieval time, and safe limitations. The Evidence Reviewer evaluates whether the request's required evidence is satisfied before synthesis. A bounded supplemental retrieval may be attempted when configured and useful on direct/fixed paths. In adaptive mode, each immutable result also produces a bounded request-local `EvidenceReference`: context identity identifies its scope, while a versioned semantic fingerprint identifies normalized content independently of operational metadata. The deterministic, temporally aware Evidence Ledger owns gap state and the Investigator proposes the next action; the Reviewer does not select tools.
 
 ### 8. Context composition
 
 The Context Composer receives validated Product, Graph, Knowledge, and memory context. It applies configured per-source budgets plus the global LLM context window, reserved output, safety margin, and token-estimate multiplier. Structured asset search and aggregate serialization have their own model-facing token limits and row/group bounds.
+
+Adaptive decisions use a separate compact state builder, not final Synth context. Each Investigator turn preserves task/request authority, authorized entities/candidates, unresolved gaps, budget, relevant capability schemas, a bounded evidence-reference index, and only the latest observation delta. It excludes raw provider payloads and prior Investigator transcripts. Deterministic compaction records before/after token estimates and fails safely if mandatory authority exceeds the hard limit.
 
 ### 9. Synthesis
 
@@ -171,10 +179,11 @@ Product Thread-State uses the Product wire contract while internal Copilot memor
 
 ## LLM Architecture
 
-Three roles are configured independently:
+Four roles are configured independently:
 
 - Router
 - Planner
+- Investigator
 - Synthesizer
 
 The transport is OpenAI-compatible. Supported provider policies are:
@@ -184,7 +193,7 @@ The transport is OpenAI-compatible. Supported provider policies are:
 - `ollama`
 - `openai_compatible`
 
-Arvan uses its API-key requirement. Private compatible endpoints may be configured without an API key. Base URL, model, API key, token limits, timeout, sampling support, and repair/retry token budgets are role-specific. The provider type is selected globally for the current deployment.
+Arvan uses its API-key requirement. Private compatible endpoints may be configured without an API key. Base URL, model, API key, token limits, timeout, and sampling support are role-specific; Router and Planner also retain their repair budgets. The Investigator deployment is constructed only when adaptive mode is enabled and may explicitly point to the same physical endpoint/model as another role. The provider type is selected globally for the current deployment.
 
 ## RAG Architecture
 
@@ -204,8 +213,10 @@ Application observability includes:
 - rotating file logs;
 - request and trace identifiers;
 - workflow-node and capability telemetry;
+- bounded adaptive-loop outcomes, budgets, actions, and stop reasons;
+- adaptive evidence-reference changes, equivalent-action suppression, material progress, and context savings;
 - provider latency/token metadata;
-- human-readable detailed traces;
+- human-readable detailed traces, including safe adaptive lifecycle summaries;
 - optional bounded evidence snapshots;
 - Prometheus metrics;
 - Loki/Alloy log collection;

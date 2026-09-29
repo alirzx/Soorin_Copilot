@@ -161,6 +161,34 @@ Router behavior:
 - `SOORIN_PLANNER_REPAIR_ENABLED`
 - `SOORIN_PLANNER_SYSTEM_PROMPT_PATH`
 
+### Investigator and adaptive orchestration
+
+The Investigator is a separate OpenAI-compatible role used only when adaptive orchestration is enabled. Its deployment is not implicitly aliased to Router, Planner, or Synthesizer; configure the same endpoint/model explicitly if desired.
+
+- `SOORIN_INVESTIGATOR_BASE_URL` — no default; required when adaptive mode is enabled.
+- `SOORIN_INVESTIGATOR_MODEL` — `CHANGE_ME_MODEL`.
+- `SOORIN_INVESTIGATOR_API_KEY` — empty by default; provider policy may require it.
+- `SOORIN_INVESTIGATOR_TIMEOUT_SECONDS` — `60`.
+- `SOORIN_INVESTIGATOR_MAX_TOKENS` — `512`.
+- `SOORIN_INVESTIGATOR_TEMPERATURE` — unset in application settings; `.env.example` uses `0.0`.
+- `SOORIN_INVESTIGATOR_TOP_P` — unset in application settings; `.env.example` uses `0.1`.
+- `SOORIN_INVESTIGATOR_SUPPORTS_TEMPERATURE` — `false`.
+- `SOORIN_INVESTIGATOR_SUPPORTS_TOP_P` — `false`.
+- `SOORIN_INVESTIGATOR_SYSTEM_PROMPT_PATH` — `app/prompts/investigator_system_prompt.md`.
+- `SOORIN_INVESTIGATOR_MAX_INPUT_TOKENS` — `8000`, the deterministic compaction target.
+- `SOORIN_INVESTIGATOR_HARD_INPUT_TOKENS` — `12000`, the fail-closed hard limit; it must be at least the target.
+
+Adaptive selection and request-level budgets:
+
+- `SOORIN_ADAPTIVE_AGENT_ENABLED` — `false`; this preserves direct/fixed behavior by default.
+- `SOORIN_AGENT_MAX_INVESTIGATOR_TURNS` — `4`.
+- `SOORIN_AGENT_MAX_LLM_CALLS` — `6`, including Router, Investigator, and final Synthesizer calls. It must leave two non-Investigator calls reserved.
+- `SOORIN_AGENT_MAX_TOTAL_CAPABILITY_CALLS` — `6` across all adaptive turns.
+- `SOORIN_AGENT_MAX_DEEPENED_ENTITIES` — `2`.
+- `SOORIN_AGENT_MAX_TECHNICAL_FAILURES` — `2`.
+
+Existing agent-wide bounds continue to apply: `SOORIN_AGENT_MAX_CAPABILITY_CALLS`, `SOORIN_AGENT_MAX_ENTITIES`, `SOORIN_AGENT_MAX_GRAPH_DEPTH`, `SOORIN_AGENT_EXECUTOR_MAX_CONCURRENCY`, and `SOORIN_AGENT_REQUEST_TIMEOUT_SECONDS`. The checked-in example uses a 90-second request timeout. LangGraph recursion is a backstop and is not the adaptive budget.
+
 ### Synthesizer
 
 - `SOORIN_SYNTHESIZER_BASE_URL`

@@ -10,6 +10,7 @@ from uuid import uuid4
 
 from pydantic import BaseModel, Field
 
+from src.core.agent.capability_projection import project_capability_schema
 from src.core.agent.contracts import CapabilitySpec, ExecutionPlan, PlanStep, TaskSpec
 from src.core.llm.errors import LLMError
 from src.core.llm.output_parser import parse_json_object
@@ -141,34 +142,7 @@ class BoundedPlanner:
 
     @staticmethod
     def _catalog_entry(spec: CapabilitySpec) -> dict[str, Any]:
-        schema = spec.input_schema.model_json_schema()
-        allowed_arguments = list(spec.allowed_arguments or tuple(schema.get("properties", {})))
-        properties = schema.get("properties", {})
-        return {
-            "name": spec.name,
-            "purpose": spec.description,
-            "minimum_entities": spec.required_entity_cardinality[0],
-            "maximum_entities": spec.required_entity_cardinality[1],
-            "allowed_arguments": allowed_arguments,
-            "argument_schema": {
-                "type": "object",
-                "properties": {
-                    name: properties[name]
-                    for name in allowed_arguments
-                    if name in properties
-                },
-                "additionalProperties": False,
-            },
-            "allowed_views": list(spec.allowed_views),
-            "allowed_detail_levels": list(spec.allowed_detail_levels),
-            "allowed_knowledge_purposes": list(spec.allowed_purposes),
-            "allowed_scopes": list(spec.allowed_scopes),
-            "allowed_depths": list(spec.allowed_depths),
-            "dependencies": list(spec.dependencies),
-            "parallelization": spec.parallelization,
-            "reusable_locally": spec.reusable_locally,
-            "read_only": spec.read_only,
-        }
+        return project_capability_schema(spec)
 
     @staticmethod
     def _parse(text: str, task: TaskSpec) -> ExecutionPlan:

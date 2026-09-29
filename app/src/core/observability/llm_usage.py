@@ -21,6 +21,7 @@ _OUTBOUND_PURPOSES = {
     "intent_router_repair": "router",
     "planner": "planner",
     "planner_repair": "planner",
+    "investigator": "investigator",
     "chat": "chat",
 }
 

@@ -15,6 +15,7 @@ from uuid import uuid4
 
 from src.config.settings import Settings
 from src.core.agent.executor import CapabilityExecutor
+from src.core.agent.investigator import Investigator
 from src.core.agent.plan_validator import PlanValidator
 from src.core.agent.planner import BoundedPlanner
 from src.core.agent.registry import build_capability_registry
@@ -218,6 +219,14 @@ class CopilotService:
             llm_client,
             repair_enabled=settings.planner_repair_enabled,
             system_prompt_path=settings.planner_system_prompt_path,
+        )
+        self.investigator = (
+            Investigator(
+                llm_client,
+                system_prompt_path=settings.investigator_system_prompt_path,
+            )
+            if settings.adaptive_agent_enabled
+            else None
         )
         self.evidence_reviewer = EvidenceReviewer()
         self._capability_provider_ids = self._current_capability_provider_ids()
