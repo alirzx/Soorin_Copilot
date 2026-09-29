@@ -317,7 +317,12 @@ def _apply_canonical_values(
         if not isinstance(raw, dict):
             return raw
         updated = dict(raw)
-        field = str(updated.get("field") or "")
+        raw_field = updated.get("field")
+        field = (
+            raw_field.value
+            if isinstance(raw_field, AssetPredicateField)
+            else str(raw_field or "")
+        )
         if field in _CANONICAL_FIELDS:
             if updated.get("value") is not None:
                 updated["value"] = canonical(field, updated["value"])
