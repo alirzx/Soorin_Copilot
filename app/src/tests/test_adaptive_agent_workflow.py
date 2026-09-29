@@ -381,8 +381,8 @@ def test_current_gap_rejects_historical_memory_and_accepts_current_product_evide
         projection_usable=True,
     )
     ledger = update_ledger(_ledger(), _task(), (historical,))
-    assert ledger.gaps[0].status == "unavailable"
-    assert evaluate_progress(ledger, _budget()) == "answer_with_limitations"
+    assert ledger.gaps[0].status == "open"
+    assert evaluate_progress(ledger, _budget()) is None
 
     current = replace(
         historical,
@@ -395,20 +395,128 @@ def test_current_gap_rejects_historical_memory_and_accepts_current_product_evide
     assert evaluate_progress(ledger, _budget()) == "evidence_sufficient"
 
 
+def test_action_validator_enforces_selected_gap_entity_scope(
+    registry: CapabilityRegistry,
+) -> None:
+    task = replace(
+        _task(),
+        entities=("10.0.0.1", "10.0.0.2"),
+    )
+    ledger = replace(
+        _ledger(),
+        authorized_entities=task.entities,
+    )
+    with pytest.raises(AgentActionValidationError) as caught:
+        AgentActionValidator(registry, PlanValidator(registry)).validate(
+            _decision(entity="10.0.0.2"),
+            task=task,
+            constraints=RequestConstraints(),
+            ledger=ledger,
+            budget=_budget(),
+            turn=1,
+        )
+    assert caught.value.code == "evidence_gap_entity_scope_violation"
+
+
 @pytest.mark.parametrize(
     ("budget", "reason"),
     [
         (_budget(investigator_turns=4), "budget_exhausted"),
+        (_budget(deadline_monotonic=time.monotonic() - 1), "budget_exhausted"),
         (_budget(llm_calls=5), "llm_budget_exhausted"),
         (_budget(capability_calls=6), "tool_budget_exhausted"),
         (_budget(technical_failures=2), "technical_failure_ceiling"),
     ],
+    ids=("turns", "deadline", "llm-reserve", "tools", "technical"),
 )
 def test_progress_gate_enforces_each_runtime_budget(
     budget: AgentLoopBudget,
     reason: str,
 ) -> None:
     assert evaluate_progress(_ledger(), budget) == reason
+
+
+@pytest.mark.parametrize(
+    ("router_called", "repair_count", "expected_calls"),
+    [(False, 3, 0), (True, 0, 1), (True, 2, 3)],
+)
+def test_agent_budget_starts_from_actual_router_calls_only(
+    router_called: bool,
+    repair_count: int,
+    expected_calls: int,
+) -> None:
+    service = SimpleNamespace(settings=get_settings())
+    nodes = CopilotWorkflowNodes(service)
+    initialized = nodes.initialize_agent_loop({
+        "request_id": "budget-request",
+        "trace_id": "budget-trace",
+        "session_id": "budget-session",
+        "task": _task(),
+        "routing_result": SimpleNamespace(
+            semantic_router_called=router_called,
+            semantic_router_retry_count=repair_count,
+        ),
+    })
+    assert initialized["agent_loop_state"].budget.llm_calls == expected_calls
+
+
+def test_malformed_investigator_output_consumes_exactly_one_llm_call(
+    registry: CapabilityRegistry,
+) -> None:
+    class MalformedInvestigator:
+        system_prompt = "system"
+
+        @staticmethod
+        def decide(*_args: object, **_kwargs: object) -> object:
+            raise InvestigatorError("investigator_malformed_json", "invalid")
+
+    service = SimpleNamespace(
+        settings=get_settings(),
+        investigator=MalformedInvestigator(),
+        _capability_runtime_snapshot=lambda: (registry, PlanValidator(registry), None),
+    )
+    nodes = CopilotWorkflowNodes(service)
+    loop = AgentLoopState(
+        turn=0,
+        budget=_budget(llm_calls=1, investigator_turns=0),
+        ledger=_ledger(),
+        started_monotonic=time.monotonic(),
+    )
+    update = nodes.investigator_decide({
+        "request_id": "malformed-request",
+        "trace_id": "malformed-trace",
+        "session_id": "malformed-session",
+        "task": _task(),
+        "request_constraints": RequestConstraints(),
+        "task_envelope": TaskEnvelope(ordered_entities=("10.0.0.1",)),
+        "agent_loop_state": loop,
+    })
+    consumed = update["agent_loop_state"].budget
+    assert consumed.llm_calls == 2
+    assert consumed.investigator_turns == 1
+    assert consumed.technical_failures == 1
+
+
+def test_action_validator_enforces_deepened_entity_budget(
+    registry: CapabilityRegistry,
+) -> None:
+    candidate = "10.0.0.2"
+    gap = replace(_ledger().gaps[0], entities=(candidate,))
+    ledger = replace(
+        _ledger(),
+        gaps=(gap,),
+        structured_candidates=(candidate,),
+    )
+    with pytest.raises(AgentActionValidationError) as caught:
+        AgentActionValidator(registry, PlanValidator(registry)).validate(
+            _decision(entity=candidate),
+            task=_task(),
+            constraints=RequestConstraints(),
+            ledger=ledger,
+            budget=_budget(deepened_entities=("10.0.0.3", "10.0.0.4")),
+            turn=1,
+        )
+    assert caught.value.code == "entity_deepening_budget_exhausted"
 
 
 def test_structured_search_candidates_open_only_bounded_post_search_gaps() -> None:
@@ -642,6 +750,70 @@ def test_graph_equivalence_requires_exact_action_and_same_projection_version() -
     next_version = evidence_reference_for_result(_graph_result("v2"), (gap,), step=prior_step)
     assert not references_semantically_equivalent(reference, next_version)
     assert reference.semantic_fingerprint != next_version.semantic_fingerprint
+
+
+def test_graph_projection_switch_invalidates_prior_request_local_reuse() -> None:
+    task = replace(
+        _task(),
+        entities=("10.0.0.1", "10.0.0.2"),
+        required_capabilities=("graph.get_neighbors",),
+    )
+    prior_gap = replace(
+        _ledger().gaps[0],
+        gap_id="prior-graph-gap",
+        authorized_capabilities=("graph.get_neighbors",),
+        authority_requirement="graph_projection",
+    )
+    current_gap = replace(
+        prior_gap,
+        gap_id="current-graph-gap",
+        entities=("10.0.0.2",),
+    )
+    step = PlanStep(
+        "graph-prior",
+        "graph.get_neighbors",
+        {
+            "entities": ["10.0.0.1"],
+            "scope": "two_hop",
+            "direction": "both",
+            "depth": 2,
+            "relationship_mode": "neighbors",
+        },
+    )
+    ledger = update_ledger(
+        EvidenceLedger(authorized_entities=task.entities, gaps=(prior_gap, current_gap)),
+        task,
+        (_graph_result("v1"),),
+        action_fingerprints=(canonical_action_fingerprint(step),),
+        action_steps=(step,),
+    )
+    assert dict((item.gap_id, item.status) for item in ledger.gaps) == {
+        "prior-graph-gap": "satisfied",
+        "current-graph-gap": "open",
+    }
+
+    current_step = replace(
+        step,
+        id="graph-current",
+        arguments={**step.arguments, "entities": ["10.0.0.2"]},
+    )
+    ledger = update_ledger(
+        ledger,
+        task,
+        (replace(_graph_result("v2"), entities=("10.0.0.2",), step_id="graph-current"),),
+        action_fingerprints=(canonical_action_fingerprint(current_step),),
+        action_steps=(current_step,),
+    )
+    references = {item.active_graph_version: item for item in ledger.evidence_references}
+    assert references["v1"].reusable is False
+    assert references["v1"].covered_gap_ids == ()
+    assert references["v2"].reusable is True
+    assert canonical_action_fingerprint(step) not in ledger.action_fingerprints
+    assert canonical_action_fingerprint(current_step) in ledger.action_fingerprints
+    assert dict((item.gap_id, item.status) for item in ledger.gaps) == {
+        "prior-graph-gap": "open",
+        "current-graph-gap": "satisfied",
+    }
 
 
 def test_structured_and_knowledge_equivalence_reuse_existing_identity_rules() -> None:

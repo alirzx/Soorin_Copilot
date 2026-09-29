@@ -151,6 +151,8 @@ The shared transport is OpenAI-compatible and supports these provider types:
 
 Router, Planner, Investigator, and Synthesizer have independent base URLs, model names, API-key fields, token budgets, and timeouts while sharing the selected provider policy. Adaptive mode defaults off; repeated no-progress turns stop safely, and the final evidence/Synth path remains unchanged. See [Bounded Adaptive Investigator Workflow](docs/AUTONOMOUS_AGENT_WORKFLOW.md).
 
+Adaptive production readiness is evaluated separately with a versioned RFC 5737 synthetic corpus. Deterministic replay makes no LLM or live provider calls; explicit model-backed shadow replay calls only the configured Investigator and supplies synthetic tool results after production validation. Passing local gates does not enable the flag or substitute for staging/canary evidence. See [Adaptive Investigator Evaluation and Rollout](docs/AUTONOMOUS_AGENT_EVALUATION.md).
+
 ## Knowledge / RAG
 
 Knowledge retrieval uses local Qdrant and Hugging Face embeddings. The deployment keeps the Qdrant corpus and Hugging Face model cache outside the Docker image so rebuilds remain reproducible and do not duplicate model/data storage.
@@ -229,6 +231,7 @@ Canonical operational references:
 - [Neo4j Graph and Enrichment](docs/NEO4J_GRAPH_ENRICHMENT_GRAPHRAG.md)
 - [Observability](docs/OBSERVABILITY.md)
 - [Bounded Adaptive Investigator Workflow](docs/AUTONOMOUS_AGENT_WORKFLOW.md)
+- [Adaptive Investigator Evaluation and Rollout](docs/AUTONOMOUS_AGENT_EVALUATION.md)
 
 ## Validation
 
@@ -237,5 +240,19 @@ Run the repository test suite with:
 ```bash
 PYTHONPATH=app .venv/bin/python -m pytest -q app/src/tests
 ```
+
+Run the safe deterministic adaptive release gate with:
+
+```bash
+make agent-eval
+```
+
+Run real-Investigator shadow replay explicitly (configured model required and tokens are consumed) with:
+
+```bash
+make agent-eval-model
+```
+
+`SOORIN_ADAPTIVE_AGENT_ENABLED` remains `false` by default. Deterministic replay supports model-replay readiness; model replay supports staging readiness; canary telemetry and explicit review are required before default enablement.
 
 Deployment-level validation additionally uses `make config`, `make preflight`, `make preflight-image`, `make inspect-image`, and `make health`.

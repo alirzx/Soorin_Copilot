@@ -31,7 +31,7 @@ FORBIDDEN_LABEL_NAMES = frozenset(
     }
 )
 
-WORKFLOW_MODES = frozenset({"direct", "fixed", "adaptive", "multi_step", "unknown"})
+WORKFLOW_MODES = frozenset({"direct", "fixed", "adaptive", "unknown"})
 REQUEST_STATUSES = frozenset({"completed", "partial", "failed", "cancelled"})
 MEMORY_KINDS = frozenset({"short_term", "exact", "semantic"})
 MEMORY_RESULTS = frozenset({"hit", "miss", "unavailable"})
@@ -55,6 +55,11 @@ AGENT_EQUIVALENCE_REASONS = frozenset({
 })
 AGENT_REFERENCE_CHANGES = frozenset({"created", "changed"})
 MATERIAL_PROGRESS_RESULTS = frozenset({"yes", "no"})
+AGENT_AUTHORITY_REASONS = frozenset({
+    "capability", "entity", "live_policy", "graph_depth", "graph_direction",
+    "graph_scope", "structured_query", "temporal", "other",
+})
+AGENT_DECISION_INVALID_REASONS = frozenset({"malformed_json", "schema", "kind", "empty", "other"})
 EVIDENCE_REVIEW_OUTCOMES = frozenset({
     "sufficient", "answer_with_limitations", "missing_required_evidence", "safe_failure",
 })
@@ -192,6 +197,13 @@ class SoorinMetrics:
         self.copilot_duration = Histogram(
             "soorin_copilot_request_duration_seconds",
             "End-to-end Copilot workflow duration.",
+            buckets=WORKFLOW_DURATION_BUCKETS,
+            registry=self.registry,
+        )
+        self.copilot_duration_by_mode = Histogram(
+            "soorin_copilot_request_duration_by_mode_seconds",
+            "End-to-end Copilot workflow duration by bounded orchestration mode.",
+            ("workflow_mode",),
             buckets=WORKFLOW_DURATION_BUCKETS,
             registry=self.registry,
         )
@@ -453,6 +465,35 @@ class SoorinMetrics:
             ("progress",),
             registry=self.registry,
         )
+        self.agent_llm_calls_per_request = Histogram(
+            "soorin_agent_llm_calls_per_request",
+            "Logical Router, Investigator, and final Synthesizer calls for one adaptive request.",
+            buckets=(0, 1, 2, 3, 4, 5, 6, 8, 10),
+            registry=self.registry,
+        )
+        self.agent_capability_calls_per_request = Histogram(
+            "soorin_agent_capability_calls_per_request",
+            "Validated provider capability calls for one adaptive request.",
+            buckets=(0, 1, 2, 3, 4, 5, 6, 8, 10),
+            registry=self.registry,
+        )
+        self.agent_premature_finish_rejections = Counter(
+            "soorin_agent_premature_finish_rejections_total",
+            "Investigator FINISH proposals rejected while obtainable required gaps remain.",
+            registry=self.registry,
+        )
+        self.agent_authority_invalid_proposals = Counter(
+            "soorin_agent_authority_invalid_proposals_total",
+            "Investigator proposals rejected by a bounded authority category.",
+            ("reason",),
+            registry=self.registry,
+        )
+        self.agent_malformed_decisions = Counter(
+            "soorin_agent_malformed_decisions_total",
+            "Investigator outputs rejected by a bounded parser/schema category.",
+            ("reason",),
+            registry=self.registry,
+        )
         self.evidence_review_outcomes = Counter(
             "soorin_evidence_review_outcomes_total",
             "Deterministic evidence-review outcomes by bounded orchestration mode.",
@@ -544,6 +585,9 @@ class SoorinMetrics:
             _bounded(workflow_mode, WORKFLOW_MODES, "unknown"),
         ).inc()
         self.copilot_duration.observe(max(0.0, duration_seconds))
+        self.copilot_duration_by_mode.labels(
+            _bounded(workflow_mode, WORKFLOW_MODES, "unknown")
+        ).observe(max(0.0, duration_seconds))
 
     def observe_stage(self, stage: str, duration_seconds: float, *, error: object = "") -> None:
         if not self.enabled:
@@ -736,6 +780,27 @@ class SoorinMetrics:
         if self.enabled:
             self.agent_material_progress.labels(
                 _bounded("yes" if material_progress else "no", MATERIAL_PROGRESS_RESULTS)
+            ).inc()
+
+    def observe_agent_request_calls(self, *, llm_calls: int, capability_calls: int) -> None:
+        if self.enabled:
+            self.agent_llm_calls_per_request.observe(max(0, int(llm_calls)))
+            self.agent_capability_calls_per_request.observe(max(0, int(capability_calls)))
+
+    def observe_agent_premature_finish_rejection(self) -> None:
+        if self.enabled:
+            self.agent_premature_finish_rejections.inc()
+
+    def observe_agent_authority_invalid(self, reason: str) -> None:
+        if self.enabled:
+            self.agent_authority_invalid_proposals.labels(
+                _bounded(reason, AGENT_AUTHORITY_REASONS)
+            ).inc()
+
+    def observe_agent_malformed_decision(self, reason: str) -> None:
+        if self.enabled:
+            self.agent_malformed_decisions.labels(
+                _bounded(reason, AGENT_DECISION_INVALID_REASONS)
             ).inc()
 
     def observe_evidence_review(self, mode: str, outcome: str) -> None:

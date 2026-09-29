@@ -758,6 +758,22 @@ class BoundedCopilotWorkflow:
             workflow_mode,
             time.perf_counter() - request_started,
         )
+        loop = final.get("agent_loop_state")
+        if workflow_mode == "adaptive" and loop is not None:
+            budget = getattr(loop, "budget", None)
+            synthesis = final.get("synthesis_result") or {}
+            warnings = tuple((final.get("final_response") or {}).get("_warnings") or ())
+            synthesis_calls = int(
+                bool(synthesis)
+                and (
+                    synthesis.get("provider") != "deterministic"
+                    or "final_synthesis_fallback_used" in warnings
+                )
+            )
+            get_metrics().observe_agent_request_calls(
+                llm_calls=int(getattr(budget, "llm_calls", 0)) + synthesis_calls,
+                capability_calls=int(getattr(budget, "capability_calls", 0)),
+            )
         if final.get("routing_fallback_used"):
             get_metrics().observe_workflow_fallback("routing")
         if final.get("fallback_used"):
@@ -770,7 +786,8 @@ class BoundedCopilotWorkflow:
         orchestration_mode = getattr(task, "orchestration_mode", None)
         if orchestration_mode:
             return str(orchestration_mode)
-        return str(getattr(task, "workflow_mode", "unknown"))
+        workflow_mode = str(getattr(task, "workflow_mode", "unknown"))
+        return "fixed" if workflow_mode == "multi_step" else workflow_mode
 
     def _config(self, request_id: str) -> dict[str, Any]:
         return {"recursion_limit": self.recursion_limit}

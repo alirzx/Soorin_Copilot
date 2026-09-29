@@ -484,3 +484,19 @@ def test_detailed_trace_exposes_sanitized_structured_query_authority_and_identit
     ):
         assert expected in rendered
     assert "must-not-leak" not in rendered
+
+
+def test_human_trace_reports_active_entity_count_without_routing_state_values() -> None:
+    trace = trace_from_investigation_state({
+        "request_id": "safe-trace",
+        "session_id": "safe-session",
+        "message": "continue the investigation",
+        "workflow_status": "completed",
+        "active_entity_state": SimpleNamespace(
+            active_entities=("192.0.2.90", "198.51.100.90"),
+            previous_scope="pair",
+        ),
+    })
+    transition = trace.sections["MEMORY TRANSITION"]
+    assert transition["active_entity_count"] == 2
+    assert "active_entities" not in transition

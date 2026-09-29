@@ -540,7 +540,7 @@ def trace_from_investigation_state(state: dict[str, Any]) -> CopilotRequestTrace
         thread_state_persistence_attempted=memory.get(
             "thread_state_persistence_attempted"
         ),
-        active_entities=list(getattr(active, "active_entities", ()) or ()),
+        active_entity_count=len(tuple(getattr(active, "active_entities", ()) or ())),
         previous_scope=getattr(active, "previous_scope", None),
     )
     router_calls = (
@@ -550,7 +550,14 @@ def trace_from_investigation_state(state: dict[str, Any]) -> CopilotRequestTrace
     )
     planner_calls = int(bool(state.get("planner_called")))
     investigator_calls = int(getattr(getattr(loop, "budget", None), "investigator_turns", 0))
-    synthesis_calls = int(bool(synthesis) and synthesis.get("provider") != "deterministic")
+    response_warnings = tuple((state.get("final_response") or {}).get("_warnings") or ())
+    synthesis_calls = int(
+        bool(synthesis)
+        and (
+            synthesis.get("provider") != "deterministic"
+            or "final_synthesis_fallback_used" in response_warnings
+        )
+    )
     usage = synthesis.get("usage") or {}
     trace.put(
         "LLM CALLS",

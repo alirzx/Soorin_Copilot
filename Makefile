@@ -64,7 +64,7 @@ RAG_MODEL_CACHE_KEY := models--$(subst /,--,$(RAG_MODEL))
 RAG_CONFIG_PATH := $(HF_CACHE_DIR)/hub/$(RAG_MODEL_CACHE_KEY)/snapshots/$(RAG_REVISION)/config.json
 
 .PHONY: \
-	help show-config preflight preflight-image check-ports config test-local \
+	help show-config preflight preflight-image check-ports config test-local agent-eval agent-eval-model \
 	build build-no-cache deploy up down restart logs ps health \
 	inspect-image inspect-size export clean-export
 
@@ -80,6 +80,8 @@ help:
 	@echo "  make config           Validate docker-compose.yaml with the unified .env"
 	@echo "  make show-config      Print non-secret resolved deployment values"
 	@echo "  make test-local       Run the complete offline test suite"
+	@echo "  make agent-eval       Run deterministic adaptive replay (no external calls)"
+	@echo "  make agent-eval-model Run explicit Investigator model replay with synthetic tools"
 	@echo "  make build            Build the image directly with Docker cache"
 	@echo "  make build-no-cache   Build the image directly without Docker cache"
 	@echo "  make up               Validate, then start the prebuilt image"
@@ -197,6 +199,14 @@ config:
 
 test-local:
 	cd "$(ROOT_DIR)" && PYTHONPATH=app "$(PYTHON)" -m pytest -q app/src/tests
+
+agent-eval:
+	cd "$(ROOT_DIR)" && PYTHONPATH=app "$(PYTHON)" app/scripts/evaluate_adaptive_agent.py \
+		--mode replay --output adaptive-agent-eval-report.json
+
+agent-eval-model:
+	cd "$(ROOT_DIR)" && PYTHONPATH=app "$(PYTHON)" app/scripts/evaluate_adaptive_agent.py \
+		--mode model-replay --output adaptive-agent-model-replay-report.json
 
 build:
 	@test -f "$(ENV_FILE)" || \

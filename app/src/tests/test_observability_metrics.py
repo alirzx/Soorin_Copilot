@@ -53,6 +53,10 @@ def test_metrics_registry_exposes_expected_prometheus_families() -> None:
     metrics.observe_agent_equivalent_action("equivalent_evidence_already_available")
     metrics.observe_agent_evidence_references(created=2, changed=1)
     metrics.observe_agent_material_progress(True)
+    metrics.observe_agent_request_calls(llm_calls=4, capability_calls=2)
+    metrics.observe_agent_premature_finish_rejection()
+    metrics.observe_agent_authority_invalid("entity")
+    metrics.observe_agent_malformed_decision("schema")
     metrics.observe_evidence_review("adaptive", "sufficient")
     metrics.graph_enrichment_cycle_started("scheduled")
     metrics.observe_graph_enrichment_assets(
@@ -85,6 +89,7 @@ def test_metrics_registry_exposes_expected_prometheus_families() -> None:
     assert {
         "soorin_http_requests",
         "soorin_copilot_requests",
+        "soorin_copilot_request_duration_by_mode_seconds",
         "soorin_workflow_stage_duration_seconds",
         "soorin_llm_requests",
         "soorin_llm_input_tokens",
@@ -109,6 +114,11 @@ def test_metrics_registry_exposes_expected_prometheus_families() -> None:
         "soorin_agent_equivalent_actions_blocked",
         "soorin_agent_evidence_references",
         "soorin_agent_material_progress_turns",
+        "soorin_agent_llm_calls_per_request",
+        "soorin_agent_capability_calls_per_request",
+        "soorin_agent_premature_finish_rejections",
+        "soorin_agent_authority_invalid_proposals",
+        "soorin_agent_malformed_decisions",
         "soorin_evidence_review_outcomes",
         "soorin_graph_enrichment_scheduler_cycles",
         "soorin_graph_enrichment_assets",
@@ -128,6 +138,7 @@ def test_histograms_use_explicit_workload_specific_buckets() -> None:
     assert tuple(metrics.http_duration._upper_bounds[:-1]) == HTTP_DURATION_BUCKETS
     assert tuple(metrics.llm_duration._upper_bounds[:-1]) == LLM_DURATION_BUCKETS
     assert tuple(metrics.copilot_duration._upper_bounds[:-1]) == WORKFLOW_DURATION_BUCKETS
+    assert tuple(metrics.copilot_duration_by_mode._upper_bounds[:-1]) == WORKFLOW_DURATION_BUCKETS
     assert metrics.http_duration._upper_bounds != metrics.llm_duration._upper_bounds
     assert metrics.context_estimated_tokens_per_request._upper_bounds[-2] == 65536
 
@@ -161,6 +172,9 @@ def test_adaptive_equivalence_and_progress_labels_are_bounded() -> None:
     metrics.observe_agent_material_progress(False)
     metrics.observe_agent_evidence_references(created=1, changed=1)
     metrics.observe_evidence_review("request-123", "arbitrary-result")
+    metrics.observe_agent_authority_invalid("192.0.2.1")
+    metrics.observe_agent_malformed_decision("raw-model-output")
+    metrics.observe_copilot("completed", "planner", 0.1)
     rendered = metrics.render().decode("utf-8")
     assert 'soorin_agent_equivalent_actions_blocked_total{reason="other"} 1.0' in rendered
     assert 'soorin_agent_material_progress_turns_total{progress="no"} 1.0' in rendered
@@ -170,6 +184,9 @@ def test_adaptive_equivalence_and_progress_labels_are_bounded() -> None:
         'soorin_evidence_review_outcomes_total{mode="unknown",outcome="safe_failure"} 1.0'
         in rendered
     )
+    assert 'soorin_agent_authority_invalid_proposals_total{reason="other"} 1.0' in rendered
+    assert 'soorin_agent_malformed_decisions_total{reason="other"} 1.0' in rendered
+    assert 'workflow_mode="unknown"' in rendered
     assert "192.0.2.1" not in rendered
 
 

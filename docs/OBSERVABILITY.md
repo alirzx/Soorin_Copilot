@@ -97,6 +97,7 @@ Copilot and workflow:
 
 - `soorin_copilot_requests_total`
 - `soorin_copilot_request_duration_seconds`
+- `soorin_copilot_request_duration_by_mode_seconds{workflow_mode}`
 - `soorin_workflow_stage_duration_seconds`
 - `soorin_stream_time_to_first_output_seconds`
 - `soorin_stream_duration_seconds`
@@ -112,6 +113,11 @@ Bounded adaptive Investigator:
 - `soorin_agent_stop_reasons_total{reason}`
 - `soorin_agent_budget_exhaustion_total{budget_type}`
 - `soorin_investigator_context_tokens`
+- `soorin_agent_llm_calls_per_request`
+- `soorin_agent_capability_calls_per_request`
+- `soorin_agent_premature_finish_rejections_total`
+- `soorin_agent_authority_invalid_proposals_total{reason}`
+- `soorin_agent_malformed_decisions_total{reason}`
 
 LLM:
 
@@ -167,6 +173,11 @@ Bounded adaptive execution:
 - `soorin_investigator_context_tokens`
 - `soorin_investigator_context_tokens_before_compaction`
 - `soorin_investigator_context_token_savings_total`
+- `soorin_agent_llm_calls_per_request`
+- `soorin_agent_capability_calls_per_request`
+- `soorin_agent_premature_finish_rejections_total`
+- `soorin_agent_authority_invalid_proposals_total{reason}`
+- `soorin_agent_malformed_decisions_total{reason}`
 
 Adaptive labels are closed low-cardinality sets. They never contain request,
 session, entity, gap, query, or reference identifiers.
@@ -187,6 +198,38 @@ calls. They are included in both Prometheus LLM totals and the Product
 usage-report aggregate under their own purposes, including
 `purpose=investigator`. This keeps operational telemetry and Product
 accounting aligned with actual provider usage.
+
+The adaptive per-request LLM histogram counts logical calls already present in
+authoritative request state: actual Router calls and repairs, every consumed
+Investigator decision including malformed output, and an actual or attempted
+final Synth call. Fixed Planner calls are not folded into adaptive state. The
+capability histogram counts only validated executed actions.
+
+Useful PromQL for rollout review includes:
+
+```promql
+# p95 end-to-end latency by orchestration mode
+histogram_quantile(0.95,
+  sum by (le, workflow_mode) (
+    rate(soorin_copilot_request_duration_by_mode_seconds_bucket[$__rate_interval])
+  )
+)
+
+# average logical LLM calls per adaptive request
+sum(rate(soorin_agent_llm_calls_per_request_sum[$__rate_interval]))
+/
+clamp_min(sum(rate(soorin_agent_llm_calls_per_request_count[$__rate_interval])), 1e-9)
+
+# rejected authority-invalid proposals
+sum by (reason) (
+  rate(soorin_agent_authority_invalid_proposals_total[$__rate_interval])
+)
+
+# adaptive deterministic review outcomes
+sum by (outcome) (
+  rate(soorin_evidence_review_outcomes_total{mode="adaptive"}[$__rate_interval])
+)
+```
 
 ## Adaptive Events and Human Trace
 
@@ -257,6 +300,11 @@ The provisioned dashboard contains restrained sections for:
 5. Context gauges, per-request distributions, savings, and compaction ratio.
 6. Product dependency volume, error ratio, latency, and range failures.
 7. Structured application, dependency, memory, and context diagnostic logs.
+8. Adaptive requests by mode, p95 latency, LLM/tool calls per request, rejected proposals, stop reasons, and review outcomes.
+
+The dashboard is operational evidence, not the release gate. The reproducible
+corpus, JSON report, and staged rollout policy are documented in
+[AUTONOMOUS_AGENT_EVALUATION.md](AUTONOMOUS_AGENT_EVALUATION.md).
 
 Dashboard variables use only low-cardinality environment, provider, model,
 capability, and view labels.

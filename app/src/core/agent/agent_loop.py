@@ -98,7 +98,6 @@ def update_ledger(
             f"{result.source_capability}:contradiction:{index}"
             for index, _item in enumerate(result.contradictions[:8], start=1)
         )
-        limitations.extend(f"{result.source_capability}:{item}"[:240] for item in result.limitations[:8])
         if result.status in {"unavailable", "not_configured", "invalid"}:
             failures.append(f"{result.source_capability}:{result.status}")
         if result.structured_asset_set is not None:
@@ -107,18 +106,39 @@ def update_ledger(
                 if identity and identity not in candidates and len(candidates) < MAX_STRUCTURED_CANDIDATES:
                     candidates.append(identity)
         step = step_by_id.get(result.step_id)
-        new_references.append(evidence_reference_for_result(
+        reference = evidence_reference_for_result(
             result,
             ledger.gaps,
             step=step,
             action_fingerprint=fingerprint_by_id.get(result.step_id, ""),
-        ))
+        )
+        new_references.append(reference)
+        limitations.extend(
+            f"{result.source_capability}:{flag}"
+            for flag in reference.material_limitation_flags
+        )
 
     references = _merge_references(ledger.evidence_references, tuple(new_references))
+    stale_graph_gap_ids = _stale_graph_gap_ids(references, tuple(new_references))
+    stale_graph_action_fingerprints = _stale_graph_action_fingerprints(
+        references,
+        tuple(new_references),
+    )
+    references = _enforce_active_graph_version(references, tuple(new_references))
+    current_new_references = _enforce_active_graph_version(
+        tuple(new_references),
+        tuple(new_references),
+    )
     evidence_fingerprints = tuple(dict.fromkeys(
         (*ledger.evidence_fingerprints, *(item.semantic_fingerprint for item in new_references))
     ))[-MAX_LEDGER_EVIDENCE_FINGERPRINTS:]
-    gaps = [_updated_gap(gap, tuple(new_references), attempted) for gap in ledger.gaps]
+    reconciled_gaps = tuple(
+        replace(gap, status="open")
+        if gap.status == "satisfied" and gap.gap_id in stale_graph_gap_ids
+        else gap
+        for gap in ledger.gaps
+    )
+    gaps = [_updated_gap(gap, current_new_references, attempted) for gap in reconciled_gaps]
     if candidates and task.post_search_requirements is not None:
         gaps.extend(_post_search_gaps(task, tuple(candidates), tuple(gaps)))
     return EvidenceLedger(
@@ -131,11 +151,92 @@ def update_ledger(
         gaps=tuple(gaps),
         coverage_limitations=tuple(dict.fromkeys(limitations[-16:])),
         failures=tuple(dict.fromkeys(failures[-16:])),
-        action_fingerprints=tuple(dict.fromkeys(
-            (*ledger.action_fingerprints, *action_fingerprints)
-        ))[-MAX_LEDGER_ACTION_FINGERPRINTS:],
+        action_fingerprints=tuple(
+            item
+            for item in dict.fromkeys((*ledger.action_fingerprints, *action_fingerprints))
+            if item not in stale_graph_action_fingerprints
+        )[-MAX_LEDGER_ACTION_FINGERPRINTS:],
         evidence_fingerprints=evidence_fingerprints,
         evidence_references=references,
+    )
+
+
+def _enforce_active_graph_version(
+    references: tuple[EvidenceReference, ...],
+    incoming: tuple[EvidenceReference, ...],
+) -> tuple[EvidenceReference, ...]:
+    """Invalidate request-local Graph reuse after an observed projection switch.
+
+    The runtime does not pin a Graph version for the full request. Once a newer
+    observation reports a different active projection, evidence from the prior
+    version may remain useful to final synthesis but cannot satisfy or suppress a
+    later Graph action.
+    """
+    observed_versions = tuple(
+        item.active_graph_version
+        for item in incoming
+        if item.source_capability.startswith("graph.") and item.active_graph_version
+    )
+    if not observed_versions:
+        return references
+    active_version = observed_versions[-1]
+    return tuple(
+        replace(item, reusable=False, covered_gap_ids=())
+        if (
+            item.source_capability.startswith("graph.")
+            and item.active_graph_version
+            and item.active_graph_version != active_version
+        )
+        else item
+        for item in references
+    )
+
+
+def _stale_graph_gap_ids(
+    references: tuple[EvidenceReference, ...],
+    incoming: tuple[EvidenceReference, ...],
+) -> frozenset[str]:
+    observed_versions = tuple(
+        item.active_graph_version
+        for item in incoming
+        if item.source_capability.startswith("graph.") and item.active_graph_version
+    )
+    if not observed_versions:
+        return frozenset()
+    active_version = observed_versions[-1]
+    return frozenset(
+        gap_id
+        for item in references
+        if (
+            item.source_capability.startswith("graph.")
+            and item.active_graph_version
+            and item.active_graph_version != active_version
+        )
+        for gap_id in item.covered_gap_ids
+    )
+
+
+def _stale_graph_action_fingerprints(
+    references: tuple[EvidenceReference, ...],
+    incoming: tuple[EvidenceReference, ...],
+) -> frozenset[str]:
+    observed_versions = tuple(
+        item.active_graph_version
+        for item in incoming
+        if item.source_capability.startswith("graph.") and item.active_graph_version
+    )
+    if not observed_versions:
+        return frozenset()
+    active_version = observed_versions[-1]
+    return frozenset(
+        item.canonical_action_fingerprint
+        for item in references
+        if (
+            item.source_capability.startswith("graph.")
+            and item.active_graph_version
+            and item.active_graph_version != active_version
+            and item.canonical_action_fingerprint
+        )
     )
 
 
@@ -273,9 +374,32 @@ def _updated_gap(
     acceptable = tuple(item for item in matching if gap.gap_id in item.covered_gap_ids)
     if acceptable:
         return replace(gap, status="satisfied")
-    if matching and all(capability in attempted for capability in gap.authorized_capabilities):
+    authoritative_attempts = tuple(
+        item for item in matching
+        if _reference_has_gap_authority(item, gap)
+    )
+    if authoritative_attempts and all(
+        capability in attempted for capability in gap.authorized_capabilities
+    ):
         return replace(gap, status="unavailable")
     return gap
+
+
+def _reference_has_gap_authority(reference: EvidenceReference, gap: EvidenceGap) -> bool:
+    if gap.entities and reference.entities != gap.entities:
+        return False
+    if (
+        gap.authority_requirement != "authorized_source"
+        and reference.authority_class != gap.authority_requirement
+    ):
+        return False
+    if gap.temporal_requirement == "current" and reference.temporal_class != "current":
+        return False
+    if gap.temporal_requirement == "historical" and reference.temporal_class not in {
+        "historical", "current",
+    }:
+        return False
+    return True
 
 
 def _post_search_gaps(

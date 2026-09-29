@@ -13,6 +13,7 @@ These documents describe the current runtime and should be treated as the primar
 - [NEO4J_GRAPH_ENRICHMENT_GRAPHRAG.md](NEO4J_GRAPH_ENRICHMENT_GRAPHRAG.md) — Neo4j projection, synchronization, enrichment, structured graph retrieval, and graph-aware investigation.
 - [OBSERVABILITY.md](OBSERVABILITY.md) — application logging, Prometheus, Loki, Alloy, Grafana, metrics authentication, and evidence diagnostics.
 - [AUTONOMOUS_AGENT_WORKFLOW.md](AUTONOMOUS_AGENT_WORKFLOW.md) — feature-flagged bounded adaptive investigation, contracts, budgets, safety boundaries, and rollout behavior.
+- [AUTONOMOUS_AGENT_EVALUATION.md](AUTONOMOUS_AGENT_EVALUATION.md) — deterministic/model-backed shadow replay, synthetic corpus, metrics, readiness gates, and staging/canary policy.
 
 ## Architecture and Design References
 

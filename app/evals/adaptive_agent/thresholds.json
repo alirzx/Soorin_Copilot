@@ -1,0 +1,24 @@
+{
+  "schema_version": "adaptive-agent-thresholds-v1",
+  "threshold_version": "adaptive-agent-thresholds-2026-09-v1",
+  "quality_gates": {
+    "scenario_success_rate": {"operator": "min", "value": 95},
+    "required_gap_completion_rate": {"operator": "min", "value": 95},
+    "tool_selection_precision": {"operator": "min", "value": 90},
+    "unnecessary_tool_call_rate": {"operator": "max", "value": 10},
+    "duplicate_provider_call_rate": {"operator": "equal", "value": 0},
+    "premature_finish_accepted_rate": {"operator": "equal", "value": 0},
+    "authority_violation_accepted_rate": {"operator": "equal", "value": 0},
+    "normal_scenario_budget_exhaustion_rate": {"operator": "max", "value": 5},
+    "direct_adaptive_entry_rate": {"operator": "equal", "value": 0}
+  },
+  "advisory_metrics": [
+    "tool_selection_coverage",
+    "equivalent_action_suppression_rate",
+    "clarification_accuracy",
+    "average_investigator_turns",
+    "average_capability_calls",
+    "average_investigator_input_tokens",
+    "context_compaction_savings"
+  ]
+}

@@ -68,7 +68,7 @@ restore memory/entity context
   -> final continuity/memory update
 ```
 
-Only the seven adaptive nodes repeat. Each accepted action is compiled into an `ExecutionPlan` with `source=investigator`, checked by `AgentActionValidator`, checked again by the existing `PlanValidator`, and run through the existing `CapabilityExecutor`. The Reviewer identifies evidence sufficiency; it does not choose adaptive tools. Legacy supplemental retrieval is disabled only while adaptive mode is active.
+After one-time initialization, the six-node decision cycle can repeat: progress evaluation, Investigator decision, action validation, capability execution, observation construction, and ledger update. Each accepted action is compiled into an `ExecutionPlan` with `source=investigator`, checked by `AgentActionValidator`, checked again by the existing `PlanValidator`, and run through the existing `CapabilityExecutor`. The Reviewer identifies evidence sufficiency; it does not choose adaptive tools. Legacy supplemental retrieval is disabled only while adaptive mode is active.
 
 ## Validation and security boundaries
 
@@ -86,6 +86,8 @@ The canonical action fingerprint is computed only after `PlanValidator` has norm
 
 Equivalence is conservative and capability-specific. Complete usable Product evidence may cover a requested subset of the same capability's views and detail. Graph reuse requires the same action semantics and an active projection version. Structured search/aggregate reuse requires the same semantic query and a known request-local active Graph version. Knowledge reuse applies the same deterministic purpose/query policy as Planner validation. When equivalence is proven, only the selected compatible gap is marked covered and the existing immutable result remains available to final synthesis; no provider call is made. Partial, truncated, contradictory, projection-unusable, source-incomplete, cross-provider, or temporally incompatible evidence is never treated as an equivalent current result. Identical terminal provider failures are also blocked because executor/provider retry policy already owns low-level retries.
 
+The Graph runtime does not pin a projection for the full request. If a later Graph result reports a different active version, prior-version Graph references remain available to final synthesis but become non-reusable, their covered Graph gaps reopen, and their action fingerprints no longer suppress a current-version retrieval. A result for a different gap/entity cannot mark that reopened gap unavailable.
+
 Structured search arguments are rebuilt from the validated `TaskSpec`; model-supplied filters cannot replace them. Graph requests cannot expand the validated scope or depth. Provider payloads, prompts, model output, credentials, and hidden reasoning are excluded from metrics and Human Trace.
 
 ## Budgets and stopping
@@ -102,7 +104,7 @@ The Investigator receives a freshly rendered state each turn, never an accumulat
 
 Compaction is deterministic. It first removes older/non-material summaries and reduces memory and reference indexes while retaining latest/open-gap references; an aggressive pass further bounds non-authority metadata. Task authority, live/no-live policy, entity/candidate scope, unresolved gap IDs, budget, latest delta, and capability schemas are never arbitrarily string-truncated. The existing `TokenEstimator` records pre- and post-compaction estimates, tokens removed, reference/delta/schema counts, and remaining hard budget. If mandatory authority still exceeds the hard limit, the loop terminates with `context_budget_exhausted`.
 
-The ledger retains at most 24 evidence references, at most two semantic states per context identity, 24 action fingerprints, 24 evidence fingerprints, 20 structured candidates, and eight recent deltas. This state is composed only of frozen dataclasses and primitive containers, making its projection checkpoint-safe without enabling or changing checkpoint persistence.
+The ledger retains at most 24 evidence references, at most two semantic states per context identity, 24 action fingerprints, 24 evidence fingerprints, 20 structured candidates, and eight recent deltas. The adaptive state is composed of serializable typed data, but its absolute monotonic request deadline is process-local. LangGraph checkpoint persistence and restart/resume are not enabled; the runtime does not claim restart-safe adaptive execution.
 
 The final Synthesizer continues to use the existing evidence/context pipeline. It receives only adaptive execution metadata: orchestration mode, stop reason, turn count, unresolved-gap count, and whether a budget was exhausted.
 
@@ -110,12 +112,14 @@ The final Synthesizer continues to use the existing evidence/context pipeline. I
 
 Safe workflow events cover selection, loop initialization, progress checks, decision request/receipt/invalidity, context budget and compaction, action validation/rejection/equivalence, tool observation, evidence-reference and delta changes, ledger updates, no-progress observations, and loop completion. Fields are allow-listed and bounded.
 
-Prometheus records adaptive loop outcomes, turns, duration, action outcomes, equivalent calls blocked, evidence-reference changes, turns with/without material progress, stop reasons, budget-exhaustion categories, Investigator context size before/after compaction, estimated token savings, and deterministic review outcomes by orchestration mode. Existing LLM metrics and Product usage accounting report Investigator calls under `purpose=investigator`.
+Prometheus records adaptive loop outcomes, turns, duration, action outcomes, equivalent calls blocked, evidence-reference changes, turns with/without material progress, stop reasons, budget-exhaustion categories, Investigator context size before/after compaction, estimated token savings, per-request logical LLM/capability calls, rejected premature finishes, rejected authority-invalid/malformed proposals, mode-grouped end-to-end latency, and deterministic review outcomes by orchestration mode. Existing LLM metrics and Product usage accounting report actual Investigator provider calls under `purpose=investigator`.
 
 Human Trace adds the selected orchestration mode and a bounded `ADAPTIVE AGENT LOOP` section with aggregate budget/stop data and per-turn reference/gap deltas, skipped execution reason, progress, and context-token summaries. It contains no prompt, raw fingerprint, raw payload, arbitrary model output, or chain-of-thought.
 
-## Phase4C compatibility and future migration
+## Phase4C compatibility and evaluation
 
 Direct Phase4C structured search/aggregation and deterministic focal deepening remain the default behavior when the feature flag is off and remain available for simple work when it is on. Adaptive structured discovery reuses the same typed search contracts, treats returned assets as bounded candidates, and opens only validated post-search gaps.
 
-Patch D may evaluate this bounded architecture with scenario corpora, shadow measurements, quality/cost/latency thresholds, premature-stop analysis, tool precision, and an explicit rollout decision. The current patch does not enable adaptive mode by default, enable checkpoints, mirror production traffic, add evaluator LLMs, or change public chat/streaming contracts, capability authority, final synthesis, or memory persistence.
+Patch D provides deterministic replay and opt-in real-Investigator shadow replay over a versioned synthetic corpus. The release gate measures gap completion, tool precision, stopping, authority, calls, context size, usage, and latency where available. It does not use an evaluator LLM, mirror live production traffic, call live tools, or write memory. See [AUTONOMOUS_AGENT_EVALUATION.md](AUTONOMOUS_AGENT_EVALUATION.md).
+
+Passing deterministic replay means `READY_FOR_MODEL_REPLAY`; passing configured model replay means `READY_FOR_STAGING`. Staging and canary evidence are still required before default enablement, so architecture completion does not change the default flag, enable checkpoints, or alter public chat/streaming contracts, capability authority, final synthesis, or memory persistence.

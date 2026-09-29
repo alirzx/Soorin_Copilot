@@ -73,6 +73,8 @@ The validated task is assigned a deterministic orchestration mode. Simple reques
 
 In adaptive mode, the Investigator proposes one strict typed decision at a time. Deterministic code validates capability, evidence-gap, entity, temporal, Graph, request-constraint, repetition, and budget authority; compiles the action to an `ExecutionPlan`; runs the existing `PlanValidator`; fingerprints the normalized action; suppresses only proven equivalent/repeated work; and executes new work through the existing `CapabilityExecutor`. See [AUTONOMOUS_AGENT_WORKFLOW.md](AUTONOMOUS_AGENT_WORKFLOW.md).
 
+Patch D adds an offline evaluation plane, not another production route. Deterministic replay and opt-in real-Investigator shadow replay use synthetic `ToolResult` fixtures after the production validators; they have no capability executor or memory writer. Passing replay advances only to model-replay readiness, and passing model replay advances only to staging readiness. See [AUTONOMOUS_AGENT_EVALUATION.md](AUTONOMOUS_AGENT_EVALUATION.md).
+
 ### 5. Capability execution
 
 The capability registry exposes only approved read-only operations. Current capabilities are:
@@ -108,6 +110,8 @@ Ambiguous multi-result searches remain set-level rather than triggering unbounde
 ### 7. Evidence normalization and review
 
 Each tool result is normalized into evidence metadata that includes source capability, entity binding, freshness, completeness, truncation, retrieval time, and safe limitations. The Evidence Reviewer evaluates whether the request's required evidence is satisfied before synthesis. A bounded supplemental retrieval may be attempted when configured and useful on direct/fixed paths. In adaptive mode, each immutable result also produces a bounded request-local `EvidenceReference`: context identity identifies its scope, while a versioned semantic fingerprint identifies normalized content independently of operational metadata. The deterministic, temporally aware Evidence Ledger owns gap state and the Investigator proposes the next action; the Reviewer does not select tools.
+
+Graph evidence is reusable only for its observed active projection version. If a later Graph result exposes a version switch within the request, prior-version references remain evidence for final synthesis but lose reuse/coverage authority; affected Graph gaps reopen and can be retrieved against the new active version.
 
 ### 8. Context composition
 
@@ -215,6 +219,7 @@ Application observability includes:
 - workflow-node and capability telemetry;
 - bounded adaptive-loop outcomes, budgets, actions, and stop reasons;
 - adaptive evidence-reference changes, equivalent-action suppression, material progress, and context savings;
+- workflow-mode latency, adaptive logical LLM/capability calls per request, and bounded invalid-proposal counters;
 - provider latency/token metadata;
 - human-readable detailed traces, including safe adaptive lifecycle summaries;
 - optional bounded evidence snapshots;
@@ -222,8 +227,12 @@ Application observability includes:
 - Loki/Alloy log collection;
 - Grafana dashboards.
 
+The provisioned dashboard contains a compact Adaptive Investigator readiness row. Evaluation JSON is a separate release artifact and is never rendered into normal request traces.
+
 ## Deployment Boundaries
 
 The production Docker image contains application code and Python dependencies, not private configuration, Qdrant data, model caches, or runtime logs. The API runs as the non-root `soorin` user.
 
 Persistent resources are supplied externally through repository/runtime data, host cache mounts, and named Docker volumes. See [DEPLOYMENT.md](DEPLOYMENT.md) for the current deployment contract and [ENVIRONMENT_VARIABLES.md](ENVIRONMENT_VARIABLES.md) for configuration.
+
+Adaptive state uses serializable typed values, but the monotonic request deadline is process-local. Checkpoint persistence and adaptive restart/resume remain disabled.

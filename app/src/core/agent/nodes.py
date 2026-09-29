@@ -872,6 +872,15 @@ class CopilotWorkflowNodes:
                 error_type=exc.code,
                 llm_call_count=failed_budget.llm_calls,
             )
+            get_metrics().observe_agent_malformed_decision(
+                {
+                    "investigator_malformed_json": "malformed_json",
+                    "investigator_schema_invalid": "schema",
+                    "investigator_kind_invalid": "kind",
+                    "investigator_empty_output": "empty",
+                    "investigator_length_exhausted": "empty",
+                }.get(exc.code, "other")
+            )
             return {
                 "agent_loop_state": failed_loop,
                 "agent_decision_status": "invalid",
@@ -937,6 +946,7 @@ class CopilotWorkflowNodes:
                     reason="finish_with_obtainable_required_gap",
                 )
                 get_metrics().observe_agent_action("rejected")
+                get_metrics().observe_agent_premature_finish_rejection()
                 return {"agent_loop_state": failed, "agent_action_edge": "retry", "next_edge": "retry"}
             reason = deterministic_stop or decision.stop_reason
             return self._finish_agent_loop(state, loop, reason)
@@ -1184,6 +1194,20 @@ class CopilotWorkflowNodes:
             reason=reason,
         )
         get_metrics().observe_agent_action("rejected")
+        authority_reason = {
+            "unknown_capability": "capability",
+            "capability_not_authorized": "capability",
+            "capability_not_authorized_for_gap": "capability",
+            "entity_authority_violation": "entity",
+            "evidence_gap_entity_scope_violation": "entity",
+            "live_capability_forbidden_by_request": "live_policy",
+            "graph_depth_authority_violation": "graph_depth",
+            "graph_direction_authority_violation": "graph_direction",
+            "graph_scope_authority_violation": "graph_scope",
+            "structured_query_authority_violation": "structured_query",
+        }.get(reason)
+        if authority_reason:
+            get_metrics().observe_agent_authority_invalid(authority_reason)
         return {"agent_loop_state": updated, "agent_action_edge": "retry", "next_edge": "retry"}
 
     def _reuse_equivalent_agent_evidence(

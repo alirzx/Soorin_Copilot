@@ -111,6 +111,11 @@ class AgentActionValidator:
                     arguments["entities"] = list(entities)
             if any(entity not in authorized_entities for entity in entities):
                 raise AgentActionValidationError("entity_authority_violation", "Investigator introduced an unauthorized entity.")
+            if gap.entities and entities != gap.entities:
+                raise AgentActionValidationError(
+                    "evidence_gap_entity_scope_violation",
+                    "Investigator selected an entity scope outside the chosen evidence gap.",
+                )
             selected_entities.extend(entity for entity in entities if entity not in selected_entities)
             self._validate_graph_authority(request.capability, arguments, task)
             steps.append(PlanStep(

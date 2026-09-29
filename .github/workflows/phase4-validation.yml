@@ -63,8 +63,21 @@ jobs:
           app/src/tests/test_phase3_specialists.py
           app/src/tests/test_agentic_rag_foundation.py
           app/src/tests/test_adaptive_agent_workflow.py
+          app/src/tests/test_adaptive_agent_evaluation.py
           --deselect=app/src/tests/test_context_routing.py::ServiceAndTraceTests::test_compaction_honors_one_recent_raw_message_exactly
           -q
+      - name: Run deterministic adaptive-agent readiness evaluation
+        run: >-
+          python app/scripts/evaluate_adaptive_agent.py
+          --mode replay
+          --output adaptive-agent-eval-report.json
+      - name: Upload adaptive-agent evaluation report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: adaptive-agent-evaluation
+          path: adaptive-agent-eval-report.json
+          if-no-files-found: warn
       - name: Run structured Neo4j integration regression
         run: python -m pytest app/src/tests/test_structured_graph_neo4j_integration.py -q
       - name: Run read-only EXPLAIN and PROFILE audit
