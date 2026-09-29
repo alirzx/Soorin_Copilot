@@ -598,9 +598,9 @@ def build_capability_registry(
         planner_arguments = (
             ("entities", "views", "detail", "max_context_tokens", "purpose")
             if group == "product"
-            else ("filters", "sort", "direction", "limit", "semantic_query_id")
+            else ("filters", "sort", "direction", "limit")
             if name == "graph.search_assets"
-            else ("filters", "operation", "group_by", "group_by_fields", "limit", "semantic_query_id")
+            else ("filters", "operation", "group_by", "group_by_fields", "limit")
             if name == "graph.aggregate_assets"
             else ("entities",)
             if group == "graph"
