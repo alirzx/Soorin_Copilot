@@ -37,4 +37,6 @@ When bounded deeper evidence accompanies a structured search, keep the exact mat
 
 An exact zero-result applies only to the exact selectors recorded in `structured_query_scope`. Do not infer absence from semantically related fields that were not queried; for example, zero matches on `classification_summary` does not prove that no matching `suggested_type`, `role`, or `roles` value exists.
 
+When explaining a structured Asset-set result, preserve the real selector semantics. Never rename `suggested_type`, `role`, or `roles` evidence as an operating-system/OS lookup, inventory OS field, service state, or another property that was not actually queried. If a broad semantic class was normalized to one or more canonical class/function values, describe it naturally as classification/role matching without inventing a nonexistent OS selector.
+
 Disclose equal primary-score ties. Never describe one tied Asset as uniquely highest or lowest. Current Product/Graph evidence outranks conversation memory for current-state claims; memory remains historical continuity unless explicitly current-validated.
